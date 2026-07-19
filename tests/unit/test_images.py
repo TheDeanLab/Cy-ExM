@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -168,6 +169,30 @@ def test_load_ants_image_rejects_truncated_raw_cyexm_descriptions(
         load_ants_image(path, (0.2, 0.3, 0.5))
 
 
+def test_load_ants_image_ignores_unrelated_raw_cyexm_string_value(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unrelated-cyexm-note.tif"
+    data = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
+    description = '{"shape":[2,3,4],"axes":"ZYX","note":"cyexm"}'
+    tifffile.imwrite(
+        path,
+        data,
+        description=description,
+        metadata=None,
+        photometric="minisblack",
+    )
+    with tifffile.TiffFile(path) as handle:
+        assert handle.series[0].axes == "ZYX"
+        assert handle.shaped_metadata == (
+            {"shape": [2, 3, 4], "axes": "ZYX", "note": "cyexm"},
+        )
+
+    image = load_ants_image(path, (0.2, 0.3, 0.5))
+
+    np.testing.assert_array_equal(image.numpy(), np.transpose(data, (2, 1, 0)))
+
+
 def test_load_ants_image_accepts_plain_qyx_grayscale_stack(tmp_path: Path) -> None:
     path = tmp_path / "plain-qyx.tif"
     data = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
@@ -178,7 +203,14 @@ def test_load_ants_image_accepts_plain_qyx_grayscale_stack(tmp_path: Path) -> No
         photometric="minisblack",
     )
     with tifffile.TiffFile(path) as handle:
-        assert handle.series[0].axes == "QYX"
+        series = handle.series[0]
+        assert series.axes == "QYX"
+        assert len(series.pages) == 2
+        assert all(page.axes == "YX" for page in series.pages)
+        assert all(page.samplesperpixel == 1 for page in series.pages)
+        assert all(
+            page.photometric == tifffile.PHOTOMETRIC.MINISBLACK for page in series.pages
+        )
 
     image = load_ants_image(path, (0.2, 0.3, 0.5))
 
@@ -242,6 +274,59 @@ def test_load_ants_image_rejects_plain_sample_or_channel_layouts(
         load_ants_image(path, (0.2, 0.3, 0.5))
 
 
+@pytest.mark.parametrize("disguised_axes", ["ZYX", "QYX"])
+def test_load_ants_image_rejects_rgb_pages_disguised_as_scalar_layouts(
+    tmp_path: Path,
+    disguised_axes: str,
+) -> None:
+    path = tmp_path / f"rgb-disguised-as-{disguised_axes.lower()}.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((3, 4, 3), dtype=np.uint8),
+        metadata={"axes": disguised_axes},
+        photometric="rgb",
+    )
+    with tifffile.TiffFile(path) as handle:
+        page = handle.pages.first
+        assert handle.series[0].axes == disguised_axes
+        assert page.axes == "YXS"
+        assert page.samplesperpixel == 3
+        assert page.photometric == tifffile.PHOTOMETRIC.RGB
+
+    with pytest.raises(InputValidationError, match=r"TIFF.*layout"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
+def test_load_ants_image_rejects_later_rgb_page_in_disguised_series(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "later-rgb-page-disguised-as-zyx.tif"
+    with tifffile.TiffWriter(path) as writer:
+        writer.write(
+            np.ones((3, 3), dtype=np.uint8),
+            description='{"shape":[2,3,3],"axes":"ZYX"}',
+            metadata=None,
+            photometric="minisblack",
+        )
+        writer.write(
+            np.ones((3, 3, 3), dtype=np.uint8),
+            metadata=None,
+            photometric="rgb",
+        )
+    with tifffile.TiffFile(path) as handle:
+        series = handle.series[0]
+        assert series.axes == "ZYX"
+        assert len(series.pages) == 2
+        assert series.pages[0].axes == "YX"
+        assert series.pages[0].samplesperpixel == 1
+        assert series.pages[1].axes == "YXS"
+        assert series.pages[1].samplesperpixel == 3
+        assert series.pages[1].photometric == tifffile.PHOTOMETRIC.RGB
+
+    with pytest.raises(InputValidationError, match=r"TIFF.*layout"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
 def _cyexm_tiff_metadata(
     *,
     shape: list[int] | None = None,
@@ -264,6 +349,45 @@ def _cyexm_tiff_metadata(
             },
         },
     }
+
+
+@pytest.mark.parametrize(
+    ("relative_determinant", "accepted"),
+    [
+        pytest.param(
+            math.nextafter(1e-12, 0.0),
+            False,
+            id="just-below-cutoff",
+        ),
+        pytest.param(1e-12, False, id="at-cutoff"),
+        pytest.param(
+            math.nextafter(1e-12, math.inf),
+            True,
+            id="just-above-cutoff",
+        ),
+    ],
+)
+def test_image_geometry_relative_determinant_cutoff(
+    relative_determinant: float,
+    accepted: bool,
+) -> None:
+    payload: dict[str, object] = {
+        "shape": [2, 3, 4],
+        "origin": [0.0, 0.0, 0.0],
+        "spacing": [0.2, 0.3, 0.5],
+        "direction": [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, relative_determinant],
+        ],
+    }
+
+    if accepted:
+        geometry = ImageGeometry.from_dict(payload)
+        assert geometry.direction[2][2] == relative_determinant
+    else:
+        with pytest.raises(ValueError, match="direction must be non-singular"):
+            ImageGeometry.from_dict(payload)
 
 
 @pytest.mark.parametrize(

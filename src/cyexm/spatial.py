@@ -12,6 +12,10 @@ type Direction3D = tuple[PixelSize, PixelSize, PixelSize]
 AXIS_CONVENTION_VERSION = "external-zyx-ants-xyz-v1"
 TIFF_GEOMETRY_ATOL = 1e-7
 _GEOMETRY_KEYS = frozenset({"shape", "origin", "spacing", "direction"})
+# After normalizing the largest coefficient to one, determinant magnitude is a
+# relative proxy for rank loss. This cutoff rejects directions whose near-dependent
+# axes would amplify numerical error, while rotation roundoff remains near magnitude 1.
+_DIRECTION_RELATIVE_DETERMINANT_CUTOFF = 1e-12
 
 
 def _triple_array(value: object, name: str) -> list[object]:
@@ -75,7 +79,7 @@ def _direction_matrix(value: object) -> Direction3D:
         tuple(item / scale for item in row) for row in direction
     )
     determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
-    if abs(determinant) <= 1e-12:
+    if abs(determinant) <= _DIRECTION_RELATIVE_DETERMINANT_CUTOFF:
         raise ValueError("direction must be non-singular")
     return direction
 

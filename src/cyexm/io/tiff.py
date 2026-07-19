@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from numbers import Real
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from cyexm.spatial import (
 
 _TIFF_GEOMETRY_SCHEMA_VERSION = 1
 _CYEXM_TIFF_KEYS = frozenset({"schema_version", "axis_convention_version", "geometry"})
+_RAW_CYEXM_KEY = re.compile(r'(?:\{|,)\s*"cyexm"\s*(?::|$)')
 
 
 def _metadata_error(
@@ -69,6 +71,25 @@ def _geometry_from_shaped_metadata(
     return geometry
 
 
+def _geometry_metadata_from_description(
+    description: object,
+) -> dict[str, object] | None:
+    if not isinstance(description, str):
+        return None
+    try:
+        decoded = json.loads(description)
+    except json.JSONDecodeError as error:
+        if _RAW_CYEXM_KEY.search(description) is not None:
+            raise _metadata_error(
+                "raw ImageDescription containing a cyexm key is invalid",
+                error,
+            ) from error
+        return None
+    if isinstance(decoded, dict) and "cyexm" in decoded:
+        return decoded
+    return None
+
+
 def read_tiff_geometry(
     path: str | Path,
     data_shape: tuple[int, ...],
@@ -78,30 +99,36 @@ def read_tiff_geometry(
 
     try:
         with tifffile.TiffFile(path) as handle:
-            series_axes = handle.series[0].axes
+            series = handle.series[0]
+            series_axes = series.axes
             shaped = handle.shaped_metadata
             metadata = shaped[0] if shaped else None
-            description = handle.pages.first.description
+            description = series.keyframe.description
+            selected_pages = tuple(
+                page.aspage() if isinstance(page, tifffile.TiffFrame) else page
+                for page in series.pages
+            )
+            scalar_grayscale_pages = all(
+                page is not None
+                and "S" not in page.axes
+                and "C" not in page.axes
+                and page.samplesperpixel == 1
+                and page.photometric
+                in {
+                    tifffile.PHOTOMETRIC.MINISBLACK,
+                    tifffile.PHOTOMETRIC.MINISWHITE,
+                }
+                for page in selected_pages
+            )
     except (OSError, ValueError) as error:
         raise InputValidationError(
             f"TIFF metadata could not be read: {path}"
         ) from error
 
-    if (
-        (not isinstance(metadata, dict) or "cyexm" not in metadata)
-        and isinstance(description, str)
-        and '"cyexm"' in description
-    ):
-        try:
-            decoded = json.loads(description)
-            if not isinstance(decoded, dict) or "cyexm" not in decoded:
-                raise ValueError("raw ImageDescription has no cyexm object")
-        except (json.JSONDecodeError, TypeError, ValueError) as error:
-            raise _metadata_error(
-                "raw ImageDescription containing the cyexm marker is invalid",
-                error,
-            ) from error
-        metadata = decoded
+    if not isinstance(metadata, dict) or "cyexm" not in metadata:
+        raw_metadata = _geometry_metadata_from_description(description)
+        if raw_metadata is not None:
+            metadata = raw_metadata
 
     geometry = _geometry_from_shaped_metadata(metadata, data_shape)
     singleton_z = (
@@ -111,7 +138,9 @@ def read_tiff_geometry(
         and isinstance(metadata, dict)
         and metadata.get("axes") == "ZYX"
     )
-    if series_axes not in {"ZYX", "QYX"} and not singleton_z:
+    if not scalar_grayscale_pages or (
+        series_axes not in {"ZYX", "QYX"} and not singleton_z
+    ):
         raise InputValidationError(
             "Unsupported TIFF spatial layout; expected ZYX, grayscale QYX, "
             "or reconstructed singleton-Z YX"

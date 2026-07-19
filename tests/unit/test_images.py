@@ -174,23 +174,67 @@ def test_load_ants_image_ignores_unrelated_raw_cyexm_string_value(
 ) -> None:
     path = tmp_path / "unrelated-cyexm-note.tif"
     data = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
-    description = '{"shape":[2,3,4],"axes":"ZYX","note":"cyexm"}'
+    description = '{"note":"cyexm"}'
     tifffile.imwrite(
         path,
         data,
         description=description,
-        metadata=None,
+        metadata={"axes": "ZYX"},
         photometric="minisblack",
+        shape=data.shape,
     )
     with tifffile.TiffFile(path) as handle:
         assert handle.series[0].axes == "ZYX"
-        assert handle.shaped_metadata == (
-            {"shape": [2, 3, 4], "axes": "ZYX", "note": "cyexm"},
-        )
+        assert handle.shaped_metadata == ({"shape": [2, 3, 4], "axes": "ZYX"},)
+        assert handle.series[0].keyframe.description == description
 
     image = load_ants_image(path, (0.2, 0.3, 0.5))
 
     np.testing.assert_array_equal(image.numpy(), np.transpose(data, (2, 1, 0)))
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        pytest.param(
+            '{"axes":"ZYX" "cyexm":',
+            id="missing-comma-before-key",
+        ),
+        pytest.param(
+            '{"axes":"ZYX","cyexm"=',
+            id="equals-after-key",
+        ),
+        pytest.param(
+            '{"axes":"ZYX","cyexm"garbage',
+            id="garbage-after-key",
+        ),
+        pytest.param(
+            '{"axes":"ZYX","note":"cyexm"',
+            id="malformed-unrelated-value-is-ambiguous",
+        ),
+    ],
+)
+def test_load_ants_image_rejects_any_quoted_cyexm_in_malformed_description(
+    tmp_path: Path,
+    description: str,
+) -> None:
+    path = tmp_path / "malformed-cyexm-with-shaped-fallback.tif"
+    data = np.ones((2, 3, 4), dtype=np.uint16)
+    tifffile.imwrite(
+        path,
+        data,
+        description=description,
+        metadata={"axes": "ZYX"},
+        photometric="minisblack",
+        shape=data.shape,
+    )
+    with tifffile.TiffFile(path) as handle:
+        assert handle.series[0].axes == "ZYX"
+        assert handle.shaped_metadata == ({"shape": [2, 3, 4], "axes": "ZYX"},)
+        assert handle.series[0].keyframe.description == description
+
+    with pytest.raises(InputValidationError, match="Cy-ExM TIFF geometry metadata"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
 
 
 def test_load_ants_image_accepts_plain_qyx_grayscale_stack(tmp_path: Path) -> None:

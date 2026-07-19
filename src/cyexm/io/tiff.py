@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from numbers import Real
 from pathlib import Path
 from typing import Any
@@ -16,7 +15,6 @@ from cyexm.spatial import (
 
 _TIFF_GEOMETRY_SCHEMA_VERSION = 1
 _CYEXM_TIFF_KEYS = frozenset({"schema_version", "axis_convention_version", "geometry"})
-_RAW_CYEXM_KEY = re.compile(r'(?:\{|,)\s*"cyexm"\s*(?::|$)')
 
 
 def _metadata_error(
@@ -79,9 +77,9 @@ def _geometry_metadata_from_description(
     try:
         decoded = json.loads(description)
     except json.JSONDecodeError as error:
-        if _RAW_CYEXM_KEY.search(description) is not None:
+        if '"cyexm"' in description:
             raise _metadata_error(
-                "raw ImageDescription containing a cyexm key is invalid",
+                "raw malformed ImageDescription contains a quoted cyexm marker",
                 error,
             ) from error
         return None

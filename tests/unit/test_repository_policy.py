@@ -142,8 +142,9 @@ def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> Non
         assert forbidden not in direct_dependencies
 
     acceptance = _read_repository_file("docs/phase-1-acceptance.md")
-    assert "3768882870f1b163fbbef8c8447c409d98c44394" in acceptance
+    assert "0fb61ba42f86cc29c5beb6e0fe5b4b7aaef197a3" in acceptance
     assert "cannot contain its own commit hash" in acceptance
+    normalized_acceptance = " ".join(acceptance.split()).lower()
     for required_evidence in (
         "ANTSpyX",
         "ITK",
@@ -153,13 +154,43 @@ def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> Non
         "legacy parity",
         "import side effects",
         "thread defaults and overrides",
+        "strict explicit thread counts",
+        "external ZYX geometry boundary",
+        "fail-closed TIFF validation",
+        "source snapshot identity",
         "affine resume",
         "chunk resume",
+        "serial chunk scalar parity",
+        "transform provenance chain",
         "forbidden dependencies and exports",
         "Phase 2",
     ):
-        assert required_evidence.lower() in acceptance.lower()
-    assert "required uv version is pinned to exactly 0.7.13" in acceptance.lower()
+        assert required_evidence.lower() in normalized_acceptance
+    assert "required uv version is pinned to exactly 0.7.13" in normalized_acceptance
+    for required_snapshot in (
+        "| Python | 3.12.11 |",
+        "| ANTSpyX | 0.6.3 |",
+        "| ITK | 5.4.5 |",
+        "604 passed, 0 skipped, in 6.92 s",
+        "40 passed, 0 skipped, in 4.23 s",
+        "59 files already formatted",
+        "644 passed in 8.86 s",
+        "16 unit modules and 7 integration modules",
+        "whole-image and serial-chunk workflow cache requests",
+        "allowed grayscale ZYX, QYX, or singleton-Z layout",
+        "affine, nonlinear, and optional fixed/moving crop records",
+        "XYZ pixel spacing",
+    ):
+        assert required_snapshot.lower() in normalized_acceptance
+    for stale_snapshot in (
+        "3768882870f1b163fbbef8c8447c409d98c44394",
+        "416 passed",
+        "36 passed",
+        "452 passed",
+        "58 files already formatted",
+        "6 integration modules",
+    ):
+        assert stale_snapshot not in acceptance
 
     readme = _read_repository_file("README.md")
     assert "[Phase 1 acceptance audit](docs/phase-1-acceptance.md)" in readme

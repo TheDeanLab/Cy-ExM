@@ -4,8 +4,8 @@
 
 - **Audit date:** 2026-07-19
 - **Committed implementation baseline under audit:**
-  `3768882870f1b163fbbef8c8447c409d98c44394` (`fix: normalize notebook crop
-  origin`), committed 2026-07-19 at 12:25:53 -05:00.
+  `0fb61ba42f86cc29c5beb6e0fe5b4b7aaef197a3` (`fix: validate native thread
+  counts strictly`), committed 2026-07-19 at 16:13:13 -05:00.
 - **Acceptance-gate commit:** this document is committed as part of the acceptance
   gate, and a commit cannot contain its own commit hash. The resulting gate commit is
   identified by repository history and the audit handoff rather than by inventing a
@@ -47,13 +47,13 @@ All commands below ran on 2026-07-19 with uv's cache and managed-Python location
 | --- | --- |
 | `uv lock --check` | Exit 0; 133 packages resolved |
 | `uv sync --locked --group dev --extra examples` | Exit 0; 133 packages resolved and 130 packages audited |
-| `uv run pytest -m "unit and not hpc" tests/unit -v` | 416 passed, 0 skipped, in 5.61 s |
-| `uv run pytest -m "integration and not hpc" tests/integration -v` | 36 passed, 0 skipped, in 4.04 s |
-| `uv run ruff format --check .` | Exit 0; 58 files already formatted |
+| `uv run pytest -m "unit and not hpc" tests/unit -v` | 604 passed, 0 skipped, in 6.92 s |
+| `uv run pytest -m "integration and not hpc" tests/integration -v` | 40 passed, 0 skipped, in 4.23 s |
+| `uv run ruff format --check .` | Exit 0; 59 files already formatted |
 | `uv run ruff check .` | Exit 0; all checks passed |
 | `uv run basedpyright` | Exit 0; 0 errors, 0 warnings, 0 notes |
 | `uv run pre-commit run --all-files` | 4 of 4 hooks passed |
-| `uv run pytest tests/unit tests/integration -q` | 452 passed in 7.41 s |
+| `uv run pytest tests/unit tests/integration -q` | 644 passed in 8.86 s |
 
 `uv run pre-commit validate-config .pre-commit-config.yaml` also exited zero. The
 pre-commit configuration and GitHub workflow both parsed as YAML using the already
@@ -69,10 +69,10 @@ CI fixes all six native-thread variables at the job level before Python starts:
 or lab-storage access.
 
 Collection-time policy requires every test to have exactly one `unit`, `integration`,
-or `hpc` marker matching its first directory. Fresh collection selected all 416 unit
-tests with `-m unit`, all 36 bounded integration tests with `integration and not hpc`,
-and all 452 portable tests together. The marked module inventory was 16 unit modules
-and 6 integration modules.
+or `hpc` marker matching its first directory. Fresh collection selected all 604 unit
+tests with `-m unit`, all 40 bounded integration tests with `integration and not hpc`,
+and all 644 portable tests together. The marked module inventory was 16 unit modules
+and 7 integration modules.
 
 ## Acceptance evidence
 
@@ -82,16 +82,48 @@ and 6 integration modules.
   confirmed lightweight package/runtime/registration imports, unchanged environment
   and root logging state, no filesystem work during construction, and no eager ANTs,
   NumPy, SciPy, or tifffile import.
-- **Thread defaults and overrides:** all six tests in `test_threads.py` passed. They
+- **Thread defaults and overrides:** all 38 tests in `test_threads.py` passed. They
   confirmed one thread for every native runtime by default, explicit values over
   inherited values, inherited values over defaults per variable, stable reporting,
-  idempotent reapplication, and rejection of a late change.
+  idempotent reapplication, and rejection of a late change. Strict explicit thread
+  counts accept only exact built-in positive integers: booleans, floats, strings, and
+  integer subclasses are not coerced. Inherited environment counts keep their
+  documented base-10 string grammar and invalid updates remain atomic.
+- **External ZYX geometry boundary:** anisotropic, non-cubic tests confirmed that TIFF
+  arrays, shapes, chunk bounds, and crop bounds remain external ZYX while ANTs arrays
+  and physical metadata remain native XYZ. Whole-image and serial-chunk workflow cache
+  requests, plus the schema-version-2 chunk manifest, record
+  `external-zyx-ants-xyz-v1` and must match it before reuse.
+- **Fail-closed TIFF validation:** TIFF geometry metadata is parsed with strict schema,
+  numeric, finite, dimensional, and direction-matrix validation. A malformed,
+  truncated, unsupported, or disguised semantic Cy-ExM marker is rejected. When no
+  Cy-ExM marker is present, the documented zero-origin, supplied-spacing fallback is
+  limited to an allowed grayscale ZYX, QYX, or singleton-Z layout; unrelated metadata
+  may coexist with that fallback.
+- **Source snapshot identity:** whole-image and serial-chunk runs snapshot both inputs
+  before either load and revalidate the same path, size, and nanosecond-mtime identities
+  after loading and around every artifact reuse or commit. A changed source fails the
+  run closed, including exceptional exits, and a just-promoted record is rejected if
+  the source changed during commit.
 - **Affine resume:** the focused unit test proved that an affine artifact survives an
   injected nonlinear failure and is reused. The bounded real-library integration test
   `test_resume_reuses_affine_after_injected_nonlinear_failure` also passed.
 - **Chunk resume:** the focused unit test
   `test_resume_reuses_completed_chunk` passed, proving a valid completed chunk is
   reused after a later chunk fails.
+- **Serial chunk scalar parity:** scalar chunk output is reconstructed from each
+  committed local warp using local histogram matching, float32 core extraction, and a
+  single core stitch under
+  `serial-chunk-local-histogram-match-core-stitch-v1`. Fresh and resumed execution use
+  the same policy; the whole-image path retains its distinct
+  `whole-global-histogram-match-v1` policy, and records from the earlier global-rematch
+  behavior fail closed rather than being silently reused.
+- **Transform provenance chain:** `transform_directory.ipynb` validates affine,
+  nonlinear, and optional fixed/moving crop records and then validates their complete
+  chain before reading bounds, loading images, or applying transforms. The chain must
+  agree on exact fixed and moving inputs, fixed geometry, immediate upstream artifact,
+  round, crop, axis convention, XYZ pixel spacing, stage and role, and current
+  fixed-image identity.
 - **Examples migrated:** the exact inventory test passed for five parameterized
   scripts and six cleared notebooks. The all-files policy checks also confirmed that
   examples use Cy-ExM and contain no lab paths, ClearEx imports, Dask, SLURM, or YAML
@@ -102,8 +134,10 @@ and 6 integration modules.
   dependency. The prescribed source search returned ten hits; inspection found only
   negative tests and `AGENTS.md` policy text, with no runtime import or dependency.
 
-The focused import, thread, inventory, affine-resume, and chunk-resume audit command
-collected and passed all 13 selected tests in 1.03 s.
+The complete portable unit and bounded integration suites above supersede the earlier
+focused audit count; every focused import, thread, inventory, affine-resume,
+chunk-resume, geometry, TIFF, source-identity, scalar-parity, and provenance-chain test
+is included in the recorded 644-test result.
 
 ## Deferred Phase 2 scope
 

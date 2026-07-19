@@ -1,27 +1,146 @@
 # Cy-ExM
 
-Cy-ExM is an independent Python package for reusable cyclic expansion microscopy
-registration workflows. Phase 1 is scoped to whole-image and restartable serial
-chunk registration behavior from the recorded ClearEx baseline while keeping the
-new package free of a runtime dependency on ClearEx.
+Cy-ExM provides reusable cyclic expansion microscopy registration without a runtime
+dependency on ClearEx. Phase 1 supports restartable whole-image registration and a
+restartable **serial** chunked nonlinear workflow. Both use affine registration
+before nonlinear registration and preserve physical image geometry.
 
-The project requires Python 3.12. Create the locked development environment with:
+Cy-ExM requires Python 3.12 and retains the academic-research-use terms in
+[LICENSE.md](LICENSE.md).
+
+## Installation
+
+Create the locked runtime plus notebook/example dependencies with uv:
 
 ```bash
-export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
-export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
-uv sync --group dev
+uv sync --extra examples
 ```
 
-The top-level import is intentionally lightweight and exposes version metadata:
+For development, include the development group:
+
+```bash
+uv sync --group dev --extra examples
+```
+
+On a quota-limited HPC host, point uv's cache and managed Python installation at the
+active project filesystem before either command.
+
+## Native threads
+
+Prior registration runs showed instability when ITK and BLAS-family libraries used
+uncontrolled thread counts. Cy-ExM therefore defaults each native runtime to one
+thread. Pass an explicit immutable configuration when a dataset and environment have
+been validated at higher counts:
 
 ```python
-import cyexm
+from cyexm.runtime import NativeThreadConfig
 
-print(cyexm.__version__)
+threads = NativeThreadConfig(itk_threads=1, blas_threads=1)
 ```
 
-Run the current unit tests with `uv run pytest tests/unit -v`.
+Explicit values override inherited environment values; inherited values override the
+one-thread default. Configure threads before ANTs, NumPy, or SciPy initializes. Cy-ExM
+raises a focused error instead of pretending a late change took effect.
 
-Cy-ExM retains the ClearEx academic-research-use license. See [LICENSE.md](LICENSE.md)
-before using or redistributing the software.
+## Whole-image registration
+
+Public pixel size is expressed in micrometers in `(x, y, z)` order. NumPy and TIFF
+volume axes remain `(z, y, x)`.
+
+```python
+from pathlib import Path
+
+from cyexm.registration import register_round
+from cyexm.runtime import NativeThreadConfig
+
+register_round(
+    fixed_image_path=Path("data/fixed.tif"),
+    moving_image_path=Path("data/round2_registration_channel.tif"),
+    save_directory=Path("results/round2"),
+    imaging_round=2,
+    pixel_size=(0.15, 0.15, 0.40),
+    native_threads=NativeThreadConfig(itk_threads=1, blas_threads=1),
+    linear_accuracy="low",
+    nonlinear_accuracy="high",
+)
+```
+
+The equivalent command-line example is:
+
+```bash
+uv run python examples/scripts/whole_image_registration.py \
+  data/fixed.tif data/round2_registration_channel.tif results/round2 \
+  --round 2 --pixel-size-x 0.15 --pixel-size-y 0.15 --pixel-size-z 0.40
+```
+
+## Serial chunked registration
+
+`ChunkedImageRegistration` estimates one whole-image affine transform, then processes
+the nonlinear field serially in overlapping chunks. `chunk_size` follows array order
+`(z, y, x)`; pixel size remains public `(x, y, z)` spacing.
+
+```python
+from pathlib import Path
+
+from cyexm.registration import ChunkedImageRegistration
+from cyexm.runtime import NativeThreadConfig
+
+registration = ChunkedImageRegistration(
+    fixed_image_path=Path("data/fixed.tif"),
+    moving_image_path=Path("data/round2_registration_channel.tif"),
+    save_directory=Path("results/round2-chunked"),
+    imaging_round=2,
+    pixel_size=(0.15, 0.15, 0.40),
+    chunk_size=(512, 512, 512),
+    overlap_fraction=0.15,
+    native_threads=NativeThreadConfig(itk_threads=1, blas_threads=1),
+)
+registration.register()
+```
+
+Chunk execution is deliberately serial in Phase 1. It is the trusted numerical and
+restart reference for later orchestration work.
+
+## Outputs and restart
+
+Expensive stages are written to temporary sibling files, validated, promoted
+atomically, and then committed with a matching `.complete.json` record. A nonlinear
+failure leaves a reusable affine transform; a chunk failure leaves earlier valid
+local warp records. Rerun the same request to resume. Use `--force` (or
+`force_override=True`) only for intentional recomputation.
+
+Use a dedicated output directory for each fixed/moving request because fixed-reference
+and metric filenames are not round-scoped. See
+[registration artifacts and recovery](docs/registration-artifacts.md) for every
+filename, cache-validation rule, stale marker, and recovery case.
+
+## Examples and migration
+
+Five parameterized scripts live in `examples/scripts`; six cleared notebooks live in
+`examples/notebooks`. They require caller-provided paths and do not download data.
+
+Existing users should consult [migration from ClearEx](docs/migration-from-clearex.md)
+for the import map, downstream consumer note, moved examples, and intentionally
+corrected legacy behavior. The numerical extraction evidence is recorded in the
+[legacy parity report](docs/legacy-parity-report.md).
+
+## Phase 2 boundary
+
+Phase 1 does not implement a YAML scientific dataset manifest, round-level Dask task
+submission, or SLURM cluster provisioning. Those capabilities belong to a separately
+designed Phase 2. That design will keep scientific dataset description separate from
+execution profiles and will build on Phase 1 completion records rather than creating
+a second checkpoint mechanism.
+
+## Development checks
+
+```bash
+uv run pytest tests/unit -v
+uv run pytest -m integration tests/integration -v
+uv run ruff check .
+uv run ruff format --check .
+uv run basedpyright
+```
+
+`import cyexm` remains lightweight: it exposes version metadata without importing
+scientific runtimes, changing thread environment variables, or configuring logging.

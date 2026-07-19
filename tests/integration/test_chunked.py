@@ -8,6 +8,7 @@ import pytest
 
 from cyexm.io.images import zero_mask
 from cyexm.registration import linear, nonlinear
+from cyexm.registration._native_paths import discard_path
 from cyexm.registration.artifacts import ArtifactStore
 from cyexm.registration.backend import AntsRegistrationBackend
 from cyexm.registration.chunked import ChunkedImageRegistration, compute_chunk_grid
@@ -160,7 +161,7 @@ def test_one_chunk_and_whole_apply_the_same_real_estimated_transform_pair(
     try:
         backend.write_warp(ants.image_read(str(candidate_warp)), shared_warp)
     finally:
-        candidate_warp.unlink(missing_ok=True)
+        discard_path(candidate_warp)
     returned_candidates: list[Path] = []
 
     whole = _run_whole_with_estimated_pair(

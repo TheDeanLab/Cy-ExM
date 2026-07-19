@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,39 @@ import pytest
 from . import compare_legacy, legacy_baseline
 
 pytestmark = pytest.mark.integration
+
+
+def _valid_array_record(*, passed: bool, exact: bool = False) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "passed": passed,
+        "comparison_valid": True,
+        "shape_matches": True,
+        "actual_shape": [2, 2],
+        "expected_shape": [2, 2],
+        "actual_finite": True,
+        "expected_finite": True,
+        "max_abs_difference": 0.0 if passed else 0.25,
+        "rtol": 0.0 if exact else 1e-4,
+        "atol": 0.0 if exact else 1e-5,
+        "exact": exact,
+    }
+
+
+def _valid_literal_comparisons() -> dict[str, dict[str, object]]:
+    return {
+        "affine_result": _valid_array_record(passed=True),
+        "affine_mask": _valid_array_record(passed=True, exact=True),
+        "nonlinear_result": _valid_array_record(passed=False),
+    }
+
+
+def _expected_literal_shapes() -> dict[str, list[int]]:
+    return {
+        "affine_result": [2, 2],
+        "affine_mask": [2, 2],
+        "nonlinear_result": [2, 2],
+    }
 
 
 @pytest.fixture
@@ -135,21 +169,126 @@ def test_import_provenance_must_resolve_under_the_supplied_checkout(
         )
 
 
-def test_literal_dry_diagnostic_requires_a_present_result_to_diverge() -> None:
-    comparisons = {
-        "affine_result": {"passed": False},
-        "affine_mask": {"passed": False},
-        "nonlinear_result": {"passed": False},
+def test_capture_audit_records_matching_clean_pin_before_and_after(
+    git_checkout: tuple[Path, str],
+    tmp_path: Path,
+) -> None:
+    checkout, commit = git_checkout
+    previous = sys.dont_write_bytecode
+    try:
+        payload, audit = legacy_baseline._run_capture_with_source_audit(
+            checkout,
+            tmp_path / "baseline",
+            lambda before: {"captured_commit": before["source_commit"]},
+            expected_commit=commit,
+        )
+    finally:
+        sys.dont_write_bytecode = previous
+
+    assert payload == {"captured_commit": commit}
+    assert audit["before"] == audit["after"]
+    assert audit["unchanged"] is True
+    assert audit["bytecode_writes_disabled"] is True
+
+
+def test_capture_audit_rejects_a_checkout_dirtied_during_capture(
+    git_checkout: tuple[Path, str],
+    tmp_path: Path,
+) -> None:
+    checkout, commit = git_checkout
+    previous = sys.dont_write_bytecode
+
+    def dirty_checkout(_before: dict[str, object]) -> dict[str, object]:
+        (checkout / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        return {}
+
+    try:
+        with pytest.raises(RuntimeError, match="must be clean"):
+            legacy_baseline._run_capture_with_source_audit(
+                checkout,
+                tmp_path / "baseline",
+                dirty_checkout,
+                expected_commit=commit,
+            )
+    finally:
+        sys.dont_write_bytecode = previous
+
+
+def test_post_capture_audit_error_does_not_mask_primary_capture_error(
+    git_checkout: tuple[Path, str],
+    tmp_path: Path,
+) -> None:
+    checkout, commit = git_checkout
+    previous = sys.dont_write_bytecode
+
+    def fail_and_dirty(_before: dict[str, object]) -> dict[str, object]:
+        (checkout / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        raise ValueError("injected primary capture failure")
+
+    try:
+        with pytest.raises(
+            ValueError,
+            match="injected primary capture failure",
+        ) as error:
+            legacy_baseline._run_capture_with_source_audit(
+                checkout,
+                tmp_path / "baseline",
+                fail_and_dirty,
+                expected_commit=commit,
+            )
+    finally:
+        sys.dont_write_bytecode = previous
+
+    assert any(
+        "post-capture source audit also failed" in note
+        for note in error.value.__notes__
+    )
+
+
+def test_comparator_requires_complete_matching_post_capture_audit(
+    git_checkout: tuple[Path, str],
+    tmp_path: Path,
+) -> None:
+    checkout, commit = git_checkout
+    validation = legacy_baseline._validate_source_checkout(
+        checkout,
+        tmp_path / "baseline",
+        expected_commit=commit,
+    )
+    audit = {
+        "before": validation,
+        "after": dict(validation),
+        "unchanged": True,
+        "bytecode_writes_disabled": True,
     }
 
-    diagnostic = compare_legacy._literal_dry_expected_divergence(comparisons)
+    compare_legacy._require_source_audit(audit, expected_commit=commit)
+
+    audit["after"] = {**validation, "git_status": "dirty"}
+    with pytest.raises(RuntimeError, match="post-capture source audit"):
+        compare_legacy._require_source_audit(audit, expected_commit=commit)
+
+
+def test_literal_dry_diagnostic_requires_a_present_result_to_diverge() -> None:
+    comparisons = _valid_literal_comparisons()
+
+    expected_shapes = _expected_literal_shapes()
+    diagnostic = compare_legacy._literal_dry_expected_divergence(
+        comparisons,
+        expected_shapes,
+    )
 
     assert diagnostic["classification"] == "expected_divergence"
     assert diagnostic["passed"] is True
+    assert diagnostic["all_required_records_valid"] is True
     for comparison in comparisons.values():
         comparison["passed"] = True
     assert (
-        compare_legacy._literal_dry_expected_divergence(comparisons)["passed"] is False
+        compare_legacy._literal_dry_expected_divergence(
+            comparisons,
+            expected_shapes,
+        )["passed"]
+        is False
     )
 
 
@@ -157,16 +296,122 @@ def test_literal_dry_diagnostic_requires_a_present_result_to_diverge() -> None:
 def test_literal_dry_diagnostic_rejects_non_boolean_result_evidence(
     invalid_passed: object,
 ) -> None:
-    comparisons = {
-        "affine_result": {"passed": False},
-        "affine_mask": {"passed": invalid_passed},
-        "nonlinear_result": {"passed": True},
-    }
+    comparisons = _valid_literal_comparisons()
+    comparisons["affine_mask"]["passed"] = invalid_passed
 
-    diagnostic = compare_legacy._literal_dry_expected_divergence(comparisons)
+    diagnostic = compare_legacy._literal_dry_expected_divergence(
+        comparisons,
+        _expected_literal_shapes(),
+    )
 
     assert diagnostic["passed"] is False
     assert diagnostic["all_required_results_boolean"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("schema_version", 99, id="schema-version"),
+        pytest.param("comparison_valid", False, id="comparison-invalid"),
+        pytest.param("shape_matches", False, id="shape-mismatch"),
+        pytest.param("actual_finite", False, id="current-nonfinite"),
+        pytest.param("expected_finite", False, id="baseline-nonfinite"),
+        pytest.param("max_abs_difference", None, id="missing-maximum"),
+        pytest.param("max_abs_difference", float("inf"), id="nonfinite-maximum"),
+        pytest.param("rtol", "1e-4", id="malformed-tolerance"),
+    ],
+)
+def test_literal_dry_diagnostic_rejects_malformed_comparison_records(
+    field: str,
+    invalid_value: object,
+) -> None:
+    comparisons = _valid_literal_comparisons()
+    comparisons["nonlinear_result"][field] = invalid_value
+
+    diagnostic = compare_legacy._literal_dry_expected_divergence(
+        comparisons,
+        _expected_literal_shapes(),
+    )
+
+    assert diagnostic["passed"] is False
+    assert diagnostic["all_required_records_valid"] is False
+    assert diagnostic["invalid_results"] == ["nonlinear_result"]
+
+
+def test_literal_dry_diagnostic_anchors_shapes_to_baseline_summary() -> None:
+    comparisons = _valid_literal_comparisons()
+    comparisons["nonlinear_result"]["actual_shape"] = [3, 3]
+    comparisons["nonlinear_result"]["expected_shape"] = [3, 3]
+
+    diagnostic = compare_legacy._literal_dry_expected_divergence(
+        comparisons,
+        _expected_literal_shapes(),
+    )
+
+    assert diagnostic["passed"] is False
+    assert diagnostic["all_shapes_match_baseline_summary"] is False
+    assert diagnostic["invalid_results"] == ["nonlinear_result"]
+
+
+def test_array_result_records_complete_finite_comparison_schema(
+    native_threads: object,
+) -> None:
+    del native_threads
+    import numpy as np
+
+    result = compare_legacy._array_result(
+        np,
+        np.asarray([0.0, 1.0], dtype=np.float32),
+        np.asarray([0.0, 2.0], dtype=np.float32),
+        exact=False,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    assert result == {
+        "schema_version": 1,
+        "passed": False,
+        "comparison_valid": True,
+        "shape_matches": True,
+        "actual_shape": [2],
+        "expected_shape": [2],
+        "actual_finite": True,
+        "expected_finite": True,
+        "max_abs_difference": 1.0,
+        "rtol": 1e-4,
+        "atol": 1e-5,
+        "exact": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected"),
+    [
+        pytest.param([0.0, float("nan")], [0.0, 1.0], id="current-nonfinite"),
+        pytest.param([0.0, 1.0], [0.0, float("inf")], id="baseline-nonfinite"),
+        pytest.param([0.0], [0.0, 1.0], id="wrong-shape"),
+    ],
+)
+def test_array_result_marks_nonfinite_or_wrong_shape_evidence_invalid(
+    native_threads: object,
+    actual: list[float],
+    expected: list[float],
+) -> None:
+    del native_threads
+    import numpy as np
+
+    result = compare_legacy._array_result(
+        np,
+        np.asarray(actual, dtype=np.float32),
+        np.asarray(expected, dtype=np.float32),
+        exact=False,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    assert result["passed"] is False
+    assert result["comparison_valid"] is False
+    assert result["max_abs_difference"] is None
 
 
 def test_fixed_mask_diagnostic_requires_captured_legacy_keyword_evidence() -> None:

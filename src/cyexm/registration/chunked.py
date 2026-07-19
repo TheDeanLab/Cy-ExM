@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from cyexm.errors import CacheValidationError, ChunkRegistrationError
+from cyexm.registration._native_paths import discard_path
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import RegistrationBackend
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
@@ -593,8 +594,7 @@ class ChunkedImageRegistration(ImageRegistration):
                 raise
             return committed, True
         finally:
-            if temporary_warp is not None:
-                temporary_warp.unlink(missing_ok=True)
+            discard_path(temporary_warp)
 
     def _reconstruct_local_images(
         self,
@@ -750,7 +750,7 @@ class ChunkedImageRegistration(ImageRegistration):
         )
         os.close(descriptor)
         candidate = Path(candidate_name)
-        candidate.unlink()
+        discard_path(candidate)
         try:
             backend.write_warp(warp, candidate)
             read = backend.read_warp(candidate)
@@ -767,7 +767,7 @@ class ChunkedImageRegistration(ImageRegistration):
             if not bool(np.isfinite(array).all()):
                 raise ValueError("assembled warp values must all be finite")
         except Exception:
-            candidate.unlink(missing_ok=True)
+            discard_path(candidate)
             raise
         return candidate
 
@@ -779,6 +779,7 @@ class ChunkedImageRegistration(ImageRegistration):
         fixed_mask: object,
         moving_linear_mask: object,
     ) -> tuple[object, Path]:
+        """Return a unique disposable full-warp candidate owned by the caller."""
         self._nonlinear_request_evidence = {}
         resolved = configure_native_threads(self.native_threads)
         np = _scientific_runtime()

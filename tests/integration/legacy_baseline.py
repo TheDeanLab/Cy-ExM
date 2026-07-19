@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -100,6 +101,54 @@ def _validate_source_checkout(
         "git_status": "clean",
         "output_directory": str(destination),
         "output_outside_checkout": True,
+    }
+
+
+def _run_capture_with_source_audit(
+    source_root: Path,
+    output: Path,
+    capture: Callable[[dict[str, object]], dict[str, object]],
+    *,
+    expected_commit: str = _CLEAR_EX_COMMIT,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Run capture between matching read-only source audits."""
+    sys.dont_write_bytecode = True
+    before = _validate_source_checkout(
+        source_root,
+        output,
+        expected_commit=expected_commit,
+    )
+
+    def audit_after() -> dict[str, object]:
+        after = _validate_source_checkout(
+            source_root,
+            output,
+            expected_commit=expected_commit,
+        )
+        if after != before:
+            raise RuntimeError(
+                "post-capture source audit does not match the pre-capture audit"
+            )
+        return after
+
+    try:
+        payload = capture(before)
+    except BaseException as primary:
+        try:
+            audit_after()
+        except Exception as audit_error:
+            primary.add_note(
+                "post-capture source audit also failed: "
+                f"{type(audit_error).__name__}: {audit_error}"
+            )
+        raise
+
+    after = audit_after()
+    return payload, {
+        "before": before,
+        "after": after,
+        "unchanged": True,
+        "bytecode_writes_disabled": sys.dont_write_bytecode,
     }
 
 
@@ -271,8 +320,11 @@ def _legacy_chunks(
     return chunks, extractions, scalar_stitch, vector_stitch
 
 
-def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
-    source_validation = _validate_source_checkout(source_root, output)
+def _capture_baseline(
+    output: Path,
+    source_root: Path,
+    source_validation: dict[str, object],
+) -> dict[str, object]:
     commit = str(source_validation["source_commit"])
     _configure_one_thread()
 
@@ -310,7 +362,9 @@ def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
     moving_mask = ants.from_numpy(moving_mask_data, spacing=_PIXEL_SIZE)
 
     with tempfile.TemporaryDirectory(
-        dir=output, prefix=".legacy-ants-native-"
+        dir=output,
+        prefix=".legacy-ants-native-",
+        ignore_cleanup_errors=True,
     ) as native_directory_text:
         native_directory = Path(native_directory_text)
         with _controlled_registration_outputs(
@@ -431,7 +485,7 @@ def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
     np.save(output / "stitch_vector.npy", vector_stitch, allow_pickle=False)
 
     summary: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_commit": commit,
         "source_validation": source_validation,
         "import_provenance": import_provenance,
@@ -544,6 +598,20 @@ def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
             "stitch_order": [int(chunk.chunk_id) for chunk in chunks],
         },
     }
+    return summary
+
+
+def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
+    summary, source_audit = _run_capture_with_source_audit(
+        source_root,
+        output,
+        lambda source_validation: _capture_baseline(
+            output,
+            source_root,
+            source_validation,
+        ),
+    )
+    summary["source_audit"] = source_audit
     (output / "summary.json").write_text(
         json.dumps(summary, allow_nan=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

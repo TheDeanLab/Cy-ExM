@@ -62,6 +62,7 @@ class RegistrationBackend(Protocol):
         raise NotImplementedError
 
     def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
+        """Transfer ownership of one unique disposable warp candidate to caller."""
         raise NotImplementedError
 
     def apply_affine(
@@ -226,6 +227,7 @@ class AntsRegistrationBackend:
         )
 
     def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
+        """Return a scalar and unique candidate path that the caller must discard."""
         register: Any = nonlinear_kernel.register_image
         return register(
             **kwargs,

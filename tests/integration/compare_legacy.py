@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -43,6 +44,7 @@ def _deterministic_masks(np: Any) -> tuple[Any, Any]:
 
 def _literal_dry_expected_divergence(
     comparisons: dict[str, dict[str, object]],
+    expected_shapes: object,
 ) -> dict[str, object]:
     expected = ("affine_result", "affine_mask", "nonlinear_result")
     present = all(name in comparisons for name in expected)
@@ -51,19 +53,42 @@ def _literal_dry_expected_divergence(
         or comparisons[name].get("passed") is False
         for name in expected
     )
+    recorded_shapes = expected_shapes if isinstance(expected_shapes, dict) else {}
+    record_validity = {
+        name: _valid_array_comparison_record(
+            comparisons.get(name),
+            recorded_shapes.get(name),
+        )
+        for name in expected
+    }
+    invalid_results = [name for name in expected if not record_validity[name]]
+    records_valid = present and boolean_results and not invalid_results
+    shapes_match_summary = present and all(
+        isinstance(comparisons.get(name), dict)
+        and comparisons[name].get("actual_shape") == recorded_shapes.get(name)
+        and comparisons[name].get("expected_shape") == recorded_shapes.get(name)
+        for name in expected
+    )
     outside_tolerance = [
-        name for name in expected if comparisons.get(name, {}).get("passed") is False
+        name
+        for name in expected
+        if record_validity[name] and comparisons[name].get("passed") is False
     ]
     within_tolerance = [
-        name for name in expected if comparisons.get(name, {}).get("passed") is True
+        name
+        for name in expected
+        if record_validity[name] and comparisons[name].get("passed") is True
     ]
-    divergent = present and boolean_results and bool(outside_tolerance)
+    divergent = records_valid and shapes_match_summary and bool(outside_tolerance)
     return {
         "classification": "expected_divergence",
         "passed": divergent,
         "required_results": list(expected),
         "all_required_results_present": present,
         "all_required_results_boolean": boolean_results,
+        "all_required_records_valid": records_valid,
+        "all_shapes_match_baseline_summary": shapes_match_summary,
+        "invalid_results": invalid_results,
         "at_least_one_result_outside_legacy_tolerance": divergent,
         "outside_legacy_tolerance": outside_tolerance,
         "within_legacy_tolerance": within_tolerance,
@@ -72,6 +97,90 @@ def _literal_dry_expected_divergence(
             "keyword; literal dry-run equivalence is therefore not expected"
         ),
     }
+
+
+def _finite_number(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int | float)
+        and math.isfinite(float(value))
+    )
+
+
+def _valid_shape(value: object) -> bool:
+    return isinstance(value, list) and all(
+        not isinstance(dimension, bool)
+        and isinstance(dimension, int)
+        and dimension >= 0
+        for dimension in value
+    )
+
+
+def _valid_array_comparison_record(
+    record: object,
+    expected_shape: object,
+) -> bool:
+    if not isinstance(record, dict) or not _valid_shape(expected_shape):
+        return False
+    actual_shape = record.get("actual_shape")
+    baseline_shape = record.get("expected_shape")
+    maximum = record.get("max_abs_difference")
+    rtol = record.get("rtol")
+    atol = record.get("atol")
+    exact = record.get("exact")
+    passed = record.get("passed")
+    tolerances_valid = (
+        _finite_number(rtol)
+        and float(rtol) >= 0.0
+        and _finite_number(atol)
+        and float(atol) >= 0.0
+    )
+    exact_tolerances_valid = exact is not True or (
+        tolerances_valid and float(rtol) == 0.0 and float(atol) == 0.0
+    )
+    numerical_result_valid = _finite_number(maximum) and (
+        passed is True or float(maximum) > 0.0
+    )
+    return (
+        record.get("schema_version") == 1
+        and passed in (True, False)
+        and isinstance(passed, bool)
+        and record.get("comparison_valid") is True
+        and record.get("shape_matches") is True
+        and _valid_shape(actual_shape)
+        and _valid_shape(baseline_shape)
+        and actual_shape == baseline_shape == expected_shape
+        and record.get("actual_finite") is True
+        and record.get("expected_finite") is True
+        and numerical_result_valid
+        and tolerances_valid
+        and isinstance(exact, bool)
+        and exact_tolerances_valid
+    )
+
+
+def _require_source_audit(
+    audit: object,
+    *,
+    expected_commit: str = _CLEAR_EX_COMMIT,
+) -> None:
+    details = audit if isinstance(audit, dict) else {}
+    before = details.get("before")
+    after = details.get("after")
+    entries_valid = all(
+        isinstance(entry, dict)
+        and entry.get("source_commit") == expected_commit
+        and entry.get("git_status") == "clean"
+        and entry.get("output_outside_checkout") is True
+        for entry in (before, after)
+    )
+    if not (
+        entries_valid
+        and before == after
+        and details.get("unchanged") is True
+        and details.get("bytecode_writes_disabled") is True
+    ):
+        raise RuntimeError("legacy post-capture source audit evidence is incomplete")
 
 
 def _fixed_mask_corrected_defect(
@@ -157,13 +266,30 @@ def _array_result(
 ) -> dict[str, object]:
     actual_array = np.asarray(actual)
     expected_array = np.asarray(expected)
-    if actual_array.shape != expected_array.shape:
-        return {
-            "passed": False,
-            "actual_shape": list(actual_array.shape),
-            "expected_shape": list(expected_array.shape),
-        }
-    passed = bool(
+    actual_shape = list(actual_array.shape)
+    expected_shape = list(expected_array.shape)
+    shape_matches = actual_shape == expected_shape
+    actual_finite = bool(np.isfinite(actual_array).all())
+    expected_finite = bool(np.isfinite(expected_array).all())
+    tolerances_valid = (
+        _finite_number(rtol)
+        and float(rtol) >= 0.0
+        and _finite_number(atol)
+        and float(atol) >= 0.0
+    )
+    comparison_valid = shape_matches and actual_finite and expected_finite
+    comparison_valid = comparison_valid and tolerances_valid and isinstance(exact, bool)
+    maximum: float | None = None
+    if comparison_valid:
+        difference = np.abs(
+            actual_array.astype(np.float64) - expected_array.astype(np.float64)
+        )
+        candidate_maximum = float(difference.max(initial=0.0))
+        if math.isfinite(candidate_maximum):
+            maximum = candidate_maximum
+        else:
+            comparison_valid = False
+    passed = comparison_valid and bool(
         np.array_equal(actual_array, expected_array)
         if exact
         else np.allclose(
@@ -174,13 +300,16 @@ def _array_result(
             equal_nan=False,
         )
     )
-    difference = np.abs(
-        actual_array.astype(np.float64) - expected_array.astype(np.float64)
-    )
     return {
+        "schema_version": 1,
         "passed": passed,
-        "shape": list(actual_array.shape),
-        "max_abs_difference": float(difference.max(initial=0.0)),
+        "comparison_valid": comparison_valid,
+        "shape_matches": shape_matches,
+        "actual_shape": actual_shape,
+        "expected_shape": expected_shape,
+        "actual_finite": actual_finite,
+        "expected_finite": expected_finite,
+        "max_abs_difference": maximum,
         "rtol": rtol,
         "atol": atol,
         "exact": exact,
@@ -314,7 +443,7 @@ def _chunk_results(
 def compare_baseline(baseline: Path) -> dict[str, object]:
     summary_path = baseline / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    if summary.get("schema_version") != 2:
+    if summary.get("schema_version") != 3:
         raise RuntimeError("unsupported legacy baseline schema")
     if summary.get("source_commit") != _CLEAR_EX_COMMIT:
         raise RuntimeError("legacy baseline source commit does not match the pin")
@@ -327,6 +456,13 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
         or source_validation.get("output_outside_checkout") is not True
     ):
         raise RuntimeError("legacy baseline source safety evidence is incomplete")
+    _require_source_audit(summary.get("source_audit"))
+    source_audit = summary["source_audit"]
+    if (
+        not isinstance(source_audit, dict)
+        or source_audit.get("before") != source_validation
+    ):
+        raise RuntimeError("legacy source validation and audit evidence disagree")
     import_provenance = summary.get("import_provenance")
     checkout_root = source_validation.get("checkout_root")
     if not isinstance(import_provenance, dict) or not isinstance(checkout_root, str):
@@ -383,6 +519,7 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
     import tifffile
 
     from cyexm.registration import linear, nonlinear
+    from cyexm.registration._native_paths import discard_path
     from cyexm.registration.backend import AntsRegistrationBackend
     from cyexm.registration.transforms import apply_transform_chain
 
@@ -475,7 +612,7 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
             ),
         }
     finally:
-        literal_dry_warp.unlink(missing_ok=True)
+        discard_path(literal_dry_warp)
     affine_image, affine_mask, affine = linear.register_image(
         moving,
         fixed,
@@ -517,7 +654,7 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
             )
         warp = ants.image_read(str(warp_path))
     finally:
-        warp_path.unlink(missing_ok=True)
+        discard_path(warp_path)
     actual_geometry = {
         "fixed": _geometry(fixed),
         "affine": _geometry(affine_image),
@@ -618,7 +755,8 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
     )
     diagnostics = {
         "literal_dry_expected_divergence": _literal_dry_expected_divergence(
-            literal_dry_comparison
+            literal_dry_comparison,
+            literal_policy.get("shapes"),
         ),
         "fixed_mask_corrected_defect": _fixed_mask_corrected_defect(
             summary.get("fixed_mask_characterization")
@@ -628,9 +766,10 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
     import sys
 
     report: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_commit": summary["source_commit"],
         "source_validation": source_validation,
+        "source_audit": source_audit,
         "import_provenance": import_provenance,
         "registration_tolerance": {
             "rtol": _REGISTRATION_RTOL,

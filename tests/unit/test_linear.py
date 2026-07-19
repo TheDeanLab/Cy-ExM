@@ -98,7 +98,11 @@ def test_linear_trsaa_preserves_established_registration_parameters(
         verbose=True,
     )
 
-    assert calls.registration == {
+    registration = dict(calls.registration)
+    outprefix = registration.pop("outprefix")
+    assert isinstance(outprefix, str)
+    assert not Path(outprefix).parent.exists()
+    assert registration == {
         "fixed": fixed,
         "moving": moving,
         "mask": fixed_mask,
@@ -140,7 +144,7 @@ def test_linear_mask_uses_nearest_neighbor_and_thresholds_at_half(
     assert transformed_mask is calls.thresholded
 
 
-def test_linear_removes_all_native_transform_files_after_deserializing(
+def test_linear_removes_its_workspace_without_unlinking_external_transforms(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -155,11 +159,12 @@ def test_linear_removes_all_native_transform_files_after_deserializing(
     )
 
     assert transform is calls.transform
-    assert not calls.warp_path.exists()
-    assert not inverse_path.exists()
+    assert calls.warp_path.is_file()
+    assert inverse_path.is_file()
+    assert not Path(str(calls.registration["outprefix"])).parent.exists()
 
 
-def test_linear_removes_native_transform_files_when_application_fails(
+def test_linear_application_failure_does_not_unlink_external_transforms(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -180,8 +185,47 @@ def test_linear_removes_native_transform_files_when_application_fails(
             fixed_image=fake_image(),
         )
 
-    assert not calls.warp_path.exists()
-    assert not inverse_path.exists()
+    assert calls.warp_path.is_file()
+    assert inverse_path.is_file()
+    assert not Path(str(calls.registration["outprefix"])).parent.exists()
+
+
+def test_linear_native_failure_removes_owned_workspace_and_preserves_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_fake_ants(monkeypatch, "cyexm.registration.linear", tmp_path)
+    fake_ants, _ = linear._scientific_runtime()
+    workspaces: list[Path] = []
+    partials: list[Path] = []
+    received_outprefix: list[object] = []
+
+    def fail_after_partial_outputs(**kwargs: object) -> object:
+        outprefix = kwargs.get("outprefix")
+        received_outprefix.append(outprefix)
+        workspace = (
+            Path(str(outprefix)).parent
+            if outprefix is not None
+            else tmp_path / "unowned-linear-native"
+        )
+        workspace.mkdir(parents=True, exist_ok=True)
+        prefix = Path(str(outprefix)) if outprefix is not None else workspace / "ants-"
+        forward = Path(f"{prefix}0GenericAffine.mat")
+        inverse = Path(f"{prefix}0GenericAffineInverse.mat")
+        forward.write_bytes(b"partial-forward")
+        inverse.write_bytes(b"partial-inverse")
+        workspaces.append(workspace)
+        partials.extend((forward, inverse))
+        raise RuntimeError("injected native linear failure")
+
+    monkeypatch.setattr(fake_ants, "registration", fail_after_partial_outputs)
+
+    with pytest.raises(RuntimeError, match="injected native linear failure"):
+        register_image(moving_image=fake_image(), fixed_image=fake_image())
+
+    assert received_outprefix[0] is not None
+    assert all(not workspace.exists() for workspace in workspaces)
+    assert all(not partial.exists() for partial in partials)
 
 
 @pytest.mark.parametrize("accuracy", ["unknown", "", "HIGHER", "High"])

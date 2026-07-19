@@ -33,7 +33,10 @@ finite-value checks, similarity measurements, transform types, mask values, chun
 coordinates, extended/core shapes, stitching order, clean pinned checkout state,
 external output directory, import provenance, and native-artifact cleanup. The
 generated `comparison.json` records every tolerance, maximum difference, result,
-the effective Cy-ExM thread configuration, and both required diagnostics.
+the effective Cy-ExM thread configuration, and both required diagnostics. Both files
+use evidence schema version 3. The baseline records matching source snapshots before
+and after capture, confirms that bytecode writes were disabled before ClearEx was
+imported, and requires the comparator to reproduce that exact audit.
 
 The one-chunk integration check estimates one real Rigid dry-run affine followed by
 one real SyNOnly dry-run warp. It then supplies that same estimated pair at the two
@@ -75,10 +78,13 @@ difference, not a parity pass:
 The parity command requires the `expected_divergence` classification, all three
 literal result records, and at least one result outside the approved tolerance. It
 exits nonzero if all literal outputs unexpectedly become equivalent or if the
-classification evidence is absent. This makes the corrected behavior visible without
-weakening `rtol=1e-4`, `atol=1e-5` or fabricating literal dry-run parity. The separate
-shifted-volume integration test exercises the corrected bounded kernels, similarity
-improvement, and a mask containing both zero and one.
+classification evidence is absent. Every required record must also have the complete
+comparison schema, finite inputs and maximum difference, and equal actual/baseline
+shapes matching the corresponding shape in `summary.json`; malformed diagnostic
+records fail rather than count as divergence. This makes the corrected behavior
+visible without weakening `rtol=1e-4`, `atol=1e-5` or fabricating literal dry-run
+parity. The separate shifted-volume integration test exercises the corrected bounded
+kernels, similarity improvement, and a mask containing both zero and one.
 
 ## Environments
 
@@ -100,7 +106,11 @@ The six recorded native variables were all `1`:
 The baseline command rejects a checkout that is not the exact pin, is dirty, imports
 ClearEx from elsewhere, or places output inside that checkout. All native ClearEx
 registration artifacts are confined to an exception-safe temporary directory under
-the explicit output and removed after durable evidence is copied.
+the explicit output and removed after durable evidence is copied. Temporary-directory
+cleanup errors cannot replace a primary registration exception, while a successful
+capture still rejects a residual native directory. The script disables bytecode
+writes before importing ClearEx and repeats the exact-pin/clean/outside-output audit
+after capture; the comparator requires the matching machine record.
 
 From any durable Cy-ExM checkout, use this checkout-relative command:
 
@@ -140,19 +150,19 @@ cd /project/bioinformatics/Danuser_lab/Dean/dean/git/clearex
 uv run --no-sync python \
   /project/bioinformatics/Danuser_lab/Dean/dean/git/Cy-ExM/.worktrees/phase-1-registration/tests/integration/legacy_baseline.py \
   --source-root /project/bioinformatics/Danuser_lab/Dean/dean/git/clearex \
-  --output /tmp/cyexm-legacy-baseline-task8-fix-20260719
+  --output /tmp/cyexm-legacy-baseline-task8-fix2-20260719
 
 cd /project/bioinformatics/Danuser_lab/Dean/dean/git/Cy-ExM/.worktrees/phase-1-registration
 uv run --no-sync python tests/integration/compare_legacy.py \
-  --baseline /tmp/cyexm-legacy-baseline-task8-fix-20260719 \
-  --report /tmp/cyexm-legacy-baseline-task8-fix-20260719/comparison.json
+  --baseline /tmp/cyexm-legacy-baseline-task8-fix2-20260719 \
+  --report /tmp/cyexm-legacy-baseline-task8-fix2-20260719/comparison.json
 ```
 
 Observed source and script results were:
 
 ```text
 2311a873b783477add7391ff00245f76490147f0
-PASS legacy baseline commit=2311a873b783477add7391ff00245f76490147f0 output=/tmp/cyexm-legacy-baseline-task8-fix-20260719
+PASS legacy baseline commit=2311a873b783477add7391ff00245f76490147f0 output=/tmp/cyexm-legacy-baseline-task8-fix2-20260719
 PASS geometry
 PASS affine result
 PASS nonlinear result
@@ -165,7 +175,7 @@ PASS diagnostic literal dry expected divergence
 PASS diagnostic fixed mask corrected defect
 ```
 
-The baseline took 5.30 seconds and the comparison took 2.91 seconds on the recorded
+The baseline took 5.14 seconds and the comparison took 2.95 seconds on the recorded
 one-thread environment.
 
 ## Intentionally corrected legacy defects
@@ -193,9 +203,13 @@ that can return incomplete, stale, or incorrectly transformed results:
    characterized above.
 10. Fixed registration masks use ANTSpyX's consumed `mask=` keyword; the pinned
     ClearEx wrappers instead forward ignored `fixed_mask=` kwargs.
-11. Linear kernels remove native transform files after deserialization. Nonlinear
-    kernels remove inverse and superseded components while transferring ownership of
-    exactly one returned forward warp to the caller; parity and orchestration callers
-    remove transferred candidates in `finally` blocks after durable persistence.
+11. Linear and nonlinear ANTSpyX calls run inside owned, exception-safe workspaces,
+    so partial native output is isolated even when registration or warp composition
+    raises. Linear transforms are consumed before its workspace closes. Nonlinear
+    registration copies exactly one readable forward warp to a unique disposable
+    candidate outside its workspace and transfers ownership to the immediate caller;
+    parity and orchestration callers dispose of that candidate after durable
+    persistence. Cleanup is best effort, never deletes a returned external native
+    source, and cannot replace registration success or the primary exception.
 12. Atomic TIFF validation checks declared `ZYX` metadata and effective `ZYX` series
     axes, with only tifffile's leading singleton-Z squeeze accepted explicitly.

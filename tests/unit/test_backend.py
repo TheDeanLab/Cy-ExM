@@ -10,6 +10,7 @@ import pytest
 from fakes import fake_image, install_fake_ants
 
 import cyexm.registration.backend as backend_module
+from cyexm.registration._native_paths import discard_path
 from cyexm.registration.backend import AntsRegistrationBackend, RegistrationBackend
 from cyexm.runtime import NativeThreadConfig
 from cyexm.spatial import ImageGeometry
@@ -360,24 +361,30 @@ def test_backend_registration_delegates_configure_once_in_underlying_kernel(
     monkeypatch.setattr(kernel, "configure_native_threads", kernel_configure)
     backend = AntsRegistrationBackend(requested)
 
-    with caplog.at_level(logging.INFO):
-        if operation == "linear":
-            backend.linear(moving_image=fake_image(), fixed_image=fake_image())
-        else:
-            backend.nonlinear(moving_image=fake_image(), fixed_image=fake_image())
+    candidate: Path | None = None
+    try:
+        with caplog.at_level(logging.INFO):
+            if operation == "linear":
+                backend.linear(moving_image=fake_image(), fixed_image=fake_image())
+            else:
+                _, candidate = backend.nonlinear(
+                    moving_image=fake_image(), fixed_image=fake_image()
+                )
 
-    assert calls.events == ["configure", "describe", "runtime"]
-    assert (
-        sum(
-            record.name == kernel.__name__
-            and record.getMessage().startswith("Native thread settings:")
-            for record in caplog.records
+        assert calls.events == ["configure", "describe", "runtime"]
+        assert (
+            sum(
+                record.name == kernel.__name__
+                and record.getMessage().startswith("Native thread settings:")
+                for record in caplog.records
+            )
+            == 1
         )
-        == 1
-    )
-    assert not any(
-        record.name == "cyexm.registration.backend" for record in caplog.records
-    )
+        assert not any(
+            record.name == "cyexm.registration.backend" for record in caplog.records
+        )
+    finally:
+        discard_path(candidate)
 
 
 @pytest.mark.parametrize(

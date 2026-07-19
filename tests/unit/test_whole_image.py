@@ -1102,6 +1102,62 @@ def test_temporary_warp_is_validated_and_masks_use_only_committed_path(
     assert candidate.name.startswith(".nonlinear_warp_2")
 
 
+def test_candidate_cleanup_oserror_does_not_fail_successful_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend()
+    candidate = tmp_path / "temporary-warp-1.nii.gz"
+    original_unlink = Path.unlink
+
+    def fail_candidate_unlink(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        if path == candidate:
+            raise OSError("injected candidate cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_candidate_unlink)
+    try:
+        make_registration(tmp_path, backend=backend).register()
+
+        assert round_paths(tmp_path).registered.is_file()
+        assert candidate.is_file()
+    finally:
+        original_unlink(candidate, missing_ok=True)
+
+
+def test_candidate_cleanup_oserror_does_not_mask_primary_stage_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend(fail_warp_interpolation="linear")
+    candidate = tmp_path / "temporary-warp-1.nii.gz"
+    original_unlink = Path.unlink
+
+    def fail_candidate_unlink(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        if path == candidate:
+            raise OSError("injected candidate cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_candidate_unlink)
+    try:
+        with pytest.raises(
+            RegistrationStageError,
+            match="nonlinear registration failed",
+        ) as error:
+            make_registration(tmp_path, backend=backend).register()
+
+        assert isinstance(error.value.__cause__, RuntimeError)
+        assert "injected linear warp application failure" in str(error.value.__cause__)
+    finally:
+        original_unlink(candidate, missing_ok=True)
+
+
 @pytest.mark.parametrize(
     ("failure", "force_after_existing"),
     [

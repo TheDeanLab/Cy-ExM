@@ -134,6 +134,58 @@ def test_successful_chunked_registration_removes_kernel_warp_candidates(
     assert all(not path.exists() for path in backend.temporary_warps)
 
 
+def test_local_candidate_cleanup_oserror_does_not_fail_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeChunkBackend()
+    original_unlink = Path.unlink
+
+    def fail_local_candidate_unlink(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        if path.name.startswith("temporary-chunk-"):
+            raise OSError("injected local candidate cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_local_candidate_unlink)
+    try:
+        make_chunked_registration(tmp_path, backend=backend).register()
+
+        assert round_paths(tmp_path).registered.is_file()
+    finally:
+        for candidate in backend.temporary_warps:
+            original_unlink(candidate, missing_ok=True)
+
+
+def test_full_candidate_cleanup_oserror_does_not_fail_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeChunkBackend()
+    original_unlink = Path.unlink
+
+    def fail_full_candidate_unlink(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        if path.name.startswith(".chunked-full-warp-"):
+            raise OSError("injected full candidate cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_full_candidate_unlink)
+    try:
+        make_chunked_registration(tmp_path, backend=backend).register()
+
+        assert round_paths(tmp_path).registered.is_file()
+    finally:
+        for candidate in round_paths(tmp_path).output.glob(
+            ".chunked-full-warp-*.nii.gz"
+        ):
+            original_unlink(candidate, missing_ok=True)
+
+
 def test_chunk_failure_propagates_without_final_success(tmp_path: Path) -> None:
     backend = FakeChunkBackend(fail_chunk=1)
     registration = make_chunked_registration(tmp_path, backend=backend)

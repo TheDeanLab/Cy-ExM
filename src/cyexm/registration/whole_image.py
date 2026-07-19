@@ -17,6 +17,7 @@ from cyexm.errors import (
 )
 from cyexm.io.images import Bounds3D, robust_bounding_box
 from cyexm.metrics import read_metrics, write_metrics
+from cyexm.registration._native_paths import discard_path
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import AntsRegistrationBackend, RegistrationBackend
 from cyexm.runtime import (
@@ -801,8 +802,7 @@ class ImageRegistration:
                 f"nonlinear registration failed for round {self.imaging_round}"
             ) from error
         finally:
-            if temporary_warp is not None:
-                temporary_warp.unlink(missing_ok=True)
+            discard_path(temporary_warp)
         return paths.warp, moving_nonlinear, moving_nonlinear_mask
 
     @staticmethod
@@ -840,6 +840,7 @@ class ImageRegistration:
         fixed_mask: object,
         moving_linear_mask: object,
     ) -> tuple[object, Path]:
+        """Return a unique disposable candidate owned by this method's caller."""
         return backend.nonlinear(
             moving_image=moving_linear,
             fixed_image=fixed,

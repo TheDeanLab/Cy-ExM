@@ -9,6 +9,7 @@ import tifffile
 from fakes import fake_image, install_fake_ants
 
 import cyexm.registration.nonlinear as nonlinear
+from cyexm.registration._native_paths import discard_path
 from cyexm.registration.nonlinear import (
     inspect_warp_transform,
     register_image,
@@ -34,18 +35,23 @@ def test_nonlinear_synonly_uses_established_accuracy_schedules(
 ) -> None:
     calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
 
-    transformed, warp_path = register_image(
-        moving_image=fake_image(),
-        fixed_image=fake_image(),
-        registration_type="SyNOnly",
-        accuracy=accuracy,
-    )
+    warp_path: Path | None = None
+    try:
+        transformed, warp_path = register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+            registration_type="SyNOnly",
+            accuracy=accuracy,
+        )
 
-    assert calls.registration["reg_iterations"] == iterations
-    assert "shrink_factors" not in calls.registration
-    assert "smoothing_sigmas" not in calls.registration
-    assert transformed is calls.histogram_matched
-    assert warp_path == calls.warp_path
+        assert calls.registration["reg_iterations"] == iterations
+        assert "shrink_factors" not in calls.registration
+        assert "smoothing_sigmas" not in calls.registration
+        assert transformed is calls.histogram_matched
+        assert warp_path != calls.warp_path
+        assert warp_path.read_bytes() == calls.warp_path.read_bytes()
+    finally:
+        discard_path(warp_path)
 
 
 def test_nonlinear_high_synonly_preserves_established_registration_parameters(
@@ -58,17 +64,25 @@ def test_nonlinear_high_synonly_preserves_established_registration_parameters(
     moving_mask = fake_image()
     fixed_mask = fake_image()
 
-    register_image(
-        moving_image=moving,
-        fixed_image=fixed,
-        moving_mask=moving_mask,
-        fixed_mask=fixed_mask,
-        registration_type="SyNOnly",
-        accuracy="high",
-        verbose=True,
-    )
+    warp_path: Path | None = None
+    try:
+        _, warp_path = register_image(
+            moving_image=moving,
+            fixed_image=fixed,
+            moving_mask=moving_mask,
+            fixed_mask=fixed_mask,
+            registration_type="SyNOnly",
+            accuracy="high",
+            verbose=True,
+        )
+    finally:
+        discard_path(warp_path)
 
-    assert calls.registration == {
+    registration = dict(calls.registration)
+    outprefix = registration.pop("outprefix")
+    assert isinstance(outprefix, str)
+    assert not Path(outprefix).parent.exists()
+    assert registration == {
         "fixed": fixed,
         "moving": moving,
         "mask": fixed_mask,
@@ -149,14 +163,18 @@ def test_nonlinear_accepts_each_established_method(
 ) -> None:
     calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
 
-    register_image(
-        moving_image=fake_image(),
-        fixed_image=fake_image(),
-        registration_type=registration_type,
-        accuracy="low",
-    )
+    warp_path: Path | None = None
+    try:
+        _, warp_path = register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+            registration_type=registration_type,
+            accuracy="low",
+        )
 
-    assert calls.registration["type_of_transform"] == registration_type
+        assert calls.registration["type_of_transform"] == registration_type
+    finally:
+        discard_path(warp_path)
 
 
 def test_nonlinear_rejects_a_missing_forward_warp(
@@ -184,21 +202,26 @@ def test_nonlinear_composes_the_complete_forward_transform_list(
     affine_path.write_bytes(b"affine")
     calls.forward_transforms = [calls.warp_path, affine_path]
 
-    transformed, warp_path = register_image(
-        moving_image=fake_image(),
-        fixed_image=fake_image(),
-        registration_type=registration_type,
-    )
+    warp_path: Path | None = None
+    try:
+        transformed, warp_path = register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+            registration_type=registration_type,
+        )
 
-    assert calls.transformlist == [str(calls.warp_path), str(affine_path)]
-    assert calls.whichtoinvert == [False, False]
-    assert calls.interpolator == "linear"
-    assert calls.compose is not None
-    assert calls.composed_path is not None
-    assert warp_path == calls.composed_path
-    assert warp_path != calls.warp_path
-    assert warp_path.is_file()
-    assert transformed is calls.histogram_matched
+        assert calls.transformlist == [str(calls.warp_path), str(affine_path)]
+        assert calls.whichtoinvert == [False, False]
+        assert calls.interpolator == "linear"
+        assert calls.compose is not None
+        assert calls.composed_path is not None
+        assert warp_path != calls.composed_path
+        assert warp_path != calls.warp_path
+        assert warp_path.is_file()
+        assert not calls.composed_path.exists()
+        assert transformed is calls.histogram_matched
+    finally:
+        discard_path(warp_path)
 
 
 def test_nonlinear_preserves_only_the_returned_forward_warp(
@@ -213,17 +236,23 @@ def test_nonlinear_preserves_only_the_returned_forward_warp(
     calls.forward_transforms = [calls.warp_path, affine_path]
     calls.inverse_transforms = [inverse_path, affine_path]
 
-    _, returned_warp = register_image(
-        moving_image=fake_image(),
-        fixed_image=fake_image(),
-        registration_type="SyN",
-    )
+    returned_warp: Path | None = None
+    try:
+        _, returned_warp = register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+            registration_type="SyN",
+        )
 
-    assert returned_warp == calls.composed_path
-    assert returned_warp.is_file()
-    assert not calls.warp_path.exists()
-    assert not affine_path.exists()
-    assert not inverse_path.exists()
+        assert returned_warp != calls.composed_path
+        assert returned_warp.is_file()
+        assert calls.composed_path is not None
+        assert not calls.composed_path.exists()
+        assert calls.warp_path.is_file()
+        assert affine_path.is_file()
+        assert inverse_path.is_file()
+    finally:
+        discard_path(returned_warp)
 
 
 def test_nonlinear_removes_every_transform_when_postprocessing_fails(
@@ -253,8 +282,104 @@ def test_nonlinear_removes_every_transform_when_postprocessing_fails(
             fixed_image=fake_image(),
         )
 
-    assert not calls.warp_path.exists()
-    assert not inverse_path.exists()
+    assert calls.warp_path.is_file()
+    assert inverse_path.is_file()
+    assert not Path(str(calls.registration["outprefix"])).parent.exists()
+
+
+def test_nonlinear_native_failure_removes_owned_workspace_and_preserves_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    fake_ants, _ = nonlinear._scientific_runtime()
+    workspaces: list[Path] = []
+    partials: list[Path] = []
+    received_outprefix: list[object] = []
+
+    def fail_after_partial_outputs(**kwargs: object) -> object:
+        outprefix = kwargs.get("outprefix")
+        received_outprefix.append(outprefix)
+        workspace = (
+            Path(str(outprefix)).parent
+            if outprefix is not None
+            else tmp_path / "unowned-nonlinear-native"
+        )
+        workspace.mkdir(parents=True, exist_ok=True)
+        prefix = Path(str(outprefix)) if outprefix is not None else workspace / "ants-"
+        forward = Path(f"{prefix}1Warp.nii.gz")
+        inverse = Path(f"{prefix}1InverseWarp.nii.gz")
+        forward.write_bytes(b"partial-forward")
+        inverse.write_bytes(b"partial-inverse")
+        workspaces.append(workspace)
+        partials.extend((forward, inverse))
+        raise RuntimeError("injected native nonlinear failure")
+
+    monkeypatch.setattr(fake_ants, "registration", fail_after_partial_outputs)
+
+    with pytest.raises(RuntimeError, match="injected native nonlinear failure"):
+        register_image(moving_image=fake_image(), fixed_image=fake_image())
+
+    assert received_outprefix[0] is not None
+    assert all(not workspace.exists() for workspace in workspaces)
+    assert all(not partial.exists() for partial in partials)
+
+
+def test_nonlinear_composition_failure_removes_workspace_residue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    affine_path = tmp_path / "forward-affine.mat"
+    affine_path.write_bytes(b"affine")
+    calls.forward_transforms = [calls.warp_path, affine_path]
+    fake_ants, _ = nonlinear._scientific_runtime()
+    workspaces: list[Path] = []
+    residues: list[Path] = []
+
+    def fail_composition(**kwargs: object) -> object:
+        compose = kwargs.get("compose")
+        assert isinstance(compose, str)
+        residue = Path(f"{compose}comptx.nii.gz")
+        residue.write_bytes(b"partial-composite")
+        workspaces.append(residue.parent)
+        residues.append(residue)
+        raise RuntimeError("injected composition failure")
+
+    monkeypatch.setattr(fake_ants, "apply_transforms", fail_composition)
+
+    with pytest.raises(RuntimeError, match="injected composition failure"):
+        register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+            registration_type="SyN",
+        )
+
+    assert all(not workspace.exists() for workspace in workspaces)
+    assert all(not residue.exists() for residue in residues)
+
+
+def test_nonlinear_returns_a_unique_validated_copy_not_the_native_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    first: Path | None = None
+    second: Path | None = None
+    try:
+        _, first = register_image(moving_image=fake_image(), fixed_image=fake_image())
+        _, second = register_image(moving_image=fake_image(), fixed_image=fake_image())
+
+        assert first != second
+        assert first != calls.warp_path
+        assert second != calls.warp_path
+        assert first.is_file()
+        assert second.is_file()
+        assert calls.warp_path.is_file()
+        assert calls.image_read_path == str(second)
+    finally:
+        discard_path(first)
+        discard_path(second)
 
 
 def test_nonlinear_transform_uses_forward_transform_and_linear_interpolation(
@@ -338,12 +463,16 @@ def test_nonlinear_configures_threads_before_runtime_and_logs_resolution(
 
     monkeypatch.setattr(nonlinear, "configure_native_threads", configure)
 
+    warp_path: Path | None = None
     with caplog.at_level(logging.INFO, logger="cyexm.registration.nonlinear"):
-        register_image(
-            moving_image=fake_image(),
-            fixed_image=fake_image(),
-            native_threads=requested,
-        )
+        try:
+            _, warp_path = register_image(
+                moving_image=fake_image(),
+                fixed_image=fake_image(),
+                native_threads=requested,
+            )
+        finally:
+            discard_path(warp_path)
 
     assert calls.events[:2] == ["configure", "runtime"]
     assert "resolved nonlinear threads" in caplog.text

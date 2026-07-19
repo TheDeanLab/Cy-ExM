@@ -6,6 +6,7 @@ import pytest
 
 from cyexm.io.images import zero_mask
 from cyexm.registration import linear, nonlinear
+from cyexm.registration._native_paths import discard_path
 from cyexm.runtime import NativeThreadConfig
 
 pytestmark = pytest.mark.integration
@@ -78,4 +79,4 @@ def test_dry_run_kernels_preserve_geometry_masks_and_improve_similarity(
         )
         assert nonlinear_mse < pre_mse
     finally:
-        warp_path.unlink(missing_ok=True)
+        discard_path(warp_path)

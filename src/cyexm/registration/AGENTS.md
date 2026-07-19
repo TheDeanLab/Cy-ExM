@@ -19,3 +19,7 @@
 - Artifact writer methods must write exactly to the supplied path so callers
   can provide atomic temporary destinations. Do not add artifact lifecycle,
   whole-image orchestration, chunking, scheduling, or CLI behavior here.
+- `RegistrationBackend.nonlinear` and every `_estimate_nonlinear` override transfer
+  ownership of one unique disposable warp candidate to their immediate caller. The
+  caller must persist or consume it and then use the shared best-effort cleanup helper;
+  a backend must never return a canonical cache path or shared native source.

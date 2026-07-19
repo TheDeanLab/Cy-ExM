@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from cyexm.registration._native_paths import (
-    cleanup_registration_transforms,
-    registration_transform_paths,
-)
+from cyexm.registration._native_paths import discard_path
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
 logger = logging.getLogger(__name__)
@@ -62,6 +60,7 @@ def _materialize_forward_warp(
     fixed_image: Any,
     moving_image: Any,
     forward_transforms: object,
+    workspace: Path,
 ) -> Path:
     if not isinstance(forward_transforms, list | tuple) or not forward_transforms:
         raise FileNotFoundError("ANTs registration did not produce a forward warp")
@@ -75,13 +74,13 @@ def _materialize_forward_warp(
         return transform_paths[0]
 
     descriptor, prefix_text = tempfile.mkstemp(
-        dir=transform_paths[0].parent,
+        dir=workspace,
         prefix="cyexm-composite-",
         suffix="-",
     )
     os.close(descriptor)
     prefix = Path(prefix_text)
-    prefix.unlink()
+    discard_path(prefix)
     composed = ants.apply_transforms(
         fixed=fixed_image,
         moving=moving_image,
@@ -98,6 +97,28 @@ def _materialize_forward_warp(
             f"ANTs composite forward warp does not exist: {warp_path}"
         )
     return warp_path
+
+
+def _copy_disposable_forward_warp(
+    ants: Any,
+    source: Path,
+    *,
+    workspace: Path,
+) -> Path:
+    descriptor, candidate_text = tempfile.mkstemp(
+        dir=workspace.parent,
+        prefix="cyexm-forward-warp-",
+        suffix=".nii.gz",
+    )
+    os.close(descriptor)
+    candidate = Path(candidate_text)
+    try:
+        shutil.copyfile(source, candidate)
+        ants.image_read(str(candidate))
+    except BaseException:
+        discard_path(candidate)
+        raise
+    return candidate
 
 
 def register_image(
@@ -144,35 +165,41 @@ def register_image(
         registration_type,
         kwargs["reg_iterations"],
     )
-    registered = ants.registration(**kwargs)
-    native_paths = registration_transform_paths(registered)
-    warp_path: Path | None = None
-    completed = False
+    candidate: Path | None = None
     try:
-        warp_path = _materialize_forward_warp(
-            ants,
-            fixed_image=fixed_image,
-            moving_image=moving_image,
-            forward_transforms=registered["fwdtransforms"],
-        )
+        with tempfile.TemporaryDirectory(
+            prefix="cyexm-nonlinear-native-",
+            ignore_cleanup_errors=True,
+        ) as workspace_text:
+            workspace = Path(workspace_text)
+            kwargs["outprefix"] = str(workspace / "ants-")
+            registered = ants.registration(**kwargs)
+            native_warp = _materialize_forward_warp(
+                ants,
+                fixed_image=fixed_image,
+                moving_image=moving_image,
+                forward_transforms=registered["fwdtransforms"],
+                workspace=workspace,
+            )
 
-        transformed_image = ants.resample_image_to_target(
-            image=registered["warpedmovout"],
-            target=fixed_image,
-            interp_type="linear",
-        )
-        transformed_image = ants.histogram_match_image(
-            source_image=transformed_image,
-            reference_image=moving_image,
-        )
-        completed = True
-        return transformed_image, warp_path
-    finally:
-        returned = () if warp_path is None else (warp_path,)
-        cleanup_registration_transforms(
-            native_paths | set(returned),
-            preserve=returned if completed else (),
-        )
+            transformed_image = ants.resample_image_to_target(
+                image=registered["warpedmovout"],
+                target=fixed_image,
+                interp_type="linear",
+            )
+            transformed_image = ants.histogram_match_image(
+                source_image=transformed_image,
+                reference_image=moving_image,
+            )
+            candidate = _copy_disposable_forward_warp(
+                ants,
+                native_warp,
+                workspace=workspace,
+            )
+        return transformed_image, candidate
+    except BaseException:
+        discard_path(candidate)
+        raise
 
 
 def transform_image(

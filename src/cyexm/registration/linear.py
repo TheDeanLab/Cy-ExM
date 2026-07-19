@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
+from pathlib import Path
 from typing import Any
 
-from cyexm.registration._native_paths import (
-    cleanup_registration_transforms,
-    registration_transform_paths,
-)
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
 logger = logging.getLogger(__name__)
@@ -105,9 +103,13 @@ def register_image(
             iterations,
         )
 
-    registered = ants.registration(**kwargs)
-    native_paths = registration_transform_paths(registered)
-    try:
+    with tempfile.TemporaryDirectory(
+        prefix="cyexm-linear-native-",
+        ignore_cleanup_errors=True,
+    ) as workspace_text:
+        workspace = Path(workspace_text)
+        kwargs["outprefix"] = str(workspace / "ants-")
+        registered = ants.registration(**kwargs)
         transform = ants.read_transform(filename=registered["fwdtransforms"][0])
         transformed_image = transform.apply_to_image(
             image=moving_image,
@@ -129,10 +131,7 @@ def register_image(
                 inval=1,
                 outval=0,
             )
-
         return transformed_image, transformed_mask, transform
-    finally:
-        cleanup_registration_transforms(native_paths)
 
 
 def inspect_affine_transform(

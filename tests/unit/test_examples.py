@@ -12,6 +12,8 @@ from typing import get_type_hints
 
 import pytest
 
+pytestmark = pytest.mark.unit
+
 SCRIPT_NAMES = (
     "apply_transforms.py",
     "chunked_registration.py",
@@ -121,6 +123,7 @@ def test_transform_directory_notebook_preserves_optional_crop_geometry() -> None
     assert "FIXED_CROP_INDICES: Path | None" in source
     assert "MOVING_CROP_INDICES: Path | None" in source
     assert "transform_index_to_physical_point" in source
+    assert "tuple(float(value) for value in origin)" in source
     assert "origin=origin" in source
     assert "spacing=image.spacing" in source
     assert "direction=image.direction" in source
@@ -530,7 +533,8 @@ def test_nested_example_and_documentation_guidance_is_specific() -> None:
 def test_user_documentation_matches_phase_one_contract() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     for phrase in (
-        "uv sync --extra examples",
+        "uv sync --no-dev --extra examples",
+        "uv sync --group dev --extra examples",
         "NativeThreadConfig",
         "(x, y, z)",
         "ChunkedImageRegistration",

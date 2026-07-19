@@ -10,10 +10,10 @@ Cy-ExM requires Python 3.12 and retains the academic-research-use terms in
 
 ## Installation
 
-Create the locked runtime plus notebook/example dependencies with uv:
+Create a lean locked runtime plus notebook/example dependencies with uv:
 
 ```bash
-uv sync --extra examples
+uv sync --no-dev --extra examples
 ```
 
 For development, include the development group:

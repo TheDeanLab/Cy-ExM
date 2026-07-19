@@ -778,5 +778,6 @@ git status --short
 git log --oneline --decorate main..HEAD
 ```
 
-Expected: empty status and seven branch commits: one approved design commit, this plan
-commit, and five implementation commits from Tasks 1 through 5.
+Expected: empty status. History contains the approved design and plan, one
+implementation commit for each of Tasks 1 through 5, and only documented preflight or
+review-fix commits beyond that composition. Do not enforce an exact commit count.

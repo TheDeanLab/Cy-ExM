@@ -155,11 +155,18 @@ def test_uint16_export_preserves_compound_suffix_on_atomic_temporary(
 ) -> None:
     destination = tmp_path / "registered.part.tiff"
     seen: list[Path] = []
+    seen_metadata: list[dict[str, str]] = []
     real_imwrite = tifffile.imwrite
 
-    def recording_imwrite(path: Path, data: np.ndarray) -> None:
+    def recording_imwrite(
+        path: Path,
+        data: np.ndarray,
+        *,
+        metadata: dict[str, str],
+    ) -> None:
         seen.append(Path(path))
-        real_imwrite(path, data)
+        seen_metadata.append(metadata)
+        real_imwrite(path, data, metadata=metadata)
 
     monkeypatch.setattr(tifffile, "imwrite", recording_imwrite)
 
@@ -173,7 +180,10 @@ def test_uint16_export_preserves_compound_suffix_on_atomic_temporary(
     assert seen[0] != destination
     assert seen[0].parent == destination.parent
     assert seen[0].name.endswith(".part.tiff")
+    assert seen_metadata == [{"axes": "ZYX"}]
     assert destination.is_file()
+    with tifffile.TiffFile(destination) as written:
+        assert written.series[0].axes == "ZYX"
     assert list(tmp_path.glob(".*.tmp*")) == []
 
 
@@ -184,8 +194,14 @@ def test_uint16_export_failure_keeps_the_previous_artifact(
     destination = tmp_path / "registered.tif"
     destination.write_bytes(b"previous")
 
-    def failing_imwrite(path: Path, data: np.ndarray) -> None:
+    def failing_imwrite(
+        path: Path,
+        data: np.ndarray,
+        *,
+        metadata: dict[str, str],
+    ) -> None:
         del data
+        assert metadata == {"axes": "ZYX"}
         Path(path).write_bytes(b"partial")
         raise RuntimeError("injected TIFF failure")
 

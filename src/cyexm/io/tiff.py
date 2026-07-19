@@ -93,7 +93,7 @@ def write_uint16_tiff(
     import tifffile
 
     def writer(temporary: Path) -> None:
-        tifffile.imwrite(temporary, encoded)
+        tifffile.imwrite(temporary, encoded, metadata={"axes": "ZYX"})
 
     def validator(temporary: Path) -> bool:
         try:

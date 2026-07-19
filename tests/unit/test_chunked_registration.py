@@ -123,6 +123,17 @@ def test_chunk_paths_are_round_scoped_and_include_completion_record(
     assert paths.completion_record == ArtifactStore().record_path(paths.warp)
 
 
+def test_successful_chunked_registration_removes_kernel_warp_candidates(
+    tmp_path: Path,
+) -> None:
+    backend = FakeChunkBackend()
+
+    make_chunked_registration(tmp_path, backend=backend).register()
+
+    assert backend.temporary_warps
+    assert all(not path.exists() for path in backend.temporary_warps)
+
+
 def test_chunk_failure_propagates_without_final_success(tmp_path: Path) -> None:
     backend = FakeChunkBackend(fail_chunk=1)
     registration = make_chunked_registration(tmp_path, backend=backend)

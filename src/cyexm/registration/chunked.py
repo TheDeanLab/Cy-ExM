@@ -554,40 +554,47 @@ class ChunkedImageRegistration(ImageRegistration):
                 f"Required local chunk cache entry is missing: {paths.warp}"
             )
 
-        if low_variance:
-
-            def writer(path: Path) -> None:
-                backend.write_identity_warp(fixed_chunk, path)
-
-        else:
-            _candidate_scalar, temporary_warp = backend.nonlinear(
-                moving_image=moving_chunk,
-                fixed_image=fixed_chunk,
-                fixed_mask=fixed_mask_chunk,
-                moving_mask=moving_mask_chunk,
-                registration_type=self.nonlinear_type,
-                accuracy=self.nonlinear_accuracy,
-                verbose=True,
-            )
-            reader(temporary_warp)
-
-            def writer(path: Path) -> None:
-                shutil.copyfile(temporary_warp, path)
-
-        def validator(path: Path) -> bool:
-            try:
-                reader(path)
-            except Exception:
-                return False
-            return True
-
-        self._store().commit(paths.warp, request, writer, validator)
+        temporary_warp: Path | None = None
         try:
-            committed = reader(paths.warp)[1]
-        except Exception:
-            self._store().mark_stale(paths.warp)
-            raise
-        return committed, True
+            if low_variance:
+
+                def writer(path: Path) -> None:
+                    backend.write_identity_warp(fixed_chunk, path)
+
+            else:
+                _candidate_scalar, temporary_warp = backend.nonlinear(
+                    moving_image=moving_chunk,
+                    fixed_image=fixed_chunk,
+                    fixed_mask=fixed_mask_chunk,
+                    moving_mask=moving_mask_chunk,
+                    registration_type=self.nonlinear_type,
+                    accuracy=self.nonlinear_accuracy,
+                    verbose=True,
+                )
+                reader(temporary_warp)
+
+                def writer(path: Path) -> None:
+                    if temporary_warp is None:
+                        raise RuntimeError("local warp candidate was not prepared")
+                    shutil.copyfile(temporary_warp, path)
+
+            def validator(path: Path) -> bool:
+                try:
+                    reader(path)
+                except Exception:
+                    return False
+                return True
+
+            self._store().commit(paths.warp, request, writer, validator)
+            try:
+                committed = reader(paths.warp)[1]
+            except Exception:
+                self._store().mark_stale(paths.warp)
+                raise
+            return committed, True
+        finally:
+            if temporary_warp is not None:
+                temporary_warp.unlink(missing_ok=True)
 
     def _reconstruct_local_images(
         self,

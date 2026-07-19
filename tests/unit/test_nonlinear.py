@@ -201,6 +201,62 @@ def test_nonlinear_composes_the_complete_forward_transform_list(
     assert transformed is calls.histogram_matched
 
 
+def test_nonlinear_preserves_only_the_returned_forward_warp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    affine_path = tmp_path / "forward-affine.mat"
+    inverse_path = tmp_path / "inverse-warp.nii.gz"
+    affine_path.write_bytes(b"affine")
+    inverse_path.write_bytes(b"inverse")
+    calls.forward_transforms = [calls.warp_path, affine_path]
+    calls.inverse_transforms = [inverse_path, affine_path]
+
+    _, returned_warp = register_image(
+        moving_image=fake_image(),
+        fixed_image=fake_image(),
+        registration_type="SyN",
+    )
+
+    assert returned_warp == calls.composed_path
+    assert returned_warp.is_file()
+    assert not calls.warp_path.exists()
+    assert not affine_path.exists()
+    assert not inverse_path.exists()
+
+
+def test_nonlinear_removes_every_transform_when_postprocessing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    inverse_path = tmp_path / "inverse-warp.nii.gz"
+    inverse_path.write_bytes(b"inverse")
+    calls.inverse_transforms = [inverse_path]
+    fake_ants, np_runtime = nonlinear._scientific_runtime()
+
+    def fail_histogram_match(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("injected nonlinear postprocessing failure")
+
+    monkeypatch.setattr(fake_ants, "histogram_match_image", fail_histogram_match)
+    monkeypatch.setattr(
+        nonlinear,
+        "_scientific_runtime",
+        lambda: (fake_ants, np_runtime),
+    )
+
+    with pytest.raises(RuntimeError, match="injected nonlinear postprocessing failure"):
+        register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+        )
+
+    assert not calls.warp_path.exists()
+    assert not inverse_path.exists()
+
+
 def test_nonlinear_transform_uses_forward_transform_and_linear_interpolation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

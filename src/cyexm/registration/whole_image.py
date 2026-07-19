@@ -676,7 +676,6 @@ class ImageRegistration:
     ) -> tuple[Path, object, object]:
         del affine
         temporary_warp: Path | None = None
-        prepared_candidate = False
         warp_commit_attempted = False
         warp_committed = False
         try:
@@ -689,7 +688,6 @@ class ImageRegistration:
                         fixed_mask,
                         moving_linear_mask,
                     )
-                    prepared_candidate = True
                 except (
                     CacheValidationError,
                     ChunkRegistrationError,
@@ -803,7 +801,7 @@ class ImageRegistration:
                 f"nonlinear registration failed for round {self.imaging_round}"
             ) from error
         finally:
-            if prepared_candidate and temporary_warp is not None:
+            if temporary_warp is not None:
                 temporary_warp.unlink(missing_ok=True)
         return paths.warp, moving_nonlinear, moving_nonlinear_mask
 

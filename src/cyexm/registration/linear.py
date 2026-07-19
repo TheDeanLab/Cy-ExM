@@ -4,6 +4,10 @@ import logging
 import os
 from typing import Any
 
+from cyexm.registration._native_paths import (
+    cleanup_registration_transforms,
+    registration_transform_paths,
+)
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
 logger = logging.getLogger(__name__)
@@ -102,29 +106,33 @@ def register_image(
         )
 
     registered = ants.registration(**kwargs)
-    transform = ants.read_transform(filename=registered["fwdtransforms"][0])
-    transformed_image = transform.apply_to_image(
-        image=moving_image,
-        reference=fixed_image,
-        interpolation="linear",
-    )
-
-    transformed_mask: object | None = None
-    if moving_mask is not None:
-        transformed_mask = transform.apply_to_image(
-            image=moving_mask,
+    native_paths = registration_transform_paths(registered)
+    try:
+        transform = ants.read_transform(filename=registered["fwdtransforms"][0])
+        transformed_image = transform.apply_to_image(
+            image=moving_image,
             reference=fixed_image,
-            interpolation="nearestNeighbor",
-        )
-        transformed_mask = ants.threshold_image(
-            transformed_mask,
-            low_thresh=0.5,
-            high_thresh=1.0,
-            inval=1,
-            outval=0,
+            interpolation="linear",
         )
 
-    return transformed_image, transformed_mask, transform
+        transformed_mask: object | None = None
+        if moving_mask is not None:
+            transformed_mask = transform.apply_to_image(
+                image=moving_mask,
+                reference=fixed_image,
+                interpolation="nearestNeighbor",
+            )
+            transformed_mask = ants.threshold_image(
+                transformed_mask,
+                low_thresh=0.5,
+                high_thresh=1.0,
+                inval=1,
+                outval=0,
+            )
+
+        return transformed_image, transformed_mask, transform
+    finally:
+        cleanup_registration_transforms(native_paths)
 
 
 def inspect_affine_transform(

@@ -6,6 +6,10 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from cyexm.registration._native_paths import (
+    cleanup_registration_transforms,
+    registration_transform_paths,
+)
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
 logger = logging.getLogger(__name__)
@@ -141,23 +145,34 @@ def register_image(
         kwargs["reg_iterations"],
     )
     registered = ants.registration(**kwargs)
-    warp_path = _materialize_forward_warp(
-        ants,
-        fixed_image=fixed_image,
-        moving_image=moving_image,
-        forward_transforms=registered["fwdtransforms"],
-    )
+    native_paths = registration_transform_paths(registered)
+    warp_path: Path | None = None
+    completed = False
+    try:
+        warp_path = _materialize_forward_warp(
+            ants,
+            fixed_image=fixed_image,
+            moving_image=moving_image,
+            forward_transforms=registered["fwdtransforms"],
+        )
 
-    transformed_image = ants.resample_image_to_target(
-        image=registered["warpedmovout"],
-        target=fixed_image,
-        interp_type="linear",
-    )
-    transformed_image = ants.histogram_match_image(
-        source_image=transformed_image,
-        reference_image=moving_image,
-    )
-    return transformed_image, warp_path
+        transformed_image = ants.resample_image_to_target(
+            image=registered["warpedmovout"],
+            target=fixed_image,
+            interp_type="linear",
+        )
+        transformed_image = ants.histogram_match_image(
+            source_image=transformed_image,
+            reference_image=moving_image,
+        )
+        completed = True
+        return transformed_image, warp_path
+    finally:
+        returned = () if warp_path is None else (warp_path,)
+        cleanup_registration_transforms(
+            native_paths | set(returned),
+            preserve=returned if completed else (),
+        )
 
 
 def transform_image(

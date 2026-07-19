@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
 import subprocess
+import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -46,15 +50,76 @@ def _configure_one_thread() -> None:
     os.environ["ANTS_RANDOM_SEED"] = _ANTS_RANDOM_SEED
 
 
-def _source_commit(source_root: Path) -> str:
+def _git_output(source_root: Path, *arguments: str) -> str:
     completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        ["git", *arguments],
         cwd=source_root,
         check=True,
         capture_output=True,
         text=True,
     )
     return completed.stdout.strip()
+
+
+def _validate_source_checkout(
+    source_root: Path,
+    output: Path,
+    *,
+    expected_commit: str = _CLEAR_EX_COMMIT,
+) -> dict[str, object]:
+    checkout = source_root.resolve()
+    destination = output.resolve()
+    if not checkout.is_dir():
+        raise FileNotFoundError(f"ClearEx source checkout does not exist: {checkout}")
+    if destination.is_relative_to(checkout):
+        raise ValueError("baseline output must be outside the ClearEx checkout")
+
+    top_level = Path(_git_output(checkout, "rev-parse", "--show-toplevel")).resolve()
+    if top_level != checkout:
+        raise RuntimeError(
+            f"supplied ClearEx source must be the checkout root: {checkout}"
+        )
+    commit = _git_output(checkout, "rev-parse", "HEAD")
+    if commit != expected_commit:
+        raise RuntimeError(
+            f"ClearEx source does not match expected pin {expected_commit}: {commit}"
+        )
+    status = _git_output(
+        checkout,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    if status:
+        raise RuntimeError(
+            "ClearEx source checkout must be clean before baseline capture"
+        )
+    return {
+        "checkout_root": str(checkout),
+        "source_commit": commit,
+        "git_status": "clean",
+        "output_directory": str(destination),
+        "output_outside_checkout": True,
+    }
+
+
+def _validate_import_provenance(
+    modules: Mapping[str, object], source_root: Path
+) -> dict[str, str]:
+    checkout = source_root.resolve()
+    provenance: dict[str, str] = {}
+    for name, module in modules.items():
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(module_file, str):
+            raise RuntimeError(f"imported module {name!r} has no filesystem provenance")
+        resolved = Path(module_file).resolve()
+        if not resolved.is_relative_to(checkout):
+            raise RuntimeError(
+                f"imported module {name!r} resolves outside the supplied source "
+                f"checkout: {resolved}"
+            )
+        provenance[name] = str(resolved)
+    return provenance
 
 
 def _synthetic_volume(np: Any) -> Any:
@@ -68,6 +133,52 @@ def _synthetic_volume(np: Any) -> Any:
     ramp = 0.07 * (x / 31.0) + 0.03 * (y / 31.0) + 0.02 * (z / 15.0)
     volume = 0.1 + 0.65 * primary + 0.35 * secondary + ramp
     return volume.astype(np.float32)
+
+
+def _deterministic_masks(np: Any) -> tuple[Any, Any]:
+    """Return asymmetric binary masks independent of the synthetic intensities."""
+    z, y, x = np.mgrid[:16, :32, :32]
+    ellipsoid = ((z - 7.0) / 5.0) ** 2 + ((y - 13.0) / 8.0) ** 2 + (
+        (x - 18.0) / 7.0
+    ) ** 2 <= 1.0
+    spur = (z >= 9) & (z < 14) & (y >= 20) & (y < 27) & (x >= 5) & (x < 12)
+    notch = (z >= 5) & (z < 9) & (y >= 10) & (y < 15) & (x >= 18) & (x < 24)
+    fixed = (ellipsoid | spur) & ~notch
+    moving = np.roll(fixed, shift=(0, 1, -1), axis=(0, 1, 2))
+    return fixed.astype(np.float32), moving.astype(np.float32)
+
+
+@contextmanager
+def _controlled_registration_outputs(
+    ants: Any, directory: Path
+) -> Iterator[tuple[list[dict[str, object]], list[str]]]:
+    """Keep every legacy ANTSpyX native artifact inside one owned directory."""
+    original = ants.registration
+    signature_parameters = list(inspect.signature(original).parameters)
+    calls: list[dict[str, object]] = []
+
+    def registration(**kwargs: object) -> object:
+        index = len(calls)
+        received_keywords = sorted(kwargs)
+        prefix = directory / f"call-{index:02d}-"
+        calls.append(
+            {
+                "index": index,
+                "received_keywords": received_keywords,
+                "received_fixed_mask": kwargs.get("fixed_mask") is not None,
+                "received_mask_keyword": "mask" in kwargs,
+                "outprefix": str(prefix),
+            }
+        )
+        controlled = dict(kwargs)
+        controlled["outprefix"] = str(prefix)
+        return original(**controlled)
+
+    ants.registration = registration
+    try:
+        yield calls, signature_parameters
+    finally:
+        ants.registration = original
 
 
 def _geometry(image: Any) -> dict[str, object]:
@@ -161,14 +272,13 @@ def _legacy_chunks(
 
 
 def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
-    commit = _source_commit(source_root)
-    if commit != _CLEAR_EX_COMMIT:
-        raise RuntimeError(
-            f"ClearEx source mismatch: expected {_CLEAR_EX_COMMIT}, found {commit}"
-        )
+    source_validation = _validate_source_checkout(source_root, output)
+    commit = str(source_validation["source_commit"])
     _configure_one_thread()
 
     import ants
+    import clearex
+    import clearex.registration as legacy_registration
     import numpy as np
     import scipy
     import tifffile
@@ -176,9 +286,19 @@ def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
     from clearex.registration import linear as legacy_linear
     from clearex.registration import nonlinear as legacy_nonlinear
 
+    import_provenance = _validate_import_provenance(
+        {
+            "clearex": clearex,
+            "clearex.registration": legacy_registration,
+            "clearex.registration.linear": legacy_linear,
+            "clearex.registration.nonlinear": legacy_nonlinear,
+        },
+        source_root,
+    )
     output.mkdir(parents=True, exist_ok=True)
     fixed_data = _synthetic_volume(np)
     moving_data = fixed_data.copy()
+    fixed_mask_data, moving_mask_data = _deterministic_masks(np)
     fixed_path = output / "fixed.tif"
     moving_path = output / "moving.tif"
     tifffile.imwrite(fixed_path, fixed_data, metadata={"axes": "ZYX"})
@@ -186,88 +306,110 @@ def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
 
     fixed = ants.from_numpy(fixed_data, spacing=_PIXEL_SIZE)
     moving = ants.from_numpy(moving_data, spacing=_PIXEL_SIZE)
-    fixed_mask = ants.from_numpy(
-        (fixed_data > 0).astype(np.float32), spacing=_PIXEL_SIZE
-    )
-    moving_mask = ants.from_numpy(
-        (moving_data > 0).astype(np.float32), spacing=_PIXEL_SIZE
-    )
-    literal_dry_affine, literal_dry_mask, _literal_dry_transform = (
-        legacy_linear.register_image(
-            moving,
-            fixed,
-            fixed_mask=fixed_mask,
-            moving_mask=moving_mask,
-            accuracy="dry run",
-            verbose=False,
+    fixed_mask = ants.from_numpy(fixed_mask_data, spacing=_PIXEL_SIZE)
+    moving_mask = ants.from_numpy(moving_mask_data, spacing=_PIXEL_SIZE)
+
+    with tempfile.TemporaryDirectory(
+        dir=output, prefix=".legacy-ants-native-"
+    ) as native_directory_text:
+        native_directory = Path(native_directory_text)
+        with _controlled_registration_outputs(
+            ants, native_directory
+        ) as registration_characterization:
+            registration_calls, antspyx_signature_parameters = (
+                registration_characterization
+            )
+            literal_dry_affine, literal_dry_mask, _literal_dry_transform = (
+                legacy_linear.register_image(
+                    moving,
+                    fixed,
+                    fixed_mask=fixed_mask,
+                    moving_mask=moving_mask,
+                    accuracy="dry run",
+                    verbose=False,
+                )
+            )
+            literal_dry_nonlinear, _literal_dry_warp = legacy_nonlinear.register_image(
+                literal_dry_affine,
+                fixed,
+                moving_mask=literal_dry_mask,
+                fixed_mask=fixed_mask,
+                accuracy="dry run",
+                verbose=False,
+            )
+            literal_dry_arrays = {
+                "affine_result": literal_dry_affine.numpy(),
+                "affine_mask": literal_dry_mask.numpy(),
+                "nonlinear_result": literal_dry_nonlinear.numpy(),
+            }
+
+            # The matched numerical gate includes only parameters both wrappers
+            # actually deliver to ANTSpyX. ClearEx forwards fixed masks with the
+            # unconsumed ``fixed_mask`` keyword, so both matched calls omit it.
+            affine_image, affine_mask, affine = legacy_linear.register_image(
+                moving,
+                fixed,
+                fixed_mask=None,
+                moving_mask=moving_mask,
+                registration_type="TRSAA",
+                accuracy="low",
+                verbose=False,
+            )
+            affine_path = output / "affine.mat"
+            ants.write_transform(affine, str(affine_path))
+            nonlinear_image, temporary_warp = legacy_nonlinear.register_image(
+                affine_image,
+                fixed,
+                moving_mask=affine_mask,
+                fixed_mask=None,
+                accuracy="dry run",
+                verbose=False,
+            )
+            warp = ants.image_read(str(temporary_warp))
+            warp_path = output / "nonlinear_warp.nii.gz"
+            ants.image_write(warp, str(warp_path))
+            raw_nonlinear_mask = ants.apply_transforms(
+                fixed=fixed,
+                moving=affine_mask,
+                transformlist=[str(warp_path)],
+                whichtoinvert=[False],
+                interpolator="nearestNeighbor",
+            )
+            nonlinear_mask = ants.threshold_image(
+                raw_nonlinear_mask,
+                low_thresh=0.5,
+                high_thresh=1.0,
+                inval=1,
+                outval=0,
+            )
+            transform_order = ants.apply_transforms(
+                fixed=fixed,
+                moving=moving,
+                transformlist=[str(warp_path), str(affine_path)],
+                whichtoinvert=[False, False],
+                interpolator="linear",
+            )
+    if native_directory.exists():
+        raise RuntimeError("legacy ANTSpyX native artifact directory was not removed")
+    if len(registration_calls) != 4:
+        raise RuntimeError(
+            "legacy baseline did not execute the four characterized calls"
         )
-    )
-    literal_dry_nonlinear, _literal_dry_warp = legacy_nonlinear.register_image(
-        literal_dry_affine,
-        fixed,
-        moving_mask=literal_dry_mask,
-        fixed_mask=fixed_mask,
-        accuracy="dry run",
-        verbose=False,
-    )
-    literal_dry_arrays = {
-        "affine_result": literal_dry_affine.numpy(),
-        "affine_mask": literal_dry_mask.numpy(),
-        "nonlinear_result": literal_dry_nonlinear.numpy(),
-    }
+    for call, label in zip(
+        registration_calls,
+        ("literal_linear", "literal_nonlinear", "matched_linear", "matched_nonlinear"),
+        strict=True,
+    ):
+        call["label"] = label
+
     for name, array in literal_dry_arrays.items():
         np.save(output / f"literal_dry_{name}.npy", array, allow_pickle=False)
-
-    # Shared TRSAA-low parameters provide a numerical migration comparison. The
-    # literal legacy dry-run call above is retained separately because it wires its
-    # Rigid schedule through names that ANTSpyX does not consume for affine stages.
-    affine_image, affine_mask, affine = legacy_linear.register_image(
-        moving,
-        fixed,
-        fixed_mask=fixed_mask,
-        moving_mask=moving_mask,
-        registration_type="TRSAA",
-        accuracy="low",
-        verbose=False,
-    )
-    affine_path = output / "affine.mat"
-    ants.write_transform(affine, str(affine_path))
-    nonlinear_image, temporary_warp = legacy_nonlinear.register_image(
-        affine_image,
-        fixed,
-        moving_mask=affine_mask,
-        fixed_mask=fixed_mask,
-        accuracy="dry run",
-        verbose=False,
-    )
-    warp = ants.image_read(str(temporary_warp))
-    warp_path = output / "nonlinear_warp.nii.gz"
-    ants.image_write(warp, str(warp_path))
-    raw_nonlinear_mask = ants.apply_transforms(
-        fixed=fixed,
-        moving=affine_mask,
-        transformlist=[str(warp_path)],
-        whichtoinvert=[False],
-        interpolator="nearestNeighbor",
-    )
-    nonlinear_mask = ants.threshold_image(
-        raw_nonlinear_mask,
-        low_thresh=0.5,
-        high_thresh=1.0,
-        inval=1,
-        outval=0,
-    )
-    transform_order = ants.apply_transforms(
-        fixed=fixed,
-        moving=moving,
-        transformlist=[str(warp_path), str(affine_path)],
-        whichtoinvert=[False, False],
-        interpolator="linear",
-    )
 
     arrays = {
         "fixed": fixed_data,
         "moving": moving_data,
+        "fixed_mask_input": fixed_mask_data,
+        "moving_mask_input": moving_mask_data,
         "affine_result": affine_image.numpy(),
         "affine_mask": affine_mask.numpy(),
         "nonlinear_result": nonlinear_image.numpy(),
@@ -289,8 +431,15 @@ def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
     np.save(output / "stitch_vector.npy", vector_stitch, allow_pickle=False)
 
     summary: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": commit,
+        "source_validation": source_validation,
+        "import_provenance": import_provenance,
+        "native_artifact_cleanup": {
+            "strategy": "caller-owned temporary directory",
+            "directory": str(native_directory),
+            "removed": True,
+        },
         "versions": {
             "python": os.sys.version.split()[0],
             "antspyx": ants.__version__,
@@ -305,12 +454,30 @@ def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
             "linear_accuracy": "low",
             "nonlinear_registration_type": "SyNOnly",
             "nonlinear_accuracy": "dry run",
+            "fixed_mask": None,
+            "moving_mask": "deterministic asymmetric binary mask",
             "reason": (
-                "shared consumed parameters; legacy literal dry-run is captured "
-                "separately because its affine schedule uses ineffective names"
+                "shared consumed parameters; fixed masks are excluded because "
+                "ClearEx forwards an ANTSpyX keyword that is not consumed"
             ),
         },
+        "fixed_mask_characterization": {
+            "classification": "corrected_legacy_defect",
+            "legacy_wrapper_keyword": "fixed_mask",
+            "antspyx_consumed_keyword": "mask",
+            "antspyx_signature_parameters": antspyx_signature_parameters,
+            "legacy_keyword_in_antspyx_signature": (
+                "fixed_mask" in antspyx_signature_parameters
+            ),
+            "corrected_keyword_in_antspyx_signature": (
+                "mask" in antspyx_signature_parameters
+            ),
+            "literal_fixed_mask_provided": True,
+            "matched_fixed_mask": None,
+            "registration_calls": registration_calls,
+        },
         "literal_dry_run": {
+            "classification": "expected_divergence",
             "linear_registration_type_argument": "TRSAA",
             "linear_accuracy_argument": "dry run",
             "effective_linear_registration_type": "Rigid",
@@ -352,6 +519,8 @@ def create_baseline(output: Path, source_root: Path) -> dict[str, object]:
             "inversion_flags": [False, False],
         },
         "mask_values": {
+            "fixed_input": [float(value) for value in np.unique(fixed_mask_data)],
+            "moving_input": [float(value) for value in np.unique(moving_mask_data)],
             "affine": [float(value) for value in np.unique(affine_mask.numpy())],
             "nonlinear": [float(value) for value in np.unique(nonlinear_mask.numpy())],
         },

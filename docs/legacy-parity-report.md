@@ -6,20 +6,23 @@ Cy-ExM was compared with the read-only ClearEx extraction source at commit
 `2311a873b783477add7391ff00245f76490147f0` on 2026-07-19. The comparison used
 one native thread for ITK and every configured BLAS-family runtime, the deterministic
 ANTs seed `20260719`, and an identical `16 x 32 x 32` synthetic volume for fixed and
-moving input.
+moving scalar input. Mask behavior uses independently constructed deterministic,
+asymmetric fixed and moving masks; the moving mask is shifted by one voxel in Y and
+X, and every input and transformed mask has the exact value set `[0.0, 1.0]`.
 
 The numerical migration gate is explicitly **TRSAA low followed by SyNOnly dry
-run**. Those are shared parameters consumed equivalently by both implementations.
-All eight migration categories passed. Registration arrays use `rtol=1e-4` and
-`atol=1e-5`; chunk geometry and data are exact. Spatial metadata uses an absolute
-`1e-7` tolerance only for float32 NIfTI spacing serialization.
+run**. The matched calls use the shared, consumed moving-mask parameter and omit the
+fixed mask in both environments. ClearEx's fixed-mask keyword defect is characterized
+separately below. All eight migration categories passed. Registration arrays use
+`rtol=1e-4` and `atol=1e-5`; chunk geometry and data are exact. Spatial metadata uses
+an absolute `1e-7` tolerance only for float32 NIfTI spacing serialization.
 
 | Gate | Result | Evidence |
 | --- | --- | --- |
 | Geometry | PASS | Shape exact; origin, spacing, and direction within `1e-7` |
 | Affine scalar | PASS | Maximum absolute difference `0.0` |
 | Nonlinear scalar | PASS | Maximum absolute difference `0.0` |
-| Mask interpolation | PASS | Affine and nonlinear masks exactly equal and binary |
+| Mask interpolation | PASS | Input, affine, and nonlinear masks exactly equal with values `[0.0, 1.0]` |
 | Transform order | PASS | Warp then affine, both uninverted; maximum difference `5.960464477539063e-8` |
 | Chunk grid | PASS | Eight chunk records exactly equal |
 | Chunk extraction | PASS | Every fixed and moving extended chunk exactly equal |
@@ -27,35 +30,55 @@ All eight migration categories passed. Registration arrays use `rtol=1e-4` and
 
 The generated `summary.json` records the baseline policy, versions, geometry,
 finite-value checks, similarity measurements, transform types, mask values, chunk
-coordinates, extended/core shapes, and stitching order. The generated
-`comparison.json` records every tolerance, maximum difference, result, and the
-effective Cy-ExM thread configuration.
+coordinates, extended/core shapes, stitching order, clean pinned checkout state,
+external output directory, import provenance, and native-artifact cleanup. The
+generated `comparison.json` records every tolerance, maximum difference, result,
+the effective Cy-ExM thread configuration, and both required diagnostics.
+
+The one-chunk integration check estimates one real Rigid dry-run affine followed by
+one real SyNOnly dry-run warp. It then supplies that same estimated pair at the two
+workflows' expensive estimation boundaries. Whole-image and one-chunk orchestration
+still perform real ANTs scalar/mask application, affine and warp persistence,
+committed-artifact reads, and TIFF output. This is an application-and-persistence
+equivalence check for one genuinely estimated pair; it does not claim that two
+independent optimizer runs converge to identical transforms.
 
 ## Literal dry-run characterization
 
 This report does **not** relabel the matched-low gate as dry-run parity. The baseline
 and comparison scripts also execute and store the literal `accuracy="dry run"`
-linear and nonlinear calls in both environments. Those outputs are intentionally
-excluded from the overall parity verdict because the pinned ClearEx linear wrapper
+linear and nonlinear calls in both environments. Those outputs remain separate from
+the eight matched-policy categories because the pinned ClearEx linear wrapper
 changes its transform to Rigid but supplies `reg_iterations`, `smoothing_sigmas`, and
 `shrink_factors`. ANTSpyX's Rigid path consumes the affine-prefixed parameter names,
 so the legacy call actually retains its default affine schedule. Cy-ExM corrects the
 call to `aff_iterations=(1,)`, `aff_smoothing_sigmas=(0,)`, and
 `aff_shrink_factors=(8,)`.
 
+ClearEx also forwards the fixed registration mask as `fixed_mask=`. ANTSpyX 0.6.2's
+registration signature consumes `mask=`, not `fixed_mask=`. Cy-ExM corrects that
+keyword. The baseline records the ANTSpyX signature and all four received call-key
+sets: the two literal calls received a nontrivial `fixed_mask` and no `mask`, while
+the matched calls received no fixed-mask value. Fixed masks are therefore not claimed
+as equivalently consumed; matched mask parity measures the shared moving-mask
+nearest-neighbor transformations.
+
 The independently generated literal-dry comparison therefore records an expected
 difference, not a parity pass:
 
 | Literal dry-run diagnostic | Within migration tolerance? | Maximum absolute difference |
 | --- | --- | --- |
-| Affine scalar | No | `0.21112346649169922` |
-| Affine mask | No | `1.0` |
-| Nonlinear scalar after that affine | No | `0.21028149127960205` |
+| Affine scalar | Yes | `0.0` |
+| Affine mask | Yes, exactly | `0.0` |
+| Nonlinear scalar after that affine | No | `0.028033554553985596` |
 
-This characterization makes the corrected API behavior visible without weakening
-the approved `rtol=1e-4`, `atol=1e-5` numerical gate or fabricating dry-run parity.
-The separate shifted-volume integration test exercises the corrected bounded kernels,
-similarity improvement, and a mask containing both zero and one.
+The parity command requires the `expected_divergence` classification, all three
+literal result records, and at least one result outside the approved tolerance. It
+exits nonzero if all literal outputs unexpectedly become equivalent or if the
+classification evidence is absent. This makes the corrected behavior visible without
+weakening `rtol=1e-4`, `atol=1e-5` or fabricating literal dry-run parity. The separate
+shifted-volume integration test exercises the corrected bounded kernels, similarity
+improvement, and a mask containing both zero and one.
 
 ## Environments
 
@@ -74,10 +97,12 @@ The six recorded native variables were all `1`:
 
 ## Reproduction
 
-The implementation was unmerged when this evidence was generated, so the commands
-use the explicit Phase 1 worktree path rather than the main Cy-ExM checkout. The
-baseline command writes only to its explicit `/tmp` output and did not change the
-ClearEx worktree.
+The baseline command rejects a checkout that is not the exact pin, is dirty, imports
+ClearEx from elsewhere, or places output inside that checkout. All native ClearEx
+registration artifacts are confined to an exception-safe temporary directory under
+the explicit output and removed after durable evidence is copied.
+
+From any durable Cy-ExM checkout, use this checkout-relative command:
 
 ```bash
 export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
@@ -90,24 +115,44 @@ export NUMEXPR_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 export ANTS_RANDOM_SEED=20260719
 
-git -C /project/bioinformatics/Danuser_lab/Dean/dean/git/clearex rev-parse HEAD
+CYEXM_ROOT=$PWD
+CLEAR_EX_ROOT=/project/bioinformatics/Danuser_lab/Dean/dean/git/clearex
+BASELINE_DIR=/tmp/cyexm-legacy-baseline
 
+git -C "$CLEAR_EX_ROOT" rev-parse HEAD
+git -C "$CLEAR_EX_ROOT" status --short
+
+uv run --project "$CLEAR_EX_ROOT" --no-sync python \
+  "$CYEXM_ROOT/tests/integration/legacy_baseline.py" \
+  --source-root "$CLEAR_EX_ROOT" \
+  --output "$BASELINE_DIR"
+
+uv run --project "$CYEXM_ROOT" --no-sync python \
+  "$CYEXM_ROOT/tests/integration/compare_legacy.py" \
+  --baseline "$BASELINE_DIR" \
+  --report "$BASELINE_DIR/comparison.json"
+```
+
+The historical Task 8 evidence used the unmerged Phase 1 worktree explicitly:
+
+```bash
 cd /project/bioinformatics/Danuser_lab/Dean/dean/git/clearex
 uv run --no-sync python \
   /project/bioinformatics/Danuser_lab/Dean/dean/git/Cy-ExM/.worktrees/phase-1-registration/tests/integration/legacy_baseline.py \
-  --output /tmp/cyexm-legacy-baseline-task8-final-20260719
+  --source-root /project/bioinformatics/Danuser_lab/Dean/dean/git/clearex \
+  --output /tmp/cyexm-legacy-baseline-task8-fix-20260719
 
 cd /project/bioinformatics/Danuser_lab/Dean/dean/git/Cy-ExM/.worktrees/phase-1-registration
 uv run --no-sync python tests/integration/compare_legacy.py \
-  --baseline /tmp/cyexm-legacy-baseline-task8-final-20260719 \
-  --report /tmp/cyexm-legacy-baseline-task8-final-20260719/comparison.json
+  --baseline /tmp/cyexm-legacy-baseline-task8-fix-20260719 \
+  --report /tmp/cyexm-legacy-baseline-task8-fix-20260719/comparison.json
 ```
 
-Observed source and script results:
+Observed source and script results were:
 
 ```text
 2311a873b783477add7391ff00245f76490147f0
-PASS legacy baseline commit=2311a873b783477add7391ff00245f76490147f0 output=/tmp/cyexm-legacy-baseline-task8-final-20260719
+PASS legacy baseline commit=2311a873b783477add7391ff00245f76490147f0 output=/tmp/cyexm-legacy-baseline-task8-fix-20260719
 PASS geometry
 PASS affine result
 PASS nonlinear result
@@ -116,9 +161,11 @@ PASS transform order
 PASS chunk grid
 PASS chunk extraction
 PASS overlap stitching
+PASS diagnostic literal dry expected divergence
+PASS diagnostic fixed mask corrected defect
 ```
 
-The baseline took 5.29 seconds and the comparison took 3.71 seconds on the recorded
+The baseline took 5.30 seconds and the comparison took 2.91 seconds on the recorded
 one-thread environment.
 
 ## Intentionally corrected legacy defects
@@ -144,3 +191,11 @@ that can return incomplete, stale, or incorrectly transformed results:
    cannot be reported as successful Cy-ExM work.
 9. Literal affine dry-run parameters use the ANTSpyX names consumed by Rigid, as
    characterized above.
+10. Fixed registration masks use ANTSpyX's consumed `mask=` keyword; the pinned
+    ClearEx wrappers instead forward ignored `fixed_mask=` kwargs.
+11. Linear kernels remove native transform files after deserialization. Nonlinear
+    kernels remove inverse and superseded components while transferring ownership of
+    exactly one returned forward warp to the caller; parity and orchestration callers
+    remove transferred candidates in `finally` blocks after durable persistence.
+12. Atomic TIFF validation checks declared `ZYX` metadata and effective `ZYX` series
+    axes, with only tifffile's leading singleton-Z squeeze accepted explicitly.

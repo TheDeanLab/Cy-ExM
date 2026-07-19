@@ -97,7 +97,20 @@ def write_uint16_tiff(
 
     def validator(temporary: Path) -> bool:
         try:
-            written = tifffile.imread(temporary)
+            with tifffile.TiffFile(temporary) as handle:
+                series = handle.series[0]
+                shaped = handle.shaped_metadata
+                declared_axes = (
+                    shaped[0].get("axes")
+                    if shaped and isinstance(shaped[0], dict)
+                    else None
+                )
+                singleton_z_is_squeezed = encoded.shape[0] == 1 and series.axes == "YX"
+                if declared_axes != "ZYX" or (
+                    series.axes != "ZYX" and not singleton_z_is_squeezed
+                ):
+                    return False
+                written = handle.asarray()
         except Exception:
             return False
         return (

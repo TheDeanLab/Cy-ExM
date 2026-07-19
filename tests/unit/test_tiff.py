@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from cyexm.errors import InputValidationError
+from cyexm.errors import CacheValidationError, InputValidationError
 from cyexm.io.tiff import write_uint16_tiff
 
 
@@ -210,6 +210,37 @@ def test_uint16_export_failure_keeps_the_previous_artifact(
     with pytest.raises(RuntimeError, match="injected TIFF failure"):
         write_uint16_tiff(
             np.ones((1, 1, 1)),
+            destination,
+            min_value=0.0,
+            max_value=100.0,
+        )
+
+    assert destination.read_bytes() == b"previous"
+    assert list(tmp_path.glob(".*.tmp*")) == []
+
+
+def test_uint16_export_rejects_atomic_temporary_with_wrong_axes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "registered.tif"
+    destination.write_bytes(b"previous")
+    real_imwrite = tifffile.imwrite
+
+    def wrong_axes_imwrite(
+        path: Path,
+        data: np.ndarray,
+        *,
+        metadata: dict[str, str],
+    ) -> None:
+        assert metadata == {"axes": "ZYX"}
+        real_imwrite(path, data)
+
+    monkeypatch.setattr(tifffile, "imwrite", wrong_axes_imwrite)
+
+    with pytest.raises(CacheValidationError, match="failed validation"):
+        write_uint16_tiff(
+            np.arange(8, dtype=np.float32).reshape(2, 2, 2),
             destination,
             min_value=0.0,
             max_value=100.0,

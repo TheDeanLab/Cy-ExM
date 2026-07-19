@@ -1087,6 +1087,7 @@ def test_temporary_warp_is_validated_and_masks_use_only_committed_path(
 
     paths = round_paths(tmp_path)
     assert backend.temporary_warps == [tmp_path / "temporary-warp-1.nii.gz"]
+    assert not backend.temporary_warps[0].exists()
     assert all(
         path != backend.temporary_warps[0] for path, _ in backend.warp_applications
     )

@@ -140,6 +140,50 @@ def test_linear_mask_uses_nearest_neighbor_and_thresholds_at_half(
     assert transformed_mask is calls.thresholded
 
 
+def test_linear_removes_all_native_transform_files_after_deserializing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.linear", tmp_path)
+    inverse_path = tmp_path / "inverse.mat"
+    inverse_path.write_bytes(b"inverse")
+    calls.inverse_transforms = [inverse_path, calls.warp_path]
+
+    _, _, transform = register_image(
+        moving_image=fake_image(),
+        fixed_image=fake_image(),
+    )
+
+    assert transform is calls.transform
+    assert not calls.warp_path.exists()
+    assert not inverse_path.exists()
+
+
+def test_linear_removes_native_transform_files_when_application_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.linear", tmp_path)
+    inverse_path = tmp_path / "inverse.mat"
+    inverse_path.write_bytes(b"inverse")
+    calls.inverse_transforms = [inverse_path]
+
+    def fail_application(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("injected affine application failure")
+
+    monkeypatch.setattr(calls.transform, "apply_to_image", fail_application)
+
+    with pytest.raises(RuntimeError, match="injected affine application failure"):
+        register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+        )
+
+    assert not calls.warp_path.exists()
+    assert not inverse_path.exists()
+
+
 @pytest.mark.parametrize("accuracy", ["unknown", "", "HIGHER", "High"])
 def test_linear_rejects_unknown_accuracy_before_loading_ants(
     monkeypatch: pytest.MonkeyPatch,

@@ -142,6 +142,7 @@ class FakeAntsCalls:
     transform: FakeTransform = field(default_factory=FakeTransform)
     warp_path: Path = Path("fake-warp.nii.gz")
     forward_transforms: list[Path] | None = None
+    inverse_transforms: list[Path] = field(default_factory=list)
     compose: str | None = None
     composed_path: Path | None = None
     histogram_matched: FakeImage = field(default_factory=FakeImage)
@@ -759,6 +760,7 @@ def install_fake_ants(
                     else calls.forward_transforms
                 )
             ],
+            "invtransforms": [str(path) for path in calls.inverse_transforms],
             "warpedmovout": calls.registered_warped,
         }
 

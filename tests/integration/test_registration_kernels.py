@@ -50,30 +50,32 @@ def test_dry_run_kernels_preserve_geometry_masks_and_improve_similarity(
         accuracy="dry run",
         native_threads=native_threads,
     )
+    try:
+        for image in (affine_image, affine_mask, nonlinear_image):
+            assert image.shape == fixed.shape
+            assert image.origin == fixed.origin
+            assert image.spacing == fixed.spacing
+            np.testing.assert_array_equal(image.direction, fixed.direction)
+            assert np.isfinite(image.numpy()).all()
+        np.testing.assert_array_equal(np.unique(affine_mask.numpy()), (0.0, 1.0))
+        assert affine.transform_type == "AffineTransform"
 
-    for image in (affine_image, affine_mask, nonlinear_image):
-        assert image.shape == fixed.shape
-        assert image.origin == fixed.origin
-        assert image.spacing == fixed.spacing
-        np.testing.assert_array_equal(image.direction, fixed.direction)
-        assert np.isfinite(image.numpy()).all()
-    np.testing.assert_array_equal(np.unique(affine_mask.numpy()), (0.0, 1.0))
-    assert affine.transform_type == "AffineTransform"
+        assert isinstance(warp_path, Path)
+        assert warp_path.is_file()
+        warp = ants.image_read(str(warp_path))
+        assert warp.shape == fixed.shape
+        assert warp.has_components
+        assert warp.origin == fixed.origin
+        # NIfTI spacing is float32; 1e-7 covers serialization rounding only.
+        np.testing.assert_allclose(warp.spacing, fixed.spacing, rtol=0.0, atol=1e-7)
+        np.testing.assert_array_equal(warp.direction, fixed.direction)
+        assert warp.numpy().shape == (*fixed.shape, 3)
+        assert np.isfinite(warp.numpy()).all()
 
-    assert isinstance(warp_path, Path)
-    assert warp_path.is_file()
-    warp = ants.image_read(str(warp_path))
-    assert warp.shape == fixed.shape
-    assert warp.has_components
-    assert warp.origin == fixed.origin
-    # NIfTI stores spacing as float32, so 1e-7 covers only serialization rounding.
-    np.testing.assert_allclose(warp.spacing, fixed.spacing, rtol=0.0, atol=1e-7)
-    np.testing.assert_array_equal(warp.direction, fixed.direction)
-    assert warp.numpy().shape == (*fixed.shape, 3)
-    assert np.isfinite(warp.numpy()).all()
-
-    pre_mse = float(np.mean((np.asarray(fixed_data) - moving.numpy()) ** 2))
-    nonlinear_mse = float(
-        np.mean((np.asarray(fixed_data) - nonlinear_image.numpy()) ** 2)
-    )
-    assert nonlinear_mse < pre_mse
+        pre_mse = float(np.mean((np.asarray(fixed_data) - moving.numpy()) ** 2))
+        nonlinear_mse = float(
+            np.mean((np.asarray(fixed_data) - nonlinear_image.numpy()) ** 2)
+        )
+        assert nonlinear_mse < pre_mse
+    finally:
+        warp_path.unlink(missing_ok=True)

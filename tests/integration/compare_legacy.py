@@ -28,6 +28,109 @@ _CHUNK_FIELDS = (
 )
 
 
+def _deterministic_masks(np: Any) -> tuple[Any, Any]:
+    """Independently reconstruct the baseline's asymmetric binary masks."""
+    z, y, x = np.mgrid[:16, :32, :32]
+    ellipsoid = ((z - 7.0) / 5.0) ** 2 + ((y - 13.0) / 8.0) ** 2 + (
+        (x - 18.0) / 7.0
+    ) ** 2 <= 1.0
+    spur = (z >= 9) & (z < 14) & (y >= 20) & (y < 27) & (x >= 5) & (x < 12)
+    notch = (z >= 5) & (z < 9) & (y >= 10) & (y < 15) & (x >= 18) & (x < 24)
+    fixed = (ellipsoid | spur) & ~notch
+    moving = np.roll(fixed, shift=(0, 1, -1), axis=(0, 1, 2))
+    return fixed.astype(np.float32), moving.astype(np.float32)
+
+
+def _literal_dry_expected_divergence(
+    comparisons: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    expected = ("affine_result", "affine_mask", "nonlinear_result")
+    present = all(name in comparisons for name in expected)
+    boolean_results = present and all(
+        comparisons[name].get("passed") is True
+        or comparisons[name].get("passed") is False
+        for name in expected
+    )
+    outside_tolerance = [
+        name for name in expected if comparisons.get(name, {}).get("passed") is False
+    ]
+    within_tolerance = [
+        name for name in expected if comparisons.get(name, {}).get("passed") is True
+    ]
+    divergent = present and boolean_results and bool(outside_tolerance)
+    return {
+        "classification": "expected_divergence",
+        "passed": divergent,
+        "required_results": list(expected),
+        "all_required_results_present": present,
+        "all_required_results_boolean": boolean_results,
+        "at_least_one_result_outside_legacy_tolerance": divergent,
+        "outside_legacy_tolerance": outside_tolerance,
+        "within_legacy_tolerance": within_tolerance,
+        "reason": (
+            "Cy-ExM corrects the legacy Rigid schedule keywords and fixed-mask "
+            "keyword; literal dry-run equivalence is therefore not expected"
+        ),
+    }
+
+
+def _fixed_mask_corrected_defect(
+    characterization: object,
+) -> dict[str, object]:
+    details = characterization if isinstance(characterization, dict) else {}
+    calls = details.get("registration_calls")
+    calls_by_label = (
+        {
+            call.get("label"): call
+            for call in calls
+            if isinstance(call, dict) and isinstance(call.get("label"), str)
+        }
+        if isinstance(calls, list)
+        else {}
+    )
+    literal_calls = [
+        calls_by_label.get("literal_linear"),
+        calls_by_label.get("literal_nonlinear"),
+    ]
+    matched_calls = [
+        calls_by_label.get("matched_linear"),
+        calls_by_label.get("matched_nonlinear"),
+    ]
+    captured_calls_pass = all(
+        isinstance(call, dict)
+        and call.get("received_fixed_mask") is True
+        and call.get("received_mask_keyword") is False
+        for call in literal_calls
+    ) and all(
+        isinstance(call, dict)
+        and call.get("received_fixed_mask") is False
+        and call.get("received_mask_keyword") is False
+        for call in matched_calls
+    )
+    passed = (
+        details.get("classification") == "corrected_legacy_defect"
+        and details.get("legacy_wrapper_keyword") == "fixed_mask"
+        and details.get("antspyx_consumed_keyword") == "mask"
+        and details.get("legacy_keyword_in_antspyx_signature") is False
+        and details.get("corrected_keyword_in_antspyx_signature") is True
+        and details.get("literal_fixed_mask_provided") is True
+        and details.get("matched_fixed_mask") is None
+        and captured_calls_pass
+    )
+    return {
+        "classification": "corrected_legacy_defect",
+        "passed": passed,
+        "legacy_wrapper_keyword": details.get("legacy_wrapper_keyword"),
+        "antspyx_consumed_keyword": details.get("antspyx_consumed_keyword"),
+        "matched_fixed_mask": details.get("matched_fixed_mask"),
+        "captured_registration_calls_pass": captured_calls_pass,
+        "reason": (
+            "fixed masks are intentionally excluded from matched parity because "
+            "ClearEx forwards fixed_mask while ANTSpyX consumes mask"
+        ),
+    }
+
+
 def _geometry(image: Any) -> dict[str, object]:
     return {
         "shape": [int(value) for value in image.shape],
@@ -211,17 +314,47 @@ def _chunk_results(
 def compare_baseline(baseline: Path) -> dict[str, object]:
     summary_path = baseline / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    if summary.get("schema_version") != 1:
+    if summary.get("schema_version") != 2:
         raise RuntimeError("unsupported legacy baseline schema")
     if summary.get("source_commit") != _CLEAR_EX_COMMIT:
         raise RuntimeError("legacy baseline source commit does not match the pin")
     if not all(summary.get("finite", {}).values()):
         raise RuntimeError("legacy baseline contains nonfinite arrays")
+    source_validation = summary.get("source_validation")
+    if not isinstance(source_validation, dict) or (
+        source_validation.get("source_commit") != _CLEAR_EX_COMMIT
+        or source_validation.get("git_status") != "clean"
+        or source_validation.get("output_outside_checkout") is not True
+    ):
+        raise RuntimeError("legacy baseline source safety evidence is incomplete")
+    import_provenance = summary.get("import_provenance")
+    checkout_root = source_validation.get("checkout_root")
+    if not isinstance(import_provenance, dict) or not isinstance(checkout_root, str):
+        raise RuntimeError("legacy baseline import provenance is incomplete")
+    checkout = Path(checkout_root).resolve()
+    if (
+        not import_provenance
+        or any(
+            not Path(path).resolve().is_relative_to(checkout)
+            for path in import_provenance.values()
+            if isinstance(path, str)
+        )
+        or any(not isinstance(path, str) for path in import_provenance.values())
+    ):
+        raise RuntimeError("legacy baseline imports did not resolve under the checkout")
+    native_cleanup = summary.get("native_artifact_cleanup")
+    if (
+        not isinstance(native_cleanup, dict)
+        or native_cleanup.get("removed") is not True
+    ):
+        raise RuntimeError("legacy native artifact cleanup evidence is incomplete")
     expected_policy = {
         "linear_registration_type": "TRSAA",
         "linear_accuracy": "low",
         "nonlinear_registration_type": "SyNOnly",
         "nonlinear_accuracy": "dry run",
+        "fixed_mask": None,
+        "moving_mask": "deterministic asymmetric binary mask",
     }
     policy = summary.get("comparison_policy")
     if not isinstance(policy, dict) or any(
@@ -231,6 +364,7 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
     literal_policy = summary.get("literal_dry_run")
     if not isinstance(literal_policy, dict) or (
         literal_policy.get("linear_accuracy_argument") != "dry run"
+        or literal_policy.get("classification") != "expected_divergence"
         or literal_policy.get("effective_linear_registration_type") != "Rigid"
         or literal_policy.get("nonlinear_accuracy_argument") != "dry run"
         or not all(literal_policy.get("finite", {}).values())
@@ -248,7 +382,6 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
     import scipy
     import tifffile
 
-    from cyexm.io.images import zero_mask
     from cyexm.registration import linear, nonlinear
     from cyexm.registration.backend import AntsRegistrationBackend
     from cyexm.registration.transforms import apply_transform_chain
@@ -269,8 +402,31 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
         spacing=tuple(fixed_geometry["spacing"]),
         direction=np.asarray(fixed_geometry["direction"], dtype=np.float64),
     )
-    fixed_mask = zero_mask(fixed)
-    moving_mask = zero_mask(moving)
+    fixed_mask_data, moving_mask_data = _deterministic_masks(np)
+    fixed_mask_input = _array_result(
+        np,
+        fixed_mask_data,
+        np.load(baseline / "fixed_mask_input.npy", allow_pickle=False),
+        exact=True,
+    )
+    moving_mask_input = _array_result(
+        np,
+        moving_mask_data,
+        np.load(baseline / "moving_mask_input.npy", allow_pickle=False),
+        exact=True,
+    )
+    fixed_mask = ants.from_numpy(
+        fixed_mask_data,
+        origin=fixed.origin,
+        spacing=fixed.spacing,
+        direction=fixed.direction,
+    )
+    moving_mask = ants.from_numpy(
+        moving_mask_data,
+        origin=moving.origin,
+        spacing=moving.spacing,
+        direction=moving.direction,
+    )
     literal_dry_affine, literal_dry_mask, _literal_dry_transform = (
         linear.register_image(
             moving,
@@ -283,7 +439,7 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
     )
     if literal_dry_mask is None:
         raise RuntimeError("Cy-ExM dry-run registration did not return the input mask")
-    literal_dry_nonlinear, _literal_dry_warp = nonlinear.register_image(
+    literal_dry_nonlinear, literal_dry_warp = nonlinear.register_image(
         literal_dry_affine,
         fixed,
         moving_mask=literal_dry_mask,
@@ -291,38 +447,39 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
         accuracy="dry run",
         native_threads=native_threads,
     )
-    literal_dry_comparison = {
-        "affine_result": _array_result(
-            np,
-            literal_dry_affine.numpy(),
-            np.load(baseline / "literal_dry_affine_result.npy", allow_pickle=False),
-            exact=False,
-            rtol=_REGISTRATION_RTOL,
-            atol=_REGISTRATION_ATOL,
-        ),
-        "affine_mask": _array_result(
-            np,
-            literal_dry_mask.numpy(),
-            np.load(baseline / "literal_dry_affine_mask.npy", allow_pickle=False),
-            exact=True,
-        ),
-        "nonlinear_result": _array_result(
-            np,
-            literal_dry_nonlinear.numpy(),
-            np.load(baseline / "literal_dry_nonlinear_result.npy", allow_pickle=False),
-            exact=False,
-            rtol=_REGISTRATION_RTOL,
-            atol=_REGISTRATION_ATOL,
-        ),
-        "interpretation": (
-            "informational expected difference: Cy-ExM uses ANTSpyX affine schedule "
-            "names consumed by Rigid while the pinned legacy wrapper does not"
-        ),
-    }
+    try:
+        literal_dry_comparison = {
+            "affine_result": _array_result(
+                np,
+                literal_dry_affine.numpy(),
+                np.load(baseline / "literal_dry_affine_result.npy", allow_pickle=False),
+                exact=False,
+                rtol=_REGISTRATION_RTOL,
+                atol=_REGISTRATION_ATOL,
+            ),
+            "affine_mask": _array_result(
+                np,
+                literal_dry_mask.numpy(),
+                np.load(baseline / "literal_dry_affine_mask.npy", allow_pickle=False),
+                exact=True,
+            ),
+            "nonlinear_result": _array_result(
+                np,
+                literal_dry_nonlinear.numpy(),
+                np.load(
+                    baseline / "literal_dry_nonlinear_result.npy", allow_pickle=False
+                ),
+                exact=False,
+                rtol=_REGISTRATION_RTOL,
+                atol=_REGISTRATION_ATOL,
+            ),
+        }
+    finally:
+        literal_dry_warp.unlink(missing_ok=True)
     affine_image, affine_mask, affine = linear.register_image(
         moving,
         fixed,
-        fixed_mask=fixed_mask,
+        fixed_mask=None,
         moving_mask=moving_mask,
         registration_type="TRSAA",
         accuracy="low",
@@ -334,31 +491,33 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
         affine_image,
         fixed,
         moving_mask=affine_mask,
-        fixed_mask=fixed_mask,
+        fixed_mask=None,
         accuracy="dry run",
         native_threads=native_threads,
     )
     backend = AntsRegistrationBackend(native_threads)
-    raw_nonlinear_mask = backend.apply_warp(
-        fixed=fixed,
-        moving=affine_mask,
-        warp_path=warp_path,
-        interpolation="nearestNeighbor",
-    )
-    nonlinear_mask = backend.threshold_mask(raw_nonlinear_mask)
-    with tempfile.TemporaryDirectory(prefix="cyexm-legacy-parity-") as directory:
-        affine_path = Path(directory) / "affine.mat"
-        backend.write_affine(affine, affine_path)
-        transform_order = apply_transform_chain(
+    try:
+        raw_nonlinear_mask = backend.apply_warp(
             fixed=fixed,
-            moving=moving,
-            affine_path=affine_path,
+            moving=affine_mask,
             warp_path=warp_path,
-            interpolation="linear",
-            native_threads=native_threads,
+            interpolation="nearestNeighbor",
         )
-
-    warp = ants.image_read(str(warp_path))
+        nonlinear_mask = backend.threshold_mask(raw_nonlinear_mask)
+        with tempfile.TemporaryDirectory(prefix="cyexm-legacy-parity-") as directory:
+            affine_path = Path(directory) / "affine.mat"
+            backend.write_affine(affine, affine_path)
+            transform_order = apply_transform_chain(
+                fixed=fixed,
+                moving=moving,
+                affine_path=affine_path,
+                warp_path=warp_path,
+                interpolation="linear",
+                native_threads=native_threads,
+            )
+        warp = ants.image_read(str(warp_path))
+    finally:
+        warp_path.unlink(missing_ok=True)
     actual_geometry = {
         "fixed": _geometry(fixed),
         "affine": _geometry(affine_image),
@@ -402,19 +561,29 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
     nonlinear_mask_values = sorted(
         float(value) for value in np.unique(nonlinear_mask.numpy())
     )
+    fixed_input_values = sorted(float(value) for value in np.unique(fixed_mask_data))
+    moving_input_values = sorted(float(value) for value in np.unique(moving_mask_data))
     expected_mask_values = summary["mask_values"]
     results["mask_interpolation"] = {
-        "passed": bool(affine_mask_result["passed"])
+        "passed": bool(fixed_mask_input["passed"])
+        and bool(moving_mask_input["passed"])
+        and bool(affine_mask_result["passed"])
         and bool(nonlinear_mask_result["passed"])
-        and bool(affine_mask_values)
-        and bool(nonlinear_mask_values)
-        and set(affine_mask_values).issubset({0.0, 1.0})
-        and set(nonlinear_mask_values).issubset({0.0, 1.0})
+        and fixed_input_values == [0.0, 1.0]
+        and moving_input_values == [0.0, 1.0]
+        and affine_mask_values == [0.0, 1.0]
+        and nonlinear_mask_values == [0.0, 1.0]
+        and fixed_input_values == expected_mask_values["fixed_input"]
+        and moving_input_values == expected_mask_values["moving_input"]
         and affine_mask_values == expected_mask_values["affine"]
         and nonlinear_mask_values == expected_mask_values["nonlinear"],
+        "fixed_input": fixed_mask_input,
+        "moving_input": moving_mask_input,
         "affine": affine_mask_result,
         "nonlinear": nonlinear_mask_result,
         "values": {
+            "fixed_input": fixed_input_values,
+            "moving_input": moving_input_values,
             "affine": affine_mask_values,
             "nonlinear": nonlinear_mask_values,
         },
@@ -447,12 +616,22 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
             summary["chunk"],
         )
     )
+    diagnostics = {
+        "literal_dry_expected_divergence": _literal_dry_expected_divergence(
+            literal_dry_comparison
+        ),
+        "fixed_mask_corrected_defect": _fixed_mask_corrected_defect(
+            summary.get("fixed_mask_characterization")
+        ),
+    }
 
     import sys
 
     report: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": summary["source_commit"],
+        "source_validation": source_validation,
+        "import_provenance": import_provenance,
         "registration_tolerance": {
             "rtol": _REGISTRATION_RTOL,
             "atol": _REGISTRATION_ATOL,
@@ -468,9 +647,14 @@ def compare_baseline(baseline: Path) -> dict[str, object]:
         "native_threads": dict(resolved.values),
         "ants_random_seed": os.environ["ANTS_RANDOM_SEED"],
         "comparison_policy": summary["comparison_policy"],
-        "literal_dry_run_comparison": literal_dry_comparison,
+        "literal_dry_run_comparison": {
+            "classification": "expected_divergence",
+            "results": literal_dry_comparison,
+        },
+        "diagnostics": diagnostics,
         "results": results,
-        "passed": all(bool(result["passed"]) for result in results.values()),
+        "passed": all(bool(result["passed"]) for result in results.values())
+        and all(bool(diagnostic["passed"]) for diagnostic in diagnostics.values()),
     }
     return report
 
@@ -497,6 +681,9 @@ def main() -> int:
     for name, result in report["results"].items():
         status = "PASS" if result["passed"] else "FAIL"
         print(f"{status} {name.replace('_', ' ')}")
+    for name, diagnostic in report["diagnostics"].items():
+        status = "PASS" if diagnostic["passed"] else "FAIL"
+        print(f"{status} diagnostic {name.replace('_', ' ')}")
     return 0 if report["passed"] else 1
 
 

@@ -8,6 +8,38 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+_ANTSPYX_REGISTRATION_PARAMETERS = frozenset(
+    {
+        "fixed",
+        "moving",
+        "type_of_transform",
+        "initial_transform",
+        "outprefix",
+        "mask",
+        "moving_mask",
+        "mask_all_stages",
+        "grad_step",
+        "flow_sigma",
+        "total_sigma",
+        "aff_metric",
+        "aff_sampling",
+        "aff_random_sampling_rate",
+        "syn_metric",
+        "syn_sampling",
+        "reg_iterations",
+        "aff_iterations",
+        "aff_shrink_factors",
+        "aff_smoothing_sigmas",
+        "write_composite_transform",
+        "verbose",
+        "multivariate_extras",
+        "restrict_transformation",
+        "smoothing_in_mm",
+        "singleprecision",
+        "use_legacy_histogram_matching",
+    }
+)
+
 
 @dataclass
 class FakeImage:
@@ -148,6 +180,10 @@ def install_fake_ants(
     calls = FakeAntsCalls(warp_path=warp_path)
 
     def registration(**kwargs: object) -> dict[str, object]:
+        unexpected = set(kwargs) - _ANTSPYX_REGISTRATION_PARAMETERS
+        if unexpected:
+            names = ", ".join(sorted(unexpected))
+            raise TypeError(f"Unexpected ANTSpyX registration keyword(s): {names}")
         calls.registration_call_count += 1
         calls.registration = dict(kwargs)
         return {

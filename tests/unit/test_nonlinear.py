@@ -42,8 +42,8 @@ def test_nonlinear_synonly_uses_established_accuracy_schedules(
     )
 
     assert calls.registration["reg_iterations"] == iterations
-    assert calls.registration["shrink_factors"] == [4, 2, 1]
-    assert calls.registration["smoothing_sigmas"] == [2, 1, 0]
+    assert "shrink_factors" not in calls.registration
+    assert "smoothing_sigmas" not in calls.registration
     assert transformed is calls.histogram_matched
     assert warp_path == calls.warp_path
 
@@ -71,16 +71,13 @@ def test_nonlinear_high_synonly_preserves_established_registration_parameters(
     assert calls.registration == {
         "fixed": fixed,
         "moving": moving,
-        "fixed_mask": fixed_mask,
+        "mask": fixed_mask,
         "moving_mask": moving_mask,
         "type_of_transform": "SyNOnly",
         "flow_sigma": 3.0,
         "total_sigma": 0.5,
-        "shrink_factors": [4, 2, 1],
-        "smoothing_sigmas": [2, 1, 0],
         "syn_metric": "mattes",
-        "metric_weight": 1.0,
-        "number_of_bins": 32,
+        "syn_sampling": 32,
         "singleprecision": False,
         "aff_random_sampling_rate": 1.0,
         "verbose": True,
@@ -88,6 +85,13 @@ def test_nonlinear_high_synonly_preserves_established_registration_parameters(
         "mask_all_stages": True,
         "reg_iterations": (100, 70, 50),
     }
+    assert calls.registration["mask"] is fixed_mask
+    assert calls.registration["moving_mask"] is moving_mask
+    assert "fixed_mask" not in calls.registration
+    assert "number_of_bins" not in calls.registration
+    assert "metric_weight" not in calls.registration
+    assert "shrink_factors" not in calls.registration
+    assert "smoothing_sigmas" not in calls.registration
     assert calls.resample == {
         "image": calls.registered_warped,
         "target": fixed,

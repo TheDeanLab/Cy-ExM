@@ -50,8 +50,9 @@ def test_linear_trsaa_uses_established_accuracy_schedules(
     )
 
     assert calls.registration["reg_iterations"] == iterations
-    assert calls.registration["smoothing_sigmas"] == (3, 2, 1, 0)
-    assert calls.registration["shrink_factors"] == (8, 4, 2, 1)
+    assert "aff_iterations" not in calls.registration
+    assert "aff_smoothing_sigmas" not in calls.registration
+    assert "aff_shrink_factors" not in calls.registration
     assert transformed_mask is None
     assert transform is calls.transform
 
@@ -70,9 +71,10 @@ def test_linear_dry_run_uses_the_established_rigid_schedule(
     )
 
     assert calls.registration["type_of_transform"] == "Rigid"
-    assert calls.registration["reg_iterations"] == (1,)
-    assert calls.registration["smoothing_sigmas"] == (0,)
-    assert calls.registration["shrink_factors"] == (8,)
+    assert calls.registration["aff_iterations"] == (1,)
+    assert calls.registration["aff_smoothing_sigmas"] == (0,)
+    assert calls.registration["aff_shrink_factors"] == (8,)
+    assert "reg_iterations" not in calls.registration
     assert calls.registration["aff_random_sampling_rate"] == 0.1
 
 
@@ -99,7 +101,7 @@ def test_linear_trsaa_preserves_established_registration_parameters(
     assert calls.registration == {
         "fixed": fixed,
         "moving": moving,
-        "fixed_mask": fixed_mask,
+        "mask": fixed_mask,
         "moving_mask": moving_mask,
         "type_of_transform": "TRSAA",
         "aff_metric": "mattes",
@@ -108,9 +110,12 @@ def test_linear_trsaa_preserves_established_registration_parameters(
         "verbose": True,
         "mask_all_stages": True,
         "reg_iterations": (1000, 500, 250, 100),
-        "smoothing_sigmas": (3, 2, 1, 0),
-        "shrink_factors": (8, 4, 2, 1),
     }
+    assert calls.registration["mask"] is fixed_mask
+    assert calls.registration["moving_mask"] is moving_mask
+    assert "fixed_mask" not in calls.registration
+    assert "smoothing_sigmas" not in calls.registration
+    assert "shrink_factors" not in calls.registration
 
 
 def test_linear_mask_uses_nearest_neighbor_and_thresholds_at_half(

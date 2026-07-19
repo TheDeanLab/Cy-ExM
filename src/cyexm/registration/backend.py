@@ -200,7 +200,6 @@ class AntsRegistrationBackend:
         )
 
     def linear(self, **kwargs: object) -> tuple[object, object | None, object]:
-        self._prepare()
         register: Any = linear_kernel.register_image
         return register(
             **kwargs,
@@ -208,7 +207,6 @@ class AntsRegistrationBackend:
         )
 
     def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
-        self._prepare()
         register: Any = nonlinear_kernel.register_image
         return register(
             **kwargs,
@@ -223,7 +221,6 @@ class AntsRegistrationBackend:
         transform: object,
         interpolation: str,
     ) -> object:
-        self._prepare()
         return transform_helpers.apply_affine(
             fixed=fixed,
             moving=moving,
@@ -240,7 +237,6 @@ class AntsRegistrationBackend:
         warp_path: Path,
         interpolation: str,
     ) -> object:
-        self._prepare()
         return transform_helpers.apply_warp(
             fixed=fixed,
             moving=moving,
@@ -250,7 +246,6 @@ class AntsRegistrationBackend:
         )
 
     def write_affine(self, transform: object, path: Path) -> None:
-        self._prepare()
         transform_helpers.export_affine_transform(
             transform,
             path,
@@ -258,7 +253,6 @@ class AntsRegistrationBackend:
         )
 
     def read_affine(self, path: Path) -> object:
-        self._prepare()
         return transform_helpers.import_affine_transform(
             path,
             native_threads=self.native_threads,

@@ -73,7 +73,7 @@ def register_image(
     kwargs: dict[str, object] = {
         "fixed": fixed_image,
         "moving": moving_image,
-        "fixed_mask": fixed_mask,
+        "mask": fixed_mask,
         "moving_mask": moving_mask,
         "type_of_transform": registration_type,
         "aff_metric": "mattes",
@@ -84,16 +84,14 @@ def register_image(
     }
     if registration_type == "TRSAA" and accuracy != "dry run":
         kwargs["reg_iterations"] = _TRSAA_ITERATIONS[accuracy]
-        kwargs["smoothing_sigmas"] = (3, 2, 1, 0)
-        kwargs["shrink_factors"] = (8, 4, 2, 1)
     if accuracy == "dry run":
         kwargs["type_of_transform"] = "Rigid"
-        kwargs["reg_iterations"] = (1,)
-        kwargs["smoothing_sigmas"] = (0,)
-        kwargs["shrink_factors"] = (8,)
+        kwargs["aff_iterations"] = (1,)
+        kwargs["aff_smoothing_sigmas"] = (0,)
+        kwargs["aff_shrink_factors"] = (8,)
         kwargs["aff_random_sampling_rate"] = 0.1
 
-    iterations = kwargs.get("reg_iterations")
+    iterations = kwargs.get("reg_iterations", kwargs.get("aff_iterations"))
     if iterations is None:
         logger.info("Using %s registration.", kwargs["type_of_transform"])
     else:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -262,6 +263,118 @@ def test_nonlinear_delegates_all_arguments_and_native_thread_configuration(
     assert result is expected
 
 
+@pytest.mark.parametrize("operation", ["linear", "nonlinear"])
+def test_backend_registration_delegates_configure_once_in_underlying_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+) -> None:
+    kernel = (
+        backend_module.linear_kernel
+        if operation == "linear"
+        else backend_module.nonlinear_kernel
+    )
+    calls = install_fake_ants(monkeypatch, kernel.__name__, tmp_path)
+    requested = NativeThreadConfig(itk_threads=1)
+
+    class Resolved:
+        def describe(self) -> str:
+            calls.events.append("describe")
+            return f"resolved {operation} threads"
+
+    def backend_configure(config: NativeThreadConfig | None) -> Resolved:
+        assert config is requested
+        calls.events.append("backend-configure")
+        return Resolved()
+
+    def kernel_configure(config: NativeThreadConfig | None) -> Resolved:
+        assert config is requested
+        calls.events.append("configure")
+        return Resolved()
+
+    monkeypatch.setattr(backend_module, "configure_native_threads", backend_configure)
+    monkeypatch.setattr(kernel, "configure_native_threads", kernel_configure)
+    backend = AntsRegistrationBackend(requested)
+
+    with caplog.at_level(logging.INFO):
+        if operation == "linear":
+            backend.linear(moving_image=fake_image(), fixed_image=fake_image())
+        else:
+            backend.nonlinear(moving_image=fake_image(), fixed_image=fake_image())
+
+    assert calls.events == ["configure", "describe", "runtime"]
+    assert (
+        sum(
+            record.name == kernel.__name__
+            and record.getMessage().startswith("Native thread settings:")
+            for record in caplog.records
+        )
+        == 1
+    )
+    assert not any(
+        record.name == "cyexm.registration.backend" for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    ("operation", "registration_type", "accuracy", "error"),
+    [
+        pytest.param(
+            "linear", "SyNOnly", "high", "registration type", id="linear-method"
+        ),
+        pytest.param("linear", "TRSAA", "unknown", "accuracy", id="linear-accuracy"),
+        pytest.param(
+            "nonlinear", "Rigid", "high", "registration type", id="nonlinear-method"
+        ),
+        pytest.param(
+            "nonlinear", "SyNOnly", "unknown", "accuracy", id="nonlinear-accuracy"
+        ),
+    ],
+)
+def test_backend_rejects_invalid_registration_policy_before_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    registration_type: str,
+    accuracy: str,
+    error: str,
+) -> None:
+    events: list[str] = []
+    mutation_canary = "CYEXM_TEST_BACKEND_POLICY_CONFIGURED"
+    monkeypatch.delenv(mutation_canary, raising=False)
+    kernel = (
+        backend_module.linear_kernel
+        if operation == "linear"
+        else backend_module.nonlinear_kernel
+    )
+
+    def configure(config: NativeThreadConfig | None) -> _Resolved:
+        del config
+        events.append("configure")
+        monkeypatch.setenv(mutation_canary, "mutated")
+        return _Resolved()
+
+    def runtime() -> tuple[object, object]:
+        events.append("runtime")
+        monkeypatch.setenv(mutation_canary, "mutated")
+        raise AssertionError("scientific runtime was accessed")
+
+    monkeypatch.setattr(backend_module, "configure_native_threads", configure)
+    monkeypatch.setattr(kernel, "configure_native_threads", configure)
+    monkeypatch.setattr(kernel, "_scientific_runtime", runtime)
+
+    with pytest.raises(ValueError, match=error):
+        getattr(AntsRegistrationBackend(), operation)(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+            registration_type=registration_type,
+            accuracy=accuracy,
+        )
+
+    assert events == []
+    assert mutation_canary not in os.environ
+
+
 @pytest.mark.parametrize(
     "interpolation",
     [pytest.param("linear", id="scalar"), pytest.param("nearestNeighbor", id="label")],
@@ -315,6 +428,72 @@ def test_apply_warp_delegates_path_and_interpolation(
     assert received["warp_path"] == warp_path
     assert received["interpolation"] == "nearestNeighbor"
     assert result is expected
+
+
+@pytest.mark.parametrize(
+    "operation", ["apply_affine", "apply_warp", "write_affine", "read_affine"]
+)
+def test_backend_transform_delegates_configure_once_in_underlying_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.transforms", tmp_path)
+    requested = NativeThreadConfig(blas_threads=1)
+
+    class Resolved:
+        def describe(self) -> str:
+            calls.events.append("describe")
+            return f"resolved {operation} threads"
+
+    def backend_configure(config: NativeThreadConfig | None) -> Resolved:
+        assert config is requested
+        calls.events.append("backend-configure")
+        return Resolved()
+
+    def helper_configure(config: NativeThreadConfig | None) -> Resolved:
+        assert config is requested
+        calls.events.append("configure")
+        return Resolved()
+
+    monkeypatch.setattr(backend_module, "configure_native_threads", backend_configure)
+    monkeypatch.setattr(
+        backend_module.transform_helpers,
+        "configure_native_threads",
+        helper_configure,
+    )
+    backend = AntsRegistrationBackend(requested)
+    path = tmp_path / "delegated.mat"
+
+    with caplog.at_level(logging.INFO):
+        if operation == "apply_affine":
+            backend.apply_affine(
+                fixed=fake_image(),
+                moving=fake_image(),
+                transform=calls.transform,
+                interpolation="linear",
+            )
+        elif operation == "apply_warp":
+            backend.apply_warp(
+                fixed=fake_image(),
+                moving=fake_image(),
+                warp_path=calls.warp_path,
+                interpolation="nearestNeighbor",
+            )
+        elif operation == "write_affine":
+            backend.write_affine(calls.transform, path)
+        else:
+            backend.read_affine(path)
+
+    assert calls.events == ["configure", "describe", "runtime"]
+    assert (
+        sum(record.name == "cyexm.registration.transforms" for record in caplog.records)
+        == 1
+    )
+    assert not any(
+        record.name == "cyexm.registration.backend" for record in caplog.records
+    )
 
 
 def test_affine_readers_and_writers_use_the_supplied_artifact_paths(

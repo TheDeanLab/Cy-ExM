@@ -1,0 +1,21 @@
+# Registration package guidance
+
+- Keep low-level registration policy in `linear.py`, `nonlinear.py`, and
+  `transforms.py`; keep native-runtime and I/O adaptation behind `backend.py`.
+- Do not import ANTs, NumPy, SciPy, or tifffile at module scope. Any public
+  operation that needs a scientific runtime must first call
+  `configure_native_threads`, log the resolved description with the module's
+  named logger, and only then import or request that runtime.
+- Validate registration method and accuracy before requesting ANTs. Preserve
+  the characterized TRSAA and SyNOnly schedules, metrics, sampling settings,
+  masks, interpolation modes, histogram matching, and single-precision policy.
+- Apply forward transforms in warp-then-affine list order with both inversion
+  flags false. Scalars use linear interpolation; labels and masks use
+  `nearestNeighbor`, with transformed masks thresholded at 0.5.
+- Keep affine decomposition helpers callable without runtime configuration;
+  they are characterization utilities over arrays already supplied by callers.
+- Preserve image origin, spacing, direction, vector components, and the public
+  ZYX crop-bound convention when adapting ANTs images.
+- Artifact writer methods must write exactly to the supplied path so callers
+  can provide atomic temporary destinations. Do not add artifact lifecycle,
+  whole-image orchestration, chunking, scheduling, or CLI behavior here.

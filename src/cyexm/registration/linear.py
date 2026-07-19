@@ -156,8 +156,13 @@ def inspect_affine_transform(
     native_threads: NativeThreadConfig | None = None,
 ) -> None:
     """Print the translation, rotation, shear, scale, and full affine matrix."""
-    ants, np = _configured_runtime(native_threads)
+    resolved = configure_native_threads(native_threads)
+    logger.info("Native thread settings: %s", resolved.describe())
+    import numpy as np
+
     if isinstance(affine_transform, (str, os.PathLike)):
+        import ants
+
         affine_transform = ants.read_transform(str(affine_transform))
 
     transform_parameters = affine_transform.parameters

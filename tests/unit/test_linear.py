@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
-import ants
 import numpy as np
 import pytest
 from fakes import fake_image, install_fake_ants
@@ -773,16 +773,17 @@ class TestInspectAffineTransform:
             [rotation_scale_shear.flatten(), adjusted_translation]
         )
 
-        mock_transform = Mock(spec=ants.core.ants_transform.ANTsTransform)
+        mock_transform = Mock(spec=["parameters", "fixed_parameters"])
         mock_transform.parameters = parameters
         mock_transform.fixed_parameters = center
 
         return mock_transform
 
-    def test_identity_transform(self, capsys):
+    def test_identity_transform(self, capsys, monkeypatch):
         """Test inspection of identity transform."""
         affine_matrix = np.eye(4)
         mock_transform = self.create_mock_transform(affine_matrix)
+        monkeypatch.setitem(sys.modules, "ants", None)
 
         inspect_affine_transform(mock_transform)
 

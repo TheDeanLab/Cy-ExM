@@ -14,7 +14,8 @@
 - Keep unit tests free of real ANTs; place bounded real-ANTs geometry characterization under `tests/integration` with `pytest.mark.integration`.
 - Keep all scientific imports lazy in package code.
 - Use serial execution only and retain the parent-owned final warp, scalar, mask, metrics, and registered-image lifecycle.
-- Use one final correction commit with subject `fix: make chunked cache identity transitive`; do not amend or push.
+- Keep the existing correction commit `fix: make chunked cache identity transitive` intact.
+- Create the re-review fix as a separate commit with subject `fix: invalidate deterministic chunk failures`; do not amend or push.
 
 ---
 
@@ -101,3 +102,101 @@
 - [ ] Remove only generated project caches, inspect the diff for architecture/API regressions, and update the Task 7 report with exact evidence.
 - [ ] Commit tracked source/tests with subject `fix: make chunked cache identity transitive` without amending or pushing.
 - [ ] Confirm the worktree is clean and report commit hash, verification counts, and any residual concerns.
+
+### Task 6: Invalidate cached deterministic chunk-output failures
+
+**Files:**
+- Modify: `src/cyexm/registration/chunked.py`
+- Modify: `tests/unit/fakes.py`
+- Modify: `tests/unit/test_chunked_registration.py`
+- Modify: `.superpowers/sdd/task-7-report.md` (ignored handoff report)
+
+**Interfaces:**
+- Consumes: Cy-ExM-owned scalar/mask/core shape, finiteness, and float32 post-cast validation failures during per-chunk reconstruction.
+- Produces: private `_ChunkOutputValidationError(ValueError)` and transitive staling of the failing local warp, canonical manifest, parent full warp, nonlinear metrics, and registered TIFF.
+
+- [ ] **Step 1: Add focused cached-output RED tests**
+
+Add a table-driven test that first completes a two-chunk run, then injects one
+cached deterministic failure in chunk 1 (`invalid_scalar_chunk`,
+`invalid_mask_chunk`, or `overflow_warp_chunk`). Assert the failing run moves
+completion records for these exact artifacts to `.stale`:
+
+```python
+(
+    registration.chunk_paths(1).warp,
+    manifest_path(tmp_path),
+    round_paths(tmp_path).warp,
+    round_paths(tmp_path).nonlinear_metrics,
+    round_paths(tmp_path).registered,
+)
+```
+
+Run a third normal registration and assert `registered_chunk_ids == [1]`, all
+five completion records are renewed, and all five stale markers are removed.
+
+- [ ] **Step 2: Add a backend-ValueError RED boundary test**
+
+Extend `FakeChunkBackend` with `backend_value_error_chunk: int | None`. Its
+`apply_warp()` raises `ValueError("injected backend chunk value error")` only
+for the configured local chunk's linear application. After a completed run,
+inject chunk 1 and assert the resulting `ChunkRegistrationError` preserves the
+`ValueError` cause while byte-for-byte completion records for the local,
+manifest, full warp, nonlinear metrics, and registered TIFF remain current and
+no stale marker exists.
+
+- [ ] **Step 3: Run tests to verify RED**
+
+Run:
+
+```bash
+uv run pytest \
+  tests/unit/test_chunked_registration.py::test_cached_deterministic_chunk_output_failure_stales_chain_and_recovers \
+  tests/unit/test_chunked_registration.py::test_cached_backend_value_error_preserves_transitive_records -q
+```
+
+Expected: deterministic cases fail because cached local records remain current;
+the backend-`ValueError` boundary test passes under the existing transient
+behavior.
+
+- [ ] **Step 4: Implement the private validation boundary and stale-chain helper**
+
+Add the private exception and raise it only from explicit Cy-ExM checks:
+
+```python
+class _ChunkOutputValidationError(ValueError):
+    pass
+
+if array.shape != expected_shape:
+    raise _ChunkOutputValidationError(...)
+
+if not bool(np.isfinite(converted).all()):
+    raise _ChunkOutputValidationError(...)
+```
+
+Do not wrap exceptions raised by `backend.to_array`, `backend.apply_warp`,
+`backend.histogram_match`, or `backend.threshold_mask`. Add a helper that calls
+`ArtifactStore.mark_stale()` for the current chunk warp, `_manifest_path()`, and
+`RegistrationPaths.for_round(...).warp`, `.nonlinear_metrics`, and `.registered`.
+Catch `_ChunkOutputValidationError` before the generic reconstruction exception,
+stale the full chain, and re-raise. Retain the generic branch's existing
+fresh-only local staling for arbitrary backend exceptions.
+
+- [ ] **Step 5: Run focused GREEN and regression verification**
+
+Run the focused chunk tests, whole-image/backend regressions, full unit suite,
+real-ANTs crop integration, Ruff format/lint, BasedPyright, fresh import/no-
+Parallel checks, and `git diff --check`, exporting the required `/project` uv
+cache and Python locations for every `uv` command.
+
+- [ ] **Step 6: Report and commit separately**
+
+Append exact RED/GREEN evidence to `.superpowers/sdd/task-7-report.md`, remove
+only generated project caches, inspect staged scope, and commit tracked changes:
+
+```bash
+git commit -m "fix: invalidate deterministic chunk failures"
+```
+
+Do not amend or push. Confirm the commit parent is
+`425060cb46cfafc7427e57545d461d6b08a304ff` and the worktree is clean.

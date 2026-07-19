@@ -539,8 +539,10 @@ class FakeChunkBackend(FakeBackend):
     missing_warp_chunk: int | None = None
     invalid_warp_chunk: int | None = None
     invalid_scalar_chunk: int | None = None
+    invalid_mask_chunk: int | None = None
     overflow_scalar_chunk: int | None = None
     overflow_warp_chunk: int | None = None
+    backend_value_error_chunk: int | None = None
     full_warp_float64: bool = False
     warp_origin_delta: float = 0.0
     chunk_depth: int = 8
@@ -699,6 +701,12 @@ class FakeChunkBackend(FakeBackend):
         chunk_id = None if decoded is None else decoded.get("chunk_id")
         if (
             interpolation == "linear"
+            and self.backend_value_error_chunk is not None
+            and chunk_id == self.backend_value_error_chunk
+        ):
+            raise ValueError("injected backend chunk value error")
+        if (
+            interpolation == "linear"
             and self.overflow_scalar_chunk is not None
             and chunk_id == self.overflow_scalar_chunk
         ):
@@ -711,6 +719,12 @@ class FakeChunkBackend(FakeBackend):
             interpolation == "linear"
             and self.invalid_scalar_chunk is not None
             and chunk_id == self.invalid_scalar_chunk
+        ):
+            transformed.data = transformed.data[:-1]
+        if (
+            interpolation == "nearestNeighbor"
+            and self.invalid_mask_chunk is not None
+            and chunk_id == self.invalid_mask_chunk
         ):
             transformed.data = transformed.data[:-1]
         return transformed

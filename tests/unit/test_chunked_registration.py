@@ -78,6 +78,21 @@ def manifest_path(tmp_path: Path) -> Path:
     return tmp_path / "output" / "round_2_chunks" / "manifest.json"
 
 
+def transitive_chunk_artifacts(
+    registration: ChunkedImageRegistration,
+    tmp_path: Path,
+    chunk_id: int,
+) -> tuple[Path, Path, Path, Path, Path]:
+    paths = round_paths(tmp_path)
+    return (
+        registration.chunk_paths(chunk_id).warp,
+        manifest_path(tmp_path),
+        paths.warp,
+        paths.nonlinear_metrics,
+        paths.registered,
+    )
+
+
 def rewrite_completion_artifact_identity(artifact: Path) -> None:
     record_path = ArtifactStore().record_path(artifact)
     payload = json.loads(record_path.read_text(encoding="utf-8"))
@@ -554,6 +569,72 @@ def test_cached_local_reconstruction_failure_preserves_valid_record(
 
     assert local.completion_record.read_bytes() == record_before
     assert not ArtifactStore().stale_path(local.warp).exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("scalar-shape", id="scalar-shape"),
+        pytest.param("mask-shape", id="mask-shape"),
+        pytest.param("warp-float32", id="warp-float32"),
+    ],
+)
+def test_cached_deterministic_chunk_output_failure_stales_chain_and_recovers(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    initial = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+    initial.register()
+    artifacts = transitive_chunk_artifacts(initial, tmp_path, 1)
+    failing_backend = FakeChunkBackend(
+        invalid_scalar_chunk=1 if failure == "scalar-shape" else None,
+        invalid_mask_chunk=1 if failure == "mask-shape" else None,
+        overflow_warp_chunk=1 if failure == "warp-float32" else None,
+    )
+
+    with pytest.raises(ChunkRegistrationError) as error:
+        make_chunked_registration(tmp_path, backend=failing_backend).register()
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert failing_backend.registered_chunk_ids == []
+    store = ArtifactStore()
+    for artifact in artifacts:
+        assert not store.record_path(artifact).exists()
+        assert store.stale_path(artifact).is_file()
+    resumed = FakeChunkBackend()
+
+    make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert resumed.registered_chunk_ids == [1]
+    for artifact in artifacts:
+        assert store.record_path(artifact).is_file()
+        assert not store.stale_path(artifact).exists()
+
+
+def test_cached_backend_value_error_preserves_transitive_records(
+    tmp_path: Path,
+) -> None:
+    initial = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+    initial.register()
+    artifacts = transitive_chunk_artifacts(initial, tmp_path, 1)
+    store = ArtifactStore()
+    records_before = tuple(
+        store.record_path(artifact).read_bytes() for artifact in artifacts
+    )
+    failing_backend = FakeChunkBackend(backend_value_error_chunk=1)
+
+    with pytest.raises(ChunkRegistrationError) as error:
+        make_chunked_registration(tmp_path, backend=failing_backend).register()
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert str(error.value.__cause__) == "injected backend chunk value error"
+    assert failing_backend.registered_chunk_ids == []
+    assert (
+        tuple(store.record_path(artifact).read_bytes() for artifact in artifacts)
+        == records_before
+    )
+    for artifact in artifacts:
+        assert not store.stale_path(artifact).exists()
 
 
 def test_stale_full_entry_allows_local_and_manifest_recovery(

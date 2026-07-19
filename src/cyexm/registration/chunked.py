@@ -18,6 +18,10 @@ from cyexm.runtime import NativeThreadConfig, configure_native_threads
 from cyexm.spatial import ImageGeometry, PixelSize
 
 
+class _ChunkOutputValidationError(ValueError):
+    pass
+
+
 def _scientific_runtime() -> Any:
     import numpy as np
 
@@ -366,11 +370,13 @@ class ChunkedImageRegistration(ImageRegistration):
     ) -> Any:
         array = np.asarray(backend.to_array(image))
         if array.shape != expected_shape:
-            raise ValueError(
+            raise _ChunkOutputValidationError(
                 f"{role} scalar shape {array.shape} does not match {expected_shape}"
             )
         if finite and not bool(np.isfinite(array).all()):
-            raise ValueError(f"{role} scalar values must all be finite")
+            raise _ChunkOutputValidationError(
+                f"{role} scalar values must all be finite"
+            )
         return array
 
     @staticmethod
@@ -428,25 +434,47 @@ class ChunkedImageRegistration(ImageRegistration):
         chunk: ChunkInfo,
         role: str,
     ) -> Any:
-        extended_shape = _array_shape(array, f"{role} extended chunk")
+        try:
+            extended_shape = _array_shape(array, f"{role} extended chunk")
+        except (TypeError, ValueError) as error:
+            raise _ChunkOutputValidationError(str(error)) from error
         components = extended_shape[3:]
         expected_extended = (*chunk.extended_shape, *components)
         if extended_shape != expected_extended:
-            raise ValueError(
+            raise _ChunkOutputValidationError(
                 f"{role} extended chunk shape {extended_shape} "
                 f"does not match {expected_extended}"
             )
         core = array[chunk.core_within_extended]
         expected_core = (*chunk.core_shape, *components)
-        if _array_shape(core, f"{role} core") != expected_core:
-            raise ValueError(f"{role} core shape does not match {expected_core}")
+        try:
+            core_shape = _array_shape(core, f"{role} core")
+        except (TypeError, ValueError) as error:
+            raise _ChunkOutputValidationError(str(error)) from error
+        if core_shape != expected_core:
+            raise _ChunkOutputValidationError(
+                f"{role} core shape does not match {expected_core}"
+            )
         with np.errstate(over="ignore", invalid="ignore"):
             converted = np.asarray(core, dtype=np.float32)
         if not bool(np.isfinite(converted).all()):
-            raise ValueError(
+            raise _ChunkOutputValidationError(
                 f"{role} core values must remain finite after float32 conversion"
             )
         return converted
+
+    def _mark_chunk_output_stale(self, chunk_id: int) -> None:
+        paths = RegistrationPaths.for_round(
+            Path(self.save_directory), self.imaging_round
+        )
+        for artifact in (
+            self.chunk_paths(chunk_id).warp,
+            self._manifest_path(),
+            paths.warp,
+            paths.nonlinear_metrics,
+            paths.registered,
+        ):
+            self._store().mark_stale(artifact)
 
     def _local_request(
         self,
@@ -858,6 +886,9 @@ class ChunkedImageRegistration(ImageRegistration):
                     )
                     registered[chunk.core_slices] = scalar_core
                     displacement[chunk.core_slices] = warp_core
+                except _ChunkOutputValidationError:
+                    self._mark_chunk_output_stale(chunk.chunk_id)
+                    raise
                 except Exception:
                     if freshly_committed:
                         self._store().mark_stale(self.chunk_paths(chunk.chunk_id).warp)

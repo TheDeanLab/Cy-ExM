@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -16,7 +17,11 @@ type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 
 
 def _json_value(value: object) -> JsonValue:
-    if value is None or isinstance(value, bool | int | float | str):
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
         return value
     if isinstance(value, Mapping):
         normalized: dict[str, JsonValue] = {}
@@ -190,7 +195,15 @@ class CompletionRecord:
         }
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), sort_keys=True, indent=2) + "\n"
+        return (
+            json.dumps(
+                self.to_dict(),
+                allow_nan=False,
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n"
+        )
 
     @classmethod
     def read(cls, path: Path) -> Self:

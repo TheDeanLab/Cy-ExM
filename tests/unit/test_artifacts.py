@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,12 @@ from cyexm.registration.artifacts import (
 from cyexm.spatial import ImageGeometry
 
 
-def make_request(source: Path, accuracy: str = "low") -> StageRequest:
+def make_request(
+    source: Path,
+    accuracy: str = "low",
+    *,
+    parameters: dict[str, object] | None = None,
+) -> StageRequest:
     return StageRequest.for_files(
         stage="affine",
         inputs=(source,),
@@ -35,7 +41,11 @@ def make_request(source: Path, accuracy: str = "low") -> StageRequest:
         accuracy=accuracy,
         native_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1},
         upstream=None,
-        parameters={"metric": "mattes", "sampling": [0.2, 0.1]},
+        parameters=(
+            {"metric": "mattes", "sampling": [0.2, 0.1]}
+            if parameters is None
+            else parameters
+        ),
     )
 
 
@@ -57,6 +67,36 @@ def assert_json_primitives(value: Any) -> None:
     assert all(isinstance(key, str) for key in value)
     for item in value.values():
         assert_json_primitives(item)
+
+
+def committed_cache(tmp_path: Path) -> tuple[Path, ArtifactStore, StageRequest]:
+    source = tmp_path / "moving.tif"
+    source.write_bytes(b"source")
+    artifact = tmp_path / "linear_transform_2.mat"
+    store = ArtifactStore()
+    stage_request = make_request(source)
+    store.commit(
+        artifact,
+        stage_request,
+        writer=write_bytes(b"affine"),
+        validator=lambda path: True,
+    )
+    return artifact, store, stage_request
+
+
+def mutate_record_geometry(
+    store: ArtifactStore,
+    artifact: Path,
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    record_path = store.record_path(artifact)
+    payload: dict[str, Any] = json.loads(record_path.read_text(encoding="utf-8"))
+    geometry: dict[str, Any] = payload["request"]["geometry"]
+    mutate(geometry)
+    record_path.write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def test_file_identity_captures_resolved_path_size_and_mtime(tmp_path: Path) -> None:
@@ -267,6 +307,161 @@ def test_malformed_completion_record_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(CacheValidationError, match="completion record"):
         store.reuse(artifact, make_request(source), Path.read_bytes)
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        pytest.param(8.9, id="float"),
+        pytest.param("8", id="string"),
+        pytest.param(True, id="boolean"),
+    ],
+)
+def test_reuse_rejects_shape_values_that_are_not_json_integers(
+    tmp_path: Path,
+    invalid_value: object,
+) -> None:
+    artifact, store, stage_request = committed_cache(tmp_path)
+
+    mutate_record_geometry(
+        store,
+        artifact,
+        lambda geometry: geometry["shape"].__setitem__(0, invalid_value),
+    )
+
+    with pytest.raises(CacheValidationError, match="completion record"):
+        store.reuse(artifact, stage_request, Path.read_bytes)
+
+
+def test_reuse_rejects_an_extra_direction_row(tmp_path: Path) -> None:
+    artifact, store, stage_request = committed_cache(tmp_path)
+
+    mutate_record_geometry(
+        store,
+        artifact,
+        lambda geometry: geometry["direction"].append([0.0, 0.0, 1.0]),
+    )
+
+    with pytest.raises(CacheValidationError, match="completion record"):
+        store.reuse(artifact, stage_request, Path.read_bytes)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("origin", "0.0", id="origin-string"),
+        pytest.param("spacing", True, id="spacing-boolean"),
+        pytest.param("direction", "1.0", id="direction-string"),
+    ],
+)
+def test_reuse_rejects_non_numeric_spatial_components(
+    tmp_path: Path,
+    field: str,
+    invalid_value: object,
+) -> None:
+    artifact, store, stage_request = committed_cache(tmp_path)
+
+    def replace_component(geometry: dict[str, Any]) -> None:
+        if field == "direction":
+            geometry[field][0][0] = invalid_value
+        else:
+            geometry[field][0] = invalid_value
+
+    mutate_record_geometry(store, artifact, replace_component)
+
+    with pytest.raises(CacheValidationError, match="completion record"):
+        store.reuse(artifact, stage_request, Path.read_bytes)
+
+
+def test_reuse_rejects_unexpected_geometry_keys(tmp_path: Path) -> None:
+    artifact, store, stage_request = committed_cache(tmp_path)
+
+    mutate_record_geometry(
+        store,
+        artifact,
+        lambda geometry: geometry.__setitem__("units", "micrometers"),
+    )
+
+    with pytest.raises(CacheValidationError, match="completion record"):
+        store.reuse(artifact, stage_request, Path.read_bytes)
+
+
+def test_reuse_accepts_integer_json_numbers_for_float_geometry(tmp_path: Path) -> None:
+    artifact, store, stage_request = committed_cache(tmp_path)
+
+    def replace_with_integers(geometry: dict[str, Any]) -> None:
+        geometry["origin"] = [0, 0, 0]
+        geometry["spacing"] = [0.15, 0.15, 0.4]
+        geometry["direction"] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+
+    mutate_record_geometry(store, artifact, replace_with_integers)
+
+    assert store.reuse(artifact, stage_request, Path.read_bytes) == b"affine"
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        pytest.param("origin", float("nan"), id="origin-nan"),
+        pytest.param("spacing", float("inf"), id="spacing-infinity"),
+        pytest.param("direction", float("-inf"), id="direction-negative-infinity"),
+    ],
+)
+def test_reuse_rejects_non_finite_geometry(
+    tmp_path: Path,
+    field: str,
+    invalid_value: float,
+) -> None:
+    artifact, store, stage_request = committed_cache(tmp_path)
+
+    def replace_component(geometry: dict[str, Any]) -> None:
+        if field == "direction":
+            geometry[field][0][0] = invalid_value
+        else:
+            geometry[field][0] = invalid_value
+
+    mutate_record_geometry(store, artifact, replace_component)
+
+    with pytest.raises(CacheValidationError, match="completion record"):
+        store.reuse(artifact, stage_request, Path.read_bytes)
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_stage_request_rejects_non_finite_parameters(
+    tmp_path: Path,
+    invalid_value: float,
+) -> None:
+    source = tmp_path / "moving.tif"
+    source.write_bytes(b"source")
+
+    with pytest.raises(ValueError, match="finite"):
+        make_request(source, parameters={"threshold": invalid_value})
+
+
+def test_completion_record_serialization_rejects_non_finite_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "moving.tif"
+    source.write_bytes(b"source")
+    record = CompletionRecord(
+        schema_version=1,
+        request=make_request(source),
+        artifact=FileIdentity.from_path(source),
+    )
+    payload = record.to_dict()
+    payload["non_finite"] = float("nan")
+    monkeypatch.setattr(CompletionRecord, "to_dict", lambda self: payload)
+
+    with pytest.raises(ValueError, match="Out of range"):
+        record.to_json()
 
 
 def test_failed_replacement_leaves_previous_cache_usable(

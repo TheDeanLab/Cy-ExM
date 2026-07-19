@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-19
 
-**Status:** Approved for specification
+**Status:** Approved
 
 ## Context
 

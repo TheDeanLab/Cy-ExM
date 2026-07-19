@@ -241,6 +241,13 @@ The stable default is one ITK thread and one BLAS-family thread, preserving the
 behavior selected after prior instability. Users may explicitly request higher
 values for a validated dataset and environment.
 
+Explicit `NativeThreadConfig` fields are strict operation-boundary inputs: each
+supplied count must be a built-in integer of at least one, without coercing booleans,
+floats, strings, or integer subclasses. Inherited environment values use a separate
+base-10 string parser that retains the existing acceptance of surrounding whitespace
+and a leading `+`. All effective values and late-runtime comparisons are validated
+before any environment variable is changed.
+
 Effective values are resolved in this order:
 
 1. Explicit `NativeThreadConfig` values supplied to the workflow.
@@ -269,8 +276,17 @@ Extraction must preserve the following behavior:
 - Fixed and moving image roles remain unchanged.
 - Public `pixel_size` tuples are expressed in micrometers in `(x, y, z)` order,
   matching ANTs physical axes and the legacy API. NumPy image arrays use
-  `(z, y, x)` axis order. Conversion occurs at one explicit I/O boundary rather
-  than varying by caller.
+  `(z, y, x)` axis order. Native ANTs arrays and indexes use `(x, y, z)`, so the
+  first three spatial axes are transposed at explicit orchestration boundaries.
+  Trailing vector components are never transposed and retain physical XYZ order.
+- `ImageGeometry.shape`, chunk grids, TIFF arrays, and crop bounds are external ZYX;
+  origin, spacing, direction, affine parameters, and displacement components are
+  physical XYZ.
+- Cy-ExM ANTs TIFF outputs use strict versioned geometry metadata. Only absence of
+  the custom key permits the plain-TIFF fallback; malformed present metadata fails
+  closed. Cache requests and canonical manifests carry the axis-convention version.
+- Operations wholly inside ANTs, including zero-mask and identity-warp construction,
+  stay native XYZ and do not pass through an external-array adapter.
 - The existing zero-valued-data mask semantics remain intact.
 - Linear registration precedes nonlinear registration.
 - The current TRSAA linear policy and SyNOnly nonlinear policy, including their
@@ -317,6 +333,16 @@ thread configuration, and upstream artifact identity. Full content hashing of
 multi-gigabyte images is not required. A cache entry is reusable only when its
 artifact is readable and its metadata matches the current request.
 
+**Cache-integrity correction (2026-07-19):** each registration invocation
+snapshots both resolved input identities before either backend load, uses that
+single immutable pair for whole-image, local-chunk, and manifest requests, and
+checks it after loading and immediately before and after every cache reuse or
+commit. A changed or missing input aborts without reloading. A completion record
+committed before a failing post-check is marked stale; a previously reused record
+is preserved. The snapshot remains stat-based (`path`, `st_size`, and
+`st_mtime_ns`) and does not hash file contents, so changes that preserve all three
+values are not detectable and inputs must remain immutable during a run.
+
 If an artifact exists without valid matching metadata, Cy-ExM raises a focused
 cache error instead of silently overwriting or reusing it. An explicit force
 option permits recomputation. After a replacement affine stage is committed,
@@ -345,6 +371,17 @@ Phase 1 API. Its extraction will be preceded by characterization of:
 The initial implementation remains serial. This provides a trusted numerical
 reference for any future chunk-parallel design and avoids nested multiprocessing
 inside future Dask round workers.
+
+**Scalar-policy correction (2026-07-19):** histogram matching is distribution
+sensitive. Whole-image registration reconstructs its scalar from the committed full
+warp and performs one global match. Serial chunking instead preserves the scalar
+prepared by its estimation hook: each committed local warp is applied, matched to
+that local affine-moving chunk, validated and converted at the core to float32, then
+stitched. Fresh full-warp commit and full-warp reuse use that same prepared stitch;
+they never add a global match. The mask remains reconstructed and thresholded from
+the committed full warp. Explicit versioned policy strings are part of the full
+warp, nonlinear metrics, final TIFF, and local-warp cache requests so records created
+under the incorrect scope fail closed.
 
 A future chunk-parallel implementation must pass an independent acceptance gate:
 

@@ -251,6 +251,12 @@ git commit -m "build: establish Cy-ExM package foundation"
 - Consumes: cyexm.errors.ThreadConfigurationError.
 - Produces: NativeThreadConfig, ResolvedNativeThreads, configure_native_threads(config=None), NATIVE_THREAD_ENV_VARS, and a deterministic description of effective values and sources.
 
+> **Audit correction:** Explicit configuration counts are exact built-in integers of
+> at least one and are never coerced. Inherited environment counts use a separate
+> base-10 string parser; surrounding whitespace and a leading `+` retain their prior
+> meaning. Resolution and late-runtime comparison complete before environment
+> mutation.
+
 - [ ] **Step 1: Write failing resolution and late-import tests**
 
 ~~~python
@@ -411,9 +417,15 @@ class ResolvedNativeThreads:
         )
 
 
-def _positive_int(value: int | str, name: str) -> int:
+def _positive_explicit_int(value: object, name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ThreadConfigurationError(f"{name} must be a positive integer")
+    return value
+
+
+def _positive_environment_int(value: str, name: str) -> int:
     try:
-        parsed = int(value)
+        parsed = int(value, 10)
     except (TypeError, ValueError) as error:
         raise ThreadConfigurationError(f"{name} must be a positive integer") from error
     if parsed < 1:
@@ -442,17 +454,21 @@ def configure_native_threads(
             else config.blas_threads
         )
         if explicit is not None:
-            value = _positive_int(explicit, name)
+            value = _positive_explicit_int(explicit, name)
             source = "explicit"
         elif name in target_environ:
-            value = _positive_int(target_environ[name], name)
+            value = _positive_environment_int(target_environ[name], name)
             source = "environment"
         else:
             value = 1
             source = "default"
 
         current = target_environ.get(name)
-        if runtime_loaded and current is not None and _positive_int(current, name) != value:
+        if (
+            runtime_loaded
+            and current is not None
+            and _positive_environment_int(current, name) != value
+        ):
             loaded = ", ".join(sorted(loaded_roots & SCIENTIFIC_MODULE_ROOTS))
             raise ThreadConfigurationError(
                 f"Cannot change {name} after scientific runtime already loaded: {loaded}"
@@ -510,6 +526,13 @@ git commit -m "feat: add safe native thread configuration"
 **Interfaces:**
 - Consumes: cyexm.errors.CacheValidationError.
 - Produces: atomic_write(destination, writer, validator), dependency-neutral PixelSize and ImageGeometry, FileIdentity.from_path, StageRequest, CompletionRecord, ArtifactStore.reuse, ArtifactStore.commit, and ArtifactStore.mark_stale.
+
+> **Cache-integrity correction (2026-07-19):** `StageRequest.for_identities`
+> preserves an invocation-level immutable identity tuple while applying the same
+> JSON normalization as `for_files`; `for_files` retains call-time path snapshot
+> behavior by delegating to it. `FileIdentity` is stat-based (`path`, `st_size`,
+> `st_mtime_ns`) and does not content-hash files, so inputs must remain immutable
+> because a content change that preserves all three values is not detectable.
 
 - [ ] **Step 1: Write failing atomic-write tests**
 
@@ -755,6 +778,13 @@ git commit -m "feat: add restart-safe artifact store"
 ~~~
 
 ## Task 4: Add image I/O, spatial metadata, cropping, and metrics
+
+> **Post-implementation correction (2026-07-19):** This historical plan's examples
+> equate external ZYX data with `ANTsImage.numpy()` and copy native ANTs shape into
+> `ImageGeometry.shape`. The authoritative implementation transposes the first three
+> axes between external ZYX and native ANTs XYZ, reports `ImageGeometry.shape` as
+> external ZYX, and keeps origin/spacing/direction physical XYZ. The older snippets
+> below are retained as planning history and are superseded by this note.
 
 **Files:**
 - Create: src/cyexm/io/images.py
@@ -1408,6 +1438,16 @@ work writes through ArtifactStore.commit and validates by reopening the
 artifact. Catch lower-level exceptions only to add stage context with
 RegistrationStageError and raise from the original exception.
 
+> **Cache-integrity correction (2026-07-19):** before either backend load, each
+> `register()` call snapshots both source `FileIdentity` values. All whole-image,
+> local-chunk, and manifest requests use that exact pair. Verify it after both
+> loads and immediately before and after every orchestration-level
+> `ArtifactStore.reuse` or `ArtifactStore.commit`; do not silently reload. Abort on
+> change or disappearance, mark a just-committed record stale after a failing
+> post-commit check, and leave an old record intact after a failing post-reuse
+> check. This detects path/size/mtime changes, not content changes that preserve
+> all three stat values.
+
 When nonlinear registration returns a temporary warp path, copy its bytes only
 inside the ArtifactStore writer. Apply that committed warp to the linearly
 transformed mask with nearestNeighbor. Never call apply_to_image on an ANTs
@@ -1674,6 +1714,17 @@ displacement field to a temporary warp path returned with the assembled
 registered image. The parent nonlinear lifecycle commits the full-volume warp,
 applies it to masks with nearestNeighbor, and commits the registered TIFF and
 nonlinear metrics exactly once.
+
+> **Scalar-policy correction (2026-07-19):** retain the shared parent artifact
+> lifecycle, but make scalar reconstruction scope explicit. Whole-image mode rebuilds
+> the scalar from the committed full warp and performs one global histogram match.
+> Serial chunk mode carries the locally histogram-matched float32 core stitch returned
+> by `_estimate_nonlinear` through both fresh full-warp commit and full-warp reuse;
+> absence of that prepared scalar is an error, never a reason to fall back globally.
+> Continue reconstructing and thresholding the mask from the committed full warp.
+> Record versioned policy strings on local/full warp, nonlinear-metrics, and final
+> requests. Characterize this with a distribution-sensitive two-chunk RED test,
+> stale-downstream restart, whole-mode control, and legacy-request mismatch.
 
 Extend FakeBackend as FakeChunkBackend in tests/unit/fakes.py. It records
 registered_chunk_ids, raises on the configured fail_chunk, implements array

@@ -1,0 +1,23 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Ruff check
+        entry: uv run ruff check
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: Ruff format check
+        entry: uv run ruff format --check
+        language: system
+        types_or: [python, pyi]
+      - id: basedpyright
+        name: BasedPyright
+        entry: uv run basedpyright
+        language: system
+        pass_filenames: false
+      - id: pytest-unit
+        name: Unit tests
+        entry: uv run pytest -m "unit and not hpc" tests/unit -q
+        language: system
+        pass_filenames: false

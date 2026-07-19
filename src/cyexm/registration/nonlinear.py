@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,54 @@ def _validate_policy(registration_type: str, accuracy: str) -> None:
         )
 
 
+def _is_displacement_field(path: Path) -> bool:
+    return path.name.endswith((".nii", ".nii.gz"))
+
+
+def _materialize_forward_warp(
+    ants: Any,
+    *,
+    fixed_image: Any,
+    moving_image: Any,
+    forward_transforms: object,
+) -> Path:
+    if not isinstance(forward_transforms, list | tuple) or not forward_transforms:
+        raise FileNotFoundError("ANTs registration did not produce a forward warp")
+    transform_paths = [Path(path) for path in forward_transforms]
+    for path in transform_paths:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"ANTs forward warp component does not exist: {path}"
+            )
+    if len(transform_paths) == 1 and _is_displacement_field(transform_paths[0]):
+        return transform_paths[0]
+
+    descriptor, prefix_text = tempfile.mkstemp(
+        dir=transform_paths[0].parent,
+        prefix="cyexm-composite-",
+        suffix="-",
+    )
+    os.close(descriptor)
+    prefix = Path(prefix_text)
+    prefix.unlink()
+    composed = ants.apply_transforms(
+        fixed=fixed_image,
+        moving=moving_image,
+        transformlist=[str(path) for path in transform_paths],
+        whichtoinvert=[False] * len(transform_paths),
+        interpolator="linear",
+        compose=str(prefix),
+    )
+    if composed is None:
+        raise FileNotFoundError("ANTs did not materialize the composite forward warp")
+    warp_path = Path(composed)
+    if not warp_path.is_file():
+        raise FileNotFoundError(
+            f"ANTs composite forward warp does not exist: {warp_path}"
+        )
+    return warp_path
+
+
 def register_image(
     moving_image: Any,
     fixed_image: Any,
@@ -57,7 +107,7 @@ def register_image(
     *,
     native_threads: NativeThreadConfig | None = None,
 ) -> tuple[object, Path]:
-    """Return the histogram-matched scalar image and ANTs forward-warp path."""
+    """Return the histogram-matched scalar and one materialized forward warp."""
     _validate_policy(registration_type, accuracy)
     ants, np = _configured_runtime(native_threads)
 
@@ -91,9 +141,12 @@ def register_image(
         kwargs["reg_iterations"],
     )
     registered = ants.registration(**kwargs)
-    warp_path = Path(registered["fwdtransforms"][0])
-    if not warp_path.is_file():
-        raise FileNotFoundError(f"ANTs forward warp does not exist: {warp_path}")
+    warp_path = _materialize_forward_warp(
+        ants,
+        fixed_image=fixed_image,
+        moving_image=moving_image,
+        forward_transforms=registered["fwdtransforms"],
+    )
 
     transformed_image = ants.resample_image_to_target(
         image=registered["warpedmovout"],

@@ -10,7 +10,7 @@ from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
-from cyexm.errors import CacheValidationError, RegistrationStageError
+from cyexm.errors import RegistrationStageError
 from cyexm.io.images import Bounds3D, robust_bounding_box
 from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
@@ -248,7 +248,6 @@ class ImageRegistration:
         evidence: dict[str, object] = {
             "crop": self.crop,
             "imaging_round": self.imaging_round,
-            "native_thread_sources": dict(resolved.sources),
             "pixel_size_xyz": self.pixel_size,
         }
         evidence.update(parameters)
@@ -339,22 +338,27 @@ class ImageRegistration:
         role: str,
         resolved: ResolvedNativeThreads,
     ) -> object:
-        geometry = backend.geometry(image)
-        request = self._request(
-            backend,
-            image,
-            resolved,
-            stage=f"crop:{role}",
-            method="robust-bounding-box",
-            accuracy="legacy-robust",
-            upstream=None,
-            parameters={
-                "down_sampling": 4,
-                "image_role": role,
-                "lower_pct": 0.1,
-                "upper_pct": 99.9,
-            },
-        )
+        try:
+            geometry = backend.geometry(image)
+            request = self._request(
+                backend,
+                image,
+                resolved,
+                stage=f"crop:{role}",
+                method="robust-bounding-box",
+                accuracy="legacy-robust",
+                upstream=None,
+                parameters={
+                    "down_sampling": 4,
+                    "image_role": role,
+                    "lower_pct": 0.1,
+                    "upper_pct": 99.9,
+                },
+            )
+        except Exception as error:
+            raise RegistrationStageError(
+                f"{role} crop stage failed for round {self.imaging_round}"
+            ) from error
         bounds = None
         if not self.force_override:
             bounds = self._store().reuse(
@@ -384,13 +388,16 @@ class ImageRegistration:
                         self._read_bounds(candidate, geometry.shape) == bounds
                     ),
                 )
-            except CacheValidationError:
-                raise
             except Exception as error:
                 raise RegistrationStageError(
                     f"{role} crop stage failed for round {self.imaging_round}"
                 ) from error
-        return backend.crop_image(image, bounds)
+        try:
+            return backend.crop_image(image, bounds)
+        except Exception as error:
+            raise RegistrationStageError(
+                f"{role} crop stage failed for round {self.imaging_round}"
+            ) from error
 
     @staticmethod
     def _image_range(
@@ -440,17 +447,22 @@ class ImageRegistration:
         paths: RegistrationPaths,
         resolved: ResolvedNativeThreads,
     ) -> None:
-        minimum, maximum = self._image_range(backend, fixed)
-        request = self._request(
-            backend,
-            fixed,
-            resolved,
-            stage="fixed-reference",
-            method="uint16-tiff",
-            accuracy="exact",
-            upstream=None,
-            parameters={"minimum": minimum, "maximum": maximum},
-        )
+        try:
+            minimum, maximum = self._image_range(backend, fixed)
+            request = self._request(
+                backend,
+                fixed,
+                resolved,
+                stage="fixed-reference",
+                method="uint16-tiff",
+                accuracy="exact",
+                upstream=None,
+                parameters={"minimum": minimum, "maximum": maximum},
+            )
+        except Exception as error:
+            raise RegistrationStageError(
+                f"fixed reference persistence failed for round {self.imaging_round}"
+            ) from error
 
         def reader(path: Path) -> object:
             return backend.load_image(path, self.pixel_size)
@@ -467,14 +479,19 @@ class ImageRegistration:
                 return False
             return True
 
-        self._store().commit(
-            paths.fixed_reference,
-            request,
-            writer=lambda path: backend.write_tiff(
-                fixed, path, min_value=minimum, max_value=maximum
-            ),
-            validator=validator,
-        )
+        try:
+            self._store().commit(
+                paths.fixed_reference,
+                request,
+                writer=lambda path: backend.write_tiff(
+                    fixed, path, min_value=minimum, max_value=maximum
+                ),
+                validator=validator,
+            )
+        except Exception as error:
+            raise RegistrationStageError(
+                f"fixed reference persistence failed for round {self.imaging_round}"
+            ) from error
 
     def _commit_metrics(
         self,
@@ -492,25 +509,28 @@ class ImageRegistration:
             "linearly-registered": paths.linear_metrics,
             "nonlinear-registered": paths.nonlinear_metrics,
         }
-        upstream = None
-        if stage == "linearly-registered":
-            upstream = FileIdentity.from_path(paths.affine)
-        elif stage == "nonlinear-registered":
-            upstream = FileIdentity.from_path(paths.warp)
-        request = self._request(
-            backend,
-            fixed,
-            resolved,
-            stage=f"metrics:{stage}",
-            method="Correlation+MattesMutualInformation",
-            accuracy="full",
-            upstream=upstream,
-            parameters={
-                "moving_geometry": backend.geometry(moving).to_dict(),
-                "sampling": "regular",
-                "sampling_pct": 1.0,
-            },
-        )
+        try:
+            upstream = None
+            if stage == "linearly-registered":
+                upstream = FileIdentity.from_path(paths.affine)
+            elif stage == "nonlinear-registered":
+                upstream = FileIdentity.from_path(paths.warp)
+            request = self._request(
+                backend,
+                fixed,
+                resolved,
+                stage=f"metrics:{stage}",
+                method="Correlation+MattesMutualInformation",
+                accuracy="full",
+                upstream=upstream,
+                parameters={
+                    "moving_geometry": backend.geometry(moving).to_dict(),
+                    "sampling": "regular",
+                    "sampling_pct": 1.0,
+                },
+            )
+        except Exception as error:
+            raise RegistrationStageError(f"{stage} metrics stage failed") from error
         destination = path_by_stage[stage]
         if not self.force_override:
             cached = self._store().reuse(destination, request, read_metrics)
@@ -531,8 +551,6 @@ class ImageRegistration:
                 writer=lambda path: write_metrics(metrics, path),
                 validator=lambda path: read_metrics(path) == metrics,
             )
-        except CacheValidationError:
-            raise
         except Exception as error:
             raise RegistrationStageError(f"{stage} metrics stage failed") from error
 
@@ -546,38 +564,49 @@ class ImageRegistration:
         paths: RegistrationPaths,
         resolved: ResolvedNativeThreads,
     ) -> tuple[object, object, object]:
-        request = self._request(
-            backend,
-            fixed,
-            resolved,
-            stage="affine",
-            method=self.linear_type,
-            accuracy=self.linear_accuracy,
-            upstream=None,
-            parameters={
-                "image_interpolation": "linear",
-                "mask_interpolation": "nearestNeighbor",
-                "moving_geometry": backend.geometry(moving).to_dict(),
-                "registration_parameters": self._linear_parameters(),
-            },
-        )
+        try:
+            request = self._request(
+                backend,
+                fixed,
+                resolved,
+                stage="affine",
+                method=self.linear_type,
+                accuracy=self.linear_accuracy,
+                upstream=None,
+                parameters={
+                    "image_interpolation": "linear",
+                    "mask_interpolation": "nearestNeighbor",
+                    "moving_geometry": backend.geometry(moving).to_dict(),
+                    "registration_parameters": self._linear_parameters(),
+                },
+            )
+        except Exception as error:
+            raise RegistrationStageError(
+                f"affine registration failed for round {self.imaging_round}"
+            ) from error
         if not self.force_override:
             transform = self._store().reuse(paths.affine, request, backend.read_affine)
             if transform is not None:
-                moving_linear = backend.apply_affine(
-                    fixed=fixed,
-                    moving=moving,
-                    transform=transform,
-                    interpolation="linear",
-                )
-                moving_linear_mask = backend.threshold_mask(
-                    backend.apply_affine(
+                try:
+                    moving_linear = backend.apply_affine(
                         fixed=fixed,
-                        moving=moving_mask,
+                        moving=moving,
                         transform=transform,
-                        interpolation="nearestNeighbor",
+                        interpolation="linear",
                     )
-                )
+                    moving_linear_mask = backend.threshold_mask(
+                        backend.apply_affine(
+                            fixed=fixed,
+                            moving=moving_mask,
+                            transform=transform,
+                            interpolation="nearestNeighbor",
+                        )
+                    )
+                except Exception as error:
+                    raise RegistrationStageError(
+                        "cached affine reconstruction failed "
+                        f"for round {self.imaging_round}"
+                    ) from error
                 return transform, moving_linear, moving_linear_mask
 
         try:
@@ -621,8 +650,6 @@ class ImageRegistration:
                     paths.registered,
                 ):
                     self._store().mark_stale(descendant)
-        except CacheValidationError:
-            raise
         except Exception as error:
             raise RegistrationStageError(
                 f"affine registration failed for round {self.imaging_round}"
@@ -641,43 +668,51 @@ class ImageRegistration:
         resolved: ResolvedNativeThreads,
     ) -> tuple[Path, object, object]:
         del affine
-        affine_identity = FileIdentity.from_path(paths.affine)
-        request = self._request(
-            backend,
-            fixed,
-            resolved,
-            stage="nonlinear",
-            method=self.nonlinear_type,
-            accuracy=self.nonlinear_accuracy,
-            upstream=affine_identity,
-            parameters={
-                "image_interpolation": "linear",
-                "mask_interpolation": "nearestNeighbor",
-                "moving_geometry": backend.geometry(moving_linear).to_dict(),
-                "registration_parameters": self._nonlinear_parameters(),
-            },
-        )
+        try:
+            affine_identity = FileIdentity.from_path(paths.affine)
+            request = self._request(
+                backend,
+                fixed,
+                resolved,
+                stage="nonlinear",
+                method=self.nonlinear_type,
+                accuracy=self.nonlinear_accuracy,
+                upstream=affine_identity,
+                parameters={
+                    "image_interpolation": "linear",
+                    "mask_interpolation": "nearestNeighbor",
+                    "moving_geometry": backend.geometry(moving_linear).to_dict(),
+                    "registration_parameters": self._nonlinear_parameters(),
+                    "scalar_postprocessing": "histogram-match-to-moving-linear",
+                },
+            )
+        except Exception as error:
+            raise RegistrationStageError(
+                f"nonlinear registration failed for round {self.imaging_round}"
+            ) from error
         if not self.force_override:
             warp = self._store().reuse(paths.warp, request, backend.read_warp)
             if warp is not None:
-                moving_nonlinear = backend.apply_warp(
-                    fixed=fixed,
-                    moving=moving_linear,
-                    warp_path=paths.warp,
-                    interpolation="linear",
-                )
-                moving_nonlinear_mask = backend.threshold_mask(
-                    backend.apply_warp(
-                        fixed=fixed,
-                        moving=moving_linear_mask,
-                        warp_path=paths.warp,
-                        interpolation="nearestNeighbor",
+                try:
+                    moving_nonlinear, moving_nonlinear_mask = (
+                        self._reconstruct_nonlinear_images(
+                            backend,
+                            fixed,
+                            moving_linear,
+                            moving_linear_mask,
+                            paths.warp,
+                        )
                     )
-                )
+                except Exception as error:
+                    raise RegistrationStageError(
+                        "cached nonlinear reconstruction failed "
+                        f"for round {self.imaging_round}"
+                    ) from error
                 return paths.warp, moving_nonlinear, moving_nonlinear_mask
 
+        warp_committed = False
         try:
-            moving_nonlinear, temporary_warp = self._estimate_nonlinear(
+            _candidate_scalar, temporary_warp = self._estimate_nonlinear(
                 backend,
                 fixed,
                 moving_linear,
@@ -696,21 +731,50 @@ class ImageRegistration:
                 return True
 
             self._store().commit(paths.warp, request, writer, validator)
-            moving_nonlinear_mask = backend.threshold_mask(
-                backend.apply_warp(
-                    fixed=fixed,
-                    moving=moving_linear_mask,
-                    warp_path=paths.warp,
-                    interpolation="nearestNeighbor",
+            warp_committed = True
+            moving_nonlinear, moving_nonlinear_mask = (
+                self._reconstruct_nonlinear_images(
+                    backend,
+                    fixed,
+                    moving_linear,
+                    moving_linear_mask,
+                    paths.warp,
                 )
             )
-        except CacheValidationError:
-            raise
         except Exception as error:
+            if warp_committed:
+                self._store().mark_stale(paths.warp)
             raise RegistrationStageError(
                 f"nonlinear registration failed for round {self.imaging_round}"
             ) from error
         return paths.warp, moving_nonlinear, moving_nonlinear_mask
+
+    @staticmethod
+    def _reconstruct_nonlinear_images(
+        backend: RegistrationBackend,
+        fixed: object,
+        moving_linear: object,
+        moving_linear_mask: object,
+        warp_path: Path,
+    ) -> tuple[object, object]:
+        """Rebuild canonical outputs solely from the committed displacement field."""
+        raw_scalar = backend.apply_warp(
+            fixed=fixed,
+            moving=moving_linear,
+            warp_path=warp_path,
+            interpolation="linear",
+        )
+        scalar = backend.histogram_match(
+            source=raw_scalar,
+            reference=moving_linear,
+        )
+        raw_mask = backend.apply_warp(
+            fixed=fixed,
+            moving=moving_linear_mask,
+            warp_path=warp_path,
+            interpolation="nearestNeighbor",
+        )
+        return scalar, backend.threshold_mask(raw_mask)
 
     def _estimate_nonlinear(
         self,
@@ -738,21 +802,26 @@ class ImageRegistration:
         resolved: ResolvedNativeThreads,
         warp_path: Path,
     ) -> None:
-        minimum, maximum = self._image_range(backend, moving_nonlinear)
-        request = self._request(
-            backend,
-            moving_nonlinear,
-            resolved,
-            stage="registered-image",
-            method=self.nonlinear_type,
-            accuracy=self.nonlinear_accuracy,
-            upstream=FileIdentity.from_path(warp_path),
-            parameters={
-                "format": "uint16-tiff",
-                "minimum": minimum,
-                "maximum": maximum,
-            },
-        )
+        try:
+            minimum, maximum = self._image_range(backend, moving_nonlinear)
+            request = self._request(
+                backend,
+                moving_nonlinear,
+                resolved,
+                stage="registered-image",
+                method=self.nonlinear_type,
+                accuracy=self.nonlinear_accuracy,
+                upstream=FileIdentity.from_path(warp_path),
+                parameters={
+                    "format": "uint16-tiff",
+                    "minimum": minimum,
+                    "maximum": maximum,
+                },
+            )
+        except Exception as error:
+            raise RegistrationStageError(
+                f"registered image persistence failed for round {self.imaging_round}"
+            ) from error
 
         def reader(path: Path) -> object:
             return backend.load_image(path, self.pixel_size)
@@ -769,17 +838,22 @@ class ImageRegistration:
                 return False
             return True
 
-        self._store().commit(
-            paths.registered,
-            request,
-            writer=lambda path: backend.write_tiff(
-                moving_nonlinear,
-                path,
-                min_value=minimum,
-                max_value=maximum,
-            ),
-            validator=validator,
-        )
+        try:
+            self._store().commit(
+                paths.registered,
+                request,
+                writer=lambda path: backend.write_tiff(
+                    moving_nonlinear,
+                    path,
+                    min_value=minimum,
+                    max_value=maximum,
+                ),
+                validator=validator,
+            )
+        except Exception as error:
+            raise RegistrationStageError(
+                f"registered image persistence failed for round {self.imaging_round}"
+            ) from error
 
 
 def register_round(

@@ -3,11 +3,13 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
-from fakes import FakeBackend
+from fakes import FakeBackend, FakeImage
 
 import cyexm.registration.whole_image as whole_image
 from cyexm.errors import CacheValidationError, RegistrationStageError
@@ -15,6 +17,7 @@ from cyexm.registration.artifacts import (
     ArtifactStore,
     CompletionRecord,
     FileIdentity,
+    StageRequest,
 )
 from cyexm.registration.whole_image import (
     ImageRegistration,
@@ -82,6 +85,27 @@ def round_paths(tmp_path: Path) -> RegistrationPaths:
 def completion_request(path: Path) -> object:
     store = ArtifactStore()
     return CompletionRecord.read(store.record_path(path)).request
+
+
+class RejectingValidatorStore(ArtifactStore):
+    def __init__(self, target_name: str) -> None:
+        self.target_name = target_name
+
+    def commit(
+        self,
+        artifact: Path,
+        request: StageRequest,
+        writer: Callable[[Path], None],
+        validator: Callable[[Path], bool],
+    ) -> None:
+        if artifact.name == self.target_name:
+
+            def reject(candidate: Path) -> bool:
+                del candidate
+                return False
+
+            validator = reject
+        super().commit(artifact, request, writer, validator)
 
 
 def test_registration_defaults_are_legacy_compatible(tmp_path: Path) -> None:
@@ -404,9 +428,7 @@ def test_stage_records_capture_inputs_geometry_threads_policy_and_upstream(
         assert request.inputs == expected_inputs
         assert request.geometry.spacing == (0.15, 0.15, 0.15)
         assert request.native_threads == resolved_native_threads.values
-        assert request.parameters["native_thread_sources"] == dict(
-            resolved_native_threads.sources
-        )
+        assert "native_thread_sources" not in request.parameters
 
     assert records["affine"].method == "TRSAA"
     assert records["affine"].accuracy == "low"
@@ -486,6 +508,81 @@ def test_complete_registration_is_reused_without_reestimating_or_rewriting(
     ]
 
 
+def test_equal_effective_threads_reuse_cache_across_resolution_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = {name: index + 1 for index, name in enumerate(NATIVE_THREAD_ENV_VARS)}
+    resolutions = iter(
+        (
+            ResolvedNativeThreads(
+                values=values,
+                sources={name: "default" for name in NATIVE_THREAD_ENV_VARS},
+            ),
+            ResolvedNativeThreads(
+                values=values,
+                sources={name: "environment" for name in NATIVE_THREAD_ENV_VARS},
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        whole_image,
+        "configure_native_threads",
+        lambda config: next(resolutions),
+    )
+    backend = FakeBackend()
+    registration = make_registration(tmp_path, backend=backend)
+
+    registration.register()
+    registration.register()
+
+    assert backend.linear_calls == 1
+    assert backend.nonlinear_calls == 1
+    assert len(backend.metric_calls) == 3
+    assert len(backend.tiff_writes) == 2
+
+
+def test_fresh_and_reused_warp_use_the_same_canonical_nonlinear_scalar(
+    tmp_path: Path,
+) -> None:
+    fresh = FakeBackend()
+    make_registration(tmp_path, backend=fresh).register()
+    paths = round_paths(tmp_path)
+    fresh_metric_scalar = fresh.metric_calls[-1][1]
+    fresh_final_scalar = fresh.tiff_images[-1]
+
+    store = ArtifactStore()
+    store.mark_stale(paths.nonlinear_metrics)
+    store.mark_stale(paths.registered)
+    resumed = FakeBackend()
+    make_registration(tmp_path, backend=resumed).register()
+    resumed_metric_scalar = resumed.metric_calls[-1][1]
+    resumed_final_scalar = resumed.tiff_images[-1]
+
+    assert isinstance(fresh_metric_scalar, FakeImage)
+    assert isinstance(resumed_metric_scalar, FakeImage)
+    assert fresh_metric_scalar is fresh_final_scalar
+    assert resumed_metric_scalar is resumed_final_scalar
+    np.testing.assert_array_equal(
+        fresh_metric_scalar.data,
+        resumed_metric_scalar.data,
+    )
+    np.testing.assert_array_equal(
+        fresh_metric_scalar.data,
+        fresh.moving_image.data + 1_010.0,
+    )
+    assert not np.array_equal(
+        fresh_metric_scalar.data,
+        fresh.nonlinear_candidates[0].data,
+    )
+    assert len(fresh.histogram_match_calls) == 1
+    assert len(resumed.histogram_match_calls) == 1
+    assert (
+        fresh.histogram_match_calls[0][1] is fresh.nonlinear_kwargs[0]["moving_image"]
+    )
+    assert resumed.nonlinear_calls == 0
+
+
 def test_linear_failure_is_contextualized_without_committing_affine(
     tmp_path: Path,
 ) -> None:
@@ -499,6 +596,136 @@ def test_linear_failure_is_contextualized_without_committing_affine(
     assert not paths.affine.exists()
     assert not ArtifactStore().record_path(paths.affine).exists()
     assert backend.nonlinear_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("target_name", "registration_kwargs", "stage"),
+    [
+        pytest.param(
+            "fixed_reference.tif", {}, "fixed reference", id="fixed-reference"
+        ),
+        pytest.param(
+            "fixed_crop_indices_2.json",
+            {"crop": True},
+            "fixed crop",
+            id="crop",
+        ),
+        pytest.param(
+            "image_metrics_pre-registration.txt",
+            {},
+            "pre-registration metrics",
+            id="metrics",
+        ),
+        pytest.param("linear_transform_2.mat", {}, "affine", id="affine"),
+        pytest.param("nonlinear_warp_2.nii.gz", {}, "nonlinear", id="nonlinear"),
+        pytest.param(
+            "nonlinear_registered_2.tif",
+            {},
+            "registered image",
+            id="final-image",
+        ),
+    ],
+)
+def test_fresh_validator_failure_is_a_contextual_runtime_stage_error(
+    tmp_path: Path,
+    target_name: str,
+    registration_kwargs: dict[str, object],
+    stage: str,
+) -> None:
+    store = RejectingValidatorStore(target_name)
+
+    with pytest.raises(RegistrationStageError, match=stage) as error:
+        make_registration(
+            tmp_path,
+            backend=FakeBackend(),
+            artifact_store=store,
+            **registration_kwargs,
+        ).register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+
+
+@pytest.mark.parametrize(
+    ("to_array_call", "stage"),
+    [
+        pytest.param(1, "fixed reference", id="fixed-reference"),
+        pytest.param(2, "registered image", id="final-image"),
+    ],
+)
+def test_tiff_range_failure_is_contextualized_by_persistence_stage(
+    tmp_path: Path,
+    to_array_call: int,
+    stage: str,
+) -> None:
+    backend = FakeBackend(fail_to_array_call=to_array_call)
+
+    with pytest.raises(RegistrationStageError, match=stage) as error:
+        make_registration(tmp_path, backend=backend).register()
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+
+@pytest.mark.parametrize(
+    ("tiff_role", "stage"),
+    [
+        pytest.param("fixed_reference", "fixed reference", id="fixed-reference"),
+        pytest.param("nonlinear_registered_2", "registered image", id="final-image"),
+    ],
+)
+def test_tiff_writer_failure_is_contextualized_by_persistence_stage(
+    tmp_path: Path,
+    tiff_role: str,
+    stage: str,
+) -> None:
+    backend = FakeBackend(fail_tiff_role=tiff_role)
+
+    with pytest.raises(RegistrationStageError, match=stage) as error:
+        make_registration(tmp_path, backend=backend).register()
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("linear", id="scalar-application"),
+        pytest.param("nearestNeighbor", id="mask-application"),
+        pytest.param("threshold", id="mask-thresholding"),
+    ],
+)
+def test_cached_affine_reconstruction_failure_is_contextualized(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    make_registration(tmp_path, backend=FakeBackend()).register()
+    paths = round_paths(tmp_path)
+    store = ArtifactStore()
+    record_before = store.record_path(paths.affine).read_bytes()
+    resumed = FakeBackend(
+        fail_affine_interpolation=(
+            failure if failure in {"linear", "nearestNeighbor"} else None
+        ),
+        fail_threshold_mask=failure == "threshold",
+    )
+
+    with pytest.raises(RegistrationStageError, match="cached affine") as error:
+        make_registration(tmp_path, backend=resumed).register()
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert store.record_path(paths.affine).read_bytes() == record_before
+
+
+def test_crop_application_failure_is_contextualized_after_bounds_commit(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(fail_crop_image=True)
+
+    with pytest.raises(RegistrationStageError, match="fixed crop") as error:
+        make_registration(tmp_path, backend=backend, crop=True).register()
+
+    paths = round_paths(tmp_path)
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert ArtifactStore().record_path(paths.fixed_crop).is_file()
 
 
 def test_first_run_log_reports_every_effective_thread_value_and_source(
@@ -809,6 +1036,7 @@ def test_nonlinear_hook_leaves_warp_lifecycle_to_parent(tmp_path: Path) -> None:
 
     class HookedRegistration(ImageRegistration):
         hook_calls = 0
+        candidate: FakeImage | None = None
 
         def _estimate_nonlinear(
             self,
@@ -819,10 +1047,13 @@ def test_nonlinear_hook_leaves_warp_lifecycle_to_parent(tmp_path: Path) -> None:
             moving_linear_mask: object,
         ) -> tuple[object, Path]:
             del fixed, fixed_mask, moving_linear_mask
+            assert isinstance(moving_linear, FakeImage)
             self.hook_calls += 1
             temporary = tmp_path / "hook-warp.nii.gz"
             temporary.write_bytes(b"warp-hook")
-            return moving_linear, temporary
+            self.candidate = moving_linear.clone()
+            self.candidate.data += 500.0
+            return self.candidate, temporary
 
     registration = HookedRegistration(
         fixed,
@@ -838,7 +1069,11 @@ def test_nonlinear_hook_leaves_warp_lifecycle_to_parent(tmp_path: Path) -> None:
     paths = round_paths(tmp_path)
     assert registration.hook_calls == 1
     assert paths.warp.read_bytes() == b"warp-hook"
-    assert backend.warp_applications == [(paths.warp, "nearestNeighbor")]
+    assert backend.warp_applications == [
+        (paths.warp, "linear"),
+        (paths.warp, "nearestNeighbor"),
+    ]
+    assert backend.metric_calls[-1][1] is not registration.candidate
     assert paths.nonlinear_metrics.is_file()
     assert paths.registered.is_file()
 
@@ -855,12 +1090,81 @@ def test_temporary_warp_is_validated_and_masks_use_only_committed_path(
     assert all(
         path != backend.temporary_warps[0] for path, _ in backend.warp_applications
     )
-    assert backend.warp_applications == [(paths.warp, "nearestNeighbor")]
+    assert backend.warp_applications == [
+        (paths.warp, "linear"),
+        (paths.warp, "nearestNeighbor"),
+    ]
     assert len(backend.read_warp_paths) == 1
     candidate = backend.read_warp_paths[0]
     assert candidate.parent == paths.output
     assert candidate != paths.warp
     assert candidate.name.startswith(".nonlinear_warp_2")
+
+
+@pytest.mark.parametrize(
+    ("failure", "force_after_existing"),
+    [
+        pytest.param("linear", False, id="scalar-application"),
+        pytest.param("histogram", False, id="histogram-matching"),
+        pytest.param("nearestNeighbor", False, id="mask-application"),
+        pytest.param("threshold", False, id="mask-thresholding"),
+        pytest.param("histogram", True, id="force-after-affine-replacement"),
+    ],
+)
+def test_postcommit_nonlinear_reconstruction_failure_stales_new_warp_record(
+    tmp_path: Path,
+    failure: str,
+    force_after_existing: bool,
+) -> None:
+    if force_after_existing:
+        make_registration(tmp_path, backend=FakeBackend()).register()
+    backend = FakeBackend(
+        affine_bytes=(
+            b"affine-replacement" if force_after_existing else b"affine-fake"
+        ),
+        warp_bytes=b"warp-replacement",
+        fail_warp_interpolation=(
+            failure if failure in {"linear", "nearestNeighbor"} else None
+        ),
+        fail_histogram_match=failure == "histogram",
+        fail_threshold_mask=failure == "threshold",
+    )
+
+    with pytest.raises(RegistrationStageError, match="nonlinear") as error:
+        make_registration(
+            tmp_path,
+            backend=backend,
+            force_override=force_after_existing,
+        ).register()
+
+    paths = round_paths(tmp_path)
+    store = ArtifactStore()
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert paths.warp.read_bytes() == b"warp-replacement"
+    assert not store.record_path(paths.warp).exists()
+    assert store.stale_path(paths.warp).is_file()
+    stale_record = CompletionRecord.read(store.stale_path(paths.warp))
+    assert store.reuse(paths.warp, stale_record.request, backend.read_warp) is None
+    if force_after_existing:
+        assert paths.affine.read_bytes() == b"affine-replacement"
+        assert store.record_path(paths.affine).is_file()
+
+
+def test_reused_warp_runtime_failure_preserves_prior_completion_record(
+    tmp_path: Path,
+) -> None:
+    make_registration(tmp_path, backend=FakeBackend()).register()
+    paths = round_paths(tmp_path)
+    store = ArtifactStore()
+    record_before = store.record_path(paths.warp).read_bytes()
+    resumed = FakeBackend(fail_warp_interpolation="linear")
+
+    with pytest.raises(RegistrationStageError, match="nonlinear") as error:
+        make_registration(tmp_path, backend=resumed).register()
+
+    assert isinstance(error.value.__cause__, RuntimeError)
+    assert store.record_path(paths.warp).read_bytes() == record_before
+    assert not store.stale_path(paths.warp).exists()
 
 
 def test_transformed_masks_are_thresholded_after_cached_transforms(
@@ -880,12 +1184,15 @@ def test_transformed_masks_are_thresholded_after_cached_transforms(
     "artifact_name",
     [
         pytest.param("fixed_reference", id="fixed-reference"),
-        pytest.param("pre_metrics", id="metrics"),
+        pytest.param("pre_metrics", id="pre-metrics"),
+        pytest.param("affine", id="affine"),
+        pytest.param("linear_metrics", id="linear-metrics"),
         pytest.param("warp", id="warp"),
+        pytest.param("nonlinear_metrics", id="nonlinear-metrics"),
         pytest.param("registered", id="final-image"),
     ],
 )
-def test_corrupt_downstream_artifacts_remain_cache_errors(
+def test_corrupt_cached_artifacts_remain_cache_validation_errors(
     tmp_path: Path,
     artifact_name: str,
 ) -> None:
@@ -965,7 +1272,7 @@ def test_registration_does_not_add_root_logging_handlers(tmp_path: Path) -> None
     assert tuple(root.handlers) == handlers_before
 
 
-def test_crop_completion_records_capture_both_inputs_and_thread_sources(
+def test_crop_completion_records_capture_inputs_and_effective_threads(
     tmp_path: Path,
     resolved_native_threads: ResolvedNativeThreads,
 ) -> None:
@@ -986,6 +1293,4 @@ def test_crop_completion_records_capture_both_inputs_and_thread_sources(
         assert request.accuracy == "legacy-robust"
         assert request.parameters["image_role"] == role
         assert request.native_threads == resolved_native_threads.values
-        assert request.parameters["native_thread_sources"] == dict(
-            resolved_native_threads.sources
-        )
+        assert "native_thread_sources" not in request.parameters

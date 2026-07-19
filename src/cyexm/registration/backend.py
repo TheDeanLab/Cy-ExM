@@ -84,6 +84,9 @@ class RegistrationBackend(Protocol):
     ) -> object:
         raise NotImplementedError
 
+    def histogram_match(self, *, source: object, reference: object) -> object:
+        raise NotImplementedError
+
     def write_affine(self, transform: object, path: Path) -> None:
         raise NotImplementedError
 
@@ -269,6 +272,14 @@ class AntsRegistrationBackend:
             warp_path=warp_path,
             interpolation=interpolation,
             native_threads=self.native_threads,
+        )
+
+    def histogram_match(self, *, source: object, reference: object) -> object:
+        self._prepare()
+        ants, _ = _scientific_runtime()
+        return ants.histogram_match_image(
+            source_image=source,
+            reference_image=reference,
         )
 
     def write_affine(self, transform: object, path: Path) -> None:

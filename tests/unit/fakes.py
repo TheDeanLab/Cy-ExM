@@ -123,6 +123,9 @@ class FakeAntsCalls:
     interpolator: str | None = None
     transform: FakeTransform = field(default_factory=FakeTransform)
     warp_path: Path = Path("fake-warp.nii.gz")
+    forward_transforms: list[Path] | None = None
+    compose: str | None = None
+    composed_path: Path | None = None
     histogram_matched: FakeImage = field(default_factory=FakeImage)
     resampled: FakeImage = field(default_factory=FakeImage)
     applied: FakeImage = field(default_factory=FakeImage)
@@ -173,6 +176,14 @@ class FakeBackend:
     fail_linear: bool = False
     fail_nonlinear: bool = False
     fail_affine_write: bool = False
+    fail_affine_interpolation: str | None = None
+    fail_warp_interpolation: str | None = None
+    fail_histogram_match: bool = False
+    fail_threshold_mask: bool = False
+    fail_to_array_call: int | None = None
+    fail_tiff_role: str | None = None
+    fail_crop_image: bool = False
+    fail_metrics: bool = False
     affine_bytes: bytes = b"affine-fake"
     warp_bytes: bytes = b"warp-fake"
     metric_values: dict[str, float] = field(
@@ -203,18 +214,22 @@ class FakeBackend:
     read_warp_calls: int = 0
     read_warp_paths: list[Path] = field(default_factory=list)
     threshold_mask_calls: int = 0
+    to_array_calls: int = 0
     events: list[str] = field(default_factory=list)
     load_paths: list[Path] = field(default_factory=list)
     linear_kwargs: list[dict[str, object]] = field(default_factory=list)
     nonlinear_kwargs: list[dict[str, object]] = field(default_factory=list)
     affine_interpolations: list[str] = field(default_factory=list)
     warp_applications: list[tuple[Path, str]] = field(default_factory=list)
+    histogram_match_calls: list[tuple[object, object]] = field(default_factory=list)
     metric_calls: list[tuple[object, object, object | None, object | None]] = field(
         default_factory=list
     )
     tiff_writes: list[tuple[Path, float, float]] = field(default_factory=list)
+    tiff_images: list[object] = field(default_factory=list)
     crop_bounds: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
     temporary_warps: list[Path] = field(default_factory=list)
+    nonlinear_candidates: list[FakeImage] = field(default_factory=list)
     _test_directory: Path | None = None
 
     def load_image(self, path: Path, pixel_size_xyz: PixelSize) -> object:
@@ -257,6 +272,8 @@ class FakeBackend:
             raise TypeError("image must be a FakeImage")
         self.events.append("threshold-mask")
         self.threshold_mask_calls += 1
+        if self.fail_threshold_mask:
+            raise RuntimeError("injected mask threshold failure")
         return fake_image(
             data=((source.data >= 0.5) & (source.data <= 1.0)).astype(np.float32),
             origin=source.origin,
@@ -279,6 +296,9 @@ class FakeBackend:
         source = image
         if not isinstance(source, FakeImage):
             raise TypeError("image must be a FakeImage")
+        self.to_array_calls += 1
+        if self.fail_to_array_call == self.to_array_calls:
+            raise RuntimeError("injected image range failure")
         return source.numpy()
 
     def from_array(
@@ -308,6 +328,8 @@ class FakeBackend:
         if not isinstance(source, FakeImage):
             raise TypeError("image must be a FakeImage")
         self.crop_bounds.append(bounds_zyx)
+        if self.fail_crop_image:
+            raise RuntimeError("injected crop application failure")
         z0, z1, y0, y1, x0, x1 = bounds_zyx
         start_xyz = (x0, y0, z0)
         scaled = tuple(
@@ -359,7 +381,14 @@ class FakeBackend:
         )
         warp_path.write_bytes(self.warp_bytes)
         self.temporary_warps.append(warp_path)
-        return moving.clone(), warp_path
+        candidate = fake_image(
+            data=moving.data + 100.0,
+            origin=moving.origin,
+            spacing=moving.spacing,
+            direction=moving.direction,
+        )
+        self.nonlinear_candidates.append(candidate)
+        return candidate, warp_path
 
     def apply_affine(
         self,
@@ -374,6 +403,8 @@ class FakeBackend:
             raise TypeError("moving must be a FakeImage")
         self.events.append(f"apply-affine:{interpolation}")
         self.affine_interpolations.append(interpolation)
+        if self.fail_affine_interpolation == interpolation:
+            raise RuntimeError(f"injected {interpolation} affine application failure")
         return moving.clone()
 
     def apply_warp(
@@ -391,7 +422,29 @@ class FakeBackend:
             raise FileNotFoundError(warp_path)
         self.events.append(f"apply-warp:{interpolation}")
         self.warp_applications.append((warp_path, interpolation))
-        return moving.clone()
+        if self.fail_warp_interpolation == interpolation:
+            raise RuntimeError(f"injected {interpolation} warp application failure")
+        offset = 10.0 if interpolation == "linear" else 0.0
+        return fake_image(
+            data=moving.data + offset,
+            origin=moving.origin,
+            spacing=moving.spacing,
+            direction=moving.direction,
+        )
+
+    def histogram_match(self, *, source: object, reference: object) -> object:
+        if not isinstance(source, FakeImage) or not isinstance(reference, FakeImage):
+            raise TypeError("source and reference must be FakeImages")
+        self.events.append("histogram-match")
+        self.histogram_match_calls.append((source, reference))
+        if self.fail_histogram_match:
+            raise RuntimeError("injected histogram matching failure")
+        return fake_image(
+            data=source.data + 1_000.0,
+            origin=source.origin,
+            spacing=source.spacing,
+            direction=source.direction,
+        )
 
     def write_affine(self, transform: object, path: Path) -> None:
         self.events.append("write-affine")
@@ -444,6 +497,10 @@ class FakeBackend:
             raise TypeError("image must be a FakeImage")
         self.events.append("write-tiff")
         self.tiff_writes.append((path, min_value, max_value))
+        self.tiff_images.append(image)
+        if self.fail_tiff_role is not None and self.fail_tiff_role in path.name:
+            path.write_bytes(b"partial-tiff")
+            raise RuntimeError("injected TIFF writer failure")
         path.write_bytes(b"tiff-fake")
 
     def calculate_metrics(
@@ -458,6 +515,8 @@ class FakeBackend:
         del sampling, sampling_pct
         self.events.append("metrics")
         self.metric_calls.append((fixed, moving, fixed_mask, moving_mask))
+        if self.fail_metrics:
+            raise RuntimeError("injected metrics failure")
         return dict(self.metric_values)
 
 
@@ -482,7 +541,14 @@ def install_fake_ants(
         calls.registration_call_count += 1
         calls.registration = dict(kwargs)
         return {
-            "fwdtransforms": [str(calls.warp_path)],
+            "fwdtransforms": [
+                str(path)
+                for path in (
+                    [calls.warp_path]
+                    if calls.forward_transforms is None
+                    else calls.forward_transforms
+                )
+            ],
             "warpedmovout": calls.registered_warped,
         }
 
@@ -533,17 +599,26 @@ def install_fake_ants(
         transformlist: list[str],
         interpolator: str,
         whichtoinvert: list[bool] | None = None,
-    ) -> FakeImage:
+        compose: str | None = None,
+    ) -> object:
         calls.transformlist = list(transformlist)
         calls.whichtoinvert = None if whichtoinvert is None else list(whichtoinvert)
         calls.interpolator = interpolator
+        calls.compose = compose
         calls.apply_transforms = {
             "fixed": fixed,
             "moving": moving,
             "transformlist": list(transformlist),
             "whichtoinvert": calls.whichtoinvert,
             "interpolator": interpolator,
+            "compose": compose,
         }
+        if compose is not None:
+            calls.composed_path = Path(
+                compose if compose.endswith(".h5") else f"{compose}comptx.nii.gz"
+            )
+            calls.composed_path.write_bytes(b"composite-warp")
+            return str(calls.composed_path)
         return calls.applied
 
     def image_read(filename: str) -> FakeImage:

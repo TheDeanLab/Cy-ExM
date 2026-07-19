@@ -40,6 +40,7 @@ def test_registration_backend_declares_every_required_operation() -> None:
             "warp_path",
             "interpolation",
         ),
+        "histogram_match": ("self", "source", "reference"),
         "write_affine": ("self", "transform", "path"),
         "read_affine": ("self", "path"),
         "write_warp": ("self", "warp", "path"),
@@ -151,6 +152,34 @@ def test_threshold_mask_uses_the_characterized_half_value_cutoff(
         "outval": 0,
     }
     assert result is calls.thresholded
+
+
+def test_histogram_match_configures_threads_before_runtime_and_delegates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.backend")
+    requested = NativeThreadConfig(itk_threads=2, blas_threads=3)
+
+    def configure(config: NativeThreadConfig | None) -> object:
+        assert config is requested
+        calls.events.append("configure")
+        return _Resolved()
+
+    monkeypatch.setattr(backend_module, "configure_native_threads", configure)
+    source = fake_image(data=np.full((8, 8, 8), 2.0, dtype=np.float32))
+    reference = fake_image(data=np.full((8, 8, 8), 3.0, dtype=np.float32))
+
+    result = AntsRegistrationBackend(requested).histogram_match(
+        source=source,
+        reference=reference,
+    )
+
+    assert calls.events[:2] == ["configure", "runtime"]
+    assert calls.histogram_match == {
+        "source_image": source,
+        "reference_image": reference,
+    }
+    assert result is calls.histogram_matched
 
 
 def test_geometry_returns_a_dependency_neutral_value(

@@ -173,6 +173,34 @@ def test_nonlinear_rejects_a_missing_forward_warp(
         )
 
 
+@pytest.mark.parametrize("registration_type", ["SyN", "Elastic"])
+def test_nonlinear_composes_the_complete_forward_transform_list(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registration_type: str,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    affine_path = tmp_path / "forward-affine.mat"
+    affine_path.write_bytes(b"affine")
+    calls.forward_transforms = [calls.warp_path, affine_path]
+
+    transformed, warp_path = register_image(
+        moving_image=fake_image(),
+        fixed_image=fake_image(),
+        registration_type=registration_type,
+    )
+
+    assert calls.transformlist == [str(calls.warp_path), str(affine_path)]
+    assert calls.whichtoinvert == [False, False]
+    assert calls.interpolator == "linear"
+    assert calls.compose is not None
+    assert calls.composed_path is not None
+    assert warp_path == calls.composed_path
+    assert warp_path != calls.warp_path
+    assert warp_path.is_file()
+    assert transformed is calls.histogram_matched
+
+
 def test_nonlinear_transform_uses_forward_transform_and_linear_interpolation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

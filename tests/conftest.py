@@ -1,0 +1,13 @@
+import os
+
+NATIVE_THREAD_ENV_VARS = (
+    "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+for name in NATIVE_THREAD_ENV_VARS:
+    os.environ.setdefault(name, "1")

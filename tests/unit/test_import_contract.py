@@ -26,3 +26,22 @@ assert isinstance(cyexm.__version__, str)
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_import_cyexm_runtime_keeps_scientific_libraries_unloaded() -> None:
+    code = """
+import sys
+
+import cyexm.runtime
+
+assert "ants" not in sys.modules
+assert "numpy" not in sys.modules
+assert "scipy" not in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr

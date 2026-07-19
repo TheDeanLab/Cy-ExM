@@ -115,6 +115,15 @@ could create incomplete or scientifically misleading results:
 17. `transform_directory.ipynb` requires the matching readable `.complete.json`
     record for every supplied transform and crop artifact, and validates exact file
     identity, stage, and axis-convention version before reuse.
+18. Serial chunk scalar output preserves the pinned ClearEx fresh-estimation
+    ordering: histogram-match each warped chunk against its local affine-moving
+    distribution, convert and stitch the validated cores, and do not apply a second
+    full-volume histogram match. Cy-ExM intentionally applies that same local policy
+    on restart, correcting ClearEx's inconsistent transform-only reuse behavior.
+    Whole-image registration retains its canonical single global match. Versioned
+    `scalar_postprocessing_policy` evidence binds the full warp, nonlinear metrics,
+    final TIFF, and local warps to that scope. Earlier records lacking this evidence
+    fail closed and require an intentional forced recompute.
 
 The direct low-level ANTs parity fixtures intentionally remain native-only and are
 not transposed. These corrections apply where orchestration crosses external

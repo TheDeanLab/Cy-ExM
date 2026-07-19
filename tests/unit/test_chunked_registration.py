@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from fakes import FakeChunkBackend, fake_image
+from fakes import FakeChunkBackend, FakeImage, fake_image
 
 from cyexm.errors import (
     CacheValidationError,
@@ -103,14 +103,53 @@ def rewrite_completion_artifact_identity(artifact: Path) -> None:
     )
 
 
-class FullHistogramStageErrorBackend(FakeChunkBackend):
+CHUNKED_SCALAR_POSTPROCESSING_POLICY = (
+    "serial-chunk-local-histogram-match-core-stitch-v1"
+)
+WHOLE_SCALAR_POSTPROCESSING_POLICY = "whole-global-histogram-match-v1"
+
+
+class DistributionSensitiveHistogramBackend(FakeChunkBackend):
     def histogram_match(self, *, source: object, reference: object) -> object:
+        super().histogram_match(source=source, reference=reference)
+        if not isinstance(source, FakeImage) or not isinstance(reference, FakeImage):
+            raise TypeError("source and reference must be FakeImages")
+        reference_mean = np.float32(np.mean(reference.data, dtype=np.float64))
+        return fake_image(
+            data=np.full(source.shape, reference_mean, dtype=np.float32),
+            origin=source.origin,
+            spacing=source.spacing,
+            direction=source.direction,
+        )
+
+
+class FullMaskStageErrorBackend(FakeChunkBackend):
+    def threshold_mask(self, image: object) -> object:
         if (
             self.warp_applications
             and self.warp_applications[-1][0].name == "nonlinear_warp_2.nii.gz"
         ):
-            raise RegistrationStageError("injected full reconstruction stage error")
-        return super().histogram_match(source=source, reference=reference)
+            raise RegistrationStageError(
+                "injected full mask reconstruction stage error"
+            )
+        return super().threshold_mask(image)
+
+
+def expected_local_histogram_stitch(moving: np.ndarray) -> np.ndarray:
+    expected = np.empty(moving.shape, dtype=np.float32)
+    for z_start, z_end in ((0, 8), (8, 16)):
+        expected[z_start:z_end] = np.float32(
+            np.mean(moving[z_start:z_end], dtype=np.float64)
+        )
+    return expected
+
+
+def expected_global_histogram_result(moving: np.ndarray) -> np.ndarray:
+    return np.full(
+        moving.shape,
+        np.float32(np.mean(moving, dtype=np.float64)),
+        dtype=np.float32,
+    )
 
 
 def test_chunk_paths_are_round_scoped_and_include_completion_record(
@@ -336,6 +375,10 @@ def test_chunked_full_request_records_transitive_chunk_evidence(
     chunks = request.parameters["chunk_grid"]
     assert request.parameters["registration_mode"] == "serial-chunked"
     assert request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
+    assert (
+        request.parameters["scalar_postprocessing_policy"]
+        == CHUNKED_SCALAR_POSTPROCESSING_POLICY
+    )
     assert request.parameters["chunk_size_zyx"] == [8, 8, 8]
     assert request.parameters["overlap_fraction"] == 0.25
     assert [item["chunk_id"] for item in chunks] == [0, 1, 2]  # type: ignore[index]
@@ -534,6 +577,174 @@ def test_normal_rerun_reuses_local_full_and_downstream_artifact_identities(
     assert not resumed.written_warp_paths[0].exists()
 
 
+def test_serial_chunk_scalar_is_local_core_stitch_fresh_and_on_full_warp_reuse(
+    tmp_path: Path,
+) -> None:
+    fresh = DistributionSensitiveHistogramBackend()
+    registration = make_chunked_registration(tmp_path, backend=fresh)
+
+    registration.register()
+
+    paths = round_paths(tmp_path)
+    expected_local = expected_local_histogram_stitch(fresh.moving_image.data)
+    hypothetical_global = expected_global_histogram_result(fresh.moving_image.data)
+    fresh_metric_scalar = fresh.metric_calls[-1][1]
+    fresh_final_scalar = fresh.tiff_images[-1]
+    assert isinstance(fresh_metric_scalar, FakeImage)
+    assert isinstance(fresh_final_scalar, FakeImage)
+    np.testing.assert_array_equal(fresh_metric_scalar.data, expected_local)
+    np.testing.assert_array_equal(fresh_final_scalar.data, expected_local)
+    assert not np.array_equal(fresh_metric_scalar.data, hypothetical_global)
+    assert (
+        float(np.max(np.abs(fresh_metric_scalar.data - hypothetical_global))) == 256.0
+    )
+    assert len(fresh.histogram_match_calls) == 2
+    assert all(
+        isinstance(reference, FakeImage) and reference.shape == (8, 8, 8)
+        for _, reference in fresh.histogram_match_calls
+    )
+    assert not any(
+        path.name == "nonlinear_warp_2.nii.gz" and interpolation == "linear"
+        for path, interpolation in fresh.warp_applications
+    )
+    assert (
+        paths.warp,
+        "nearestNeighbor",
+    ) in fresh.warp_applications
+
+    preserved_artifacts = (
+        registration.chunk_paths(0).warp,
+        registration.chunk_paths(1).warp,
+        paths.warp,
+    )
+    preserved_identities = tuple(
+        FileIdentity.from_path(path) for path in preserved_artifacts
+    )
+    nonlinear_metrics_bytes = paths.nonlinear_metrics.read_bytes()
+    registered_bytes = paths.registered.read_bytes()
+    store = ArtifactStore()
+    store.mark_stale(paths.nonlinear_metrics)
+    store.mark_stale(paths.registered)
+    resumed = DistributionSensitiveHistogramBackend()
+
+    make_chunked_registration(tmp_path, backend=resumed).register()
+
+    resumed_metric_scalar = resumed.metric_calls[-1][1]
+    resumed_final_scalar = resumed.tiff_images[-1]
+    assert isinstance(resumed_metric_scalar, FakeImage)
+    assert isinstance(resumed_final_scalar, FakeImage)
+    np.testing.assert_array_equal(resumed_metric_scalar.data, expected_local)
+    np.testing.assert_array_equal(resumed_final_scalar.data, expected_local)
+    np.testing.assert_array_equal(
+        resumed_metric_scalar.data,
+        fresh_metric_scalar.data,
+    )
+    assert len(resumed.histogram_match_calls) == 2
+    assert resumed.registered_chunk_ids == []
+    assert resumed.nonlinear_calls == 0
+    assert tuple(FileIdentity.from_path(path) for path in preserved_artifacts) == (
+        preserved_identities
+    )
+    assert paths.nonlinear_metrics.read_bytes() == nonlinear_metrics_bytes
+    assert paths.registered.read_bytes() == registered_bytes
+    assert not any(
+        path.name == "nonlinear_warp_2.nii.gz" and interpolation == "linear"
+        for path, interpolation in resumed.warp_applications
+    )
+    assert (paths.warp, "nearestNeighbor") in resumed.warp_applications
+
+
+def test_scalar_policy_is_recorded_on_local_full_metrics_and_final_requests(
+    tmp_path: Path,
+) -> None:
+    registration = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+
+    registration.register()
+
+    store = ArtifactStore()
+    paths = round_paths(tmp_path)
+    artifacts = (
+        registration.chunk_paths(0).warp,
+        registration.chunk_paths(1).warp,
+        paths.warp,
+        paths.nonlinear_metrics,
+        paths.registered,
+    )
+    requests = tuple(
+        CompletionRecord.read(store.record_path(path)).request for path in artifacts
+    )
+    assert all(
+        request.parameters["scalar_postprocessing_policy"]
+        == CHUNKED_SCALAR_POSTPROCESSING_POLICY
+        for request in requests
+    )
+
+
+def test_legacy_chunk_scalar_policy_record_fails_closed(tmp_path: Path) -> None:
+    make_chunked_registration(tmp_path, backend=FakeChunkBackend()).register()
+    store = ArtifactStore()
+    full_record = store.record_path(round_paths(tmp_path).warp)
+    payload = json.loads(full_record.read_text(encoding="utf-8"))
+    parameters = payload["request"]["parameters"]
+    parameters.pop("scalar_postprocessing_policy", None)
+    parameters["scalar_postprocessing"] = "histogram-match-to-moving-linear"
+    full_record.write_text(
+        json.dumps(payload, allow_nan=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    resumed = FakeChunkBackend()
+
+    with pytest.raises(CacheValidationError, match="request"):
+        make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert resumed.registered_chunk_ids == []
+
+
+def test_whole_image_scalar_remains_global_and_canonical_on_warp_reuse(
+    tmp_path: Path,
+) -> None:
+    fresh = DistributionSensitiveHistogramBackend()
+
+    make_whole_registration(tmp_path, backend=fresh).register()
+
+    paths = round_paths(tmp_path)
+    expected_global = expected_global_histogram_result(fresh.moving_image.data)
+    fresh_metric_scalar = fresh.metric_calls[-1][1]
+    fresh_final_scalar = fresh.tiff_images[-1]
+    assert isinstance(fresh_metric_scalar, FakeImage)
+    assert isinstance(fresh_final_scalar, FakeImage)
+    np.testing.assert_array_equal(fresh_metric_scalar.data, expected_global)
+    np.testing.assert_array_equal(fresh_final_scalar.data, expected_global)
+    assert len(fresh.histogram_match_calls) == 1
+    assert isinstance(fresh.histogram_match_calls[0][1], FakeImage)
+    assert fresh.histogram_match_calls[0][1].shape == (16, 8, 8)  # type: ignore[union-attr]
+
+    store = ArtifactStore()
+    requests = tuple(
+        CompletionRecord.read(store.record_path(path)).request
+        for path in (paths.warp, paths.nonlinear_metrics, paths.registered)
+    )
+    assert all(
+        request.parameters["scalar_postprocessing_policy"]
+        == WHOLE_SCALAR_POSTPROCESSING_POLICY
+        for request in requests
+    )
+    store.mark_stale(paths.nonlinear_metrics)
+    store.mark_stale(paths.registered)
+    resumed = DistributionSensitiveHistogramBackend()
+
+    make_whole_registration(tmp_path, backend=resumed).register()
+
+    resumed_metric_scalar = resumed.metric_calls[-1][1]
+    resumed_final_scalar = resumed.tiff_images[-1]
+    assert isinstance(resumed_metric_scalar, FakeImage)
+    assert isinstance(resumed_final_scalar, FakeImage)
+    np.testing.assert_array_equal(resumed_metric_scalar.data, expected_global)
+    np.testing.assert_array_equal(resumed_final_scalar.data, expected_global)
+    assert len(resumed.histogram_match_calls) == 1
+    assert resumed.nonlinear_calls == 0
+
+
 def test_prepared_candidate_is_removed_when_full_request_reuse_raises(
     tmp_path: Path,
 ) -> None:
@@ -586,6 +797,10 @@ def test_local_request_captures_sources_geometries_threads_affine_and_grid(
     assert request.parameters["chunk_size_zyx"] == [8, 8, 8]
     assert request.parameters["image_shape_zyx"] == [16, 8, 8]
     assert request.parameters["overlap_fraction"] == 0.25
+    assert (
+        request.parameters["scalar_postprocessing_policy"]
+        == CHUNKED_SCALAR_POSTPROCESSING_POLICY
+    )
     assert "registration_parameters" in request.parameters
 
 
@@ -907,9 +1122,9 @@ def test_scalar_conversion_failure_cannot_leak_full_candidate(tmp_path: Path) ->
 def test_fresh_full_stage_error_marks_committed_warp_record_stale(
     tmp_path: Path,
 ) -> None:
-    backend = FullHistogramStageErrorBackend()
+    backend = FullMaskStageErrorBackend()
 
-    with pytest.raises(RegistrationStageError, match="full reconstruction"):
+    with pytest.raises(RegistrationStageError, match="full mask reconstruction"):
         make_chunked_registration(tmp_path, backend=backend).register()
 
     warp = round_paths(tmp_path).warp

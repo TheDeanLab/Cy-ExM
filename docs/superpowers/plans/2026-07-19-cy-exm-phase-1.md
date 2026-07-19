@@ -1699,6 +1699,17 @@ registered image. The parent nonlinear lifecycle commits the full-volume warp,
 applies it to masks with nearestNeighbor, and commits the registered TIFF and
 nonlinear metrics exactly once.
 
+> **Scalar-policy correction (2026-07-19):** retain the shared parent artifact
+> lifecycle, but make scalar reconstruction scope explicit. Whole-image mode rebuilds
+> the scalar from the committed full warp and performs one global histogram match.
+> Serial chunk mode carries the locally histogram-matched float32 core stitch returned
+> by `_estimate_nonlinear` through both fresh full-warp commit and full-warp reuse;
+> absence of that prepared scalar is an error, never a reason to fall back globally.
+> Continue reconstructing and thresholding the mask from the committed full warp.
+> Record versioned policy strings on local/full warp, nonlinear-metrics, and final
+> requests. Characterize this with a distribution-sensitive two-chunk RED test,
+> stale-downstream restart, whole-mode control, and legacy-request mismatch.
+
 Extend FakeBackend as FakeChunkBackend in tests/unit/fakes.py. It records
 registered_chunk_ids, raises on the configured fail_chunk, implements array
 conversion with NumPy, and writes valid fake scalar and three-component warp

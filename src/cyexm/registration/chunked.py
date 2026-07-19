@@ -14,7 +14,11 @@ from cyexm.errors import CacheValidationError, ChunkRegistrationError
 from cyexm.registration._native_paths import discard_path
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import RegistrationBackend
-from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
+from cyexm.registration.whole_image import (
+    _SERIAL_CHUNK_SCALAR_POSTPROCESSING_POLICY,
+    ImageRegistration,
+    RegistrationPaths,
+)
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, PixelSize
 
@@ -332,6 +336,7 @@ class ChunkedImageRegistration(ImageRegistration):
         self.chunk_size = _positive_int_triple(chunk_size, "chunk_size")
         self.overlap_fraction = _validated_overlap(overlap_fraction)
         self._nonlinear_mode = "serial-chunked"
+        self._scalar_postprocessing_policy = _SERIAL_CHUNK_SCALAR_POSTPROCESSING_POLICY
         self._prepare_nonlinear_before_reuse = True
 
     def chunk_paths(self, chunk_id: int) -> ChunkPaths:
@@ -513,7 +518,7 @@ class ChunkedImageRegistration(ImageRegistration):
             ),
             "overlap_fraction": self.overlap_fraction,
             "registration_parameters": self._nonlinear_parameters(),
-            "scalar_postprocessing": "histogram-match-to-moving-linear-chunk",
+            "scalar_postprocessing_policy": self._scalar_postprocessing_policy,
         }
         return StageRequest.for_identities(
             stage=f"nonlinear-chunk:{chunk.chunk_id}",

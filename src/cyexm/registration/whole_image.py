@@ -48,6 +48,10 @@ _NONLINEAR_ITERATIONS = {
     "low": (5, 5, 5),
     "dry run": (1, 1, 1),
 }
+_WHOLE_IMAGE_SCALAR_POSTPROCESSING_POLICY = "whole-global-histogram-match-v1"
+_SERIAL_CHUNK_SCALAR_POSTPROCESSING_POLICY = (
+    "serial-chunk-local-histogram-match-core-stitch-v1"
+)
 
 
 def _validated_pixel_size(value: object) -> PixelSize:
@@ -163,6 +167,7 @@ class ImageRegistration:
         self._artifact_store = _artifact_store
         self._log = logger
         self._nonlinear_mode = "whole-image"
+        self._scalar_postprocessing_policy = _WHOLE_IMAGE_SCALAR_POSTPROCESSING_POLICY
         self._nonlinear_request_evidence: dict[str, object] = {}
         self._prepare_nonlinear_before_reuse = False
         self._source_paths: tuple[Path, Path] | None = None
@@ -659,6 +664,15 @@ class ImageRegistration:
                 upstream = FileIdentity.from_path(paths.affine)
             elif stage == "nonlinear-registered":
                 upstream = FileIdentity.from_path(paths.warp)
+            parameters: dict[str, object] = {
+                "moving_geometry": backend.geometry(moving).to_dict(),
+                "sampling": "regular",
+                "sampling_pct": 1.0,
+            }
+            if stage == "nonlinear-registered":
+                parameters["scalar_postprocessing_policy"] = (
+                    self._scalar_postprocessing_policy
+                )
             request = self._request(
                 backend,
                 fixed,
@@ -667,11 +681,7 @@ class ImageRegistration:
                 method="Correlation+MattesMutualInformation",
                 accuracy="full",
                 upstream=upstream,
-                parameters={
-                    "moving_geometry": backend.geometry(moving).to_dict(),
-                    "sampling": "regular",
-                    "sampling_pct": 1.0,
-                },
+                parameters=parameters,
             )
         except RegistrationStageError:
             raise
@@ -820,13 +830,14 @@ class ImageRegistration:
         resolved: ResolvedNativeThreads,
     ) -> tuple[Path, object, object]:
         del affine
+        prepared_scalar: object | None = None
         temporary_warp: Path | None = None
         warp_commit_attempted = False
         warp_committed = False
         try:
             if self._prepare_nonlinear_before_reuse:
                 try:
-                    _candidate_scalar, temporary_warp = self._estimate_nonlinear(
+                    prepared_scalar, temporary_warp = self._estimate_nonlinear(
                         backend,
                         fixed,
                         moving_linear,
@@ -852,7 +863,9 @@ class ImageRegistration:
                     "moving_geometry": backend.geometry(moving_linear).to_dict(),
                     "registration_mode": self._nonlinear_mode,
                     "registration_parameters": self._nonlinear_parameters(),
-                    "scalar_postprocessing": "histogram-match-to-moving-linear",
+                    "scalar_postprocessing_policy": (
+                        self._scalar_postprocessing_policy
+                    ),
                 }
                 parameters.update(self._nonlinear_request_evidence)
                 request = self._request(
@@ -883,6 +896,7 @@ class ImageRegistration:
                                 moving_linear,
                                 moving_linear_mask,
                                 paths.warp,
+                                prepared_scalar=prepared_scalar,
                             )
                         )
                     except Exception as error:
@@ -893,7 +907,7 @@ class ImageRegistration:
                     return paths.warp, moving_nonlinear, moving_nonlinear_mask
 
             if temporary_warp is None:
-                _candidate_scalar, temporary_warp = self._estimate_nonlinear(
+                prepared_scalar, temporary_warp = self._estimate_nonlinear(
                     backend,
                     fixed,
                     moving_linear,
@@ -923,6 +937,7 @@ class ImageRegistration:
                     moving_linear,
                     moving_linear_mask,
                     paths.warp,
+                    prepared_scalar=prepared_scalar,
                 )
             )
         except ChunkRegistrationError:
@@ -951,25 +966,45 @@ class ImageRegistration:
             discard_path(temporary_warp)
         return paths.warp, moving_nonlinear, moving_nonlinear_mask
 
-    @staticmethod
     def _reconstruct_nonlinear_images(
+        self,
         backend: RegistrationBackend,
         fixed: object,
         moving_linear: object,
         moving_linear_mask: object,
         warp_path: Path,
+        *,
+        prepared_scalar: object | None,
     ) -> tuple[object, object]:
-        """Rebuild canonical outputs solely from the committed displacement field."""
-        raw_scalar = backend.apply_warp(
-            fixed=fixed,
-            moving=moving_linear,
-            warp_path=warp_path,
-            interpolation="linear",
-        )
-        scalar = backend.histogram_match(
-            source=raw_scalar,
-            reference=moving_linear,
-        )
+        """Apply the mode's scalar policy and rebuild the committed-warp mask."""
+        if (
+            self._scalar_postprocessing_policy
+            == _WHOLE_IMAGE_SCALAR_POSTPROCESSING_POLICY
+        ):
+            raw_scalar = backend.apply_warp(
+                fixed=fixed,
+                moving=moving_linear,
+                warp_path=warp_path,
+                interpolation="linear",
+            )
+            scalar = backend.histogram_match(
+                source=raw_scalar,
+                reference=moving_linear,
+            )
+        elif (
+            self._scalar_postprocessing_policy
+            == _SERIAL_CHUNK_SCALAR_POSTPROCESSING_POLICY
+        ):
+            if prepared_scalar is None:
+                raise RuntimeError(
+                    "serial chunk scalar policy requires a prepared local core stitch"
+                )
+            scalar = prepared_scalar
+        else:
+            raise RuntimeError(
+                "unsupported nonlinear scalar postprocessing policy: "
+                f"{self._scalar_postprocessing_policy}"
+            )
         raw_mask = backend.apply_warp(
             fixed=fixed,
             moving=moving_linear_mask,
@@ -1020,6 +1055,9 @@ class ImageRegistration:
                     "format": "uint16-tiff",
                     "minimum": minimum,
                     "maximum": maximum,
+                    "scalar_postprocessing_policy": (
+                        self._scalar_postprocessing_policy
+                    ),
                 },
             )
         except RegistrationStageError:

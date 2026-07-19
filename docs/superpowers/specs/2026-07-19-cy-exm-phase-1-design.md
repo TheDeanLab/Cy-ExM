@@ -365,6 +365,17 @@ The initial implementation remains serial. This provides a trusted numerical
 reference for any future chunk-parallel design and avoids nested multiprocessing
 inside future Dask round workers.
 
+**Scalar-policy correction (2026-07-19):** histogram matching is distribution
+sensitive. Whole-image registration reconstructs its scalar from the committed full
+warp and performs one global match. Serial chunking instead preserves the scalar
+prepared by its estimation hook: each committed local warp is applied, matched to
+that local affine-moving chunk, validated and converted at the core to float32, then
+stitched. Fresh full-warp commit and full-warp reuse use that same prepared stitch;
+they never add a global match. The mask remains reconstructed and thresholded from
+the committed full warp. Explicit versioned policy strings are part of the full
+warp, nonlinear metrics, final TIFF, and local-warp cache requests so records created
+under the incorrect scope fail closed.
+
 A future chunk-parallel implementation must pass an independent acceptance gate:
 
 - numerical agreement with the serial reference;

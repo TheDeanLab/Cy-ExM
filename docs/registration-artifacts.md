@@ -46,6 +46,23 @@ full displacement field stitched from all local chunk cores; it is not an alias 
 local warp. Registered scalar chunk data is reconstructed from each committed local
 warp and stitched in memory. There are no standalone scalar chunk cache files.
 
+Scalar reconstruction is an explicit, versioned part of the request:
+
+- whole-image registration uses
+  `whole-global-histogram-match-v1`: apply the committed full warp to the affine
+  scalar, then perform one histogram match against the full affine moving image;
+- serial chunk registration uses
+  `serial-chunk-local-histogram-match-core-stitch-v1`: apply each committed local
+  warp, histogram-match against that chunk's affine moving distribution, convert the
+  validated core to float32, and stitch the cores without a second global match.
+
+Histogram matching depends on the reference intensity distribution, so matching
+each local distribution and then stitching is not generally equivalent to stitching
+the warped volume and matching once globally. Preserving this ordering is therefore
+a scientific requirement, not merely an output-format choice. In both modes, the
+nonlinear mask is independently reconstructed from the committed full warp with
+nearest-neighbor interpolation and thresholding at 0.5.
+
 ## Completion record contents
 
 Every `<name>.complete.json` uses `schema_version: 1` and contains:
@@ -83,6 +100,11 @@ record. Payload schema version 2 records
 `image_shape_zyx`, `chunk_size_zyx`, `overlap_fraction`, ordered chunk bounds, and
 each local warp identity.
 
+The effective `scalar_postprocessing_policy` is recorded in the full nonlinear-warp,
+nonlinear-registered metrics, and registered-image requests. Every serial local-warp
+request records the same serial policy. This binds a scalar descendant to the exact
+distribution scope and operation ordering used to produce it.
+
 `request.geometry.shape`, chunk shapes, TIFF arrays, and crop bounds use external
 ZYX order. Origin, spacing, direction, ANTs indexes, and displacement component
 values remain physical XYZ. The convention version deliberately prevents completion
@@ -114,6 +136,12 @@ An artifact without its completion record, a record without its artifact, corrup
 JSON, changed input metadata, changed geometry, changed registration policy, changed
 thread settings, or an unreadable artifact raises a focused cache-validation error.
 Cy-ExM does not guess whether such an entry is safe.
+
+Completion records made before the versioned scalar policy was introduced fail this
+exact-request check. This intentionally invalidates serial outputs that may have been
+reconstructed with an extra full-volume histogram match. Rerun with `--force` (or
+`force_override=True`) to migrate those artifacts; do not edit completion JSON to
+claim the new policy.
 
 The `transform_directory.ipynb` example applies the same minimum evidence rule before
 reading crop bounds or applying an existing transform: each supplied affine,
@@ -169,3 +197,8 @@ reported complete. Rerun the same serial chunk command: valid earlier local warp
 reopened and applied, and work resumes at the first missing or stale chunk. A changed
 chunk size or overlap is a different request and is rejected unless recomputed
 intentionally.
+
+If only nonlinear metrics or the final TIFF are stale, serial restart reopens every
+valid local warp, reconstructs the same locally matched float32 core stitch, reuses
+the valid full warp, and rebuilds only the stale descendants. It never substitutes a
+global histogram match during full-warp reuse.

@@ -53,6 +53,36 @@ committed-artifact reads, and TIFF output. This is an application-and-persistenc
 equivalence check for one genuinely estimated pair; it does not claim that two
 independent optimizer runs converge to identical transforms.
 
+## Multichunk scalar-policy correction
+
+The one-chunk check had a specific blind spot: one local reference distribution is
+also the full-volume reference distribution, so it cannot distinguish local
+histogram matching followed by core stitching from a later global histogram match.
+The original fake backend compounded that blind spot by adding the same constant for
+every histogram call. Inspection of pinned ClearEx
+`src/clearex/registration/__init__.py` confirms that its fresh serial-estimation path
+writes each locally matched `updated_chunk` core directly into `registered_image`.
+Its transform-only reuse path does not consistently repeat that local matching.
+Cy-ExM intentionally makes the local stitch canonical on restart so fresh and reused
+artifacts cannot represent different scalar policies.
+
+A deterministic two-chunk characterization now makes the histogram result equal to
+the mean of its reference distribution. The expected local stitch has plateau values
+`355.5` and `867.5`; the hypothetical global reconstruction is uniformly `611.5`,
+for a maximum absolute difference of `256`. The test requires the nonlinear metric
+scalar and final TIFF input to equal the exact local float32 core stitch on both a
+fresh full-warp commit and a restart with stale downstream artifacts. It also proves
+that both local warps and the full warp are reused, exactly two local histogram calls
+occur, no full-volume scalar histogram call occurs, and the mask is still rebuilt
+from the committed full warp.
+
+Whole-image registration remains separately characterized as one committed-full-warp
+reconstruction plus one global match, identical fresh and reused. Completion records
+now name these scopes as `whole-global-histogram-match-v1` and
+`serial-chunk-local-histogram-match-core-stitch-v1`. This deterministic orchestration
+correction supplements the eight historical native-parity categories above; it does
+not alter their recorded totals.
+
 ## Literal dry-run characterization
 
 This report does **not** relabel the matched-low gate as dry-run parity. The baseline

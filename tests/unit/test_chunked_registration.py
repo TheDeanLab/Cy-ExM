@@ -186,6 +186,43 @@ def test_full_candidate_cleanup_oserror_does_not_fail_registration(
             original_unlink(candidate, missing_ok=True)
 
 
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        pytest.param(
+            KeyboardInterrupt("injected candidate interruption"),
+            id="keyboard-interrupt",
+        ),
+        pytest.param(SystemExit("injected candidate exit"), id="system-exit"),
+    ],
+)
+def test_full_candidate_interruption_removes_exact_materialized_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: BaseException,
+) -> None:
+    backend = FakeChunkBackend()
+    original_read_warp = backend.read_warp
+
+    def interrupt_after_materialization(path: Path) -> object:
+        if path.name.startswith(".chunked-full-warp-"):
+            assert path.is_file()
+            raise interruption
+        return original_read_warp(path)
+
+    monkeypatch.setattr(backend, "read_warp", interrupt_after_materialization)
+
+    with pytest.raises(type(interruption)) as error:
+        make_chunked_registration(tmp_path, backend=backend).register()
+
+    assert error.value is interruption
+    assert len(backend.written_warp_paths) == 1
+    candidate = backend.written_warp_paths[0]
+    assert candidate.name.startswith(".chunked-full-warp-")
+    assert not candidate.exists()
+    assert not list(candidate.parent.glob(".chunked-full-warp-*.nii.gz"))
+
+
 def test_chunk_failure_propagates_without_final_success(tmp_path: Path) -> None:
     backend = FakeChunkBackend(fail_chunk=1)
     registration = make_chunked_registration(tmp_path, backend=backend)

@@ -766,7 +766,7 @@ class ChunkedImageRegistration(ImageRegistration):
                 raise ValueError("assembled warp dtype must be exactly float32")
             if not bool(np.isfinite(array).all()):
                 raise ValueError("assembled warp values must all be finite")
-        except Exception:
+        except BaseException:
             discard_path(candidate)
             raise
         return candidate

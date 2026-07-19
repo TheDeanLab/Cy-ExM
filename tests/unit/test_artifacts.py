@@ -25,6 +25,7 @@ def make_request(
     accuracy: str = "low",
     *,
     parameters: dict[str, object] | None = None,
+    upstream: FileIdentity | None = None,
 ) -> StageRequest:
     return StageRequest.for_files(
         stage="affine",
@@ -42,7 +43,7 @@ def make_request(
         method="TRSAA",
         accuracy=accuracy,
         native_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1},
-        upstream=None,
+        upstream=upstream,
         parameters=(
             {"metric": "mattes", "sampling": [0.2, 0.1]}
             if parameters is None
@@ -309,6 +310,72 @@ def test_malformed_completion_record_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(CacheValidationError, match="completion record"):
         store.reuse(artifact, make_request(source), Path.read_bytes)
+
+
+@pytest.mark.parametrize(
+    ("location", "add_unknown_field"),
+    [
+        pytest.param(
+            "completion record",
+            lambda payload: payload.__setitem__("unexpected", True),
+            id="completion-record",
+        ),
+        pytest.param(
+            "request",
+            lambda payload: payload["request"].__setitem__("unexpected", True),
+            id="request",
+        ),
+        pytest.param(
+            "input identity",
+            lambda payload: payload["request"]["inputs"][0].__setitem__(
+                "unexpected", True
+            ),
+            id="input-identity",
+        ),
+        pytest.param(
+            "upstream identity",
+            lambda payload: payload["request"]["upstream"].__setitem__(
+                "unexpected", True
+            ),
+            id="upstream-identity",
+        ),
+        pytest.param(
+            "artifact identity",
+            lambda payload: payload["artifact"].__setitem__("unexpected", True),
+            id="artifact-identity",
+        ),
+    ],
+)
+def test_reuse_rejects_unknown_completion_schema_fields(
+    tmp_path: Path,
+    location: str,
+    add_unknown_field: Callable[[dict[str, Any]], None],
+) -> None:
+    source = tmp_path / "moving.tif"
+    source.write_bytes(b"source")
+    upstream = tmp_path / "linear_transform_1.mat"
+    upstream.write_bytes(b"upstream")
+    artifact = tmp_path / "linear_transform_2.mat"
+    store = ArtifactStore()
+    request = make_request(source, upstream=FileIdentity.from_path(upstream))
+    store.commit(
+        artifact,
+        request,
+        writer=write_bytes(b"affine"),
+        validator=lambda path: True,
+    )
+    record_path = store.record_path(artifact)
+    payload: dict[str, Any] = json.loads(record_path.read_text(encoding="utf-8"))
+    add_unknown_field(payload)
+    record_path.write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CacheValidationError, match="completion record") as error:
+        store.reuse(artifact, request, Path.read_bytes)
+
+    assert location in str(error.value.__cause__)
 
 
 @pytest.mark.parametrize(

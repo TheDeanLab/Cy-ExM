@@ -15,6 +15,21 @@ from cyexm.spatial import ImageGeometry
 type JsonScalar = None | bool | int | float | str
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 
+_FILE_IDENTITY_KEYS = frozenset({"path", "st_size", "st_mtime_ns"})
+_STAGE_REQUEST_KEYS = frozenset(
+    {
+        "stage",
+        "inputs",
+        "geometry",
+        "method",
+        "accuracy",
+        "native_threads",
+        "upstream",
+        "parameters",
+    }
+)
+_COMPLETION_RECORD_KEYS = frozenset({"schema_version", "request", "artifact"})
+
 
 def _json_value(value: object) -> JsonValue:
     if value is None or isinstance(value, bool | int | str):
@@ -50,6 +65,15 @@ def _mapping(value: object, name: str) -> Mapping[str, Any]:
     return value
 
 
+def _require_exact_keys(
+    payload: Mapping[str, Any],
+    expected: frozenset[str],
+    name: str,
+) -> None:
+    if set(payload) != expected:
+        raise ValueError(f"{name} keys must be exactly: {', '.join(sorted(expected))}")
+
+
 def _integer(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be an integer")
@@ -80,7 +104,13 @@ class FileIdentity:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> Self:
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        name: str = "file identity",
+    ) -> Self:
+        _require_exact_keys(payload, _FILE_IDENTITY_KEYS, name)
         path = payload["path"]
         if not isinstance(path, str):
             raise TypeError("path must be a string")
@@ -140,6 +170,7 @@ class StageRequest:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> Self:
+        _require_exact_keys(payload, _STAGE_REQUEST_KEYS, "request")
         inputs = payload["inputs"]
         if not isinstance(inputs, list):
             raise TypeError("inputs must be a JSON array")
@@ -150,7 +181,9 @@ class StageRequest:
         return cls(
             stage=_string(payload["stage"], "stage"),
             inputs=tuple(
-                FileIdentity.from_dict(_mapping(item, "input identity"))
+                FileIdentity.from_dict(
+                    _mapping(item, "input identity"), name="input identity"
+                )
                 for item in inputs
             ),
             geometry=ImageGeometry.from_dict(geometry),
@@ -163,7 +196,9 @@ class StageRequest:
             upstream=(
                 None
                 if upstream is None
-                else FileIdentity.from_dict(_mapping(upstream, "upstream"))
+                else FileIdentity.from_dict(
+                    _mapping(upstream, "upstream"), name="upstream identity"
+                )
             ),
             parameters=_json_mapping(parameters),
         )
@@ -209,10 +244,13 @@ class CompletionRecord:
     def read(cls, path: Path) -> Self:
         payload = json.loads(path.read_text(encoding="utf-8"))
         record = _mapping(payload, "completion record")
+        _require_exact_keys(record, _COMPLETION_RECORD_KEYS, "completion record")
         return cls(
             schema_version=_integer(record["schema_version"], "schema_version"),
             request=StageRequest.from_dict(_mapping(record["request"], "request")),
-            artifact=FileIdentity.from_dict(_mapping(record["artifact"], "artifact")),
+            artifact=FileIdentity.from_dict(
+                _mapping(record["artifact"], "artifact"), name="artifact identity"
+            ),
         )
 
 

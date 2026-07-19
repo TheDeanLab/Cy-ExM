@@ -9,10 +9,21 @@
   `2311a873b783477add7391ff00245f76490147f0`. Never edit that source repository or
   add a runtime dependency on ClearEx, and retain its academic-use `LICENSE.md`
   exactly.
-- Phase 1 contains whole-image and serial chunked registration only. Do not add Dask,
-  distributed execution, SLURM integration, YAML workflow configuration, chunk
-  multiprocessing, `ParallelChunkedImageRegistration`,
-  `clearex.registration.pipeline`, or `clearex.registration.tre`.
+- Phase 1 is the current stable runtime: whole-image and serial chunked registration,
+  restart-safe artifacts, strict geometry/TIFF boundaries, and configurable native
+  threads. Preserve that API and its acceptance evidence while Phase 2 is designed.
+- Do not add Phase 2 runtime code, dependencies, or public APIs until a dedicated
+  Phase 2 runtime design and implementation plan are approved. This gate covers YAML
+  scientific dataset manifests, execution profiles, Dask/distributed execution,
+  dask-jobqueue/SLURM integration, and new workflow CLIs.
+- Scientific dataset manifests describe rounds, channels, registration inputs, voxel
+  spacing, and scientific choices; machine-specific local or HPC settings belong in
+  separate execution profiles. The Phase 1 artifact store remains the only restart
+  authority, and the serial chunk workflow remains the numerical reference. Do not
+  introduce nested chunk multiprocessing, a Dask chunk graph, or
+  `ParallelChunkedImageRegistration` inside round-level tasks by default.
+- `clearex.registration.pipeline` and `clearex.registration.tre` remain out of scope;
+  do not recreate unrelated ClearEx surfaces in this repository.
 - Child `AGENTS.md` files add scope-specific guidance and inherit, rather than repeat,
   rules from their ancestors.
 
@@ -57,8 +68,8 @@ registration run or its output directory.
 Run targeted tests first, then the relevant portable gates:
 
 ```bash
-uv lock
-uv sync --group dev --extra examples
+uv lock --check
+uv sync --locked --group dev --extra examples
 uv run pytest -m "unit and not hpc" tests/unit -v
 uv run pytest -m "integration and not hpc" tests/integration -v
 uv run ruff check .
@@ -66,6 +77,9 @@ uv run ruff format --check .
 uv run basedpyright
 uv run pre-commit run --all-files
 ```
+
+Run bare `uv lock` only when an approved dependency change intentionally regenerates
+`uv.lock`; inspect and commit that lockfile change with the dependency edit.
 
 Tests marked `hpc` require an explicit lab-storage or cluster allocation and are not
 part of portable CI.

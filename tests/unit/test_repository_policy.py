@@ -23,6 +23,10 @@ def _read_repository_file(path: str) -> str:
     return (REPOSITORY_ROOT / path).read_text(encoding="utf-8")
 
 
+def _normalized_repository_file(path: str) -> str:
+    return " ".join(_read_repository_file(path).split()).lower()
+
+
 def _load_yaml(path: str, *, github_actions: bool = False) -> object:
     loader = yaml.BaseLoader if github_actions else yaml.SafeLoader
     return yaml.load(_read_repository_file(path), Loader=loader)
@@ -122,6 +126,25 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
     workflow = _read_repository_file(".github/workflows/ci.yml").lower()
     for forbidden in ("clearex", "dask", "slurm", "/archive", "/project"):
         assert forbidden not in workflow
+
+
+def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
+    root = _normalized_repository_file("AGENTS.md")
+    for required in (
+        "phase 1 is the current stable runtime",
+        "dedicated phase 2 runtime design and implementation plan",
+        "scientific dataset manifests",
+        "execution profiles",
+        "serial chunk workflow remains",
+        "nested chunk multiprocessing",
+        "uv lock --check",
+        "uv sync --locked --group dev --extra examples",
+    ):
+        assert required in root
+
+    root_lines = set(_read_repository_file("AGENTS.md").splitlines())
+    assert "uv lock" not in root_lines
+    assert "uv sync --group dev --extra examples" not in root_lines
 
 
 def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> None:

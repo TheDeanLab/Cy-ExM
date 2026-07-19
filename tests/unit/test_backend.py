@@ -232,10 +232,10 @@ def test_from_array_preserves_reference_geometry_and_components(
     assert result.has_components is True
 
 
-def test_crop_image_applies_zyx_bounds_and_updates_xyz_origin(
+def test_crop_image_passes_zyx_start_directly_to_ants_physical_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    install_fake_ants(monkeypatch, "cyexm.registration.backend")
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.backend")
     data = np.arange(6 * 7 * 8, dtype=np.float32).reshape(6, 7, 8)
     image = fake_image(
         data=data,
@@ -247,7 +247,8 @@ def test_crop_image_applies_zyx_bounds_and_updates_xyz_origin(
     cropped = AntsRegistrationBackend().crop_image(image, (1, 5, 2, 6, 3, 7))
 
     np.testing.assert_array_equal(cropped.numpy(), data[1:5, 2:6, 3:7])
-    assert cropped.origin == (8.0, 21.5, 32.0)
+    assert calls.index_to_physical_calls == [(image, (1, 2, 3))]
+    assert cropped.origin == (8.0, 20.5, 36.0)
     assert cropped.spacing == image.spacing
     assert cropped.direction == image.direction
 

@@ -58,6 +58,7 @@ class FakeImage:
     ] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
     has_components: bool = False
     applied_interpolations: list[str] = field(default_factory=list)
+    index_to_physical_calls: list[tuple[int, int, int]] = field(default_factory=list)
 
     @property
     def dimension(self) -> int:
@@ -88,6 +89,22 @@ class FakeImage:
             direction=self.direction,
             has_components=self.has_components,
         )
+
+    def index_to_physical_point(
+        self, index: tuple[int, int, int]
+    ) -> tuple[float, float, float]:
+        self.index_to_physical_calls.append(index)
+        scaled = tuple(
+            coordinate * spacing
+            for coordinate, spacing in zip(index, self.spacing, strict=True)
+        )
+        offset = tuple(
+            sum(self.direction[row][column] * scaled[column] for column in range(3))
+            for row in range(3)
+        )
+        return tuple(
+            base + delta for base, delta in zip(self.origin, offset, strict=True)
+        )  # type: ignore[return-value]
 
     def apply_to_image(
         self,
@@ -144,6 +161,9 @@ class FakeAntsCalls:
     write_transform_path: str | None = None
     write_transform_value: object | None = None
     from_numpy_calls: list[dict[str, object]] = field(default_factory=list)
+    index_to_physical_calls: list[tuple[object, tuple[int, int, int]]] = field(
+        default_factory=list
+    )
     events: list[str] = field(default_factory=list)
 
 
@@ -185,6 +205,7 @@ class FakeBackend:
     fail_tiff_role: str | None = None
     fail_crop_image: bool = False
     fail_metrics: bool = False
+    fail_scalar_from_array: bool = False
     affine_bytes: bytes = b"affine-fake"
     warp_bytes: bytes = b"warp-fake"
     metric_values: dict[str, float] = field(
@@ -312,6 +333,8 @@ class FakeBackend:
         source = reference
         if not isinstance(source, FakeImage):
             raise TypeError("reference must be a FakeImage")
+        if self.fail_scalar_from_array and not has_components:
+            raise RuntimeError("injected scalar array conversion failure")
         return fake_image(
             data=np.asarray(array),
             origin=source.origin,
@@ -332,18 +355,7 @@ class FakeBackend:
         if self.fail_crop_image:
             raise RuntimeError("injected crop application failure")
         z0, z1, y0, y1, x0, x1 = bounds_zyx
-        start_xyz = (x0, y0, z0)
-        scaled = tuple(
-            start * spacing
-            for start, spacing in zip(start_xyz, source.spacing, strict=True)
-        )
-        offset = tuple(
-            sum(source.direction[row][column] * scaled[column] for column in range(3))
-            for row in range(3)
-        )
-        origin = tuple(
-            base + delta for base, delta in zip(source.origin, offset, strict=True)
-        )
+        origin = source.index_to_physical_point((z0, y0, x0))
         return fake_image(
             data=source.data[z0:z1, y0:y1, x0:x1],
             origin=origin,
@@ -527,6 +539,9 @@ class FakeChunkBackend(FakeBackend):
     missing_warp_chunk: int | None = None
     invalid_warp_chunk: int | None = None
     invalid_scalar_chunk: int | None = None
+    overflow_scalar_chunk: int | None = None
+    overflow_warp_chunk: int | None = None
+    full_warp_float64: bool = False
     warp_origin_delta: float = 0.0
     chunk_depth: int = 8
     fixed_image: FakeImage = field(
@@ -544,10 +559,12 @@ class FakeChunkBackend(FakeBackend):
     written_warp_paths: list[Path] = field(default_factory=list)
 
     def _chunk_id(self, image: FakeImage) -> int:
-        spacing_z = image.spacing[2]
+        spacing_z = image.spacing[0]
         if spacing_z <= 0.0:
             raise ValueError("spacing must be positive")
-        z_start = round((image.origin[2] - self.fixed_image.origin[2]) / spacing_z)
+        physical_offset = np.asarray(image.origin) - np.asarray(self.fixed_image.origin)
+        scaled_index = np.linalg.solve(np.asarray(image.direction), physical_offset)
+        z_start = round(float(scaled_index[0]) / spacing_z)
         return int(z_start // self.chunk_depth)
 
     @staticmethod
@@ -643,8 +660,19 @@ class FakeChunkBackend(FakeBackend):
             for row in decoded["direction"]  # type: ignore[union-attr]
         )
         components = int(decoded["components"])  # type: ignore[arg-type]
+        chunk_id = decoded.get("chunk_id")
+        dtype = (
+            np.float64 if chunk_id is None and self.full_warp_float64 else np.float32
+        )
+        value = 0.0
+        if (
+            self.overflow_warp_chunk is not None
+            and chunk_id == self.overflow_warp_chunk
+        ):
+            dtype = np.float64
+            value = np.finfo(np.float64).max
         return fake_image(
-            data=np.zeros((*shape, components), dtype=np.float32),
+            data=np.full((*shape, components), value, dtype=dtype),
             origin=origin,  # type: ignore[arg-type]
             spacing=spacing,  # type: ignore[arg-type]
             direction=direction,  # type: ignore[arg-type]
@@ -669,7 +697,21 @@ class FakeChunkBackend(FakeBackend):
             raise TypeError("transformed image must be a FakeImage")
         decoded = self._decoded_warp(warp_path.read_bytes())
         chunk_id = None if decoded is None else decoded.get("chunk_id")
-        if interpolation == "linear" and chunk_id == self.invalid_scalar_chunk:
+        if (
+            interpolation == "linear"
+            and self.overflow_scalar_chunk is not None
+            and chunk_id == self.overflow_scalar_chunk
+        ):
+            transformed.data = np.full(
+                transformed.shape,
+                np.finfo(np.float64).max,
+                dtype=np.float64,
+            )
+        if (
+            interpolation == "linear"
+            and self.invalid_scalar_chunk is not None
+            and chunk_id == self.invalid_scalar_chunk
+        ):
             transformed.data = transformed.data[:-1]
         return transformed
 
@@ -822,6 +864,14 @@ def install_fake_ants(
         source = image.numpy()  # type: ignore[attr-defined]
         return fake_image(data=np.ones(source.shape[:3], dtype=np.float32))
 
+    def transform_index_to_physical_point(
+        image: object, index: tuple[int, int, int]
+    ) -> tuple[float, float, float]:
+        if not isinstance(image, FakeImage):
+            raise TypeError("image must be a FakeImage")
+        calls.index_to_physical_calls.append((image, index))
+        return image.index_to_physical_point(index)
+
     fake_ants = SimpleNamespace(
         registration=registration,
         read_transform=read_transform,
@@ -834,6 +884,7 @@ def install_fake_ants(
         write_transform=write_transform,
         from_numpy=from_numpy,
         get_mask=get_mask,
+        transform_index_to_physical_point=transform_index_to_physical_point,
     )
 
     def scientific_runtime() -> tuple[object, object]:

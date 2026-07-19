@@ -10,7 +10,7 @@ from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Self
 
-from cyexm.errors import ChunkRegistrationError
+from cyexm.errors import CacheValidationError, ChunkRegistrationError
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import RegistrationBackend
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
@@ -326,6 +326,8 @@ class ChunkedImageRegistration(ImageRegistration):
         )
         self.chunk_size = _positive_int_triple(chunk_size, "chunk_size")
         self.overlap_fraction = _validated_overlap(overlap_fraction)
+        self._nonlinear_mode = "serial-chunked"
+        self._prepare_nonlinear_before_reuse = True
 
     def chunk_paths(self, chunk_id: int) -> ChunkPaths:
         return ChunkPaths.for_chunk(
@@ -333,6 +335,9 @@ class ChunkedImageRegistration(ImageRegistration):
             self.imaging_round,
             chunk_id,
         )
+
+    def _manifest_path(self) -> Path:
+        return self.chunk_paths(0).directory / "manifest.json"
 
     @staticmethod
     def _chunk_dict(chunk: ChunkInfo) -> dict[str, int]:
@@ -416,6 +421,33 @@ class ChunkedImageRegistration(ImageRegistration):
             )
         )
 
+    @staticmethod
+    def _float32_core(
+        np: Any,
+        array: Any,
+        chunk: ChunkInfo,
+        role: str,
+    ) -> Any:
+        extended_shape = _array_shape(array, f"{role} extended chunk")
+        components = extended_shape[3:]
+        expected_extended = (*chunk.extended_shape, *components)
+        if extended_shape != expected_extended:
+            raise ValueError(
+                f"{role} extended chunk shape {extended_shape} "
+                f"does not match {expected_extended}"
+            )
+        core = array[chunk.core_within_extended]
+        expected_core = (*chunk.core_shape, *components)
+        if _array_shape(core, f"{role} core") != expected_core:
+            raise ValueError(f"{role} core shape does not match {expected_core}")
+        with np.errstate(over="ignore", invalid="ignore"):
+            converted = np.asarray(core, dtype=np.float32)
+        if not bool(np.isfinite(converted).all()):
+            raise ValueError(
+                f"{role} core values must remain finite after float32 conversion"
+            )
+        return converted
+
     def _local_request(
         self,
         backend: RegistrationBackend,
@@ -474,7 +506,9 @@ class ChunkedImageRegistration(ImageRegistration):
         chunk: ChunkInfo,
         request: StageRequest,
         low_variance: bool,
-    ) -> Any:
+        *,
+        require_existing: bool,
+    ) -> tuple[Any, bool]:
         paths = self.chunk_paths(chunk.chunk_id)
         paths.directory.mkdir(parents=True, exist_ok=True)
         expected_geometry = backend.geometry(fixed_chunk)
@@ -486,7 +520,11 @@ class ChunkedImageRegistration(ImageRegistration):
         if not self.force_override:
             cached = self._store().reuse(paths.warp, request, reader)
         if cached is not None:
-            return cached[1]
+            return cached[1], False
+        if require_existing:
+            raise CacheValidationError(
+                f"Required local chunk cache entry is missing: {paths.warp}"
+            )
 
         if low_variance:
 
@@ -501,7 +539,7 @@ class ChunkedImageRegistration(ImageRegistration):
                 moving_mask=moving_mask_chunk,
                 registration_type=self.nonlinear_type,
                 accuracy=self.nonlinear_accuracy,
-                verbose=False,
+                verbose=True,
             )
             reader(temporary_warp)
 
@@ -516,7 +554,12 @@ class ChunkedImageRegistration(ImageRegistration):
             return True
 
         self._store().commit(paths.warp, request, writer, validator)
-        return reader(paths.warp)[1]
+        try:
+            committed = reader(paths.warp)[1]
+        except Exception:
+            self._store().mark_stale(paths.warp)
+            raise
+        return committed, True
 
     def _reconstruct_local_images(
         self,
@@ -601,9 +644,10 @@ class ChunkedImageRegistration(ImageRegistration):
         native_threads: dict[str, int],
         affine_identity: FileIdentity,
         warp_identities: tuple[FileIdentity, ...],
-    ) -> None:
-        directory = self.chunk_paths(0).directory
-        path = directory / "manifest.json"
+        *,
+        require_existing: bool,
+    ) -> FileIdentity:
+        path = self._manifest_path()
         payload = self._manifest_payload(chunks, image_shape, warp_identities)
         text = self._canonical_json(payload)
         request = StageRequest.for_files(
@@ -638,7 +682,11 @@ class ChunkedImageRegistration(ImageRegistration):
         if not self.force_override:
             cached = self._store().reuse(path, request, reader)
             if cached is not None:
-                return
+                return FileIdentity.from_path(path)
+            if require_existing:
+                raise CacheValidationError(
+                    f"Required chunk manifest cache entry is missing: {path}"
+                )
 
         def writer(destination: Path) -> None:
             destination.write_text(text, encoding="utf-8")
@@ -649,6 +697,7 @@ class ChunkedImageRegistration(ImageRegistration):
             writer=writer,
             validator=lambda candidate: reader(candidate) == payload,
         )
+        return FileIdentity.from_path(path)
 
     def _write_full_candidate_warp(
         self,
@@ -678,6 +727,8 @@ class ChunkedImageRegistration(ImageRegistration):
             array = np.asarray(backend.to_array(read))
             if array.shape != (*image_shape, 3):
                 raise ValueError("assembled warp must have shape (z, y, x, 3)")
+            if array.dtype != np.dtype(np.float32):
+                raise ValueError("assembled warp dtype must be exactly float32")
             if not bool(np.isfinite(array).all()):
                 raise ValueError("assembled warp values must all be finite")
         except Exception:
@@ -693,6 +744,7 @@ class ChunkedImageRegistration(ImageRegistration):
         fixed_mask: object,
         moving_linear_mask: object,
     ) -> tuple[object, Path]:
+        self._nonlinear_request_evidence = {}
         resolved = configure_native_threads(self.native_threads)
         np = _scientific_runtime()
         fixed_geometry = backend.geometry(fixed)
@@ -733,6 +785,15 @@ class ChunkedImageRegistration(ImageRegistration):
                 Path(self.save_directory), self.imaging_round
             ).affine
         )
+        round_paths = RegistrationPaths.for_round(
+            Path(self.save_directory), self.imaging_round
+        )
+        full_record = self._store().record_path(round_paths.warp)
+        full_stale = self._store().stale_path(round_paths.warp)
+        require_existing_evidence = not self.force_override and (
+            full_record.exists()
+            or (round_paths.warp.exists() and not full_stale.exists())
+        )
 
         for chunk in chunks:
             try:
@@ -766,7 +827,7 @@ class ChunkedImageRegistration(ImageRegistration):
                     dict(resolved.values),
                     affine_identity,
                 )
-                warp_array = self._load_or_commit_local_warp(
+                warp_array, freshly_committed = self._load_or_commit_local_warp(
                     np,
                     backend,
                     fixed_chunk,
@@ -776,17 +837,31 @@ class ChunkedImageRegistration(ImageRegistration):
                     chunk,
                     request,
                     low_variance,
+                    require_existing=require_existing_evidence,
                 )
-                scalar_array = self._reconstruct_local_images(
-                    np,
-                    backend,
-                    fixed_chunk,
-                    moving_chunk,
-                    moving_mask_chunk,
-                    chunk,
-                )
-                stitch_core(registered, scalar_array, chunk)
-                stitch_core(displacement, warp_array, chunk)
+                if freshly_committed:
+                    self._store().mark_stale(self._manifest_path())
+                try:
+                    scalar_array = self._reconstruct_local_images(
+                        np,
+                        backend,
+                        fixed_chunk,
+                        moving_chunk,
+                        moving_mask_chunk,
+                        chunk,
+                    )
+                    scalar_core = self._float32_core(
+                        np, scalar_array, chunk, "registered scalar"
+                    )
+                    warp_core = self._float32_core(
+                        np, warp_array, chunk, "displacement warp"
+                    )
+                    registered[chunk.core_slices] = scalar_core
+                    displacement[chunk.core_slices] = warp_core
+                except Exception:
+                    if freshly_committed:
+                        self._store().mark_stale(self.chunk_paths(chunk.chunk_id).warp)
+                    raise
             except Exception as error:
                 raise ChunkRegistrationError(chunk.chunk_id, str(error)) from error
 
@@ -794,7 +869,7 @@ class ChunkedImageRegistration(ImageRegistration):
             FileIdentity.from_path(self.chunk_paths(chunk.chunk_id).warp)
             for chunk in chunks
         )
-        self._commit_manifest(
+        manifest_identity = self._commit_manifest(
             backend,
             fixed,
             chunks,
@@ -802,7 +877,16 @@ class ChunkedImageRegistration(ImageRegistration):
             dict(resolved.values),
             affine_identity,
             warp_identities,
+            require_existing=require_existing_evidence,
         )
+        self._nonlinear_request_evidence = {
+            "chunk_grid": [self._chunk_dict(chunk) for chunk in chunks],
+            "chunk_manifest": manifest_identity.to_dict(),
+            "chunk_size_zyx": self.chunk_size,
+            "local_warps": [identity.to_dict() for identity in warp_identities],
+            "overlap_fraction": self.overlap_fraction,
+        }
+        registered_image = backend.from_array(registered, reference=fixed)
         candidate = self._write_full_candidate_warp(
             np,
             backend,
@@ -810,7 +894,7 @@ class ChunkedImageRegistration(ImageRegistration):
             displacement,
             image_shape,
         )
-        return backend.from_array(registered, reference=fixed), candidate
+        return registered_image, candidate
 
 
 __all__ = [

@@ -10,7 +10,11 @@ from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
-from cyexm.errors import ChunkRegistrationError, RegistrationStageError
+from cyexm.errors import (
+    CacheValidationError,
+    ChunkRegistrationError,
+    RegistrationStageError,
+)
 from cyexm.io.images import Bounds3D, robust_bounding_box
 from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
@@ -152,6 +156,9 @@ class ImageRegistration:
         self._backend = _backend
         self._artifact_store = _artifact_store
         self._log = logger
+        self._nonlinear_mode = "whole-image"
+        self._nonlinear_request_evidence: dict[str, object] = {}
+        self._prepare_nonlinear_before_reuse = False
 
     def register(self) -> None:
         resolved = configure_native_threads(self.native_threads)
@@ -668,59 +675,90 @@ class ImageRegistration:
         resolved: ResolvedNativeThreads,
     ) -> tuple[Path, object, object]:
         del affine
+        temporary_warp: Path | None = None
+        prepared_candidate = False
+        warp_commit_attempted = False
+        warp_committed = False
         try:
-            affine_identity = FileIdentity.from_path(paths.affine)
-            request = self._request(
-                backend,
-                fixed,
-                resolved,
-                stage="nonlinear",
-                method=self.nonlinear_type,
-                accuracy=self.nonlinear_accuracy,
-                upstream=affine_identity,
-                parameters={
+            if self._prepare_nonlinear_before_reuse:
+                try:
+                    _candidate_scalar, temporary_warp = self._estimate_nonlinear(
+                        backend,
+                        fixed,
+                        moving_linear,
+                        fixed_mask,
+                        moving_linear_mask,
+                    )
+                    prepared_candidate = True
+                except (
+                    CacheValidationError,
+                    ChunkRegistrationError,
+                    RegistrationStageError,
+                ):
+                    raise
+                except Exception as error:
+                    raise RegistrationStageError(
+                        f"nonlinear registration failed for round {self.imaging_round}"
+                    ) from error
+
+            try:
+                affine_identity = FileIdentity.from_path(paths.affine)
+                parameters: dict[str, object] = {
                     "image_interpolation": "linear",
                     "mask_interpolation": "nearestNeighbor",
                     "moving_geometry": backend.geometry(moving_linear).to_dict(),
+                    "registration_mode": self._nonlinear_mode,
                     "registration_parameters": self._nonlinear_parameters(),
                     "scalar_postprocessing": "histogram-match-to-moving-linear",
-                },
-            )
-        except Exception as error:
-            raise RegistrationStageError(
-                f"nonlinear registration failed for round {self.imaging_round}"
-            ) from error
-        if not self.force_override:
-            warp = self._store().reuse(paths.warp, request, backend.read_warp)
-            if warp is not None:
-                try:
-                    moving_nonlinear, moving_nonlinear_mask = (
-                        self._reconstruct_nonlinear_images(
-                            backend,
-                            fixed,
-                            moving_linear,
-                            moving_linear_mask,
-                            paths.warp,
-                        )
-                    )
-                except Exception as error:
-                    raise RegistrationStageError(
-                        "cached nonlinear reconstruction failed "
-                        f"for round {self.imaging_round}"
-                    ) from error
-                return paths.warp, moving_nonlinear, moving_nonlinear_mask
+                }
+                parameters.update(self._nonlinear_request_evidence)
+                request = self._request(
+                    backend,
+                    fixed,
+                    resolved,
+                    stage="nonlinear",
+                    method=self.nonlinear_type,
+                    accuracy=self.nonlinear_accuracy,
+                    upstream=affine_identity,
+                    parameters=parameters,
+                )
+            except Exception as error:
+                raise RegistrationStageError(
+                    f"nonlinear registration failed for round {self.imaging_round}"
+                ) from error
 
-        warp_committed = False
-        try:
-            _candidate_scalar, temporary_warp = self._estimate_nonlinear(
-                backend,
-                fixed,
-                moving_linear,
-                fixed_mask,
-                moving_linear_mask,
-            )
+            if not self.force_override:
+                warp = self._store().reuse(paths.warp, request, backend.read_warp)
+                if warp is not None:
+                    try:
+                        moving_nonlinear, moving_nonlinear_mask = (
+                            self._reconstruct_nonlinear_images(
+                                backend,
+                                fixed,
+                                moving_linear,
+                                moving_linear_mask,
+                                paths.warp,
+                            )
+                        )
+                    except Exception as error:
+                        raise RegistrationStageError(
+                            "cached nonlinear reconstruction failed "
+                            f"for round {self.imaging_round}"
+                        ) from error
+                    return paths.warp, moving_nonlinear, moving_nonlinear_mask
+
+            if temporary_warp is None:
+                _candidate_scalar, temporary_warp = self._estimate_nonlinear(
+                    backend,
+                    fixed,
+                    moving_linear,
+                    fixed_mask,
+                    moving_linear_mask,
+                )
 
             def writer(path: Path) -> None:
+                if temporary_warp is None:
+                    raise RuntimeError("nonlinear warp candidate was not prepared")
                 shutil.copyfile(temporary_warp, path)
 
             def validator(path: Path) -> bool:
@@ -730,6 +768,7 @@ class ImageRegistration:
                     return False
                 return True
 
+            warp_commit_attempted = True
             self._store().commit(paths.warp, request, writer, validator)
             warp_committed = True
             moving_nonlinear, moving_nonlinear_mask = (
@@ -745,12 +784,27 @@ class ImageRegistration:
             if warp_committed:
                 self._store().mark_stale(paths.warp)
             raise
+        except RegistrationStageError:
+            if warp_committed:
+                self._store().mark_stale(paths.warp)
+            raise
+        except CacheValidationError as error:
+            if warp_committed:
+                self._store().mark_stale(paths.warp)
+            if warp_commit_attempted:
+                raise RegistrationStageError(
+                    f"nonlinear registration failed for round {self.imaging_round}"
+                ) from error
+            raise
         except Exception as error:
             if warp_committed:
                 self._store().mark_stale(paths.warp)
             raise RegistrationStageError(
                 f"nonlinear registration failed for round {self.imaging_round}"
             ) from error
+        finally:
+            if prepared_candidate and temporary_warp is not None:
+                temporary_warp.unlink(missing_ok=True)
         return paths.warp, moving_nonlinear, moving_nonlinear_mask
 
     @staticmethod

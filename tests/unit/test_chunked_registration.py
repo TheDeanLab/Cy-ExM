@@ -10,10 +10,14 @@ import numpy as np
 import pytest
 from fakes import FakeChunkBackend, fake_image
 
-from cyexm.errors import ChunkRegistrationError
+from cyexm.errors import (
+    CacheValidationError,
+    ChunkRegistrationError,
+    RegistrationStageError,
+)
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
 from cyexm.registration.chunked import ChunkedImageRegistration, ChunkPaths
-from cyexm.registration.whole_image import RegistrationPaths
+from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
 
 pytestmark = pytest.mark.unit
 
@@ -45,12 +49,53 @@ def make_chunked_registration(
     )
 
 
+def make_whole_registration(
+    tmp_path: Path,
+    *,
+    backend: FakeChunkBackend,
+) -> ImageRegistration:
+    fixed = tmp_path / "fixed.tif"
+    moving = tmp_path / "moving.tif"
+    if not fixed.exists():
+        fixed.write_bytes(b"fixed-input")
+    if not moving.exists():
+        moving.write_bytes(b"moving-input")
+    return ImageRegistration(
+        fixed,
+        moving,
+        tmp_path / "output",
+        2,
+        _backend=backend,
+        _artifact_store=ArtifactStore(),
+    )
+
+
 def round_paths(tmp_path: Path) -> RegistrationPaths:
     return RegistrationPaths.for_round(tmp_path / "output", 2)
 
 
 def manifest_path(tmp_path: Path) -> Path:
     return tmp_path / "output" / "round_2_chunks" / "manifest.json"
+
+
+def rewrite_completion_artifact_identity(artifact: Path) -> None:
+    record_path = ArtifactStore().record_path(artifact)
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload["artifact"] = FileIdentity.from_path(artifact).to_dict()
+    record_path.write_text(
+        json.dumps(payload, allow_nan=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+class FullHistogramStageErrorBackend(FakeChunkBackend):
+    def histogram_match(self, *, source: object, reference: object) -> object:
+        if (
+            self.warp_applications
+            and self.warp_applications[-1][0].name == "nonlinear_warp_2.nii.gz"
+        ):
+            raise RegistrationStageError("injected full reconstruction stage error")
+        return super().histogram_match(source=source, reference=reference)
 
 
 def test_chunk_paths_are_round_scoped_and_include_completion_record(
@@ -110,7 +155,7 @@ def test_local_registration_uses_extended_physical_image_geometry(
 
     second_fixed = backend.nonlinear_kwargs[1]["fixed_image"]
     second_moving = backend.nonlinear_kwargs[1]["moving_image"]
-    assert second_fixed.origin == (3.0, 4.0, 6.2)  # type: ignore[union-attr]
+    assert second_fixed.origin == (3.0, 5.2, 5.0)  # type: ignore[union-attr]
     assert second_moving.origin == second_fixed.origin  # type: ignore[union-attr]
     assert second_fixed.spacing == (0.15, 0.15, 0.15)  # type: ignore[union-attr]
     assert second_fixed.direction == direction  # type: ignore[union-attr]
@@ -142,6 +187,189 @@ def test_manifest_is_canonical_ordered_and_records_local_warp_identities(
         for chunk_id in (0, 1)
     ]
     assert ArtifactStore().record_path(path).is_file()
+
+
+def test_chunked_full_request_records_transitive_chunk_evidence(
+    tmp_path: Path,
+) -> None:
+    registration = make_chunked_registration(
+        tmp_path,
+        backend=FakeChunkBackend(),
+        overlap_fraction=0.25,
+    )
+
+    registration.register()
+
+    request = CompletionRecord.read(
+        ArtifactStore().record_path(round_paths(tmp_path).warp)
+    ).request
+    chunks = request.parameters["chunk_grid"]
+    assert request.parameters["registration_mode"] == "serial-chunked"
+    assert request.parameters["chunk_size_zyx"] == [8, 8, 8]
+    assert request.parameters["overlap_fraction"] == 0.25
+    assert [item["chunk_id"] for item in chunks] == [0, 1, 2]  # type: ignore[index]
+    assert (
+        request.parameters["chunk_manifest"]
+        == FileIdentity.from_path(manifest_path(tmp_path)).to_dict()
+    )
+    assert request.parameters["local_warps"] == [
+        FileIdentity.from_path(registration.chunk_paths(chunk_id).warp).to_dict()
+        for chunk_id in (0, 1, 2)
+    ]
+
+
+def test_whole_image_full_warp_cannot_be_reused_as_chunked(
+    tmp_path: Path,
+) -> None:
+    make_whole_registration(tmp_path, backend=FakeChunkBackend()).register()
+    full_request = CompletionRecord.read(
+        ArtifactStore().record_path(round_paths(tmp_path).warp)
+    ).request
+    assert full_request.parameters["registration_mode"] == "whole-image"
+    resumed = FakeChunkBackend()
+    registration = make_chunked_registration(tmp_path, backend=resumed)
+
+    with pytest.raises(ChunkRegistrationError) as error:
+        registration.register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert resumed.registered_chunk_ids == []
+    assert not registration.chunk_paths(0).warp.exists()
+
+
+@pytest.mark.parametrize(
+    "changed_configuration",
+    [
+        pytest.param({"chunk_size": (16, 8, 8)}, id="chunk-size"),
+        pytest.param({"overlap_fraction": 0.25}, id="overlap"),
+    ],
+)
+def test_changed_chunk_configuration_rejects_full_warp_reuse(
+    tmp_path: Path,
+    changed_configuration: dict[str, object],
+) -> None:
+    make_chunked_registration(tmp_path, backend=FakeChunkBackend()).register()
+    resumed = FakeChunkBackend()
+
+    with pytest.raises(ChunkRegistrationError) as error:
+        make_chunked_registration(
+            tmp_path,
+            backend=resumed,
+            **changed_configuration,  # type: ignore[arg-type]
+        ).register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert resumed.registered_chunk_ids == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_existing_full_warp_requires_valid_local_warp_cache(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    initial = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+    initial.register()
+    local_warp = initial.chunk_paths(1).warp
+    if damage == "missing":
+        local_warp.unlink()
+    else:
+        local_warp.write_bytes(b"corrupt-local-warp")
+    resumed = FakeChunkBackend()
+
+    with pytest.raises(ChunkRegistrationError) as error:
+        make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert resumed.registered_chunk_ids == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "mismatch"])
+def test_existing_full_warp_requires_valid_canonical_manifest(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    make_chunked_registration(tmp_path, backend=FakeChunkBackend()).register()
+    manifest = manifest_path(tmp_path)
+    if damage == "missing":
+        manifest.unlink()
+    elif damage == "corrupt":
+        manifest.write_text("not-json\n", encoding="utf-8")
+    else:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["round_number"] = 999
+        manifest.write_text(
+            json.dumps(
+                payload,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        rewrite_completion_artifact_identity(manifest)
+    resumed = FakeChunkBackend()
+
+    with pytest.raises(CacheValidationError):
+        make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert resumed.registered_chunk_ids == []
+
+
+def test_normal_rerun_reuses_local_full_and_downstream_artifact_identities(
+    tmp_path: Path,
+) -> None:
+    initial = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+    initial.register()
+    paths = round_paths(tmp_path)
+    artifacts = (
+        initial.chunk_paths(0).warp,
+        initial.chunk_paths(1).warp,
+        manifest_path(tmp_path),
+        paths.warp,
+        paths.nonlinear_metrics,
+        paths.registered,
+    )
+    identities_before = tuple(FileIdentity.from_path(path) for path in artifacts)
+    records_before = tuple(
+        ArtifactStore().record_path(path).read_bytes() for path in artifacts
+    )
+    resumed = FakeChunkBackend()
+
+    make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert resumed.registered_chunk_ids == []
+    assert (
+        tuple(FileIdentity.from_path(path) for path in artifacts) == identities_before
+    )
+    assert (
+        tuple(ArtifactStore().record_path(path).read_bytes() for path in artifacts)
+        == records_before
+    )
+    assert len(resumed.written_warp_paths) == 1
+    assert not resumed.written_warp_paths[0].exists()
+
+
+def test_prepared_candidate_is_removed_when_full_request_reuse_raises(
+    tmp_path: Path,
+) -> None:
+    make_chunked_registration(tmp_path, backend=FakeChunkBackend()).register()
+    full_record = ArtifactStore().record_path(round_paths(tmp_path).warp)
+    payload = json.loads(full_record.read_text(encoding="utf-8"))
+    payload["request"]["parameters"]["registration_mode"] = "tampered"
+    full_record.write_text(
+        json.dumps(payload, allow_nan=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    record_before = full_record.read_bytes()
+    resumed = FakeChunkBackend()
+
+    with pytest.raises(CacheValidationError, match="request"):
+        make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert len(resumed.written_warp_paths) == 1
+    assert not resumed.written_warp_paths[0].exists()
+    assert full_record.read_bytes() == record_before
 
 
 def test_local_request_captures_sources_geometries_threads_affine_and_grid(
@@ -264,16 +492,180 @@ def test_material_local_warp_geometry_mismatch_is_rejected(tmp_path: Path) -> No
         make_chunked_registration(tmp_path, backend=backend).register()
 
 
-def test_scalar_core_shape_is_validated_after_local_commit(tmp_path: Path) -> None:
+def test_failed_fresh_local_postcommit_record_is_stale_and_recomputed(
+    tmp_path: Path,
+) -> None:
     backend = FakeChunkBackend(invalid_scalar_chunk=1)
     registration = make_chunked_registration(tmp_path, backend=backend)
 
     with pytest.raises(ChunkRegistrationError, match="scalar"):
         registration.register()
 
-    assert registration.chunk_paths(1).completion_record.is_file()
+    local = registration.chunk_paths(1)
+    store = ArtifactStore()
+    assert not local.completion_record.exists()
+    assert store.stale_path(local.warp).is_file()
     assert not manifest_path(tmp_path).exists()
     assert not round_paths(tmp_path).warp.exists()
+
+    resumed = FakeChunkBackend()
+    make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert resumed.registered_chunk_ids == [1]
+    assert local.completion_record.is_file()
+    assert not store.stale_path(local.warp).exists()
+    assert round_paths(tmp_path).warp.is_file()
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(FakeChunkBackend(fail_histogram_match=True), id="histogram"),
+        pytest.param(FakeChunkBackend(fail_threshold_mask=True), id="mask"),
+    ],
+)
+def test_fresh_local_reconstruction_failure_marks_record_stale(
+    tmp_path: Path,
+    backend: FakeChunkBackend,
+) -> None:
+    registration = make_chunked_registration(tmp_path, backend=backend)
+
+    with pytest.raises(ChunkRegistrationError):
+        registration.register()
+
+    local = registration.chunk_paths(0)
+    store = ArtifactStore()
+    assert local.warp.is_file()
+    assert not local.completion_record.exists()
+    assert store.stale_path(local.warp).is_file()
+
+
+def test_cached_local_reconstruction_failure_preserves_valid_record(
+    tmp_path: Path,
+) -> None:
+    initial = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+    initial.register()
+    local = initial.chunk_paths(0)
+    record_before = local.completion_record.read_bytes()
+    resumed = FakeChunkBackend(fail_histogram_match=True)
+
+    with pytest.raises(ChunkRegistrationError):
+        make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert local.completion_record.read_bytes() == record_before
+    assert not ArtifactStore().stale_path(local.warp).exists()
+
+
+def test_stale_full_entry_allows_local_and_manifest_recovery(
+    tmp_path: Path,
+) -> None:
+    initial = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+    initial.register()
+    failed = make_chunked_registration(
+        tmp_path,
+        backend=FakeChunkBackend(invalid_scalar_chunk=1),
+        force_override=True,
+    )
+
+    with pytest.raises(ChunkRegistrationError):
+        failed.register()
+
+    store = ArtifactStore()
+    full = round_paths(tmp_path).warp
+    local = failed.chunk_paths(1).warp
+    manifest = manifest_path(tmp_path)
+    for artifact in (full, local, manifest):
+        assert not store.record_path(artifact).exists()
+        assert store.stale_path(artifact).is_file()
+    resumed = FakeChunkBackend()
+
+    make_chunked_registration(tmp_path, backend=resumed).register()
+
+    assert resumed.registered_chunk_ids == [1]
+    for artifact in (full, local, manifest):
+        assert store.record_path(artifact).is_file()
+        assert not store.stale_path(artifact).exists()
+
+
+@pytest.mark.parametrize(
+    "overflow",
+    [
+        pytest.param("scalar", id="scalar-core"),
+        pytest.param("warp", id="warp-core"),
+    ],
+)
+def test_float64_core_overflow_is_rejected_after_float32_cast(
+    tmp_path: Path,
+    overflow: str,
+) -> None:
+    backend = FakeChunkBackend(
+        overflow_scalar_chunk=1 if overflow == "scalar" else None,
+        overflow_warp_chunk=1 if overflow == "warp" else None,
+    )
+    registration = make_chunked_registration(tmp_path, backend=backend)
+
+    with pytest.raises(ChunkRegistrationError, match="float32"):
+        registration.register()
+
+    local = registration.chunk_paths(1)
+    assert not local.completion_record.exists()
+    assert ArtifactStore().stale_path(local.warp).is_file()
+    assert not round_paths(tmp_path).warp.exists()
+
+
+def test_full_candidate_reread_rejects_non_float32_dtype(tmp_path: Path) -> None:
+    backend = FakeChunkBackend(full_warp_float64=True)
+
+    with pytest.raises(RegistrationStageError) as error:
+        make_chunked_registration(tmp_path, backend=backend).register()
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert "float32" in str(error.value.__cause__)
+    assert backend.written_warp_paths
+    assert not backend.written_warp_paths[0].exists()
+    assert not round_paths(tmp_path).warp.exists()
+
+
+def test_local_backend_verbose_value_matches_recorded_parameters(
+    tmp_path: Path,
+) -> None:
+    backend = FakeChunkBackend()
+    registration = make_chunked_registration(tmp_path, backend=backend)
+
+    registration.register()
+
+    request = CompletionRecord.read(
+        registration.chunk_paths(0).completion_record
+    ).request
+    recorded = request.parameters["registration_parameters"]["verbose"]  # type: ignore[index]
+    assert backend.nonlinear_kwargs[0]["verbose"] == recorded
+
+
+def test_scalar_conversion_failure_cannot_leak_full_candidate(tmp_path: Path) -> None:
+    backend = FakeChunkBackend(fail_scalar_from_array=True)
+
+    with pytest.raises(RegistrationStageError):
+        make_chunked_registration(tmp_path, backend=backend).register()
+
+    output = round_paths(tmp_path).output
+    assert not list(output.glob(".chunked-full-warp-*.nii.gz"))
+    assert not round_paths(tmp_path).warp.exists()
+
+
+def test_fresh_full_stage_error_marks_committed_warp_record_stale(
+    tmp_path: Path,
+) -> None:
+    backend = FullHistogramStageErrorBackend()
+
+    with pytest.raises(RegistrationStageError, match="full reconstruction"):
+        make_chunked_registration(tmp_path, backend=backend).register()
+
+    warp = round_paths(tmp_path).warp
+    store = ArtifactStore()
+    assert warp.is_file()
+    assert not store.record_path(warp).exists()
+    assert store.stale_path(warp).is_file()
+    assert not list(warp.parent.glob(".chunked-full-warp-*.nii.gz"))
 
 
 def test_force_replacement_writer_failure_preserves_old_local_pair(
@@ -305,7 +697,7 @@ def test_full_candidate_warp_is_unique_validated_and_float32(tmp_path: Path) -> 
     first_backend = FakeChunkBackend()
     make_chunked_registration(first_root, backend=first_backend).register()
     first_candidate = first_backend.written_warp_paths[0]
-    first_image = first_backend.read_warp(first_candidate)
+    first_image = first_backend.read_warp(round_paths(first_root).warp)
 
     second_backend = FakeChunkBackend()
     make_chunked_registration(second_root, backend=second_backend).register()
@@ -313,6 +705,8 @@ def test_full_candidate_warp_is_unique_validated_and_float32(tmp_path: Path) -> 
 
     assert first_candidate != second_candidate
     assert first_candidate.parent == first_root / "output"
+    assert not first_candidate.exists()
+    assert not second_candidate.exists()
     assert first_image.data.dtype == np.float32  # type: ignore[union-attr]
     assert first_image.data.shape == (16, 8, 8, 3)  # type: ignore[union-attr]
 

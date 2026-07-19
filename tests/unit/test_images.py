@@ -169,12 +169,19 @@ def test_load_ants_image_rejects_truncated_raw_cyexm_descriptions(
         load_ants_image(path, (0.2, 0.3, 0.5))
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        pytest.param('{"note":"cyexm"}', id="literal-value"),
+        pytest.param(r'{"note":"cy\u0065xm"}', id="escaped-value"),
+    ],
+)
 def test_load_ants_image_ignores_unrelated_raw_cyexm_string_value(
     tmp_path: Path,
+    description: str,
 ) -> None:
     path = tmp_path / "unrelated-cyexm-note.tif"
     data = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
-    description = '{"note":"cyexm"}'
     tifffile.imwrite(
         path,
         data,
@@ -212,9 +219,41 @@ def test_load_ants_image_ignores_unrelated_raw_cyexm_string_value(
             '{"axes":"ZYX","note":"cyexm"',
             id="malformed-unrelated-value-is-ambiguous",
         ),
+        pytest.param(
+            r'{"axes":"ZYX" "\u0063yexm":',
+            id="escaped-c",
+        ),
+        pytest.param(
+            r'{"axes":"ZYX" "c\u0079exm":',
+            id="escaped-y",
+        ),
+        pytest.param(
+            r'{"axes":"ZYX" "cy\u0065xm":',
+            id="escaped-e",
+        ),
+        pytest.param(
+            r'{"axes":"ZYX" "cye\u0078m":',
+            id="escaped-x",
+        ),
+        pytest.param(
+            r'{"axes":"ZYX" "cyex\u006D":',
+            id="escaped-m-uppercase-hex",
+        ),
+        pytest.param(
+            r'{"axes":"ZYX" "\u0063\u0079\u0065\u0078\u006D":',
+            id="all-letters-escaped",
+        ),
+        pytest.param(
+            '{"axes":"ZYX" cyexm=',
+            id="unquoted-marker",
+        ),
+        pytest.param(
+            '{"axes":"ZYX" \'cyexm\'=',
+            id="single-quoted-marker",
+        ),
     ],
 )
-def test_load_ants_image_rejects_any_quoted_cyexm_in_malformed_description(
+def test_load_ants_image_rejects_cyexm_marker_in_malformed_description(
     tmp_path: Path,
     description: str,
 ) -> None:
@@ -235,6 +274,40 @@ def test_load_ants_image_rejects_any_quoted_cyexm_in_malformed_description(
 
     with pytest.raises(InputValidationError, match="Cy-ExM TIFF geometry metadata"):
         load_ants_image(path, (0.2, 0.3, 0.5))
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        pytest.param('{"axes":"ZYX" vendor=', id="vendor-syntax"),
+        pytest.param(
+            r'{"axes":"ZYX" "note":"cy\\u0065xm"}',
+            id="escaped-backslash-is-not-unicode-escape",
+        ),
+    ],
+)
+def test_load_ants_image_accepts_noncyexm_malformed_vendor_description(
+    tmp_path: Path,
+    description: str,
+) -> None:
+    path = tmp_path / "malformed-vendor-description.tif"
+    data = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
+    tifffile.imwrite(
+        path,
+        data,
+        description=description,
+        metadata={"axes": "ZYX"},
+        photometric="minisblack",
+        shape=data.shape,
+    )
+    with tifffile.TiffFile(path) as handle:
+        assert handle.series[0].axes == "ZYX"
+        assert handle.shaped_metadata == ({"shape": [2, 3, 4], "axes": "ZYX"},)
+        assert handle.series[0].keyframe.description == description
+
+    image = load_ants_image(path, (0.2, 0.3, 0.5))
+
+    np.testing.assert_array_equal(image.numpy(), np.transpose(data, (2, 1, 0)))
 
 
 def test_load_ants_image_accepts_plain_qyx_grayscale_stack(tmp_path: Path) -> None:

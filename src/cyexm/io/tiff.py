@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from numbers import Real
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,8 @@ from cyexm.spatial import (
 
 _TIFF_GEOMETRY_SCHEMA_VERSION = 1
 _CYEXM_TIFF_KEYS = frozenset({"schema_version", "axis_convention_version", "geometry"})
+_JSON_UNICODE_ESCAPE = re.compile(r"(\\+)u([0-9A-Fa-f]{4})")
+_CYEXM_ASCII_CODEPOINTS = {ord(letter): letter for letter in "cyexm"}
 
 
 def _metadata_error(
@@ -69,6 +72,26 @@ def _geometry_from_shaped_metadata(
     return geometry
 
 
+def _malformed_description_has_cyexm_marker(description: str) -> bool:
+    """Detect semantic lowercase cyexm text without broadly decoding malformed data.
+
+    Only unescaped JSON ``\\uXXXX`` sequences for the five ASCII marker letters are
+    normalized. Other escapes and escaped backslashes remain untouched.
+    """
+
+    def replace_target_escape(match: re.Match[str]) -> str:
+        backslashes, hexadecimal = match.groups()
+        if len(backslashes) % 2 == 0:
+            return match.group(0)
+        letter = _CYEXM_ASCII_CODEPOINTS.get(int(hexadecimal, 16))
+        if letter is None:
+            return match.group(0)
+        return backslashes[:-1] + letter
+
+    normalized = _JSON_UNICODE_ESCAPE.sub(replace_target_escape, description)
+    return "cyexm" in normalized
+
+
 def _geometry_metadata_from_description(
     description: object,
 ) -> dict[str, object] | None:
@@ -77,9 +100,9 @@ def _geometry_metadata_from_description(
     try:
         decoded = json.loads(description)
     except json.JSONDecodeError as error:
-        if '"cyexm"' in description:
+        if _malformed_description_has_cyexm_marker(description):
             raise _metadata_error(
-                "raw malformed ImageDescription contains a quoted cyexm marker",
+                "raw malformed ImageDescription contains a semantic cyexm marker",
                 error,
             ) from error
         return None

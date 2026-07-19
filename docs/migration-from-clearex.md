@@ -98,6 +98,22 @@ could create incomplete or scientifically misleading results:
     is best effort and cannot replace the primary error.
 12. Atomic TIFF validation requires declared `ZYX` metadata and effective `ZYX`
     series axes, allowing only tifffile's documented leading singleton-Z squeeze.
+13. External TIFF, NumPy, chunk, and `ImageGeometry.shape` values use ZYX, while
+    native ANTs arrays and indexes use XYZ. Cy-ExM now transposes the first three
+    spatial axes explicitly; trailing displacement components remain physical XYZ.
+14. Cy-ExM-written ANTs TIFFs persist strict versioned shape, origin, spacing, and
+    direction metadata. Plain historical TIFFs still use caller XYZ spacing with
+    zero origin and identity direction, but a present malformed payload fails closed.
+15. Every whole-image and chunk cache request, plus the schema-version-2 canonical
+    chunk manifest, records `external-zyx-ants-xyz-v1`, so artifacts created under
+    the former ambiguous layout are not reused.
+16. Affine inspection reports native transform entries as X, Y, and Z and describes
+    translation offsets in physical units rather than mislabeled voxels.
+
+The direct low-level ANTs parity fixtures intentionally remain native-only and are
+not transposed. These corrections apply where orchestration crosses external
+NumPy/TIFF/chunk boundaries; native affine algebra, warp component algebra,
+zero-mask construction, and identity-warp construction are unchanged.
 
 The literal dry-run mismatch is recorded rather than hidden by weaker tolerances.
 The migration gate instead compares the shared, consumed TRSAA-low and SyNOnly-dry

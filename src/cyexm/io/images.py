@@ -6,11 +6,37 @@ from pathlib import Path
 from typing import Any
 
 from cyexm.errors import InputValidationError
-from cyexm.spatial import ImageGeometry
+from cyexm.spatial import TIFF_GEOMETRY_ATOL, ImageGeometry
 
 type Bounds3D = tuple[int, int, int, int, int, int]
 
 _SUPPORTED_EXTENSIONS = frozenset({".npy", ".tif", ".tiff"})
+
+
+def _transpose_spatial_axes(array: Any, role: str) -> Any:
+    import numpy as np
+
+    converted = np.asarray(array)
+    if converted.ndim < 3:
+        raise ValueError(f"{role} must have at least three spatial dimensions")
+    axes = (2, 1, 0, *range(3, converted.ndim))
+    return np.array(np.transpose(converted, axes), copy=True)
+
+
+def external_to_ants_array(array: Any) -> Any:
+    """Transpose external ZYX spatial axes to native ANTs XYZ axes.
+
+    Any trailing axes, including physical XYZ vector components, are unchanged.
+    """
+    return _transpose_spatial_axes(array, "external array")
+
+
+def ants_to_external_array(array: Any) -> Any:
+    """Transpose native ANTs XYZ spatial axes to external ZYX axes.
+
+    Any trailing axes, including physical XYZ vector components, are unchanged.
+    """
+    return _transpose_spatial_axes(array, "ANTs array")
 
 
 def _resolved_input_file(path: str | Path) -> Path:
@@ -103,14 +129,36 @@ def _pixel_size(pixel_size_xyz: object) -> tuple[float, float, float]:
 def load_ants_image(path: str | Path, pixel_size_xyz: object) -> Any:
     """Load a ZYX volume as an ANTs image with public XYZ spacing."""
     spacing = _pixel_size(pixel_size_xyz)
-    array = load_array(path)
+    resolved = _resolved_input_file(path)
+    array = load_array(resolved)
+
+    geometry: ImageGeometry | None = None
+    if resolved.suffix.lower() in {".tif", ".tiff"}:
+        from cyexm.io.tiff import read_tiff_geometry
+
+        geometry = read_tiff_geometry(
+            resolved, tuple(int(value) for value in array.shape)
+        )
+    if geometry is not None and any(
+        not math.isclose(
+            requested,
+            embedded,
+            rel_tol=0.0,
+            abs_tol=TIFF_GEOMETRY_ATOL,
+        )
+        for requested, embedded in zip(spacing, geometry.spacing, strict=True)
+    ):
+        raise InputValidationError(
+            "TIFF requested spacing is incompatible with embedded Cy-ExM geometry"
+        )
 
     import ants
 
     return ants.from_numpy(
-        array,
-        origin=(0.0, 0.0, 0.0),
-        spacing=spacing,
+        external_to_ants_array(array),
+        origin=(0.0, 0.0, 0.0) if geometry is None else geometry.origin,
+        spacing=spacing if geometry is None else geometry.spacing,
+        direction=None if geometry is None else geometry.direction,
     )
 
 
@@ -129,7 +177,7 @@ def _triple(values: object, name: str) -> tuple[Any, Any, Any]:
 
 
 def ants_geometry(image: Any) -> ImageGeometry:
-    """Copy an ANTs image's three-dimensional geometry into a neutral value."""
+    """Copy native ANTs geometry with its shape converted from XYZ to ZYX."""
     shape_values = _triple(image.shape, "shape")
     origin_values = _triple(image.origin, "origin")
     spacing_values = _triple(image.spacing, "spacing")
@@ -140,9 +188,9 @@ def ants_geometry(image: Any) -> ImageGeometry:
 
     return ImageGeometry(
         shape=(
-            int(shape_values[0]),
-            int(shape_values[1]),
             int(shape_values[2]),
+            int(shape_values[1]),
+            int(shape_values[0]),
         ),
         origin=(
             float(origin_values[0]),
@@ -301,7 +349,9 @@ def crop_array(array: Any, bounds: object) -> Any:
 __all__ = [
     "Bounds3D",
     "ants_geometry",
+    "ants_to_external_array",
     "crop_array",
+    "external_to_ants_array",
     "load_ants_image",
     "load_array",
     "robust_bounding_box",

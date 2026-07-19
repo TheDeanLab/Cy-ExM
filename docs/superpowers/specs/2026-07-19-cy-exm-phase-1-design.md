@@ -269,8 +269,17 @@ Extraction must preserve the following behavior:
 - Fixed and moving image roles remain unchanged.
 - Public `pixel_size` tuples are expressed in micrometers in `(x, y, z)` order,
   matching ANTs physical axes and the legacy API. NumPy image arrays use
-  `(z, y, x)` axis order. Conversion occurs at one explicit I/O boundary rather
-  than varying by caller.
+  `(z, y, x)` axis order. Native ANTs arrays and indexes use `(x, y, z)`, so the
+  first three spatial axes are transposed at explicit orchestration boundaries.
+  Trailing vector components are never transposed and retain physical XYZ order.
+- `ImageGeometry.shape`, chunk grids, TIFF arrays, and crop bounds are external ZYX;
+  origin, spacing, direction, affine parameters, and displacement components are
+  physical XYZ.
+- Cy-ExM ANTs TIFF outputs use strict versioned geometry metadata. Only absence of
+  the custom key permits the plain-TIFF fallback; malformed present metadata fails
+  closed. Cache requests and canonical manifests carry the axis-convention version.
+- Operations wholly inside ANTs, including zero-mask and identity-warp construction,
+  stay native XYZ and do not pass through an external-array adapter.
 - The existing zero-valued-data mask semantics remain intact.
 - Linear registration precedes nonlinear registration.
 - The current TRSAA linear policy and SyNOnly nonlinear policy, including their

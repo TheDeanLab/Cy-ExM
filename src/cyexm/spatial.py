@@ -9,6 +9,8 @@ type PixelSize = tuple[float, float, float]
 type Shape3D = tuple[int, int, int]
 type Direction3D = tuple[PixelSize, PixelSize, PixelSize]
 
+AXIS_CONVENTION_VERSION = "external-zyx-ants-xyz-v1"
+TIFF_GEOMETRY_ATOL = 1e-7
 _GEOMETRY_KEYS = frozenset({"shape", "origin", "spacing", "direction"})
 
 
@@ -40,11 +42,14 @@ def _finite_json_number(value: object, name: str) -> float:
 
 def _shape_triple(value: object) -> Shape3D:
     values = _triple_array(value, "shape")
-    return (
+    shape = (
         _json_integer(values[0], "shape[0]"),
         _json_integer(values[1], "shape[1]"),
         _json_integer(values[2], "shape[2]"),
     )
+    if any(item <= 0 for item in shape):
+        raise ValueError("shape values must be positive")
+    return shape
 
 
 def _float_triple(value: object, name: str) -> PixelSize:
@@ -58,6 +63,12 @@ def _float_triple(value: object, name: str) -> PixelSize:
 
 @dataclass(frozen=True, slots=True)
 class ImageGeometry:
+    """Three-dimensional external shape and physical ANTs geometry.
+
+    ``shape`` is ordered ZYX for NumPy/TIFF/chunk consumers. ``origin``,
+    ``spacing``, and the rows and columns of ``direction`` remain physical XYZ.
+    """
+
     shape: Shape3D
     origin: PixelSize
     spacing: PixelSize
@@ -79,10 +90,13 @@ class ImageGeometry:
                 + ", ".join(sorted(_GEOMETRY_KEYS))
             )
         direction = _triple_array(payload["direction"], "direction")
+        spacing = _float_triple(payload["spacing"], "spacing")
+        if any(value <= 0.0 for value in spacing):
+            raise ValueError("spacing values must be positive")
         return cls(
             shape=_shape_triple(payload["shape"]),
             origin=_float_triple(payload["origin"], "origin"),
-            spacing=_float_triple(payload["spacing"], "spacing"),
+            spacing=spacing,
             direction=(
                 _float_triple(direction[0], "direction[0]"),
                 _float_triple(direction[1], "direction[1]"),
@@ -91,4 +105,50 @@ class ImageGeometry:
         )
 
 
-__all__ = ["ImageGeometry", "PixelSize"]
+def geometry_compatible(
+    actual: ImageGeometry,
+    expected: ImageGeometry,
+    *,
+    relative_tolerance: float = 0.0,
+    absolute_tolerance: float = TIFF_GEOMETRY_ATOL,
+) -> bool:
+    """Return whether two values describe the same serialized physical grid."""
+    if actual.shape != expected.shape:
+        return False
+
+    def close(left: float, right: float) -> bool:
+        return math.isclose(
+            left,
+            right,
+            rel_tol=relative_tolerance,
+            abs_tol=absolute_tolerance,
+        )
+
+    return (
+        all(
+            close(left, right)
+            for left, right in zip(actual.origin, expected.origin, strict=True)
+        )
+        and all(
+            close(left, right)
+            for left, right in zip(actual.spacing, expected.spacing, strict=True)
+        )
+        and all(
+            close(left, right)
+            for actual_row, expected_row in zip(
+                actual.direction,
+                expected.direction,
+                strict=True,
+            )
+            for left, right in zip(actual_row, expected_row, strict=True)
+        )
+    )
+
+
+__all__ = [
+    "AXIS_CONVENTION_VERSION",
+    "TIFF_GEOMETRY_ATOL",
+    "ImageGeometry",
+    "PixelSize",
+    "geometry_compatible",
+]

@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from cyexm.io.images import external_to_ants_array
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,17 @@ def _validate_policy(registration_type: str, accuracy: str) -> None:
         )
 
 
+def _from_external_array(ants: Any, array: Any, reference: Any | None = None) -> Any:
+    kwargs: dict[str, object] = {}
+    if reference is not None:
+        kwargs = {
+            "origin": reference.origin,
+            "spacing": reference.spacing,
+            "direction": reference.direction,
+        }
+    return ants.from_numpy(external_to_ants_array(array), **kwargs)
+
+
 def register_image(
     moving_image: Any,
     fixed_image: Any,
@@ -66,9 +78,13 @@ def register_image(
     ants, np = _configured_runtime(native_threads)
 
     if isinstance(fixed_image, np.ndarray):
-        fixed_image = ants.from_numpy(fixed_image)
+        fixed_image = _from_external_array(ants, fixed_image)
     if isinstance(moving_image, np.ndarray):
-        moving_image = ants.from_numpy(moving_image)
+        moving_image = _from_external_array(ants, moving_image)
+    if isinstance(fixed_mask, np.ndarray):
+        fixed_mask = _from_external_array(ants, fixed_mask, fixed_image)
+    if isinstance(moving_mask, np.ndarray):
+        moving_mask = _from_external_array(ants, moving_mask, moving_image)
     if fixed_image.dimension != moving_image.dimension:
         raise ValueError("Both images must have the same number of dimensions.")
 
@@ -173,7 +189,7 @@ def _extract_scale(affine_matrix: Any) -> None:
     scaling_shear = polar_decomposed[1]
     scale_matrix, _ = rq(a=scaling_shear)
     scale_vector = np.abs(np.diagonal(a=scale_matrix))
-    scale_labels = ["Z", "Y", "X"]
+    scale_labels = ["X", "Y", "Z"]
     for label, scale in zip(scale_labels, scale_vector, strict=True):
         logger.info("%s Scale: %.2f-fold", label, scale)
         print(f"{label} Scale: {scale:.2f}-fold")
@@ -203,9 +219,9 @@ def _extract_shear(affine_matrix: Any) -> None:
 def _extract_translation(affine_matrix: Any) -> None:
     """Print translations from a supplied 4-by-4 affine matrix."""
     translation = affine_matrix[:3, 3]
-    for label, distance in zip(["Z", "Y", "X"], translation, strict=True):
-        logger.info("Translation %s: %.2f voxels", label, distance)
-        print(f"Translation distance in {label}: {distance:.2f} voxels")
+    for label, distance in zip(["X", "Y", "Z"], translation, strict=True):
+        logger.info("Translation %s: %.2f physical units", label, distance)
+        print(f"Translation distance in {label}: {distance:.2f} physical units")
 
 
 def _extract_rotation(affine_matrix: Any) -> None:
@@ -244,9 +260,9 @@ def transform_image(
     """Apply an affine to a scalar image and match its source histogram."""
     ants, np = _configured_runtime(native_threads)
     if isinstance(fixed_image, np.ndarray):
-        fixed_image = ants.from_numpy(fixed_image)
+        fixed_image = _from_external_array(ants, fixed_image)
     if isinstance(moving_image, np.ndarray):
-        moving_image = ants.from_numpy(moving_image)
+        moving_image = _from_external_array(ants, moving_image)
 
     warped_image = affine_transform.apply_to_image(
         moving_image,

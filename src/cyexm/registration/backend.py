@@ -5,7 +5,13 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from cyexm.io.images import ants_geometry, load_ants_image, zero_mask
+from cyexm.io.images import (
+    ants_geometry,
+    ants_to_external_array,
+    external_to_ants_array,
+    load_ants_image,
+    zero_mask,
+)
 from cyexm.io.tiff import write_uint16_tiff
 from cyexm.metrics import calculate_metrics as calculate_image_metrics
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
@@ -159,7 +165,7 @@ class AntsRegistrationBackend:
     def to_array(self, image: object) -> object:
         self._prepare()
         runtime_image: Any = image
-        return runtime_image.numpy()
+        return ants_to_external_array(runtime_image.numpy())
 
     def from_array(
         self,
@@ -172,7 +178,7 @@ class AntsRegistrationBackend:
         ants, np = _scientific_runtime()
         runtime_reference: Any = reference
         return ants.from_numpy(
-            np.asarray(array),
+            external_to_ants_array(np.asarray(array)),
             origin=runtime_reference.origin,
             spacing=runtime_reference.spacing,
             direction=runtime_reference.direction,
@@ -193,7 +199,7 @@ class AntsRegistrationBackend:
         ):
             raise TypeError("bounds_zyx must contain exactly six integers")
         z0, z1, y0, y1, x0, x1 = (int(value) for value in bounds_zyx)
-        data = np.asarray(runtime_image.numpy())
+        data = ants_to_external_array(np.asarray(runtime_image.numpy()))
         if data.ndim not in {3, 4}:
             raise ValueError("image data must have three spatial dimensions")
         spatial_shape = data.shape[:3]
@@ -208,11 +214,11 @@ class AntsRegistrationBackend:
         origin = tuple(
             float(value)
             for value in ants.transform_index_to_physical_point(
-                runtime_image, (z0, y0, x0)
+                runtime_image, (x0, y0, z0)
             )
         )
         return ants.from_numpy(
-            cropped,
+            external_to_ants_array(cropped),
             origin=origin,
             spacing=runtime_image.spacing,
             direction=runtime_image.direction,

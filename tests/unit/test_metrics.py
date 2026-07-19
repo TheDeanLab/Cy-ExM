@@ -15,10 +15,23 @@ pytestmark = pytest.mark.unit
 
 
 class FakeImage:
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        spacing: tuple[float, float, float] = (0.1, 0.2, 0.3),
+        direction: tuple[
+            tuple[float, float, float],
+            tuple[float, float, float],
+            tuple[float, float, float],
+        ] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    ) -> None:
         self.name = name
         self.shape = (2, 3, 4)
-        self.spacing = (0.1, 0.2, 0.3)
+        self.origin = origin
+        self.spacing = spacing
+        self.direction = direction
 
 
 def test_calculate_metrics_ports_clear_ex_metric_policy(
@@ -58,7 +71,8 @@ def test_calculate_metrics_ports_clear_ex_metric_policy(
     )
 
     assert metrics == {"Correlation": 0.75, "MattesMutualInformation": 0.25}
-    assert converted == [fixed, moving]
+    np.testing.assert_array_equal(converted[0], np.transpose(fixed, (2, 1, 0)))
+    np.testing.assert_array_equal(converted[1], np.transpose(moving, (2, 1, 0)))
     assert [call["metric_type"] for call in calls] == [
         "Correlation",
         "MattesMutualInformation",
@@ -67,6 +81,66 @@ def test_calculate_metrics_ports_clear_ex_metric_policy(
     assert all(call["moving_mask"] is moving_mask for call in calls)
     assert all(call["sampling_strategy"] == "random" for call in calls)
     assert all(call["sampling_percentage"] == 0.4 for call in calls)
+
+
+def test_calculate_metrics_ndarray_masks_use_matching_reference_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    converted: list[dict[str, object]] = []
+
+    def from_numpy(array: np.ndarray, **kwargs: object) -> FakeImage:
+        converted.append({"array": array, **kwargs})
+        return FakeImage(f"converted-{len(converted)}", **kwargs)  # type: ignore[arg-type]
+
+    fake_ants = SimpleNamespace(
+        from_numpy=from_numpy,
+        image_similarity=lambda *args, **kwargs: -0.5,
+    )
+    monkeypatch.setitem(sys.modules, "ants", fake_ants)
+    fixed_direction = (
+        (0.0, -1.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    moving_direction = (
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, -1.0),
+        (0.0, 1.0, 0.0),
+    )
+    fixed = FakeImage(
+        "fixed",
+        origin=(10.0, 20.0, 30.0),
+        spacing=(0.2, 0.3, 0.5),
+        direction=fixed_direction,
+    )
+    moving = FakeImage(
+        "moving",
+        origin=(-1.0, -2.0, -3.0),
+        spacing=(0.7, 0.8, 0.9),
+        direction=moving_direction,
+    )
+    fixed_mask = np.arange(2 * 3 * 4, dtype=np.uint8).reshape(2, 3, 4)
+    moving_mask = fixed_mask + 1
+
+    calculate_metrics(
+        fixed,
+        moving,
+        fixed_mask=fixed_mask,
+        moving_mask=moving_mask,
+    )
+
+    assert len(converted) == 2
+    for call, mask, reference in (
+        (converted[0], fixed_mask, fixed),
+        (converted[1], moving_mask, moving),
+    ):
+        np.testing.assert_array_equal(
+            call["array"],
+            np.transpose(mask, (2, 1, 0)),
+        )
+        assert call["origin"] == reference.origin
+        assert call["spacing"] == reference.spacing
+        assert call["direction"] == reference.direction
 
 
 @pytest.mark.parametrize(

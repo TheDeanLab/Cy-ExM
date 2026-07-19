@@ -21,6 +21,12 @@
 
 ### Task 1: Pin crop-index semantics
 
+> **Post-implementation correction (2026-07-19):** This historical task treated an
+> external ZYX array index as though it were a native ANTs index. The authoritative
+> boundary is external `(z0, y0, x0)` to native ANTs `(x0, y0, z0)`, with the first
+> three array axes transposed. The requirements below that call ANTs with
+> `(z0, y0, x0)` are superseded by this correction.
+
 **Files:**
 - Modify: `tests/unit/fakes.py`
 - Modify: `tests/unit/test_backend.py`

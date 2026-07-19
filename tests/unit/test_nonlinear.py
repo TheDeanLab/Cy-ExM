@@ -108,15 +108,88 @@ def test_nonlinear_high_synonly_preserves_established_registration_parameters(
     assert "metric_weight" not in calls.registration
     assert "shrink_factors" not in calls.registration
     assert "smoothing_sigmas" not in calls.registration
-    assert calls.resample == {
-        "image": calls.registered_warped,
-        "target": fixed,
-        "interp_type": "linear",
-    }
-    assert calls.histogram_match == {
-        "source_image": calls.resampled,
-        "reference_image": moving,
-    }
+
+
+def test_nonlinear_registration_converts_external_zyx_arrays_to_ants_xyz(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    fixed = np.arange(2 * 3 * 5, dtype=np.float32).reshape(2, 3, 5)
+    moving = fixed + 100.0
+    warp_path: Path | None = None
+
+    try:
+        _, warp_path = register_image(moving_image=moving, fixed_image=fixed)
+    finally:
+        discard_path(warp_path)
+
+    np.testing.assert_array_equal(
+        calls.from_numpy_calls[0]["data"],
+        np.transpose(fixed, (2, 1, 0)),
+    )
+    np.testing.assert_array_equal(
+        calls.from_numpy_calls[1]["data"],
+        np.transpose(moving, (2, 1, 0)),
+    )
+    assert calls.resample["image"] is calls.registered_warped
+    assert calls.resample["target"] is calls.registration["fixed"]
+    assert calls.resample["interp_type"] == "linear"
+    assert calls.histogram_match["source_image"] is calls.resampled
+    assert calls.histogram_match["reference_image"] is calls.registration["moving"]
+
+
+def test_nonlinear_ndarray_masks_use_external_axes_and_reference_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    fixed_direction = (
+        (0.0, -1.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    moving_direction = (
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, -1.0),
+        (0.0, 1.0, 0.0),
+    )
+    fixed = fake_image(
+        data=np.zeros((5, 3, 2), dtype=np.float32),
+        origin=(10.0, 20.0, 30.0),
+        spacing=(0.2, 0.3, 0.5),
+        direction=fixed_direction,
+    )
+    moving = fake_image(
+        data=np.zeros((5, 3, 2), dtype=np.float32),
+        origin=(-1.0, -2.0, -3.0),
+        spacing=(0.7, 0.8, 0.9),
+        direction=moving_direction,
+    )
+    fixed_mask = np.arange(2 * 3 * 5, dtype=np.uint8).reshape(2, 3, 5)
+    moving_mask = fixed_mask + 1
+    warp_path: Path | None = None
+
+    try:
+        _, warp_path = register_image(
+            moving_image=moving,
+            fixed_image=fixed,
+            fixed_mask=fixed_mask,
+            moving_mask=moving_mask,
+        )
+    finally:
+        discard_path(warp_path)
+
+    assert len(calls.from_numpy_calls) == 2
+    for call, mask, reference in (
+        (calls.from_numpy_calls[0], fixed_mask, fixed),
+        (calls.from_numpy_calls[1], moving_mask, moving),
+    ):
+        np.testing.assert_array_equal(call["data"], np.transpose(mask, (2, 1, 0)))
+        assert call["origin"] == reference.origin
+        assert call["spacing"] == reference.spacing
+        assert call["direction"] == reference.direction
+        assert call["has_components"] is False
 
 
 @pytest.mark.parametrize("accuracy", ["unknown", "", "HIGHER", "High"])
@@ -407,6 +480,30 @@ def test_nonlinear_transform_uses_forward_transform_and_linear_interpolation(
     assert result is calls.histogram_matched
 
 
+def test_nonlinear_transform_converts_external_zyx_arrays_to_ants_xyz(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    fixed = np.arange(2 * 3 * 5, dtype=np.float32).reshape(2, 3, 5)
+    moving = fixed + 100.0
+
+    transform_image(
+        moving_image=moving,
+        fixed_image=fixed,
+        transformed_image={"fwdtransforms": [str(calls.warp_path)]},
+    )
+
+    np.testing.assert_array_equal(
+        calls.from_numpy_calls[0]["data"],
+        np.transpose(fixed, (2, 1, 0)),
+    )
+    np.testing.assert_array_equal(
+        calls.from_numpy_calls[1]["data"],
+        np.transpose(moving, (2, 1, 0)),
+    )
+
+
 def test_nonlinear_transform_keeps_forward_warp_then_affine_uninverted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -429,11 +526,15 @@ def test_inspect_warp_transform_summarizes_vector_amplitudes(
     tmp_path: Path,
 ) -> None:
     calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
-    displacement = np.zeros((8, 8, 8, 3), dtype=np.float32)
+    displacement = np.zeros((5, 4, 2, 3), dtype=np.float32)
     displacement[..., :] = (1.0, 2.0, 2.0)
     calls.read_warp = fake_image(data=displacement, has_components=True)
     image_path = tmp_path / "registered.tif"
-    tifffile.imwrite(image_path, np.ones((8, 8, 8), dtype=np.uint16))
+    tifffile.imwrite(
+        image_path,
+        np.ones((2, 4, 5), dtype=np.uint16),
+        metadata={"axes": "ZYX"},
+    )
 
     stats = inspect_warp_transform(image_path, calls.warp_path)
 
@@ -442,7 +543,7 @@ def test_inspect_warp_transform_summarizes_vector_amplitudes(
         "min": 3.0,
         "std": 0.0,
         "max": 3.0,
-        "n_vox": 512,
+        "n_vox": 40,
     }
 
 

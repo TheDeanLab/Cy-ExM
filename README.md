@@ -47,6 +47,18 @@ raises a focused error instead of pretending a late change took effect.
 Public pixel size is expressed in micrometers in `(x, y, z)` order. NumPy and TIFF
 volume axes remain `(z, y, x)`.
 
+ANTs stores image arrays and indexes in native `(x, y, z)` order. Cy-ExM transposes
+the first three spatial axes at its orchestration boundary; vector components remain
+the final axis and keep physical `(x, y, z)` component order. Use
+`ants_to_external_array()` and `external_to_ants_array()` when crossing that boundary
+directly. `ImageGeometry.shape` is external ZYX, while origin, spacing, and direction
+are physical XYZ.
+
+Cy-ExM-written ANTs TIFFs carry strict, versioned shape/origin/spacing/direction
+metadata and round-trip that complete geometry. Plain TIFFs without the Cy-ExM key
+remain supported with caller-supplied XYZ spacing, zero origin, and identity
+direction; a present malformed Cy-ExM payload is rejected instead of ignored.
+
 ```python
 from pathlib import Path
 

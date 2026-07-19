@@ -25,7 +25,11 @@ from cyexm.runtime import (
     ResolvedNativeThreads,
     configure_native_threads,
 )
-from cyexm.spatial import PixelSize
+from cyexm.spatial import (
+    AXIS_CONVENTION_VERSION,
+    PixelSize,
+    geometry_compatible,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +258,7 @@ class ImageRegistration:
         parameters: dict[str, object],
     ) -> StageRequest:
         evidence: dict[str, object] = {
+            "axis_convention_version": AXIS_CONVENTION_VERSION,
             "crop": self.crop,
             "imaging_round": self.imaging_round,
             "pixel_size_xyz": self.pixel_size,
@@ -457,6 +462,7 @@ class ImageRegistration:
     ) -> None:
         try:
             minimum, maximum = self._image_range(backend, fixed)
+            expected_geometry = backend.geometry(fixed)
             request = self._request(
                 backend,
                 fixed,
@@ -473,7 +479,12 @@ class ImageRegistration:
             ) from error
 
         def reader(path: Path) -> object:
-            return backend.load_image(path, self.pixel_size)
+            image = backend.load_image(path, self.pixel_size)
+            if not geometry_compatible(backend.geometry(image), expected_geometry):
+                raise ValueError(
+                    "fixed reference TIFF geometry does not match the source image"
+                )
+            return image
 
         if not self.force_override:
             cached = self._store().reuse(paths.fixed_reference, request, reader)
@@ -861,6 +872,7 @@ class ImageRegistration:
     ) -> None:
         try:
             minimum, maximum = self._image_range(backend, moving_nonlinear)
+            expected_geometry = backend.geometry(moving_nonlinear)
             request = self._request(
                 backend,
                 moving_nonlinear,
@@ -881,7 +893,12 @@ class ImageRegistration:
             ) from error
 
         def reader(path: Path) -> object:
-            return backend.load_image(path, self.pixel_size)
+            image = backend.load_image(path, self.pixel_size)
+            if not geometry_compatible(backend.geometry(image), expected_geometry):
+                raise ValueError(
+                    "registered TIFF geometry does not match the nonlinear image"
+                )
+            return image
 
         if not self.force_override:
             cached = self._store().reuse(paths.registered, request, reader)

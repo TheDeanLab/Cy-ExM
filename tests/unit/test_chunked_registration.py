@@ -270,7 +270,7 @@ def test_local_registration_uses_extended_physical_image_geometry(
 
     second_fixed = backend.nonlinear_kwargs[1]["fixed_image"]
     second_moving = backend.nonlinear_kwargs[1]["moving_image"]
-    assert second_fixed.origin == (3.0, 5.2, 5.0)  # type: ignore[union-attr]
+    assert second_fixed.origin == (3.0, 4.0, 6.2)  # type: ignore[union-attr]
     assert second_moving.origin == second_fixed.origin  # type: ignore[union-attr]
     assert second_fixed.spacing == (0.15, 0.15, 0.15)  # type: ignore[union-attr]
     assert second_fixed.direction == direction  # type: ignore[union-attr]
@@ -297,11 +297,16 @@ def test_manifest_is_canonical_ordered_and_records_local_warp_identities(
         + "\n"
     )
     assert [item["chunk"]["chunk_id"] for item in payload["chunks"]] == [0, 1]
+    assert payload["schema_version"] == 2
+    assert payload["axis_convention_version"] == "external-zyx-ants-xyz-v1"
     assert [item["warp"] for item in payload["chunks"]] == [
         FileIdentity.from_path(registration.chunk_paths(chunk_id).warp).to_dict()
         for chunk_id in (0, 1)
     ]
-    assert ArtifactStore().record_path(path).is_file()
+    completion_path = ArtifactStore().record_path(path)
+    assert completion_path.is_file()
+    request = CompletionRecord.read(completion_path).request
+    assert request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
 
 
 def test_chunked_full_request_records_transitive_chunk_evidence(
@@ -320,6 +325,7 @@ def test_chunked_full_request_records_transitive_chunk_evidence(
     ).request
     chunks = request.parameters["chunk_grid"]
     assert request.parameters["registration_mode"] == "serial-chunked"
+    assert request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
     assert request.parameters["chunk_size_zyx"] == [8, 8, 8]
     assert request.parameters["overlap_fraction"] == 0.25
     assert [item["chunk_id"] for item in chunks] == [0, 1, 2]  # type: ignore[index]
@@ -511,6 +517,7 @@ def test_local_request_captures_sources_geometries_threads_affine_and_grid(
     assert request.upstream == FileIdentity.from_path(round_paths(tmp_path).affine)
     assert request.method == "SyNOnly"
     assert request.accuracy == "high"
+    assert request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
     assert request.parameters["chunk"]["chunk_id"] == 0  # type: ignore[index]
     assert request.parameters["chunk_size_zyx"] == [8, 8, 8]
     assert request.parameters["image_shape_zyx"] == [16, 8, 8]

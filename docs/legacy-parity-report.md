@@ -15,7 +15,14 @@ run**. The matched calls use the shared, consumed moving-mask parameter and omit
 fixed mask in both environments. ClearEx's fixed-mask keyword defect is characterized
 separately below. All eight migration categories passed. Registration arrays use
 `rtol=1e-4` and `atol=1e-5`; chunk geometry and data are exact. Spatial metadata uses
-an absolute `1e-7` tolerance only for float32 NIfTI spacing serialization.
+an absolute `1e-7` tolerance for float32 NIfTI spacing serialization in this
+historical gate. Current orchestration uses the same scale only for serialized TIFF
+geometry comparisons.
+
+The captured low-level parity arrays are direct native ANTs XYZ arrays and remain
+unchanged. A later orchestration correction established external NumPy/TIFF/chunk
+ZYX versus native ANTs XYZ adapters; it does not alter native affine or displacement
+component algebra and does not revise the results or totals in this report.
 
 | Gate | Result | Evidence |
 | --- | --- | --- |
@@ -213,3 +220,10 @@ that can return incomplete, stale, or incorrectly transformed results:
     source, and cannot replace registration success or the primary exception.
 12. Atomic TIFF validation checks declared `ZYX` metadata and effective `ZYX` series
     axes, with only tifffile's leading singleton-Z squeeze accepted explicitly.
+13. At external orchestration boundaries, Cy-ExM transposes the first three spatial
+    axes between ZYX arrays and native XYZ ANTs images. Vector components remain the
+    final axis in physical XYZ order; native-only zero-mask and identity-warp paths
+    are deliberately unchanged.
+14. ANTs TIFF outputs persist strict versioned shape, origin, spacing, and direction,
+    and whole-image cache readers validate all four fields. Cache requests and the
+    schema-version-2 chunk manifest record `external-zyx-ants-xyz-v1`.

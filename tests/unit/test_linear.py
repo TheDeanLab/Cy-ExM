@@ -124,6 +124,75 @@ def test_linear_trsaa_preserves_established_registration_parameters(
     assert "shrink_factors" not in calls.registration
 
 
+def test_linear_registration_converts_external_zyx_arrays_to_ants_xyz(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.linear", tmp_path)
+    fixed = np.arange(2 * 3 * 5, dtype=np.float32).reshape(2, 3, 5)
+    moving = fixed + 100.0
+
+    register_image(moving_image=moving, fixed_image=fixed)
+
+    np.testing.assert_array_equal(
+        calls.from_numpy_calls[0]["data"],
+        np.transpose(fixed, (2, 1, 0)),
+    )
+    np.testing.assert_array_equal(
+        calls.from_numpy_calls[1]["data"],
+        np.transpose(moving, (2, 1, 0)),
+    )
+
+
+def test_linear_ndarray_masks_use_external_axes_and_reference_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.linear", tmp_path)
+    fixed_direction = (
+        (0.0, -1.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    moving_direction = (
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, -1.0),
+        (0.0, 1.0, 0.0),
+    )
+    fixed = fake_image(
+        data=np.zeros((5, 3, 2), dtype=np.float32),
+        origin=(10.0, 20.0, 30.0),
+        spacing=(0.2, 0.3, 0.5),
+        direction=fixed_direction,
+    )
+    moving = fake_image(
+        data=np.zeros((5, 3, 2), dtype=np.float32),
+        origin=(-1.0, -2.0, -3.0),
+        spacing=(0.7, 0.8, 0.9),
+        direction=moving_direction,
+    )
+    fixed_mask = np.arange(2 * 3 * 5, dtype=np.uint8).reshape(2, 3, 5)
+    moving_mask = fixed_mask + 1
+
+    register_image(
+        moving_image=moving,
+        fixed_image=fixed,
+        fixed_mask=fixed_mask,
+        moving_mask=moving_mask,
+    )
+
+    assert len(calls.from_numpy_calls) == 2
+    for call, mask, reference in (
+        (calls.from_numpy_calls[0], fixed_mask, fixed),
+        (calls.from_numpy_calls[1], moving_mask, moving),
+    ):
+        np.testing.assert_array_equal(call["data"], np.transpose(mask, (2, 1, 0)))
+        assert call["origin"] == reference.origin
+        assert call["spacing"] == reference.spacing
+        assert call["direction"] == reference.direction
+        assert call["has_components"] is False
+
+
 def test_linear_mask_uses_nearest_neighbor_and_thresholds_at_half(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -306,6 +375,29 @@ def test_linear_transform_uses_linear_interpolation_and_histogram_matching(
     assert result is calls.histogram_matched
 
 
+def test_linear_transform_converts_external_zyx_arrays_to_ants_xyz(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.linear")
+    fixed = np.arange(2 * 3 * 5, dtype=np.float32).reshape(2, 3, 5)
+    moving = fixed + 100.0
+
+    transform_image(
+        moving_image=moving,
+        fixed_image=fixed,
+        affine_transform=calls.transform,
+    )
+
+    np.testing.assert_array_equal(
+        calls.from_numpy_calls[0]["data"],
+        np.transpose(fixed, (2, 1, 0)),
+    )
+    np.testing.assert_array_equal(
+        calls.from_numpy_calls[1]["data"],
+        np.transpose(moving, (2, 1, 0)),
+    )
+
+
 def test_linear_configures_threads_before_runtime_and_logs_resolution(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -345,21 +437,21 @@ class TestExtractTranslation:
         _extract_translation(affine_matrix)
 
         captured = capsys.readouterr()
-        assert "Translation distance in Z: 0.00 voxels" in captured.out
-        assert "Translation distance in Y: 0.00 voxels" in captured.out
-        assert "Translation distance in X: 0.00 voxels" in captured.out
+        assert "Translation distance in X: 0.00 physical units" in captured.out
+        assert "Translation distance in Y: 0.00 physical units" in captured.out
+        assert "Translation distance in Z: 0.00 physical units" in captured.out
 
     def test_pure_translation_positive(self, capsys):
         """Test extraction of positive translation values."""
         affine_matrix = np.eye(4)
-        affine_matrix[:3, 3] = [10.5, 20.3, 30.7]  # Z, Y, X translation
+        affine_matrix[:3, 3] = [10.5, 20.3, 30.7]  # X, Y, Z translation
 
         _extract_translation(affine_matrix)
 
         captured = capsys.readouterr()
-        assert "Translation distance in Z: 10.50 voxels" in captured.out
-        assert "Translation distance in Y: 20.30 voxels" in captured.out
-        assert "Translation distance in X: 30.70 voxels" in captured.out
+        assert "Translation distance in X: 10.50 physical units" in captured.out
+        assert "Translation distance in Y: 20.30 physical units" in captured.out
+        assert "Translation distance in Z: 30.70 physical units" in captured.out
 
     def test_pure_translation_negative(self, capsys):
         """Test extraction of negative translation values."""
@@ -369,9 +461,9 @@ class TestExtractTranslation:
         _extract_translation(affine_matrix)
 
         captured = capsys.readouterr()
-        assert "Translation distance in Z: -5.20 voxels" in captured.out
-        assert "Translation distance in Y: -15.80 voxels" in captured.out
-        assert "Translation distance in X: -25.40 voxels" in captured.out
+        assert "Translation distance in X: -5.20 physical units" in captured.out
+        assert "Translation distance in Y: -15.80 physical units" in captured.out
+        assert "Translation distance in Z: -25.40 physical units" in captured.out
 
     def test_mixed_transform_with_translation(self, capsys):
         """Test translation extraction from a combined transform."""
@@ -389,9 +481,9 @@ class TestExtractTranslation:
         _extract_translation(affine_matrix)
 
         captured = capsys.readouterr()
-        assert "Translation distance in Z: 12.00 voxels" in captured.out
-        assert "Translation distance in Y: 24.00 voxels" in captured.out
-        assert "Translation distance in X: 36.00 voxels" in captured.out
+        assert "Translation distance in X: 12.00 physical units" in captured.out
+        assert "Translation distance in Y: 24.00 physical units" in captured.out
+        assert "Translation distance in Z: 36.00 physical units" in captured.out
 
 
 class TestExtractRotation:
@@ -535,14 +627,14 @@ class TestExtractScale:
     def test_anisotropic_scale(self, capsys):
         """Test extraction of different scales for each axis."""
         affine_matrix = np.eye(4)
-        affine_matrix[:3, :3] = np.diag([0.5, 1.5, 2.0])  # Z, Y, X scales
+        affine_matrix[:3, :3] = np.diag([0.5, 1.5, 2.0])  # X, Y, Z scales
 
         _extract_scale(affine_matrix)
 
         captured = capsys.readouterr()
-        assert "Z Scale: 0.50-fold" in captured.out
+        assert "X Scale: 0.50-fold" in captured.out
         assert "Y Scale: 1.50-fold" in captured.out
-        assert "X Scale: 2.00-fold" in captured.out
+        assert "Z Scale: 2.00-fold" in captured.out
 
     def test_scale_with_rotation(self, capsys):
         """Test scale extraction from a transform with rotation."""
@@ -564,15 +656,15 @@ class TestExtractScale:
 
         captured = capsys.readouterr()
         # Should extract the original scale values
-        assert "Z Scale: 0.80-fold" in captured.out
+        assert "X Scale: 0.80-fold" in captured.out
         assert "Y Scale: 1.20-fold" in captured.out
-        assert "X Scale: 1.50-fold" in captured.out
+        assert "Z Scale: 1.50-fold" in captured.out
 
     def test_negative_determinant_scale(self, capsys):
         """Test scale extraction when determinant is negative (reflection)."""
         # Create a scale with one negative value (reflection)
         affine_matrix = np.eye(4)
-        affine_matrix[:3, :3] = np.diag([-1.0, 1.0, 1.0])  # Reflection in Z
+        affine_matrix[:3, :3] = np.diag([-1.0, 1.0, 1.0])  # Reflection in X
 
         _extract_scale(affine_matrix)
 
@@ -696,9 +788,9 @@ class TestInspectAffineTransform:
 
         captured = capsys.readouterr()
         # Check for identity values
-        assert "Translation distance in Z: 0.00 voxels" in captured.out
-        assert "Translation distance in Y: 0.00 voxels" in captured.out
-        assert "Translation distance in X: 0.00 voxels" in captured.out
+        assert "Translation distance in X: 0.00 physical units" in captured.out
+        assert "Translation distance in Y: 0.00 physical units" in captured.out
+        assert "Translation distance in Z: 0.00 physical units" in captured.out
         assert "Z Scale: 1.00-fold" in captured.out
         assert "Y Scale: 1.00-fold" in captured.out
         assert "X Scale: 1.00-fold" in captured.out
@@ -713,9 +805,9 @@ class TestInspectAffineTransform:
         inspect_affine_transform(mock_transform)
 
         captured = capsys.readouterr()
-        assert "Translation distance in Z: 5.00 voxels" in captured.out
-        assert "Translation distance in Y: 10.00 voxels" in captured.out
-        assert "Translation distance in X: 15.00 voxels" in captured.out
+        assert "Translation distance in X: 5.00 physical units" in captured.out
+        assert "Translation distance in Y: 10.00 physical units" in captured.out
+        assert "Translation distance in Z: 15.00 physical units" in captured.out
 
     def test_pure_scale_transform(self, capsys):
         """Test inspection of pure scaling."""
@@ -726,9 +818,9 @@ class TestInspectAffineTransform:
         inspect_affine_transform(mock_transform)
 
         captured = capsys.readouterr()
-        assert "Z Scale: 0.50-fold" in captured.out
+        assert "X Scale: 0.50-fold" in captured.out
         assert "Y Scale: 1.50-fold" in captured.out
-        assert "X Scale: 2.00-fold" in captured.out
+        assert "Z Scale: 2.00-fold" in captured.out
 
     def test_pure_rotation_transform(self, capsys):
         """Test inspection of pure rotation."""
@@ -812,7 +904,7 @@ class TestInspectAffineTransform:
         rotation = Rotation.from_euler("xyz", [2, -3, 1.5], degrees=True).as_matrix()
 
         # Anisotropic scale (common in microscopy - different Z and XY resolution)
-        scale = np.diag([0.62, 1.02, 1.02])  # Z different from XY
+        scale = np.diag([1.02, 1.02, 0.62])  # Z different from XY
 
         # Translation
         translation = np.array([1.5, -2.3, 3.7])
@@ -826,12 +918,12 @@ class TestInspectAffineTransform:
 
         captured = capsys.readouterr()
         # Verify all components are reported
-        assert "Translation distance in Z:" in captured.out
-        assert "Translation distance in Y:" in captured.out
         assert "Translation distance in X:" in captured.out
-        assert "Z Scale: 0.62-fold" in captured.out
-        assert "Y Scale: 1.02-fold" in captured.out
+        assert "Translation distance in Y:" in captured.out
         assert "X Scale: 1.02-fold" in captured.out
+        assert "Translation distance in Z:" in captured.out
+        assert "Y Scale: 1.02-fold" in captured.out
+        assert "Z Scale: 0.62-fold" in captured.out
         assert "Rotation around" in captured.out
 
     def test_reflection_transform(self, capsys):

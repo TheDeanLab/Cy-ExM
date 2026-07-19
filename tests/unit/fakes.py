@@ -263,6 +263,15 @@ class FakeBackend:
         payload = path.read_bytes()
         if payload.startswith(b"corrupt"):
             raise ValueError(f"unreadable image: {path}")
+        if payload.startswith(b"tiff-fake:"):
+            decoded = json.loads(payload.removeprefix(b"tiff-fake:").decode())
+            geometry = ImageGeometry.from_dict(decoded["geometry"])
+            return fake_image(
+                data=np.zeros(geometry.shape, dtype=np.float32),
+                origin=geometry.origin,
+                spacing=geometry.spacing,
+                direction=geometry.direction,
+            )
         if path.name == "fixed.tif":
             template = self.fixed_image
             self._test_directory = path.parent
@@ -356,7 +365,7 @@ class FakeBackend:
         if self.fail_crop_image:
             raise RuntimeError("injected crop application failure")
         z0, z1, y0, y1, x0, x1 = bounds_zyx
-        origin = source.index_to_physical_point((z0, y0, x0))
+        origin = source.index_to_physical_point((x0, y0, z0))
         return fake_image(
             data=source.data[z0:z1, y0:y1, x0:x1],
             origin=origin,
@@ -515,7 +524,8 @@ class FakeBackend:
         if self.fail_tiff_role is not None and self.fail_tiff_role in path.name:
             path.write_bytes(b"partial-tiff")
             raise RuntimeError("injected TIFF writer failure")
-        path.write_bytes(b"tiff-fake")
+        payload = {"geometry": self.geometry(image).to_dict()}
+        path.write_bytes(b"tiff-fake:" + json.dumps(payload, sort_keys=True).encode())
 
     def calculate_metrics(
         self,
@@ -562,12 +572,12 @@ class FakeChunkBackend(FakeBackend):
     written_warp_paths: list[Path] = field(default_factory=list)
 
     def _chunk_id(self, image: FakeImage) -> int:
-        spacing_z = image.spacing[0]
+        spacing_z = image.spacing[2]
         if spacing_z <= 0.0:
             raise ValueError("spacing must be positive")
         physical_offset = np.asarray(image.origin) - np.asarray(self.fixed_image.origin)
         scaled_index = np.linalg.solve(np.asarray(image.direction), physical_offset)
-        z_start = round(float(scaled_index[0]) / spacing_z)
+        z_start = round(float(scaled_index[2]) / spacing_z)
         return int(z_start // self.chunk_depth)
 
     @staticmethod

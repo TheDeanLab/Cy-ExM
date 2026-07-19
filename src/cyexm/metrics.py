@@ -7,8 +7,20 @@ from typing import Any
 
 from cyexm.errors import RegistrationStageError
 from cyexm.io.atomic import atomic_write
+from cyexm.io.images import external_to_ants_array
 
 _METRIC_TYPES = ("Correlation", "MattesMutualInformation")
+
+
+def _from_external_array(ants: Any, array: Any, reference: Any | None = None) -> Any:
+    kwargs: dict[str, object] = {}
+    if reference is not None:
+        kwargs = {
+            "origin": reference.origin,
+            "spacing": reference.spacing,
+            "direction": reference.direction,
+        }
+    return ants.from_numpy(external_to_ants_array(array), **kwargs)
 
 
 def _metrics_text(metrics: Mapping[str, object]) -> str:
@@ -28,9 +40,13 @@ def calculate_metrics(
     import numpy as np
 
     if isinstance(fixed, np.ndarray):
-        fixed = ants.from_numpy(fixed)
+        fixed = _from_external_array(ants, fixed)
     if isinstance(moving, np.ndarray):
-        moving = ants.from_numpy(moving)
+        moving = _from_external_array(ants, moving)
+    if isinstance(fixed_mask, np.ndarray):
+        fixed_mask = _from_external_array(ants, fixed_mask, fixed)
+    if isinstance(moving_mask, np.ndarray):
+        moving_mask = _from_external_array(ants, moving_mask, moving)
 
     results: dict[str, float] = {}
     for metric_type in _METRIC_TYPES:

@@ -756,6 +756,13 @@ git commit -m "feat: add restart-safe artifact store"
 
 ## Task 4: Add image I/O, spatial metadata, cropping, and metrics
 
+> **Post-implementation correction (2026-07-19):** This historical plan's examples
+> equate external ZYX data with `ANTsImage.numpy()` and copy native ANTs shape into
+> `ImageGeometry.shape`. The authoritative implementation transposes the first three
+> axes between external ZYX and native ANTs XYZ, reports `ImageGeometry.shape` as
+> external ZYX, and keeps origin/spacing/direction physical XYZ. The older snippets
+> below are retained as planning history and are superseded by this note.
+
 **Files:**
 - Create: src/cyexm/io/images.py
 - Create: src/cyexm/io/tiff.py

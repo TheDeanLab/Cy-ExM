@@ -200,10 +200,13 @@ def test_geometry_returns_a_dependency_neutral_value(
     assert AntsRegistrationBackend().geometry(source) == expected
 
 
-def test_to_array_returns_an_independent_numpy_copy() -> None:
-    source = fake_image()
+def test_to_array_returns_an_independent_external_zyx_copy() -> None:
+    native_xyz = np.arange(4 * 3 * 2, dtype=np.float32).reshape(4, 3, 2)
+    source = fake_image(data=native_xyz)
 
     array = AntsRegistrationBackend().to_array(source)
+    np.testing.assert_array_equal(array, np.transpose(native_xyz, (2, 1, 0)))
+    assert array.shape == (2, 3, 4)
     array[0, 0, 0] = -1
 
     assert source.data[0, 0, 0] != -1
@@ -214,11 +217,15 @@ def test_from_array_preserves_reference_geometry_and_components(
 ) -> None:
     calls = install_fake_ants(monkeypatch, "cyexm.registration.backend")
     reference = fake_image(
+        data=np.ones((5, 3, 2), dtype=np.float32),
         origin=(1.0, 2.0, 3.0),
         spacing=(0.2, 0.3, 0.4),
         direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
     )
-    array = np.ones((4, 5, 6, 3), dtype=np.float32)
+    array = np.zeros((4, 5, 6, 3), dtype=np.float32)
+    array[..., 0] = 11.0
+    array[..., 1] = 22.0
+    array[..., 2] = 33.0
 
     result = AntsRegistrationBackend().from_array(
         array,
@@ -227,7 +234,11 @@ def test_from_array_preserves_reference_geometry_and_components(
     )
 
     call = calls.from_numpy_calls[-1]
-    np.testing.assert_array_equal(call["data"], array)
+    expected_native = np.transpose(array, (2, 1, 0, 3))
+    np.testing.assert_array_equal(call["data"], expected_native)
+    np.testing.assert_array_equal(call["data"][..., 0], 11.0)
+    np.testing.assert_array_equal(call["data"][..., 1], 22.0)
+    np.testing.assert_array_equal(call["data"][..., 2], 33.0)
     assert call["origin"] == reference.origin
     assert call["spacing"] == reference.spacing
     assert call["direction"] == reference.direction
@@ -235,23 +246,27 @@ def test_from_array_preserves_reference_geometry_and_components(
     assert result.has_components is True
 
 
-def test_crop_image_passes_zyx_start_directly_to_ants_physical_index(
+def test_crop_image_maps_zyx_start_to_ants_xyz_physical_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = install_fake_ants(monkeypatch, "cyexm.registration.backend")
-    data = np.arange(6 * 7 * 8, dtype=np.float32).reshape(6, 7, 8)
+    external_zyx = np.arange(6 * 7 * 8, dtype=np.float32).reshape(6, 7, 8)
+    native_xyz = np.transpose(external_zyx, (2, 1, 0))
     image = fake_image(
-        data=data,
+        data=native_xyz,
         origin=(10.0, 20.0, 30.0),
         spacing=(0.5, 1.0, 2.0),
         direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
     )
 
-    cropped = AntsRegistrationBackend().crop_image(image, (1, 5, 2, 6, 3, 7))
+    cropped = AntsRegistrationBackend().crop_image(image, (1, 5, 2, 6, 3, 6))
 
-    np.testing.assert_array_equal(cropped.numpy(), data[1:5, 2:6, 3:7])
-    assert calls.index_to_physical_calls == [(image, (1, 2, 3))]
-    assert cropped.origin == (8.0, 20.5, 36.0)
+    np.testing.assert_array_equal(
+        cropped.numpy(),
+        np.transpose(external_zyx[1:5, 2:6, 3:6], (2, 1, 0)),
+    )
+    assert calls.index_to_physical_calls == [(image, (3, 2, 1))]
+    assert cropped.origin == (8.0, 21.5, 32.0)
     assert cropped.spacing == image.spacing
     assert cropped.direction == image.direction
 
@@ -260,12 +275,19 @@ def test_crop_image_preserves_vector_components(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = install_fake_ants(monkeypatch, "cyexm.registration.backend")
-    data = np.arange(6 * 7 * 8 * 3, dtype=np.float32).reshape(6, 7, 8, 3)
-    image = fake_image(data=data, has_components=True)
+    external_zyx = np.zeros((6, 7, 8, 3), dtype=np.float32)
+    external_zyx[..., 0] = 11.0
+    external_zyx[..., 1] = 22.0
+    external_zyx[..., 2] = 33.0
+    native_xyz = np.transpose(external_zyx, (2, 1, 0, 3))
+    image = fake_image(data=native_xyz, has_components=True)
 
-    cropped = AntsRegistrationBackend().crop_image(image, (1, 5, 2, 6, 3, 7))
+    cropped = AntsRegistrationBackend().crop_image(image, (1, 5, 2, 6, 3, 6))
 
-    np.testing.assert_array_equal(cropped.numpy(), data[1:5, 2:6, 3:7, :])
+    np.testing.assert_array_equal(
+        cropped.numpy(),
+        np.transpose(external_zyx[1:5, 2:6, 3:6, :], (2, 1, 0, 3)),
+    )
     assert calls.from_numpy_calls[-1]["has_components"] is True
     assert cropped.components == 3
 
@@ -621,6 +643,7 @@ def test_identity_warp_preserves_reference_geometry_and_vector_components(
 ) -> None:
     calls = install_fake_ants(monkeypatch, "cyexm.registration.backend")
     reference = fake_image(
+        data=np.ones((5, 3, 2), dtype=np.float32),
         origin=(1.0, 2.0, 3.0),
         spacing=(0.2, 0.3, 0.4),
         direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
@@ -630,7 +653,7 @@ def test_identity_warp_preserves_reference_geometry_and_vector_components(
     AntsRegistrationBackend().write_identity_warp(reference, path)
 
     creation = calls.from_numpy_calls[-1]
-    assert creation["data"].shape == (8, 8, 8, 3)  # type: ignore[union-attr]
+    assert creation["data"].shape == (5, 3, 2, 3)  # type: ignore[union-attr]
     assert np.count_nonzero(creation["data"]) == 0
     assert creation["origin"] == reference.origin
     assert creation["spacing"] == reference.spacing

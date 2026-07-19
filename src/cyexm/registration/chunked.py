@@ -16,7 +16,7 @@ from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageReque
 from cyexm.registration.backend import RegistrationBackend
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
-from cyexm.spatial import ImageGeometry, PixelSize
+from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, PixelSize
 
 
 class _ChunkOutputValidationError(ValueError):
@@ -491,6 +491,7 @@ class ChunkedImageRegistration(ImageRegistration):
         affine_identity: FileIdentity,
     ) -> StageRequest:
         parameters: dict[str, object] = {
+            "axis_convention_version": AXIS_CONVENTION_VERSION,
             "chunk": self._chunk_dict(chunk),
             "chunk_grid": [self._chunk_dict(item) for item in chunks],
             "chunk_size_zyx": self.chunk_size,
@@ -644,6 +645,7 @@ class ChunkedImageRegistration(ImageRegistration):
         warp_identities: tuple[FileIdentity, ...],
     ) -> dict[str, object]:
         return {
+            "axis_convention_version": AXIS_CONVENTION_VERSION,
             "chunk_size_zyx": list(self.chunk_size),
             "chunks": [
                 {
@@ -655,7 +657,7 @@ class ChunkedImageRegistration(ImageRegistration):
             "image_shape_zyx": list(image_shape),
             "overlap_fraction": self.overlap_fraction,
             "round_number": self.imaging_round,
-            "schema_version": 1,
+            "schema_version": 2,
         }
 
     @staticmethod
@@ -694,6 +696,7 @@ class ChunkedImageRegistration(ImageRegistration):
             native_threads=native_threads,
             upstream=affine_identity,
             parameters={
+                "axis_convention_version": AXIS_CONVENTION_VERSION,
                 "chunk_size_zyx": self.chunk_size,
                 "image_shape_zyx": image_shape,
                 "local_warps": [identity.to_dict() for identity in warp_identities],

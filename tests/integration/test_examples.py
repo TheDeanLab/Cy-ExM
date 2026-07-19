@@ -25,6 +25,8 @@ def _code_source(cell: dict[str, object]) -> str:
 def _load_notebook_crop_helper(
     ants_module: object,
     crop_array: Callable[[Any, object], Any],
+    ants_to_external_array: Callable[[Any], Any],
+    external_to_ants_array: Callable[[Any], Any],
 ) -> Callable[[Any, object], Any]:
     path = Path("examples/notebooks/transform_directory.ipynb")
     notebook = json.loads(path.read_text(encoding="utf-8"))
@@ -38,7 +40,9 @@ def _load_notebook_crop_helper(
                 ast.fix_missing_locations(helper_module)
                 namespace = {
                     "ants": ants_module,
+                    "ants_to_external_array": ants_to_external_array,
                     "crop_array": crop_array,
+                    "external_to_ants_array": external_to_ants_array,
                 }
                 exec(compile(helper_module, str(path), "exec"), namespace)
                 helper = namespace["crop_spatial_image"]
@@ -54,32 +58,45 @@ def test_transform_directory_crop_helper_preserves_real_ants_geometry(
     import ants
     import numpy as np
 
-    from cyexm.io.images import crop_array
+    from cyexm.io.images import (
+        ants_to_external_array,
+        crop_array,
+        external_to_ants_array,
+    )
 
-    array = np.arange(6 * 7 * 8, dtype=np.float32).reshape(6, 7, 8)
+    array_zyx = np.arange(6 * 7 * 8, dtype=np.float32).reshape(6, 7, 8)
     direction = np.asarray(
         ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
         dtype=np.float64,
     )
     image = ants.from_numpy(
-        array,
+        external_to_ants_array(array_zyx),
         origin=(10.0, 20.0, 30.0),
         spacing=(0.5, 1.0, 2.0),
         direction=direction,
     )
-    bounds = (1, 5, 2, 6, 3, 7)
-    crop_spatial_image = _load_notebook_crop_helper(ants, crop_array)
+    bounds = (1, 5, 2, 6, 3, 6)
+    crop_spatial_image = _load_notebook_crop_helper(
+        ants,
+        crop_array,
+        ants_to_external_array,
+        external_to_ants_array,
+    )
 
     cropped = crop_spatial_image(image, bounds)
 
     expected_origin = tuple(
         float(value)
-        for value in ants.transform_index_to_physical_point(image, (1, 2, 3))
+        for value in ants.transform_index_to_physical_point(image, (3, 2, 1))
     )
+    assert expected_origin == (8.0, 21.5, 32.0)
     assert cropped.origin == expected_origin
     assert cropped.spacing == image.spacing
     np.testing.assert_array_equal(cropped.direction, image.direction)
-    np.testing.assert_array_equal(cropped.numpy(), array[1:5, 2:6, 3:7])
+    np.testing.assert_array_equal(
+        ants_to_external_array(cropped.numpy()),
+        array_zyx[1:5, 2:6, 3:6],
+    )
 
 
 def test_transform_directory_crop_helper_returns_original_when_crop_is_disabled(
@@ -89,9 +106,18 @@ def test_transform_directory_crop_helper_returns_original_when_crop_is_disabled(
     import ants
     import numpy as np
 
-    from cyexm.io.images import crop_array
+    from cyexm.io.images import (
+        ants_to_external_array,
+        crop_array,
+        external_to_ants_array,
+    )
 
     image = ants.from_numpy(np.zeros((2, 3, 4), dtype=np.float32))
-    crop_spatial_image = _load_notebook_crop_helper(ants, crop_array)
+    crop_spatial_image = _load_notebook_crop_helper(
+        ants,
+        crop_array,
+        ants_to_external_array,
+        external_to_ants_array,
+    )
 
     assert crop_spatial_image(image, None) is image

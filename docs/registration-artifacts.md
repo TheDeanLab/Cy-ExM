@@ -59,14 +59,27 @@ Every `<name>.complete.json` uses `schema_version: 1` and contains:
   in `parameters`;
 - stage-specific `request.parameters`, such as round, XYZ pixel size, crop policy,
   interpolation, method schedules, moving geometry, chunk grid, overlap, and local
-  warp identities; and
+  warp identities. Every request also records
+  `axis_convention_version: external-zyx-ants-xyz-v1`; and
 - `artifact`, the normalized path, size, and modification-time identity committed
   after validation.
 
 The chunk `manifest.json` has its own payload schema in addition to its completion
-record. It records `schema_version`, `round_number`, `image_shape_zyx`,
-`chunk_size_zyx`, `overlap_fraction`, ordered chunk bounds, and each local warp
-identity.
+record. Payload schema version 2 records
+`axis_convention_version: external-zyx-ants-xyz-v1`, `round_number`,
+`image_shape_zyx`, `chunk_size_zyx`, `overlap_fraction`, ordered chunk bounds, and
+each local warp identity.
+
+`request.geometry.shape`, chunk shapes, TIFF arrays, and crop bounds use external
+ZYX order. Origin, spacing, direction, ANTs indexes, and displacement component
+values remain physical XYZ. The convention version deliberately prevents completion
+records or manifests produced with the former ambiguous layout from being reused.
+
+Cy-ExM-generated fixed and final TIFFs embed a strict versioned geometry payload
+containing shape, origin, spacing, and direction. Their commit validators and cache
+readers reopen the TIFF and compare all four fields with serialization-only
+tolerance. Only TIFFs with no `cyexm` metadata key use legacy fallback geometry;
+present malformed metadata fails closed.
 
 ## Validation and reuse
 
@@ -77,7 +90,8 @@ On an identical rerun, Cy-ExM checks the following before reuse:
 3. Every request field exactly matches the current normalized request.
 4. The current artifact identity matches the identity committed in the record.
 5. The artifact-specific reader can reopen the affine, warp, TIFF, metric text, crop
-   bounds, or manifest.
+   bounds, or manifest. Whole-image TIFF readers additionally verify reopened shape,
+   origin, spacing, and direction against the image that produced the request.
 
 An artifact without its completion record, a record without its artifact, corrupt
 JSON, changed input metadata, changed geometry, changed registration policy, changed

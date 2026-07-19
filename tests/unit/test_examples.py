@@ -123,6 +123,9 @@ def test_transform_directory_notebook_preserves_optional_crop_geometry() -> None
     assert "FIXED_CROP_INDICES: Path | None" in source
     assert "MOVING_CROP_INDICES: Path | None" in source
     assert "transform_index_to_physical_point" in source
+    assert "(x0, y0, z0)" in source
+    assert "ants_to_external_array" in source
+    assert "external_to_ants_array" in source
     assert "tuple(float(value) for value in origin)" in source
     assert "origin=origin" in source
     assert "spacing=image.spacing" in source

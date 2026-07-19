@@ -110,6 +110,38 @@ class RejectingValidatorStore(ArtifactStore):
         super().commit(artifact, request, writer, validator)
 
 
+class GeometryMismatchingBackend(FakeBackend):
+    def __init__(self, target_name: str, component: str = "origin") -> None:
+        super().__init__()
+        self.target_name = target_name
+        self.component = component
+
+    def load_image(
+        self,
+        path: Path,
+        pixel_size_xyz: tuple[float, float, float],
+    ) -> object:
+        loaded = super().load_image(path, pixel_size_xyz)
+        if self.target_name not in path.name:
+            return loaded
+        assert isinstance(loaded, FakeImage)
+        if self.component == "shape":
+            loaded.data = np.pad(loaded.data, ((0, 1), (0, 0), (0, 0)))
+        elif self.component == "origin":
+            loaded.origin = (loaded.origin[0] + 1.0, *loaded.origin[1:])
+        elif self.component == "spacing":
+            loaded.spacing = (loaded.spacing[0] + 0.01, *loaded.spacing[1:])
+        elif self.component == "direction":
+            loaded.direction = (
+                (-loaded.direction[0][0], *loaded.direction[0][1:]),
+                loaded.direction[1],
+                loaded.direction[2],
+            )
+        else:
+            raise AssertionError(f"unknown geometry component: {self.component}")
+        return loaded
+
+
 def test_registration_defaults_are_legacy_compatible(tmp_path: Path) -> None:
     fixed = write_stub(tmp_path / "fixed.tif")
     moving = write_stub(tmp_path / "moving.tif")
@@ -430,6 +462,9 @@ def test_stage_records_capture_inputs_geometry_threads_policy_and_upstream(
         assert request.inputs == expected_inputs
         assert request.geometry.spacing == (0.15, 0.15, 0.15)
         assert request.native_threads == resolved_native_threads.values
+        assert (
+            request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
+        )
         assert "native_thread_sources" not in request.parameters
 
     assert records["affine"].method == "TRSAA"
@@ -508,6 +543,56 @@ def test_complete_registration_is_reused_without_reestimating_or_rewriting(
         (paths.warp, "linear"),
         (paths.warp, "nearestNeighbor"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("target_name", "stage"),
+    [
+        pytest.param("fixed_reference", "fixed reference", id="fixed-reference"),
+        pytest.param(
+            "nonlinear_registered_2",
+            "registered image",
+            id="registered-image",
+        ),
+    ],
+)
+def test_fresh_whole_tiff_validator_rejects_reopened_geometry_mismatch(
+    tmp_path: Path,
+    target_name: str,
+    stage: str,
+) -> None:
+    backend = GeometryMismatchingBackend(target_name)
+
+    with pytest.raises(RegistrationStageError, match=stage):
+        make_registration(tmp_path, backend=backend).register()
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        pytest.param("fixed_reference", id="fixed-reference"),
+        pytest.param("nonlinear_registered_2", id="registered-image"),
+    ],
+)
+@pytest.mark.parametrize(
+    "component",
+    [
+        pytest.param("shape", id="shape"),
+        pytest.param("origin", id="origin"),
+        pytest.param("spacing", id="spacing"),
+        pytest.param("direction", id="direction"),
+    ],
+)
+def test_cached_whole_tiff_reader_rejects_every_geometry_mismatch(
+    tmp_path: Path,
+    target_name: str,
+    component: str,
+) -> None:
+    make_registration(tmp_path, backend=FakeBackend()).register()
+    resumed = GeometryMismatchingBackend(target_name, component)
+
+    with pytest.raises(CacheValidationError, match="unreadable"):
+        make_registration(tmp_path, backend=resumed).register()
 
 
 def test_equal_effective_threads_reuse_cache_across_resolution_sources(
@@ -1351,5 +1436,8 @@ def test_crop_completion_records_capture_inputs_and_effective_threads(
         assert request.method == "robust-bounding-box"
         assert request.accuracy == "legacy-robust"
         assert request.parameters["image_role"] == role
+        assert (
+            request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
+        )
         assert request.native_threads == resolved_native_threads.values
         assert "native_thread_sources" not in request.parameters

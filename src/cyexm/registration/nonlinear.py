@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from cyexm.io.images import external_to_ants_array
 from cyexm.registration._native_paths import discard_path
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
@@ -52,6 +53,17 @@ def _validate_policy(registration_type: str, accuracy: str) -> None:
 
 def _is_displacement_field(path: Path) -> bool:
     return path.name.endswith((".nii", ".nii.gz"))
+
+
+def _from_external_array(ants: Any, array: Any, reference: Any | None = None) -> Any:
+    kwargs: dict[str, object] = {}
+    if reference is not None:
+        kwargs = {
+            "origin": reference.origin,
+            "spacing": reference.spacing,
+            "direction": reference.direction,
+        }
+    return ants.from_numpy(external_to_ants_array(array), **kwargs)
 
 
 def _materialize_forward_warp(
@@ -137,9 +149,13 @@ def register_image(
     ants, np = _configured_runtime(native_threads)
 
     if isinstance(fixed_image, np.ndarray):
-        fixed_image = ants.from_numpy(fixed_image)
+        fixed_image = _from_external_array(ants, fixed_image)
     if isinstance(moving_image, np.ndarray):
-        moving_image = ants.from_numpy(moving_image)
+        moving_image = _from_external_array(ants, moving_image)
+    if isinstance(fixed_mask, np.ndarray):
+        fixed_mask = _from_external_array(ants, fixed_mask, fixed_image)
+    if isinstance(moving_mask, np.ndarray):
+        moving_mask = _from_external_array(ants, moving_mask, moving_image)
     if fixed_image.dimension != moving_image.dimension:
         raise ValueError("Both images must have the same number of dimensions.")
 
@@ -212,9 +228,9 @@ def transform_image(
     """Apply an existing forward warp and match the source histogram."""
     ants, np = _configured_runtime(native_threads)
     if isinstance(fixed_image, np.ndarray):
-        fixed_image = ants.from_numpy(fixed_image)
+        fixed_image = _from_external_array(ants, fixed_image)
     if isinstance(moving_image, np.ndarray):
-        moving_image = ants.from_numpy(moving_image)
+        moving_image = _from_external_array(ants, moving_image)
 
     transformlist = list(transformed_image["fwdtransforms"])
     warped_image = ants.apply_transforms(
@@ -238,7 +254,7 @@ def inspect_warp_transform(
     import tifffile
 
     warp = ants.image_read(filename=str(transform_path))
-    image = ants.from_numpy(data=tifffile.imread(image_path))
+    image = ants.from_numpy(data=external_to_ants_array(tifffile.imread(image_path)))
     mask = ants.get_mask(image)
     warp_array = warp.numpy()
     dimension = warp.dimension

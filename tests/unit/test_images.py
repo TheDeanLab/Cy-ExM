@@ -130,9 +130,217 @@ def test_load_tiff_preserves_zyx_and_assigns_xyz_spacing(tmp_path: Path) -> None
 
     image = load_ants_image(path, (0.15, 0.15, 0.4))
 
-    np.testing.assert_array_equal(image.numpy(), data)
+    np.testing.assert_array_equal(image.numpy(), np.transpose(data, (2, 1, 0)))
+    assert image.shape == (8, 6, 4)
     assert image.spacing == pytest.approx((0.15, 0.15, 0.4))
     assert image.origin == pytest.approx((0.0, 0.0, 0.0))
+    np.testing.assert_array_equal(image.direction, np.eye(3))
+
+
+def _cyexm_tiff_metadata(
+    *,
+    shape: list[int] | None = None,
+    spacing: list[float] | None = None,
+) -> dict[str, object]:
+    return {
+        "axes": "ZYX",
+        "cyexm": {
+            "schema_version": 1,
+            "axis_convention_version": "external-zyx-ants-xyz-v1",
+            "geometry": {
+                "shape": [2, 3, 4] if shape is None else shape,
+                "origin": [10.0, 20.0, 30.0],
+                "spacing": [0.2, 0.3, 0.5] if spacing is None else spacing,
+                "direction": [
+                    [0.0, -1.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "cyexm_payload",
+    [
+        pytest.param(None, id="null-present-payload"),
+        pytest.param({}, id="empty-present-payload"),
+        pytest.param("not-an-object", id="non-object"),
+        pytest.param(
+            {
+                "schema_version": True,
+                "axis_convention_version": "external-zyx-ants-xyz-v1",
+                "geometry": {},
+            },
+            id="boolean-schema",
+        ),
+        pytest.param(
+            {
+                "schema_version": 2,
+                "axis_convention_version": "external-zyx-ants-xyz-v1",
+                "geometry": {},
+            },
+            id="unknown-schema",
+        ),
+        pytest.param(
+            {
+                "schema_version": 1,
+                "axis_convention_version": "legacy-ambiguous-v0",
+                "geometry": {},
+            },
+            id="wrong-axis-convention",
+        ),
+    ],
+)
+def test_load_ants_image_rejects_malformed_present_cyexm_metadata(
+    tmp_path: Path,
+    cyexm_payload: object,
+) -> None:
+    path = tmp_path / "malformed.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), dtype=np.uint16),
+        metadata={"axes": "ZYX", "cyexm": cyexm_payload},
+        photometric="minisblack",
+    )
+
+    with pytest.raises(InputValidationError, match="Cy-ExM TIFF geometry metadata"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
+@pytest.mark.parametrize(
+    ("level", "mutation"),
+    [
+        pytest.param("cyexm", "missing", id="cyexm-missing-key"),
+        pytest.param("cyexm", "extra", id="cyexm-extra-key"),
+        pytest.param("geometry", "missing", id="geometry-missing-key"),
+        pytest.param("geometry", "extra", id="geometry-extra-key"),
+    ],
+)
+def test_load_ants_image_rejects_noncanonical_metadata_key_sets(
+    tmp_path: Path,
+    level: str,
+    mutation: str,
+) -> None:
+    metadata = _cyexm_tiff_metadata()
+    cyexm = metadata["cyexm"]
+    assert isinstance(cyexm, dict)
+    target = cyexm if level == "cyexm" else cyexm["geometry"]
+    assert isinstance(target, dict)
+    if mutation == "missing":
+        target.pop("schema_version" if level == "cyexm" else "origin")
+    else:
+        target["unexpected"] = "value"
+    path = tmp_path / f"{level}-{mutation}.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), dtype=np.uint16),
+        metadata=metadata,
+        photometric="minisblack",
+    )
+
+    with pytest.raises(InputValidationError, match="Cy-ExM TIFF geometry metadata"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("shape", [2, 3, 0], id="zero-shape"),
+        pytest.param("shape", [2, 3, 4.5], id="noninteger-shape"),
+        pytest.param("origin", ["10.0", 20.0, 30.0], id="nonnumeric-origin"),
+        pytest.param("spacing", [0.2, 0.0, 0.5], id="zero-spacing"),
+        pytest.param("spacing", [0.2, "0.3", 0.5], id="nonnumeric-spacing"),
+    ],
+)
+def test_load_ants_image_rejects_malformed_geometry_values(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    metadata = _cyexm_tiff_metadata()
+    cyexm = metadata["cyexm"]
+    assert isinstance(cyexm, dict)
+    geometry = cyexm["geometry"]
+    assert isinstance(geometry, dict)
+    geometry[field] = value
+    path = tmp_path / f"malformed-{field}.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), dtype=np.uint16),
+        metadata=metadata,
+        photometric="minisblack",
+    )
+
+    with pytest.raises(InputValidationError, match="Cy-ExM TIFF geometry metadata"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
+def test_load_ants_image_rejects_wrong_axes_when_cyexm_metadata_is_present(
+    tmp_path: Path,
+) -> None:
+    metadata = _cyexm_tiff_metadata()
+    metadata["axes"] = "XYZ"
+    path = tmp_path / "wrong-axes.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), dtype=np.uint16),
+        metadata=metadata,
+        photometric="minisblack",
+    )
+
+    with pytest.raises(InputValidationError, match="axes"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
+def test_load_ants_image_rejects_embedded_geometry_shape_mismatch(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "wrong-shape.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), dtype=np.uint16),
+        metadata=_cyexm_tiff_metadata(shape=[9, 3, 4]),
+        photometric="minisblack",
+    )
+
+    with pytest.raises(InputValidationError, match="shape"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
+def test_load_ants_image_rejects_requested_spacing_incompatible_with_metadata(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "wrong-spacing.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), dtype=np.uint16),
+        metadata=_cyexm_tiff_metadata(),
+        photometric="minisblack",
+    )
+
+    with pytest.raises(InputValidationError, match="requested spacing"):
+        load_ants_image(path, (0.2, 0.3, 0.6))
+
+
+def test_load_ants_image_restores_present_singleton_z_geometry_exactly(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "singleton-z.tif"
+    data = np.arange(1 * 3 * 4, dtype=np.uint16).reshape(1, 3, 4)
+    tifffile.imwrite(
+        path,
+        data,
+        metadata=_cyexm_tiff_metadata(shape=[1, 3, 4]),
+        photometric="minisblack",
+    )
+
+    image = load_ants_image(path, (0.2, 0.3, 0.5))
+
+    assert image.shape == (4, 3, 1)
+    assert ants_geometry(image).shape == (1, 3, 4)
+    np.testing.assert_array_equal(image.numpy(), np.transpose(data, (2, 1, 0)))
 
 
 @pytest.mark.parametrize(
@@ -177,7 +385,7 @@ def test_ants_geometry_returns_dependency_neutral_three_dimensional_value() -> N
     geometry = ants_geometry(image)
 
     assert geometry == ImageGeometry(
-        shape=(2, 3, 4),
+        shape=(4, 3, 2),
         origin=(1.0, 2.0, 3.0),
         spacing=(0.2, 0.3, 0.4),
         direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
@@ -201,7 +409,7 @@ def test_zero_mask_preserves_geometry() -> None:
         dtype=np.float64,
     )
     image = ants.from_numpy(
-        np.array([[[0, 2], [3, 0]]], dtype=np.float32),
+        np.arange(5 * 3 * 2, dtype=np.float32).reshape(5, 3, 2),
         origin=(1.0, 2.0, 3.0),
         spacing=(0.2, 0.3, 0.4),
         direction=direction,
@@ -209,6 +417,7 @@ def test_zero_mask_preserves_geometry() -> None:
 
     mask = zero_mask(image)
 
+    assert mask.shape == (5, 3, 2)
     np.testing.assert_array_equal(mask.numpy(), image.numpy() > 0)
     assert mask.origin == image.origin
     assert mask.spacing == image.spacing

@@ -45,6 +45,7 @@ def _registration(
     native_threads: NativeThreadConfig,
     *,
     backend: AntsRegistrationBackend | None = None,
+    crop: bool = False,
 ) -> ImageRegistration:
     return ImageRegistration(
         fixed_path,
@@ -52,6 +53,7 @@ def _registration(
         output,
         imaging_round=1,
         pixel_size=_PIXEL_SIZE,
+        crop=crop,
         enable_logging=False,
         native_threads=native_threads,
         linear_accuracy="dry run",
@@ -100,13 +102,19 @@ def test_whole_image_writes_spatially_consistent_output_and_completion_records(
         assert series.axes == "ZYX"
         assert series.shape == (16, 32, 32)
         assert series.dtype == np.dtype(np.uint16)
+        metadata = registered_tiff.shaped_metadata
+        assert metadata
+        assert metadata[0]["cyexm"]["axis_convention_version"] == (
+            "external-zyx-ants-xyz-v1"
+        )
     registered_array = tifffile.imread(paths.registered)
     assert registered_array.shape == (16, 32, 32)
     assert registered_array.dtype == np.dtype(np.uint16)
 
     backend = AntsRegistrationBackend(native_threads)
     registered = backend.load_image(paths.registered, _PIXEL_SIZE)
-    assert registered.shape == (16, 32, 32)
+    assert registered.shape == (32, 32, 16)
+    assert backend.geometry(registered).shape == (16, 32, 32)
     assert registered.origin == (0.0, 0.0, 0.0)
     assert registered.spacing == _PIXEL_SIZE
     np.testing.assert_array_equal(registered.direction, np.eye(3))
@@ -120,6 +128,63 @@ def test_whole_image_writes_spatially_consistent_output_and_completion_records(
     assert warp.has_components
     assert warp.numpy().dtype == np.dtype(np.float32)
     assert warp.numpy().shape == (*registered.shape, 3)
+
+
+def test_crop_workflow_reloads_fixed_registered_and_warp_with_fixed_geometry(
+    synthetic_tiffs: tuple[Path, Path],
+    tmp_path: Path,
+    native_threads: NativeThreadConfig,
+) -> None:
+    import json
+
+    import ants
+    import numpy as np
+
+    fixed_path, moving_path = synthetic_tiffs
+    output = tmp_path / "cropped-whole"
+
+    _registration(
+        fixed_path,
+        moving_path,
+        output,
+        native_threads,
+        crop=True,
+    ).register()
+
+    paths = RegistrationPaths.for_round(output, 1)
+    bounds = json.loads(paths.fixed_crop.read_text(encoding="utf-8"))
+    z0, z1, y0, y1, x0, x1 = bounds
+    expected_shape_zyx = (z1 - z0, y1 - y0, x1 - x0)
+    expected_origin_xyz = (
+        x0 * _PIXEL_SIZE[0],
+        y0 * _PIXEL_SIZE[1],
+        z0 * _PIXEL_SIZE[2],
+    )
+    backend = AntsRegistrationBackend(native_threads)
+    fixed_reference = backend.load_image(paths.fixed_reference, _PIXEL_SIZE)
+    registered = backend.load_image(paths.registered, _PIXEL_SIZE)
+    warp = ants.image_read(str(paths.warp))
+
+    fixed_geometry = backend.geometry(fixed_reference)
+    registered_geometry = backend.geometry(registered)
+    warp_geometry = backend.geometry(warp)
+    assert fixed_geometry.shape == expected_shape_zyx
+    assert registered_geometry.shape == expected_shape_zyx
+    assert warp_geometry.shape == expected_shape_zyx
+    for geometry in (fixed_geometry, registered_geometry, warp_geometry):
+        np.testing.assert_allclose(
+            geometry.origin,
+            expected_origin_xyz,
+            rtol=0.0,
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            geometry.spacing,
+            _PIXEL_SIZE,
+            rtol=0.0,
+            atol=1e-7,
+        )
+        np.testing.assert_array_equal(geometry.direction, np.eye(3))
 
 
 def test_resume_reuses_affine_after_injected_nonlinear_failure(

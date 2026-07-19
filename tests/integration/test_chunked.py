@@ -205,7 +205,7 @@ def test_one_chunk_and_whole_apply_the_same_real_estimated_transform_pair(
     chunked_warp = ants.image_read(str(chunked.warp)).numpy()
     local_warp_array = ants.image_read(str(local_warp)).numpy()
     for warp in (whole_warp, chunked_warp, local_warp_array):
-        assert warp.shape == (*_SHAPE, 3)
+        assert warp.shape == (*reversed(_SHAPE), 3)
         # The approved tolerance covers NIfTI serialization and chunk float32 assembly.
         np.testing.assert_allclose(warp, reference_warp, rtol=1e-4, atol=1e-5)
 

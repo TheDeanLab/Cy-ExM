@@ -241,6 +241,13 @@ The stable default is one ITK thread and one BLAS-family thread, preserving the
 behavior selected after prior instability. Users may explicitly request higher
 values for a validated dataset and environment.
 
+Explicit `NativeThreadConfig` fields are strict operation-boundary inputs: each
+supplied count must be a built-in integer of at least one, without coercing booleans,
+floats, strings, or integer subclasses. Inherited environment values use a separate
+base-10 string parser that retains the existing acceptance of surrounding whitespace
+and a leading `+`. All effective values and late-runtime comparisons are validated
+before any environment variable is changed.
+
 Effective values are resolved in this order:
 
 1. Explicit `NativeThreadConfig` values supplied to the workflow.

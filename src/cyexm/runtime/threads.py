@@ -41,9 +41,15 @@ class ResolvedNativeThreads:
         )
 
 
-def _positive_int(value: int | str, name: str) -> int:
+def _positive_explicit_int(value: object, name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ThreadConfigurationError(f"{name} must be a positive integer")
+    return value
+
+
+def _positive_environment_int(value: str, name: str) -> int:
     try:
-        parsed = int(value)
+        parsed = int(value, 10)
     except (TypeError, ValueError) as error:
         raise ThreadConfigurationError(f"{name} must be a positive integer") from error
     if parsed < 1:
@@ -70,10 +76,10 @@ def configure_native_threads(
             config.itk_threads if name == ITK_THREAD_ENV_VAR else config.blas_threads
         )
         if explicit is not None:
-            value = _positive_int(explicit, name)
+            value = _positive_explicit_int(explicit, name)
             source = "explicit"
         elif name in target_environ:
-            value = _positive_int(target_environ[name], name)
+            value = _positive_environment_int(target_environ[name], name)
             source = "environment"
         else:
             value = 1
@@ -83,7 +89,7 @@ def configure_native_threads(
         if (
             runtime_loaded
             and current is not None
-            and _positive_int(current, name) != value
+            and _positive_environment_int(current, name) != value
         ):
             loaded = ", ".join(sorted(loaded_roots & SCIENTIFIC_MODULE_ROOTS))
             raise ThreadConfigurationError(

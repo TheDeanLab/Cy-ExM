@@ -39,8 +39,13 @@ threads = NativeThreadConfig(itk_threads=1, blas_threads=1)
 ```
 
 Explicit values override inherited environment values; inherited values override the
-one-thread default. Configure threads before ANTs, NumPy, or SciPy initializes. Cy-ExM
-raises a focused error instead of pretending a late change took effect.
+one-thread default. Explicit counts must be built-in integers of at least one, so
+booleans, floats, and strings are not coerced. Inherited counts remain base-10
+strings; surrounding whitespace and a leading `+` remain accepted, while fractional,
+non-numeric, zero, and negative values are rejected. Cy-ExM resolves every value
+before changing the environment. Configure threads before ANTs, NumPy, or SciPy
+initializes; a focused error is raised instead of pretending a late change took
+effect.
 
 ## Whole-image registration
 

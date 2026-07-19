@@ -251,6 +251,12 @@ git commit -m "build: establish Cy-ExM package foundation"
 - Consumes: cyexm.errors.ThreadConfigurationError.
 - Produces: NativeThreadConfig, ResolvedNativeThreads, configure_native_threads(config=None), NATIVE_THREAD_ENV_VARS, and a deterministic description of effective values and sources.
 
+> **Audit correction:** Explicit configuration counts are exact built-in integers of
+> at least one and are never coerced. Inherited environment counts use a separate
+> base-10 string parser; surrounding whitespace and a leading `+` retain their prior
+> meaning. Resolution and late-runtime comparison complete before environment
+> mutation.
+
 - [ ] **Step 1: Write failing resolution and late-import tests**
 
 ~~~python
@@ -411,9 +417,15 @@ class ResolvedNativeThreads:
         )
 
 
-def _positive_int(value: int | str, name: str) -> int:
+def _positive_explicit_int(value: object, name: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ThreadConfigurationError(f"{name} must be a positive integer")
+    return value
+
+
+def _positive_environment_int(value: str, name: str) -> int:
     try:
-        parsed = int(value)
+        parsed = int(value, 10)
     except (TypeError, ValueError) as error:
         raise ThreadConfigurationError(f"{name} must be a positive integer") from error
     if parsed < 1:
@@ -442,17 +454,21 @@ def configure_native_threads(
             else config.blas_threads
         )
         if explicit is not None:
-            value = _positive_int(explicit, name)
+            value = _positive_explicit_int(explicit, name)
             source = "explicit"
         elif name in target_environ:
-            value = _positive_int(target_environ[name], name)
+            value = _positive_environment_int(target_environ[name], name)
             source = "environment"
         else:
             value = 1
             source = "default"
 
         current = target_environ.get(name)
-        if runtime_loaded and current is not None and _positive_int(current, name) != value:
+        if (
+            runtime_loaded
+            and current is not None
+            and _positive_environment_int(current, name) != value
+        ):
             loaded = ", ".join(sorted(loaded_roots & SCIENTIFIC_MODULE_ROOTS))
             raise ThreadConfigurationError(
                 f"Cannot change {name} after scientific runtime already loaded: {loaded}"

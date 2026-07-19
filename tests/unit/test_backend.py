@@ -19,6 +19,7 @@ def test_registration_backend_declares_every_required_operation() -> None:
     expected = {
         "load_image": ("self", "path", "pixel_size_xyz"),
         "zero_mask": ("self", "image"),
+        "threshold_mask": ("self", "image"),
         "geometry": ("self", "image"),
         "to_array": ("self", "image"),
         "from_array": ("self", "array", "reference", "has_components"),
@@ -45,6 +46,15 @@ def test_registration_backend_declares_every_required_operation() -> None:
         "read_warp": ("self", "path"),
         "write_identity_warp": ("self", "reference", "path"),
         "write_tiff": ("self", "image", "path", "min_value", "max_value"),
+        "calculate_metrics": (
+            "self",
+            "fixed",
+            "moving",
+            "fixed_mask",
+            "moving_mask",
+            "sampling",
+            "sampling_pct",
+        ),
     }
 
     assert {
@@ -118,6 +128,29 @@ def test_zero_mask_delegates_after_thread_configuration(
 
     assert events == ["configure", "zero-mask"]
     assert result is expected
+
+
+def test_threshold_mask_uses_the_characterized_half_value_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.backend")
+    monkeypatch.setattr(
+        backend_module,
+        "configure_native_threads",
+        lambda config: _Resolved(),
+    )
+    source = fake_image()
+
+    result = AntsRegistrationBackend().threshold_mask(source)
+
+    assert calls.threshold == {
+        "image": source,
+        "low_thresh": 0.5,
+        "high_thresh": 1.0,
+        "inval": 1,
+        "outval": 0,
+    }
+    assert result is calls.thresholded
 
 
 def test_geometry_returns_a_dependency_neutral_value(
@@ -603,6 +636,50 @@ def test_write_tiff_delegates_range_and_supplied_path(
         "min_value": 100.0,
         "max_value": 1100.0,
     }
+
+
+def test_metric_calculation_configures_threads_before_delegating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    requested = NativeThreadConfig(itk_threads=2, blas_threads=3)
+    expected = {"Correlation": 0.75, "MattesMutualInformation": 0.25}
+    received: dict[str, object] = {}
+
+    def configure(config: NativeThreadConfig | None) -> _Resolved:
+        assert config is requested
+        events.append("configure")
+        return _Resolved()
+
+    def calculate(*args: object, **kwargs: object) -> dict[str, float]:
+        events.append("calculate")
+        received["args"] = args
+        received["kwargs"] = kwargs
+        return expected
+
+    monkeypatch.setattr(backend_module, "configure_native_threads", configure)
+    monkeypatch.setattr(backend_module, "calculate_image_metrics", calculate)
+
+    result = AntsRegistrationBackend(requested).calculate_metrics(
+        "fixed",
+        "moving",
+        fixed_mask="fixed-mask",
+        moving_mask="moving-mask",
+        sampling="random",
+        sampling_pct=0.4,
+    )
+
+    assert events == ["configure", "calculate"]
+    assert received == {
+        "args": ("fixed", "moving"),
+        "kwargs": {
+            "fixed_mask": "fixed-mask",
+            "moving_mask": "moving-mask",
+            "sampling": "random",
+            "sampling_pct": 0.4,
+        },
+    }
+    assert result is expected
 
 
 class _Resolved:

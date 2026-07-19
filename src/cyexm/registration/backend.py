@@ -7,6 +7,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from cyexm.io.images import ants_geometry, load_ants_image, zero_mask
 from cyexm.io.tiff import write_uint16_tiff
+from cyexm.metrics import calculate_metrics as calculate_image_metrics
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 from cyexm.spatial import ImageGeometry, PixelSize
 
@@ -30,6 +31,9 @@ class RegistrationBackend(Protocol):
         raise NotImplementedError
 
     def zero_mask(self, image: object) -> object:
+        raise NotImplementedError
+
+    def threshold_mask(self, image: object) -> object:
         raise NotImplementedError
 
     def geometry(self, image: object) -> ImageGeometry:
@@ -105,6 +109,17 @@ class RegistrationBackend(Protocol):
     ) -> None:
         raise NotImplementedError
 
+    def calculate_metrics(
+        self,
+        fixed: object,
+        moving: object,
+        fixed_mask: object | None = None,
+        moving_mask: object | None = None,
+        sampling: str = "regular",
+        sampling_pct: float = 1.0,
+    ) -> dict[str, float]:
+        raise NotImplementedError
+
 
 class AntsRegistrationBackend:
     def __init__(self, native_threads: NativeThreadConfig | None = None) -> None:
@@ -121,6 +136,17 @@ class AntsRegistrationBackend:
     def zero_mask(self, image: object) -> object:
         self._prepare()
         return zero_mask(image)
+
+    def threshold_mask(self, image: object) -> object:
+        self._prepare()
+        ants, _ = _scientific_runtime()
+        return ants.threshold_image(
+            image,
+            low_thresh=0.5,
+            high_thresh=1.0,
+            inval=1,
+            outval=0,
+        )
 
     def geometry(self, image: object) -> ImageGeometry:
         self._prepare()
@@ -293,6 +319,25 @@ class AntsRegistrationBackend:
     ) -> None:
         self._prepare()
         write_uint16_tiff(image, path, min_value, max_value)
+
+    def calculate_metrics(
+        self,
+        fixed: object,
+        moving: object,
+        fixed_mask: object | None = None,
+        moving_mask: object | None = None,
+        sampling: str = "regular",
+        sampling_pct: float = 1.0,
+    ) -> dict[str, float]:
+        self._prepare()
+        return calculate_image_metrics(
+            fixed,
+            moving,
+            fixed_mask=fixed_mask,
+            moving_mask=moving_mask,
+            sampling=sampling,
+            sampling_pct=sampling_pct,
+        )
 
 
 __all__ = ["AntsRegistrationBackend", "RegistrationBackend"]

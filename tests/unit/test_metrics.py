@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from cyexm.errors import RegistrationStageError
-from cyexm.metrics import calculate_metrics, write_metrics
+from cyexm.metrics import calculate_metrics, read_metrics, write_metrics
 
 
 class FakeImage:
@@ -118,6 +118,35 @@ def test_metric_file_is_sorted_and_atomic(tmp_path: Path) -> None:
         "Correlation: 0.75\nMattesMutualInformation: 0.25\n"
     )
     assert list(tmp_path.glob(".*.tmp*")) == []
+
+
+def test_metric_file_round_trips_through_strict_reader(tmp_path: Path) -> None:
+    destination = tmp_path / "metrics.txt"
+    expected = {"MattesMutualInformation": 0.25, "Correlation": 0.75}
+
+    write_metrics(expected, destination)
+
+    assert read_metrics(destination) == expected
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param("Correlation = 0.75\n", id="missing-colon"),
+        pytest.param("Correlation: nan\n", id="non-finite"),
+        pytest.param("Correlation: 0.75\nCorrelation: 0.5\n", id="duplicate"),
+        pytest.param("Correlation: 0.750\n", id="non-canonical"),
+    ],
+)
+def test_metric_reader_rejects_malformed_or_noncanonical_files(
+    tmp_path: Path,
+    contents: str,
+) -> None:
+    destination = tmp_path / "metrics.txt"
+    destination.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        read_metrics(destination)
 
 
 def test_metric_write_failure_keeps_the_previous_artifact(

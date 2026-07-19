@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from cyexm.spatial import ImageGeometry, PixelSize
+
 _ANTSPYX_REGISTRATION_PARAMETERS = frozenset(
     {
         "fixed",
@@ -166,6 +168,299 @@ def fake_image(
     )
 
 
+@dataclass
+class FakeBackend:
+    fail_linear: bool = False
+    fail_nonlinear: bool = False
+    fail_affine_write: bool = False
+    affine_bytes: bytes = b"affine-fake"
+    warp_bytes: bytes = b"warp-fake"
+    metric_values: dict[str, float] = field(
+        default_factory=lambda: {
+            "Correlation": 0.75,
+            "MattesMutualInformation": 0.25,
+        }
+    )
+    fixed_image: FakeImage = field(
+        default_factory=lambda: fake_image(
+            data=np.pad(
+                np.ones((4, 4, 4), dtype=np.float32),
+                ((1, 3), (2, 2), (1, 3)),
+            )
+        )
+    )
+    moving_image: FakeImage = field(
+        default_factory=lambda: fake_image(
+            data=np.pad(
+                np.full((4, 4, 4), 2.0, dtype=np.float32),
+                ((2, 2), (1, 3), (2, 2)),
+            )
+        )
+    )
+    linear_calls: int = 0
+    nonlinear_calls: int = 0
+    read_affine_calls: int = 0
+    read_warp_calls: int = 0
+    read_warp_paths: list[Path] = field(default_factory=list)
+    threshold_mask_calls: int = 0
+    events: list[str] = field(default_factory=list)
+    load_paths: list[Path] = field(default_factory=list)
+    linear_kwargs: list[dict[str, object]] = field(default_factory=list)
+    nonlinear_kwargs: list[dict[str, object]] = field(default_factory=list)
+    affine_interpolations: list[str] = field(default_factory=list)
+    warp_applications: list[tuple[Path, str]] = field(default_factory=list)
+    metric_calls: list[tuple[object, object, object | None, object | None]] = field(
+        default_factory=list
+    )
+    tiff_writes: list[tuple[Path, float, float]] = field(default_factory=list)
+    crop_bounds: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
+    temporary_warps: list[Path] = field(default_factory=list)
+    _test_directory: Path | None = None
+
+    def load_image(self, path: Path, pixel_size_xyz: PixelSize) -> object:
+        self.events.append(f"load:{path.name}")
+        self.load_paths.append(path)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        payload = path.read_bytes()
+        if payload.startswith(b"corrupt"):
+            raise ValueError(f"unreadable image: {path}")
+        if path.name == "fixed.tif":
+            template = self.fixed_image
+            self._test_directory = path.parent
+        elif path.name == "moving.tif":
+            template = self.moving_image
+            self._test_directory = path.parent
+        elif "fixed_reference" in path.name:
+            template = self.fixed_image
+        else:
+            template = self.moving_image
+        loaded = template.clone()
+        loaded.spacing = tuple(float(value) for value in pixel_size_xyz)
+        return loaded
+
+    def zero_mask(self, image: object) -> object:
+        source = image
+        if not isinstance(source, FakeImage):
+            raise TypeError("image must be a FakeImage")
+        self.events.append("zero-mask")
+        return fake_image(
+            data=(source.data > 0).astype(np.float32),
+            origin=source.origin,
+            spacing=source.spacing,
+            direction=source.direction,
+        )
+
+    def threshold_mask(self, image: object) -> object:
+        source = image
+        if not isinstance(source, FakeImage):
+            raise TypeError("image must be a FakeImage")
+        self.events.append("threshold-mask")
+        self.threshold_mask_calls += 1
+        return fake_image(
+            data=((source.data >= 0.5) & (source.data <= 1.0)).astype(np.float32),
+            origin=source.origin,
+            spacing=source.spacing,
+            direction=source.direction,
+        )
+
+    def geometry(self, image: object) -> ImageGeometry:
+        source = image
+        if not isinstance(source, FakeImage):
+            raise TypeError("image must be a FakeImage")
+        return ImageGeometry(
+            shape=source.shape,
+            origin=source.origin,
+            spacing=source.spacing,
+            direction=source.direction,
+        )
+
+    def to_array(self, image: object) -> object:
+        source = image
+        if not isinstance(source, FakeImage):
+            raise TypeError("image must be a FakeImage")
+        return source.numpy()
+
+    def from_array(
+        self,
+        array: object,
+        *,
+        reference: object,
+        has_components: bool = False,
+    ) -> object:
+        source = reference
+        if not isinstance(source, FakeImage):
+            raise TypeError("reference must be a FakeImage")
+        return fake_image(
+            data=np.asarray(array),
+            origin=source.origin,
+            spacing=source.spacing,
+            direction=source.direction,
+            has_components=has_components,
+        )
+
+    def crop_image(
+        self,
+        image: object,
+        bounds_zyx: tuple[int, int, int, int, int, int],
+    ) -> object:
+        source = image
+        if not isinstance(source, FakeImage):
+            raise TypeError("image must be a FakeImage")
+        self.crop_bounds.append(bounds_zyx)
+        z0, z1, y0, y1, x0, x1 = bounds_zyx
+        start_xyz = (x0, y0, z0)
+        scaled = tuple(
+            start * spacing
+            for start, spacing in zip(start_xyz, source.spacing, strict=True)
+        )
+        offset = tuple(
+            sum(source.direction[row][column] * scaled[column] for column in range(3))
+            for row in range(3)
+        )
+        origin = tuple(
+            base + delta for base, delta in zip(source.origin, offset, strict=True)
+        )
+        return fake_image(
+            data=source.data[z0:z1, y0:y1, x0:x1],
+            origin=origin,
+            spacing=source.spacing,
+            direction=source.direction,
+        )
+
+    def linear(self, **kwargs: object) -> tuple[object, object | None, object]:
+        self.events.append("linear")
+        self.linear_calls += 1
+        self.linear_kwargs.append(dict(kwargs))
+        if self.fail_linear:
+            raise RuntimeError("injected linear failure")
+        moving = kwargs["moving_image"]
+        moving_mask = kwargs.get("moving_mask")
+        if not isinstance(moving, FakeImage):
+            raise TypeError("moving_image must be a FakeImage")
+        transformed_mask = (
+            None if moving_mask is None else moving_mask.clone()  # type: ignore[union-attr]
+        )
+        return moving.clone(), transformed_mask, self.affine_bytes
+
+    def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
+        self.events.append("nonlinear")
+        self.nonlinear_calls += 1
+        self.nonlinear_kwargs.append(dict(kwargs))
+        if self.fail_nonlinear:
+            raise RuntimeError("injected nonlinear failure")
+        moving = kwargs["moving_image"]
+        if not isinstance(moving, FakeImage):
+            raise TypeError("moving_image must be a FakeImage")
+        if self._test_directory is None:
+            raise RuntimeError("no test directory was established")
+        warp_path = (
+            self._test_directory / f"temporary-warp-{self.nonlinear_calls}.nii.gz"
+        )
+        warp_path.write_bytes(self.warp_bytes)
+        self.temporary_warps.append(warp_path)
+        return moving.clone(), warp_path
+
+    def apply_affine(
+        self,
+        *,
+        fixed: object,
+        moving: object,
+        transform: object,
+        interpolation: str,
+    ) -> object:
+        del fixed, transform
+        if not isinstance(moving, FakeImage):
+            raise TypeError("moving must be a FakeImage")
+        self.events.append(f"apply-affine:{interpolation}")
+        self.affine_interpolations.append(interpolation)
+        return moving.clone()
+
+    def apply_warp(
+        self,
+        *,
+        fixed: object,
+        moving: object,
+        warp_path: Path,
+        interpolation: str,
+    ) -> object:
+        del fixed
+        if not isinstance(moving, FakeImage):
+            raise TypeError("moving must be a FakeImage")
+        if not warp_path.is_file():
+            raise FileNotFoundError(warp_path)
+        self.events.append(f"apply-warp:{interpolation}")
+        self.warp_applications.append((warp_path, interpolation))
+        return moving.clone()
+
+    def write_affine(self, transform: object, path: Path) -> None:
+        self.events.append("write-affine")
+        if self.fail_affine_write:
+            path.write_bytes(b"partial-affine")
+            raise RuntimeError("injected affine write failure")
+        if not isinstance(transform, bytes):
+            raise TypeError("transform must be bytes")
+        path.write_bytes(transform)
+
+    def read_affine(self, path: Path) -> object:
+        self.events.append("read-affine")
+        self.read_affine_calls += 1
+        value = path.read_bytes()
+        if not value.startswith(b"affine"):
+            raise ValueError(f"unreadable affine: {path}")
+        return value
+
+    def write_warp(self, warp: object, path: Path) -> None:
+        if isinstance(warp, bytes):
+            path.write_bytes(warp)
+        else:
+            path.write_bytes(self.warp_bytes)
+
+    def read_warp(self, path: Path) -> object:
+        self.events.append("read-warp")
+        self.read_warp_calls += 1
+        self.read_warp_paths.append(path)
+        value = path.read_bytes()
+        if not value.startswith((b"warp", b"identity")):
+            raise ValueError(f"unreadable warp: {path}")
+        return fake_image(
+            data=np.zeros((*self.fixed_image.shape, 3), dtype=np.float32),
+            has_components=True,
+        )
+
+    def write_identity_warp(self, reference: object, path: Path) -> None:
+        del reference
+        path.write_bytes(b"identity-warp")
+
+    def write_tiff(
+        self,
+        image: object,
+        path: Path,
+        *,
+        min_value: float,
+        max_value: float,
+    ) -> None:
+        if not isinstance(image, FakeImage):
+            raise TypeError("image must be a FakeImage")
+        self.events.append("write-tiff")
+        self.tiff_writes.append((path, min_value, max_value))
+        path.write_bytes(b"tiff-fake")
+
+    def calculate_metrics(
+        self,
+        fixed: object,
+        moving: object,
+        fixed_mask: object | None = None,
+        moving_mask: object | None = None,
+        sampling: str = "regular",
+        sampling_pct: float = 1.0,
+    ) -> dict[str, float]:
+        del sampling, sampling_pct
+        self.events.append("metrics")
+        self.metric_calls.append((fixed, moving, fixed_mask, moving_mask))
+        return dict(self.metric_values)
+
+
 def install_fake_ants(
     monkeypatch: pytest.MonkeyPatch,
     module_name: str,
@@ -322,6 +617,7 @@ def install_fake_ants(
 
 __all__ = [
     "FakeAntsCalls",
+    "FakeBackend",
     "FakeImage",
     "FakeTransform",
     "fake_image",

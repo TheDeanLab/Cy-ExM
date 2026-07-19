@@ -169,6 +169,27 @@ def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
     assert "uv sync --group dev --extra examples" not in root_lines
 
 
+def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
+    documentation = _normalized_repository_file("docs/AGENTS.md")
+    for required in (
+        "merged phase 1 behavior",
+        "proposed phase 2",
+        "not installable behavior",
+        "dedicated runtime design",
+    ):
+        assert required in documentation
+
+    examples = _normalized_repository_file("examples/AGENTS.md")
+    for required in (
+        "phase 1 examples are the current runnable surface",
+        "runtime api is implemented and accepted",
+        "examples never lead production behavior",
+        "scientific manifest",
+        "execution profile",
+    ):
+        assert required in examples
+
+
 def test_every_maintained_directory_has_local_agent_guidance() -> None:
     actual = {
         str(path.relative_to(REPOSITORY_ROOT))

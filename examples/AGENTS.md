@@ -15,6 +15,8 @@
   interpolation.
 - Notebooks must have no saved outputs or execution counts. Scripts and notebooks
   must remain useful on local workstations without cluster services.
-- Phase 1 examples cover whole-image and serial chunked registration only. Do not add
-  workflow manifests or parallel execution examples before their separately reviewed
-  phase.
+- Phase 1 examples are the current runnable surface. Add a Phase 2 example only after
+  its runtime API is implemented and accepted; examples never lead production
+  behavior. Future manifest examples keep the scientific manifest separate from any
+  local or HPC execution profile and remain runnable without cluster services where
+  the API permits.

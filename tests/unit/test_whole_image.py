@@ -30,6 +30,8 @@ from cyexm.runtime import (
     ResolvedNativeThreads,
 )
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture(autouse=True)
 def resolved_native_threads(

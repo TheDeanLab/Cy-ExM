@@ -9,6 +9,8 @@ import tifffile
 from cyexm.errors import CacheValidationError, InputValidationError
 from cyexm.io.tiff import write_uint16_tiff
 
+pytestmark = pytest.mark.unit
+
 
 def test_uint16_export_matches_legacy_range_mapping(tmp_path: Path) -> None:
     data = np.array([[[0.0, 5.0, 10.0, np.nan]]], dtype=np.float32)

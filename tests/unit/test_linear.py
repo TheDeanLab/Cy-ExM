@@ -25,6 +25,8 @@ from cyexm.registration.linear import (
 )
 from cyexm.runtime import NativeThreadConfig
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.mark.parametrize(
     ("accuracy", "iterations"),

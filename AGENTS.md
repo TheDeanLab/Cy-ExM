@@ -59,8 +59,8 @@ Run targeted tests first, then the relevant portable gates:
 ```bash
 uv lock
 uv sync --group dev --extra examples
-uv run pytest tests/unit -v
-uv run pytest -m integration tests/integration -v
+uv run pytest -m "unit and not hpc" tests/unit -v
+uv run pytest -m "integration and not hpc" tests/integration -v
 uv run ruff check .
 uv run ruff format --check .
 uv run basedpyright

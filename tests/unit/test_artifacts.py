@@ -17,6 +17,8 @@ from cyexm.registration.artifacts import (
 )
 from cyexm.spatial import ImageGeometry
 
+pytestmark = pytest.mark.unit
+
 
 def make_request(
     source: Path,

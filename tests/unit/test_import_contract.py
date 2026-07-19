@@ -3,6 +3,10 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.unit
+
 
 def test_import_cyexm_is_lightweight_and_side_effect_free() -> None:
     code = """

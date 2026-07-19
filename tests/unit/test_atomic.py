@@ -7,6 +7,8 @@ import pytest
 from cyexm.errors import CacheValidationError
 from cyexm.io.atomic import atomic_write
 
+pytestmark = pytest.mark.unit
+
 
 def test_atomic_write_preserves_compound_extension(tmp_path: Path) -> None:
     destination = tmp_path / "warp.nii.gz"

@@ -24,7 +24,7 @@ unit and bounded integration work. It did not select HPC tests or access lab sto
 | NumPy | 2.3.5 | Installed `numpy` distribution |
 | SciPy | 1.15.3 | Installed `scipy` distribution |
 | tifffile | 2026.7.14 | Installed `tifffile` distribution |
-| uv | 0.7.13 | `uv --version` |
+| uv | 0.7.13 | `uv --version`; required by project and CI configuration |
 | pytest | 9.1.1 | `uv run pytest --version` |
 | Ruff | 0.15.22 | `uv run ruff --version` |
 | BasedPyright | 1.38.3 (Pyright 1.1.408) | `uv run basedpyright --version` |
@@ -34,6 +34,10 @@ ITK is not installed as a standalone `itk` or `SimpleITK` Python distribution in
 this environment. The recorded version therefore comes from the linked implementation
 used by ANTSpyX itself, not from unrelated package metadata.
 
+The required uv version is pinned to exactly 0.7.13 in both
+`[tool.uv].required-version` and the setup-uv action input. This makes the measured
+resolver and lock behavior reproducible locally and in CI.
+
 ## Portable validation results
 
 All commands below ran on 2026-07-19 with uv's cache and managed-Python locations on
@@ -42,14 +46,14 @@ All commands below ran on 2026-07-19 with uv's cache and managed-Python location
 | Command | Fresh result |
 | --- | --- |
 | `uv lock --check` | Exit 0; 133 packages resolved |
-| `uv sync --group dev --extra examples` | Exit 0; 133 packages resolved and 130 packages audited |
-| `uv run pytest tests/unit -v` | 416 passed, 0 skipped, in 5.62 s |
-| `uv run pytest -m integration tests/integration -v` | 36 passed, 0 skipped, in 4.15 s |
+| `uv sync --locked --group dev --extra examples` | Exit 0; 133 packages resolved and 130 packages audited |
+| `uv run pytest -m "unit and not hpc" tests/unit -v` | 416 passed, 0 skipped, in 5.61 s |
+| `uv run pytest -m "integration and not hpc" tests/integration -v` | 36 passed, 0 skipped, in 4.04 s |
 | `uv run ruff format --check .` | Exit 0; 58 files already formatted |
 | `uv run ruff check .` | Exit 0; all checks passed |
 | `uv run basedpyright` | Exit 0; 0 errors, 0 warnings, 0 notes |
 | `uv run pre-commit run --all-files` | 4 of 4 hooks passed |
-| `uv run pytest tests/unit tests/integration -q` | 452 passed in 7.08 s |
+| `uv run pytest tests/unit tests/integration -q` | 452 passed in 7.41 s |
 
 `uv run pre-commit validate-config .pre-commit-config.yaml` also exited zero. The
 pre-commit configuration and GitHub workflow both parsed as YAML using the already
@@ -60,9 +64,15 @@ action refs were confirmed to exist: `actions/checkout@v7` and
 CI fixes all six native-thread variables at the job level before Python starts:
 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS`, `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, and
-`VECLIB_MAXIMUM_THREADS`. Its integration selector is explicitly
+`VECLIB_MAXIMUM_THREADS`. Its selectors are explicitly `unit and not hpc` and
 `integration and not hpc`; the workflow contains no ClearEx, Dask, SLURM, lab path,
 or lab-storage access.
+
+Collection-time policy requires every test to have exactly one `unit`, `integration`,
+or `hpc` marker matching its first directory. Fresh collection selected all 416 unit
+tests with `-m unit`, all 36 bounded integration tests with `integration and not hpc`,
+and all 452 portable tests together. The marked module inventory was 16 unit modules
+and 6 integration modules.
 
 ## Acceptance evidence
 

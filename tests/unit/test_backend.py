@@ -15,6 +15,8 @@ from cyexm.registration.backend import AntsRegistrationBackend, RegistrationBack
 from cyexm.runtime import NativeThreadConfig
 from cyexm.spatial import ImageGeometry
 
+pytestmark = pytest.mark.unit
+
 
 def test_registration_backend_declares_every_required_operation() -> None:
     expected = {

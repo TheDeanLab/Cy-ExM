@@ -18,6 +18,6 @@ repos:
         pass_filenames: false
       - id: pytest-unit
         name: Unit tests
-        entry: uv run pytest tests/unit -q
+        entry: uv run pytest -m "unit and not hpc" tests/unit -q
         language: system
         pass_filenames: false

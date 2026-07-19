@@ -18,6 +18,8 @@ from cyexm.registration.transforms import (
 )
 from cyexm.runtime import NativeThreadConfig
 
+pytestmark = pytest.mark.unit
+
 
 def test_transform_chain_uses_warp_then_affine(
     monkeypatch: pytest.MonkeyPatch,

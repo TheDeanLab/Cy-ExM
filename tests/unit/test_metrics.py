@@ -11,6 +11,8 @@ import pytest
 from cyexm.errors import RegistrationStageError
 from cyexm.metrics import calculate_metrics, read_metrics, write_metrics
 
+pytestmark = pytest.mark.unit
+
 
 class FakeImage:
     def __init__(self, name: str) -> None:

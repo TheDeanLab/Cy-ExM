@@ -19,6 +19,8 @@ from cyexm.io.images import (
 )
 from cyexm.spatial import ImageGeometry
 
+pytestmark = pytest.mark.unit
+
 
 def test_new_image_and_metric_modules_import_without_scientific_libraries() -> None:
     code = """

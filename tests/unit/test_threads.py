@@ -9,6 +9,8 @@ from cyexm.runtime import (
     configure_native_threads,
 )
 
+pytestmark = pytest.mark.unit
+
 
 def test_defaults_set_every_native_runtime_to_one() -> None:
     environ: dict[str, str] = {}

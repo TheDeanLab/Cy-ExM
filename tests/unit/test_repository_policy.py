@@ -17,6 +17,28 @@ THREAD_ENVIRONMENT = (
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 )
+AGENT_GUIDANCE_PATHS = frozenset(
+    {
+        "AGENTS.md",
+        ".github/AGENTS.md",
+        ".github/workflows/AGENTS.md",
+        "docs/AGENTS.md",
+        "docs/superpowers/AGENTS.md",
+        "docs/superpowers/plans/AGENTS.md",
+        "docs/superpowers/specs/AGENTS.md",
+        "examples/AGENTS.md",
+        "examples/notebooks/AGENTS.md",
+        "examples/scripts/AGENTS.md",
+        "src/AGENTS.md",
+        "src/cyexm/AGENTS.md",
+        "src/cyexm/io/AGENTS.md",
+        "src/cyexm/registration/AGENTS.md",
+        "src/cyexm/runtime/AGENTS.md",
+        "tests/AGENTS.md",
+        "tests/integration/AGENTS.md",
+        "tests/unit/AGENTS.md",
+    }
+)
 
 
 def _read_repository_file(path: str) -> str:
@@ -145,6 +167,56 @@ def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
     root_lines = set(_read_repository_file("AGENTS.md").splitlines())
     assert "uv lock" not in root_lines
     assert "uv sync --group dev --extra examples" not in root_lines
+
+
+def test_every_maintained_directory_has_local_agent_guidance() -> None:
+    actual = {
+        str(path.relative_to(REPOSITORY_ROOT))
+        for path in REPOSITORY_ROOT.rglob("AGENTS.md")
+        if not {".git", ".worktrees", ".venv"}
+        & set(path.relative_to(REPOSITORY_ROOT).parts)
+    }
+    assert actual == AGENT_GUIDANCE_PATHS
+
+    required_by_path = {
+        ".github/AGENTS.md": (
+            "least-privilege",
+            "version-pinned",
+            "public github-hosted runners",
+            "lab paths",
+        ),
+        ".github/workflows/AGENTS.md": (
+            "uv sync --locked --group dev --extra examples",
+            "python 3.12",
+            "all six native-thread",
+            "unit and not hpc",
+            "integration and not hpc",
+            "slurm",
+        ),
+        "docs/superpowers/AGENTS.md": (
+            "dated",
+            "design",
+            "implementation plan",
+            "generated review packages",
+        ),
+        "docs/superpowers/plans/AGENTS.md": (
+            "exact files",
+            "tdd",
+            "evidence",
+            "historical plans",
+        ),
+        "docs/superpowers/specs/AGENTS.md": (
+            "current behavior",
+            "alternatives",
+            "failure handling",
+            "acceptance criteria",
+            "erratum",
+        ),
+    }
+    for path, required_fragments in required_by_path.items():
+        guidance = _normalized_repository_file(path)
+        for fragment in required_fragments:
+            assert fragment in guidance, (path, fragment)
 
 
 def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> None:

@@ -123,6 +123,8 @@ Existing users should consult [migration from ClearEx](docs/migration-from-clear
 for the import map, downstream consumer note, moved examples, and intentionally
 corrected legacy behavior. The numerical extraction evidence is recorded in the
 [legacy parity report](docs/legacy-parity-report.md).
+The complete portable gate and measured Phase 1 evidence are recorded in the
+[Phase 1 acceptance audit](docs/phase-1-acceptance.md).
 
 ## Phase 2 boundary
 
@@ -140,6 +142,7 @@ uv run pytest -m integration tests/integration -v
 uv run ruff check .
 uv run ruff format --check .
 uv run basedpyright
+uv run pre-commit run --all-files
 ```
 
 `import cyexm` remains lightweight: it exposes version metadata without importing

@@ -37,7 +37,7 @@ Source = "https://github.com/TheDeanLab/Cy-ExM"
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 markers = [
   "unit: isolated or mocked checks",

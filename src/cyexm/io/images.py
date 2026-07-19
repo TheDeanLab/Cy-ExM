@@ -86,7 +86,12 @@ def _pixel_size(pixel_size_xyz: object) -> tuple[float, float, float]:
             raise InputValidationError(
                 "pixel_size_xyz must contain exactly three positive finite values"
             )
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError as error:
+            raise InputValidationError(
+                "pixel_size_xyz must contain exactly three positive finite values"
+            ) from error
         if not math.isfinite(number) or number <= 0.0:
             raise InputValidationError(
                 "pixel_size_xyz must contain exactly three positive finite values"
@@ -203,8 +208,13 @@ def _validated_percentiles(
         or not isinstance(upper_pct, Real)
     ):
         raise TypeError("percentiles must be finite numeric values")
-    lower = float(lower_pct)
-    upper = float(upper_pct)
+    try:
+        lower = float(lower_pct)
+        upper = float(upper_pct)
+    except OverflowError as error:
+        raise ValueError(
+            "percentiles must satisfy 0 <= lower_pct < upper_pct <= 100"
+        ) from error
     if (
         not math.isfinite(lower)
         or not math.isfinite(upper)
@@ -246,10 +256,7 @@ def robust_bounding_box(
         total = int(cumulative[-1])
         if total == 0:
             raise ValueError("No foreground found")
-        if lower == 0.0:
-            lower_index = int(np.flatnonzero(distribution)[0])
-        else:
-            lower_index = int(np.searchsorted(cumulative, total * lower / 100.0))
+        lower_index = int(np.searchsorted(cumulative, total * lower / 100.0))
         upper_index = int(np.searchsorted(cumulative, total * upper / 100.0)) + 1
         return lower_index, upper_index
 

@@ -14,7 +14,12 @@ def _range_value(value: object, name: str) -> float:
         raise InputValidationError(
             "TIFF output range must contain finite uint16-compatible values"
         )
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as error:
+        raise InputValidationError(
+            "TIFF output range must contain finite uint16-compatible values"
+        ) from error
     if not math.isfinite(number) or not 0.0 <= number <= 65535.0:
         raise InputValidationError(
             "TIFF output range must contain finite uint16-compatible values"
@@ -63,15 +68,25 @@ def write_uint16_tiff(
     if source.size == 0:
         raise InputValidationError("TIFF image data must not be empty")
 
-    data = np.array(source, dtype=np.float64, copy=True)
-    data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-    np.maximum(data, 0.0, out=data)
-    data_minimum = float(data.min())
-    data_maximum = float(data.max())
-    if data_minimum == data_maximum:
-        scaled = np.full(data.shape, minimum, dtype=np.float64)
+    if np.issubdtype(source.dtype, np.integer):
+        data = np.array(source, copy=True)
+        if np.issubdtype(data.dtype, np.signedinteger):
+            np.maximum(data, 0, out=data)
+        data_minimum = data.min()
+        data_maximum = data.max()
     else:
-        normalized = (data - data_minimum) / (data_maximum - data_minimum)
+        data = np.array(source, dtype=np.longdouble, copy=True)
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        np.maximum(data, np.longdouble(0), out=data)
+        data_minimum = data.min()
+        data_maximum = data.max()
+    if data_minimum == data_maximum:
+        scaled = np.full(data.shape, minimum, dtype=np.longdouble)
+    else:
+        offsets = data - data_minimum
+        normalized = offsets.astype(np.longdouble) / np.longdouble(
+            data_maximum - data_minimum
+        )
         scaled = minimum + normalized * (maximum - minimum)
     encoded = np.clip(scaled, minimum, maximum).astype(np.uint16)
 

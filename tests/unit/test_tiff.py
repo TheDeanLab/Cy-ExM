@@ -61,6 +61,34 @@ def test_uint16_export_maps_constant_images_to_the_minimum(tmp_path: Path) -> No
     )
 
 
+def test_uint16_export_preserves_adjacent_uint64_extrema(tmp_path: Path) -> None:
+    data = np.array(
+        [[[np.uint64(2**64 - 2), np.uint64(2**64 - 1)]]],
+        dtype=np.uint64,
+    )
+    destination = tmp_path / "uint64.tif"
+
+    write_uint16_tiff(data, destination, min_value=100.0, max_value=1100.0)
+
+    np.testing.assert_array_equal(tifffile.imread(destination), [[[100, 1100]]])
+
+
+def test_uint16_export_preserves_longdouble_values_outside_float64(
+    tmp_path: Path,
+) -> None:
+    float64_max = np.longdouble(np.finfo(np.float64).max)
+    data = np.array(
+        [[[float64_max * np.longdouble(2), float64_max * np.longdouble(4)]]],
+        dtype=np.longdouble,
+    )
+    assert np.all(np.isfinite(data))
+    destination = tmp_path / "longdouble.tif"
+
+    write_uint16_tiff(data, destination, min_value=100.0, max_value=1100.0)
+
+    np.testing.assert_array_equal(tifffile.imread(destination), [[[100, 1100]]])
+
+
 def test_uint16_export_accepts_ants_images(tmp_path: Path) -> None:
     import ants
 
@@ -82,6 +110,7 @@ def test_uint16_export_accepts_ants_images(tmp_path: Path) -> None:
         pytest.param(0.0, float("inf"), id="infinite"),
         pytest.param(True, 100.0, id="boolean"),
         pytest.param("0", 100.0, id="string"),
+        pytest.param(0.0, 10**10000, id="overflowing-integral"),
     ],
 )
 def test_uint16_export_rejects_unusable_ranges(

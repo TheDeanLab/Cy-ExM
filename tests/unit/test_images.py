@@ -144,6 +144,7 @@ def test_load_tiff_preserves_zyx_and_assigns_xyz_spacing(tmp_path: Path) -> None
         pytest.param((float("inf"), 0.2, 0.3), id="infinite"),
         pytest.param((True, 0.2, 0.3), id="boolean"),
         pytest.param(("0.1", 0.2, 0.3), id="string"),
+        pytest.param((10**10000, 0.2, 0.3), id="overflowing-integral"),
     ],
 )
 def test_load_ants_image_rejects_invalid_xyz_spacing(
@@ -243,12 +244,27 @@ def test_robust_bounding_box_upper_bounds_are_exclusive() -> None:
     bounds = robust_bounding_box(
         array,
         down_sampling=1,
-        lower_pct=0.0,
+        lower_pct=5.0,
         upper_pct=100.0,
     )
 
     assert bounds == (1, 4, 2, 5, 3, 6)
     np.testing.assert_array_equal(crop_array(array, bounds), np.ones((3, 3, 3)))
+
+
+def test_robust_bounding_box_zero_lower_percentile_keeps_leading_planes() -> None:
+    array = np.zeros((5, 6, 7), dtype=np.uint16)
+    array[1:4, 2:5, 3:6] = 1
+
+    bounds = robust_bounding_box(
+        array,
+        down_sampling=1,
+        lower_pct=0.0,
+        upper_pct=100.0,
+    )
+
+    assert bounds == (0, 4, 0, 5, 0, 6)
+    assert all(type(value) is int for value in bounds)
 
 
 @pytest.mark.parametrize(
@@ -277,6 +293,7 @@ def test_robust_bounding_box_validates_down_sampling(down_sampling: object) -> N
         pytest.param(float("nan"), 95.0, id="nan"),
         pytest.param(5.0, float("inf"), id="infinite"),
         pytest.param(True, 95.0, id="boolean"),
+        pytest.param(5.0, 10**10000, id="overflowing-integral"),
     ],
 )
 def test_robust_bounding_box_validates_percentiles(

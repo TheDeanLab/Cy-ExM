@@ -76,10 +76,14 @@ values remain physical XYZ. The convention version deliberately prevents complet
 records or manifests produced with the former ambiguous layout from being reused.
 
 Cy-ExM-generated fixed and final TIFFs embed a strict versioned geometry payload
-containing shape, origin, spacing, and direction. Their commit validators and cache
-readers reopen the TIFF and compare all four fields with serialization-only
-tolerance. Only TIFFs with no `cyexm` metadata key use legacy fallback geometry;
-present malformed metadata fails closed.
+containing shape, origin, spacing, and direction. Before atomic promotion, the TIFF
+writer requires the serialized payload to equal all four source fields exactly.
+Tolerance is reserved for comparisons after ANTs has rehydrated the serialized
+geometry. Only TIFFs with no `cyexm` marker use fallback geometry, and only when the
+effective layout is explicit ZYX, grayscale QYX, or tifffile's reconstructed YX view
+of a declared leading singleton Z axis. YXS, SYX, CYX, and other sample/channel
+layouts are rejected. Present malformed metadata, including a truncated raw
+ImageDescription marker that tifffile cannot shape, fails closed.
 
 ## Validation and reuse
 
@@ -97,6 +101,13 @@ An artifact without its completion record, a record without its artifact, corrup
 JSON, changed input metadata, changed geometry, changed registration policy, changed
 thread settings, or an unreadable artifact raises a focused cache-validation error.
 Cy-ExM does not guess whether such an entry is safe.
+
+The `transform_directory.ipynb` example applies the same minimum evidence rule before
+reading crop bounds or applying an existing transform: each supplied affine,
+nonlinear warp, and optional crop artifact must have a readable completion record,
+an exact current `FileIdentity`, the expected stage, and the current
+`axis_convention_version`. Copy each artifact together with its `.complete.json`
+record; an artifact file by itself is intentionally unusable in this notebook.
 
 ## Stale records and force
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import inspect
 import json
@@ -67,6 +68,68 @@ def _code_source(cell: dict[str, object]) -> str:
     return "".join(source)
 
 
+def _load_notebook_function(
+    name: str,
+    namespace: dict[str, object],
+):
+    path = Path("examples/notebooks/transform_directory.ipynb")
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    for cell_index, cell in enumerate(notebook["cells"]):
+        if cell["cell_type"] != "code":
+            continue
+        module = ast.parse(_code_source(cell), filename=f"{path}:cell-{cell_index}")
+        for node in module.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                helper_module = ast.Module(body=[node], type_ignores=[])
+                ast.fix_missing_locations(helper_module)
+                exec(compile(helper_module, str(path), "exec"), namespace)
+                helper = namespace[name]
+                assert callable(helper)
+                return helper
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def _write_notebook_completion_record(
+    artifact: Path,
+    *,
+    stage: str,
+    axis_convention_version: str,
+) -> Path:
+    from cyexm.registration.artifacts import (
+        ArtifactStore,
+        CompletionRecord,
+        FileIdentity,
+        StageRequest,
+    )
+    from cyexm.spatial import ImageGeometry
+
+    source = artifact.parent / "source.tif"
+    source.write_bytes(b"source")
+    request = StageRequest.for_files(
+        stage=stage,
+        inputs=(source,),
+        geometry=ImageGeometry(
+            shape=(2, 3, 4),
+            origin=(0.0, 0.0, 0.0),
+            spacing=(0.2, 0.3, 0.5),
+            direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        ),
+        method="test",
+        accuracy="exact",
+        native_threads={},
+        upstream=None,
+        parameters={"axis_convention_version": axis_convention_version},
+    )
+    record = CompletionRecord(
+        schema_version=1,
+        request=request,
+        artifact=FileIdentity.from_path(artifact),
+    )
+    record_path = ArtifactStore().record_path(artifact)
+    record_path.write_text(record.to_json(), encoding="utf-8")
+    return record_path
+
+
 def test_expected_example_inventory_exists() -> None:
     assert {path.name for path in Path("examples/scripts").glob("*.py")} == set(
         SCRIPT_NAMES
@@ -131,6 +194,108 @@ def test_transform_directory_notebook_preserves_optional_crop_geometry() -> None
     assert "spacing=image.spacing" in source
     assert "direction=image.direction" in source
     assert "if bounds is None" in source
+
+
+def test_transform_directory_notebook_validates_every_reused_artifact_first() -> None:
+    path = Path("examples/notebooks/transform_directory.ipynb")
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    source = "\n".join(
+        _code_source(cell) for cell in notebook["cells"] if cell["cell_type"] == "code"
+    )
+
+    assert "CompletionRecord" in source
+    assert "FileIdentity" in source
+    assert "AXIS_CONVENTION_VERSION" in source
+    calls = (
+        'validate_cached_artifact(AFFINE_TRANSFORM, "affine")',
+        'validate_cached_artifact(NONLINEAR_WARP, "nonlinear")',
+        'validate_cached_artifact(FIXED_CROP_INDICES, "crop:fixed")',
+        'validate_cached_artifact(MOVING_CROP_INDICES, "crop:moving")',
+    )
+    for call in calls:
+        assert call in source
+    bounds_read = source.index("fixed_bounds = read_bounds")
+    assert all(source.index(call) < bounds_read for call in calls)
+
+
+def test_transform_directory_artifact_validator_accepts_current_record(
+    tmp_path: Path,
+) -> None:
+    from cyexm.registration.artifacts import (
+        ArtifactStore,
+        CompletionRecord,
+        FileIdentity,
+    )
+    from cyexm.spatial import AXIS_CONVENTION_VERSION
+
+    artifact = tmp_path / "linear_transform_2.mat"
+    artifact.write_bytes(b"affine")
+    _write_notebook_completion_record(
+        artifact,
+        stage="affine",
+        axis_convention_version=AXIS_CONVENTION_VERSION,
+    )
+    validator = _load_notebook_function(
+        "validate_cached_artifact",
+        {
+            "ArtifactStore": ArtifactStore,
+            "CompletionRecord": CompletionRecord,
+            "FileIdentity": FileIdentity,
+            "AXIS_CONVENTION_VERSION": AXIS_CONVENTION_VERSION,
+        },
+    )
+
+    assert validator(artifact, "affine") == artifact
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        pytest.param("missing-record", "completion record", id="missing-record"),
+        pytest.param("malformed-record", "completion record", id="malformed-record"),
+        pytest.param("identity", "identity", id="artifact-identity"),
+        pytest.param("stage", "stage", id="wrong-stage"),
+        pytest.param("axis", "axis convention", id="legacy-axis"),
+    ],
+)
+def test_transform_directory_artifact_validator_rejects_unsafe_reuse(
+    tmp_path: Path,
+    failure: str,
+    message: str,
+) -> None:
+    from cyexm.registration.artifacts import (
+        ArtifactStore,
+        CompletionRecord,
+        FileIdentity,
+    )
+    from cyexm.spatial import AXIS_CONVENTION_VERSION
+
+    artifact = tmp_path / "linear_transform_2.mat"
+    artifact.write_bytes(b"affine")
+    if failure != "missing-record":
+        record_path = _write_notebook_completion_record(
+            artifact,
+            stage="nonlinear" if failure == "stage" else "affine",
+            axis_convention_version=(
+                "legacy-ambiguous-v0" if failure == "axis" else AXIS_CONVENTION_VERSION
+            ),
+        )
+        if failure == "malformed-record":
+            record_path.write_text("{not-json", encoding="utf-8")
+        elif failure == "identity":
+            artifact.write_bytes(b"changed-affine")
+    validator = _load_notebook_function(
+        "validate_cached_artifact",
+        {
+            "ArtifactStore": ArtifactStore,
+            "CompletionRecord": CompletionRecord,
+            "FileIdentity": FileIdentity,
+            "AXIS_CONVENTION_VERSION": AXIS_CONVENTION_VERSION,
+        },
+    )
+
+    with pytest.raises(ValueError, match=message):
+        validator(artifact, "affine")
 
 
 @pytest.mark.parametrize("path", _script_paths(), ids=lambda path: path.stem)

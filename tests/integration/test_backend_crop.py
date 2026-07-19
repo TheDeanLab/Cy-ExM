@@ -73,3 +73,40 @@ def test_vector_array_round_trip_transposes_only_spatial_axes(
         np.transpose(external_zyx, (2, 1, 0, 3)),
     )
     np.testing.assert_array_equal(backend.to_array(vector), external_zyx)
+
+
+def test_crop_vector_image_uses_physical_geometry_without_scalar_ants_overload(
+    native_threads: NativeThreadConfig,
+) -> None:
+    import ants
+    import numpy as np
+
+    external_zyx = np.zeros((4, 5, 6, 3), dtype=np.float32)
+    external_zyx[..., 0] = 11.0
+    external_zyx[..., 1] = 22.0
+    external_zyx[..., 2] = 33.0
+    direction = np.asarray(
+        ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+    image = ants.from_numpy(
+        np.transpose(external_zyx, (2, 1, 0, 3)),
+        origin=(10.0, 20.0, 30.0),
+        spacing=(0.5, 1.0, 2.0),
+        direction=direction,
+        has_components=True,
+    )
+    bounds = (1, 4, 1, 5, 2, 6)
+
+    cropped = AntsRegistrationBackend(native_threads).crop_image(image, bounds)
+
+    assert cropped.origin == (9.0, 21.0, 32.0)
+    assert cropped.spacing == image.spacing
+    np.testing.assert_array_equal(cropped.direction, image.direction)
+    np.testing.assert_array_equal(
+        cropped.numpy(),
+        np.transpose(external_zyx[1:4, 1:5, 2:6], (2, 1, 0, 3)),
+    )
+    np.testing.assert_array_equal(cropped.numpy()[..., 0], 11.0)
+    np.testing.assert_array_equal(cropped.numpy()[..., 1], 22.0)
+    np.testing.assert_array_equal(cropped.numpy()[..., 2], 33.0)

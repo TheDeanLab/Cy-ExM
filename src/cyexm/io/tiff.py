@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from numbers import Real
 from pathlib import Path
@@ -10,7 +11,6 @@ from cyexm.io.atomic import atomic_write
 from cyexm.spatial import (
     AXIS_CONVENTION_VERSION,
     ImageGeometry,
-    geometry_compatible,
 )
 
 _TIFF_GEOMETRY_SCHEMA_VERSION = 1
@@ -78,13 +78,45 @@ def read_tiff_geometry(
 
     try:
         with tifffile.TiffFile(path) as handle:
+            series_axes = handle.series[0].axes
             shaped = handle.shaped_metadata
             metadata = shaped[0] if shaped else None
+            description = handle.pages.first.description
     except (OSError, ValueError) as error:
         raise InputValidationError(
             f"TIFF metadata could not be read: {path}"
         ) from error
-    return _geometry_from_shaped_metadata(metadata, data_shape)
+
+    if (
+        (not isinstance(metadata, dict) or "cyexm" not in metadata)
+        and isinstance(description, str)
+        and '"cyexm"' in description
+    ):
+        try:
+            decoded = json.loads(description)
+            if not isinstance(decoded, dict) or "cyexm" not in decoded:
+                raise ValueError("raw ImageDescription has no cyexm object")
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise _metadata_error(
+                "raw ImageDescription containing the cyexm marker is invalid",
+                error,
+            ) from error
+        metadata = decoded
+
+    geometry = _geometry_from_shaped_metadata(metadata, data_shape)
+    singleton_z = (
+        series_axes == "YX"
+        and len(data_shape) == 3
+        and data_shape[0] == 1
+        and isinstance(metadata, dict)
+        and metadata.get("axes") == "ZYX"
+    )
+    if series_axes not in {"ZYX", "QYX"} and not singleton_z:
+        raise InputValidationError(
+            "Unsupported TIFF spatial layout; expected ZYX, grayscale QYX, "
+            "or reconstructed singleton-Z YX"
+        )
+    return geometry
 
 
 def _metadata_for_geometry(geometry: ImageGeometry | None) -> dict[str, object]:
@@ -223,8 +255,7 @@ def write_uint16_tiff(
             and (
                 written_geometry is None
                 if geometry is None
-                else written_geometry is not None
-                and geometry_compatible(written_geometry, geometry)
+                else written_geometry is not None and written_geometry == geometry
             )
         )
 

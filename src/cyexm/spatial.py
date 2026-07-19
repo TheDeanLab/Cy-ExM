@@ -61,6 +61,25 @@ def _float_triple(value: object, name: str) -> PixelSize:
     )
 
 
+def _direction_matrix(value: object) -> Direction3D:
+    rows = _triple_array(value, "direction")
+    direction = (
+        _float_triple(rows[0], "direction[0]"),
+        _float_triple(rows[1], "direction[1]"),
+        _float_triple(rows[2], "direction[2]"),
+    )
+    scale = max(abs(item) for row in direction for item in row)
+    if scale == 0.0:
+        raise ValueError("direction must be non-singular")
+    (a, b, c), (d, e, f), (g, h, i) = (
+        tuple(item / scale for item in row) for row in direction
+    )
+    determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(determinant) <= 1e-12:
+        raise ValueError("direction must be non-singular")
+    return direction
+
+
 @dataclass(frozen=True, slots=True)
 class ImageGeometry:
     """Three-dimensional external shape and physical ANTs geometry.
@@ -89,7 +108,6 @@ class ImageGeometry:
                 "Image geometry keys must be exactly: "
                 + ", ".join(sorted(_GEOMETRY_KEYS))
             )
-        direction = _triple_array(payload["direction"], "direction")
         spacing = _float_triple(payload["spacing"], "spacing")
         if any(value <= 0.0 for value in spacing):
             raise ValueError("spacing values must be positive")
@@ -97,11 +115,7 @@ class ImageGeometry:
             shape=_shape_triple(payload["shape"]),
             origin=_float_triple(payload["origin"], "origin"),
             spacing=spacing,
-            direction=(
-                _float_triple(direction[0], "direction[0]"),
-                _float_triple(direction[1], "direction[1]"),
-                _float_triple(direction[2], "direction[2]"),
-            ),
+            direction=_direction_matrix(payload["direction"]),
         )
 
 

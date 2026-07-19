@@ -137,6 +137,111 @@ def test_load_tiff_preserves_zyx_and_assigns_xyz_spacing(tmp_path: Path) -> None
     np.testing.assert_array_equal(image.direction, np.eye(3))
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        pytest.param('{"axes":"ZYX","cyexm":', id="truncated-value"),
+        pytest.param('{"axes":"ZYX","cyexm"', id="truncated-key"),
+        pytest.param(
+            '{"cyexm":{"schema_version":1',
+            id="truncated-nested-object",
+        ),
+    ],
+)
+def test_load_ants_image_rejects_truncated_raw_cyexm_descriptions(
+    tmp_path: Path,
+    description: str,
+) -> None:
+    path = tmp_path / "truncated-cyexm.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), dtype=np.uint16),
+        description=description,
+        metadata=None,
+        photometric="minisblack",
+    )
+    with tifffile.TiffFile(path) as handle:
+        assert '"cyexm"' in handle.pages[0].description
+        assert handle.shaped_metadata is None
+
+    with pytest.raises(InputValidationError, match="Cy-ExM TIFF geometry metadata"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
+def test_load_ants_image_accepts_plain_qyx_grayscale_stack(tmp_path: Path) -> None:
+    path = tmp_path / "plain-qyx.tif"
+    data = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
+    tifffile.imwrite(
+        path,
+        data,
+        metadata={"axes": "QYX"},
+        photometric="minisblack",
+    )
+    with tifffile.TiffFile(path) as handle:
+        assert handle.series[0].axes == "QYX"
+
+    image = load_ants_image(path, (0.2, 0.3, 0.5))
+
+    np.testing.assert_array_equal(image.numpy(), np.transpose(data, (2, 1, 0)))
+    assert image.origin == (0.0, 0.0, 0.0)
+    np.testing.assert_array_equal(image.direction, np.eye(3))
+
+
+def test_load_ants_image_accepts_plain_reconstructed_singleton_z(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "plain-singleton-z.tif"
+    data = np.arange(1 * 3 * 4, dtype=np.uint16).reshape(1, 3, 4)
+    tifffile.imwrite(
+        path,
+        data,
+        metadata={"axes": "ZYX"},
+        photometric="minisblack",
+    )
+    with tifffile.TiffFile(path) as handle:
+        assert handle.series[0].axes == "YX"
+
+    image = load_ants_image(path, (0.2, 0.3, 0.5))
+
+    assert image.shape == (4, 3, 1)
+    np.testing.assert_array_equal(image.numpy(), np.transpose(data, (2, 1, 0)))
+
+
+@pytest.mark.parametrize("layout", ["YXS", "SYX", "CYX"])
+def test_load_ants_image_rejects_plain_sample_or_channel_layouts(
+    tmp_path: Path,
+    layout: str,
+) -> None:
+    path = tmp_path / f"plain-{layout.lower()}.tif"
+    if layout == "YXS":
+        tifffile.imwrite(
+            path,
+            np.ones((3, 4, 3), dtype=np.uint8),
+            metadata=None,
+            photometric="rgb",
+        )
+    elif layout == "SYX":
+        tifffile.imwrite(
+            path,
+            np.ones((3, 3, 4), dtype=np.uint8),
+            metadata=None,
+            photometric="rgb",
+            planarconfig="separate",
+        )
+    else:
+        tifffile.imwrite(
+            path,
+            np.ones((3, 3, 4), dtype=np.uint8),
+            metadata={"axes": "CYX"},
+            photometric="minisblack",
+        )
+    with tifffile.TiffFile(path) as handle:
+        assert handle.series[0].axes == layout
+
+    with pytest.raises(InputValidationError, match=r"TIFF.*layout"):
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+
 def _cyexm_tiff_metadata(
     *,
     shape: list[int] | None = None,
@@ -252,6 +357,21 @@ def test_load_ants_image_rejects_noncanonical_metadata_key_sets(
         pytest.param("origin", ["10.0", 20.0, 30.0], id="nonnumeric-origin"),
         pytest.param("spacing", [0.2, 0.0, 0.5], id="zero-spacing"),
         pytest.param("spacing", [0.2, "0.3", 0.5], id="nonnumeric-spacing"),
+        pytest.param(
+            "direction",
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            id="singular-direction",
+        ),
+        pytest.param(
+            "direction",
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            id="zero-direction-row",
+        ),
+        pytest.param(
+            "direction",
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1e-14]],
+            id="near-singular-direction",
+        ),
     ],
 )
 def test_load_ants_image_rejects_malformed_geometry_values(
@@ -341,6 +461,35 @@ def test_load_ants_image_restores_present_singleton_z_geometry_exactly(
     assert image.shape == (4, 3, 1)
     assert ants_geometry(image).shape == (1, 3, 4)
     np.testing.assert_array_equal(image.numpy(), np.transpose(data, (2, 1, 0)))
+
+
+def test_load_ants_image_wraps_embedded_ants_geometry_construction_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "valid-geometry.tif"
+    tifffile.imwrite(
+        path,
+        np.ones((2, 3, 4), dtype=np.uint16),
+        metadata=_cyexm_tiff_metadata(),
+        photometric="minisblack",
+    )
+
+    class FailingAnts:
+        @staticmethod
+        def from_numpy(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise RuntimeError("injected ITK geometry failure")
+
+    monkeypatch.setitem(sys.modules, "ants", FailingAnts())
+
+    with pytest.raises(
+        InputValidationError,
+        match="embedded Cy-ExM geometry",
+    ) as error:
+        load_ants_image(path, (0.2, 0.3, 0.5))
+
+    assert isinstance(error.value.__cause__, RuntimeError)
 
 
 @pytest.mark.parametrize(

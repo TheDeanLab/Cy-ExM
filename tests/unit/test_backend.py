@@ -265,7 +265,7 @@ def test_crop_image_maps_zyx_start_to_ants_xyz_physical_index(
         cropped.numpy(),
         np.transpose(external_zyx[1:5, 2:6, 3:6], (2, 1, 0)),
     )
-    assert calls.index_to_physical_calls == [(image, (3, 2, 1))]
+    assert calls.index_to_physical_calls == []
     assert cropped.origin == (8.0, 21.5, 32.0)
     assert cropped.spacing == image.spacing
     assert cropped.direction == image.direction

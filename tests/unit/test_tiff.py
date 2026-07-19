@@ -400,3 +400,56 @@ def test_ants_export_rejects_atomic_temporary_with_wrong_geometry_metadata(
 
     assert destination.read_bytes() == b"previous"
     assert list(tmp_path.glob(".*.tmp*")) == []
+
+
+def test_ants_export_requires_exact_geometry_metadata_before_atomic_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ants
+
+    destination = tmp_path / "registered.tif"
+    destination.write_bytes(b"previous")
+    image = ants.from_numpy(
+        np.ones((4, 3, 2), dtype=np.float32),
+        origin=(10.0, 20.0, 30.0),
+        spacing=(0.2, 0.3, 0.5),
+    )
+    real_imwrite = tifffile.imwrite
+
+    def subtly_wrong_geometry_imwrite(
+        path: Path,
+        data: np.ndarray,
+        *,
+        metadata: dict[str, object],
+        photometric: str,
+    ) -> None:
+        wrong_metadata = dict(metadata)
+        payload = metadata["cyexm"]
+        assert isinstance(payload, dict)
+        geometry = payload["geometry"]
+        assert isinstance(geometry, dict)
+        wrong_geometry = dict(geometry)
+        wrong_geometry["origin"] = [10.0 + 5e-8, 20.0, 30.0]
+        wrong_payload = dict(payload)
+        wrong_payload["geometry"] = wrong_geometry
+        wrong_metadata["cyexm"] = wrong_payload
+        real_imwrite(
+            path,
+            data,
+            metadata=wrong_metadata,
+            photometric=photometric,
+        )
+
+    monkeypatch.setattr(tifffile, "imwrite", subtly_wrong_geometry_imwrite)
+
+    with pytest.raises(CacheValidationError, match="failed validation"):
+        write_uint16_tiff(
+            image,
+            destination,
+            min_value=0.0,
+            max_value=100.0,
+        )
+
+    assert destination.read_bytes() == b"previous"
+    assert list(tmp_path.glob(".*.tmp*")) == []

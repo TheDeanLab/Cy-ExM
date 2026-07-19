@@ -211,11 +211,12 @@ class AntsRegistrationBackend:
             raise ValueError("bounds_zyx must define a non-empty image region")
         cropped = data[z0:z1, y0:y1, x0:x1, ...]
 
+        index_xyz = np.asarray((x0, y0, z0), dtype=np.float64)
+        spacing = np.asarray(runtime_image.spacing, dtype=np.float64)
+        direction = np.asarray(runtime_image.direction, dtype=np.float64)
+        base_origin = np.asarray(runtime_image.origin, dtype=np.float64)
         origin = tuple(
-            float(value)
-            for value in ants.transform_index_to_physical_point(
-                runtime_image, (x0, y0, z0)
-            )
+            float(value) for value in base_origin + direction @ (spacing * index_xyz)
         )
         return ants.from_numpy(
             external_to_ants_array(cropped),

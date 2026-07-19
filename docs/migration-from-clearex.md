@@ -102,13 +102,19 @@ could create incomplete or scientifically misleading results:
     native ANTs arrays and indexes use XYZ. Cy-ExM now transposes the first three
     spatial axes explicitly; trailing displacement components remain physical XYZ.
 14. Cy-ExM-written ANTs TIFFs persist strict versioned shape, origin, spacing, and
-    direction metadata. Plain historical TIFFs still use caller XYZ spacing with
-    zero origin and identity direction, but a present malformed payload fails closed.
+    direction metadata. Plain historical TIFF fallback is limited to explicit ZYX,
+    grayscale QYX, and a declared singleton-Z stack reconstructed as YX; sample or
+    channel layouts are rejected. Accepted fallback TIFFs use caller XYZ spacing with
+    zero origin and identity direction, while a present or truncated raw Cy-ExM
+    payload fails closed.
 15. Every whole-image and chunk cache request, plus the schema-version-2 canonical
     chunk manifest, records `external-zyx-ants-xyz-v1`, so artifacts created under
     the former ambiguous layout are not reused.
 16. Affine inspection reports native transform entries as X, Y, and Z and describes
     translation offsets in physical units rather than mislabeled voxels.
+17. `transform_directory.ipynb` requires the matching readable `.complete.json`
+    record for every supplied transform and crop artifact, and validates exact file
+    identity, stage, and axis-convention version before reuse.
 
 The direct low-level ANTs parity fixtures intentionally remain native-only and are
 not transposed. These corrections apply where orchestration crosses external

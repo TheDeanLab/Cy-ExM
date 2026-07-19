@@ -55,9 +55,12 @@ directly. `ImageGeometry.shape` is external ZYX, while origin, spacing, and dire
 are physical XYZ.
 
 Cy-ExM-written ANTs TIFFs carry strict, versioned shape/origin/spacing/direction
-metadata and round-trip that complete geometry. Plain TIFFs without the Cy-ExM key
-remain supported with caller-supplied XYZ spacing, zero origin, and identity
-direction; a present malformed Cy-ExM payload is rejected instead of ignored.
+metadata and round-trip that complete geometry. Plain TIFF fallback accepts only an
+explicit ZYX volume, a grayscale QYX stack, or tifffile's reconstructed YX view of a
+declared leading singleton Z axis. Sample/channel layouts such as YXS, SYX, and CYX
+are rejected. Accepted plain TIFFs use caller-supplied XYZ spacing, zero origin, and
+identity direction; a present or raw-but-truncated Cy-ExM payload is rejected instead
+of ignored.
 
 ```python
 from pathlib import Path

@@ -154,12 +154,19 @@ def load_ants_image(path: str | Path, pixel_size_xyz: object) -> Any:
 
     import ants
 
-    return ants.from_numpy(
-        external_to_ants_array(array),
-        origin=(0.0, 0.0, 0.0) if geometry is None else geometry.origin,
-        spacing=spacing if geometry is None else geometry.spacing,
-        direction=None if geometry is None else geometry.direction,
-    )
+    try:
+        return ants.from_numpy(
+            external_to_ants_array(array),
+            origin=(0.0, 0.0, 0.0) if geometry is None else geometry.origin,
+            spacing=spacing if geometry is None else geometry.spacing,
+            direction=None if geometry is None else geometry.direction,
+        )
+    except Exception as error:
+        if geometry is not None:
+            raise InputValidationError(
+                "ANTs image could not be constructed from embedded Cy-ExM geometry"
+            ) from error
+        raise
 
 
 def _triple(values: object, name: str) -> tuple[Any, Any, Any]:

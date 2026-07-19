@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from numbers import Integral, Real
 from pathlib import Path
@@ -164,6 +165,8 @@ class ImageRegistration:
         self._nonlinear_mode = "whole-image"
         self._nonlinear_request_evidence: dict[str, object] = {}
         self._prepare_nonlinear_before_reuse = False
+        self._source_paths: tuple[Path, Path] | None = None
+        self._source_identities: tuple[FileIdentity, FileIdentity] | None = None
 
     def register(self) -> None:
         resolved = configure_native_threads(self.native_threads)
@@ -176,8 +179,25 @@ class ImageRegistration:
         if self.enable_logging:
             self._log.info("Native thread settings: %s", resolved.describe())
 
-        fixed = backend.load_image(Path(self.fixed_image_path), self.pixel_size)
-        moving = backend.load_image(Path(self.moving_image_path), self.pixel_size)
+        self._source_paths = None
+        self._source_identities = None
+        source_paths = (
+            Path(self.fixed_image_path),
+            Path(self.moving_image_path),
+        )
+        source_identities = (
+            FileIdentity.from_path(source_paths[0]),
+            FileIdentity.from_path(source_paths[1]),
+        )
+        self._source_paths = source_paths
+        self._source_identities = source_identities
+        try:
+            fixed = backend.load_image(source_paths[0], self.pixel_size)
+            moving = backend.load_image(source_paths[1], self.pixel_size)
+        except Exception:
+            self._verify_source_identities()
+            raise
+        self._verify_source_identities()
         fixed, moving = self._crop_if_requested(backend, fixed, moving, paths, resolved)
         fixed_mask = backend.zero_mask(fixed)
         moving_mask = backend.zero_mask(moving)
@@ -245,6 +265,102 @@ class ImageRegistration:
             raise RuntimeError("Artifact store is available only during registration")
         return self._artifact_store
 
+    def _input_identity_snapshot(self) -> tuple[FileIdentity, FileIdentity]:
+        if self._source_identities is None:
+            raise RuntimeError(
+                "Source identities are available only during registration"
+            )
+        return self._source_identities
+
+    def _verify_source_identities(self) -> None:
+        if self._source_paths is None:
+            raise RuntimeError("Source paths are available only during registration")
+        expected_identities = self._input_identity_snapshot()
+        for path, expected in zip(
+            self._source_paths,
+            expected_identities,
+            strict=True,
+        ):
+            try:
+                current = FileIdentity.from_path(path)
+            except (OSError, RuntimeError) as error:
+                validation_error = CacheValidationError(
+                    f"Source input is no longer readable: {path}"
+                )
+                validation_error.__cause__ = error
+                raise RegistrationStageError(
+                    "source input identity changed during registration "
+                    f"for round {self.imaging_round}: {path}"
+                ) from validation_error
+            if current != expected:
+                raise RegistrationStageError(
+                    "source input identity changed during registration "
+                    f"for round {self.imaging_round}: {path}"
+                ) from CacheValidationError(
+                    f"Source input identity no longer matches the snapshot: {path}"
+                )
+
+    @staticmethod
+    def _completion_record_snapshot(
+        store: ArtifactStore,
+        artifact: Path,
+    ) -> tuple[int, int, int, int, bytes] | None:
+        try:
+            with store.record_path(artifact).open("rb") as stream:
+                contents = stream.read()
+                metadata = os.fstat(stream.fileno())
+        except FileNotFoundError:
+            return None
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            contents,
+        )
+
+    def _reuse_artifact[T](
+        self,
+        artifact: Path,
+        request: StageRequest,
+        reader: Callable[[Path], T],
+    ) -> T | None:
+        self._verify_source_identities()
+        try:
+            value = self._store().reuse(artifact, request, reader)
+        except Exception:
+            self._verify_source_identities()
+            raise
+        self._verify_source_identities()
+        return value
+
+    def _commit_artifact(
+        self,
+        artifact: Path,
+        request: StageRequest,
+        writer: Callable[[Path], None],
+        validator: Callable[[Path], bool],
+    ) -> None:
+        store = self._store()
+        record_before = self._completion_record_snapshot(store, artifact)
+        self._verify_source_identities()
+        try:
+            store.commit(artifact, request, writer, validator)
+        except Exception:
+            try:
+                self._verify_source_identities()
+            except Exception:
+                record_after = self._completion_record_snapshot(store, artifact)
+                if record_after != record_before:
+                    store.mark_stale(artifact)
+                raise
+            raise
+        try:
+            self._verify_source_identities()
+        except Exception:
+            store.mark_stale(artifact)
+            raise
+
     def _request(
         self,
         backend: RegistrationBackend,
@@ -257,6 +373,7 @@ class ImageRegistration:
         upstream: FileIdentity | None,
         parameters: dict[str, object],
     ) -> StageRequest:
+        self._verify_source_identities()
         evidence: dict[str, object] = {
             "axis_convention_version": AXIS_CONVENTION_VERSION,
             "crop": self.crop,
@@ -264,9 +381,9 @@ class ImageRegistration:
             "pixel_size_xyz": self.pixel_size,
         }
         evidence.update(parameters)
-        return StageRequest.for_files(
+        return StageRequest.for_identities(
             stage=stage,
-            inputs=(Path(self.fixed_image_path), Path(self.moving_image_path)),
+            inputs=self._input_identity_snapshot(),
             geometry=backend.geometry(image),
             method=method,
             accuracy=accuracy,
@@ -368,13 +485,15 @@ class ImageRegistration:
                     "upper_pct": 99.9,
                 },
             )
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(
                 f"{role} crop stage failed for round {self.imaging_round}"
             ) from error
         bounds = None
         if not self.force_override:
-            bounds = self._store().reuse(
+            bounds = self._reuse_artifact(
                 path,
                 request,
                 lambda source: self._read_bounds(source, geometry.shape),
@@ -393,7 +512,7 @@ class ImageRegistration:
                 def writer(destination: Path) -> None:
                     destination.write_text(text, encoding="utf-8")
 
-                self._store().commit(
+                self._commit_artifact(
                     path,
                     request,
                     writer=writer,
@@ -401,6 +520,8 @@ class ImageRegistration:
                         self._read_bounds(candidate, geometry.shape) == bounds
                     ),
                 )
+            except RegistrationStageError:
+                raise
             except Exception as error:
                 raise RegistrationStageError(
                     f"{role} crop stage failed for round {self.imaging_round}"
@@ -473,6 +594,8 @@ class ImageRegistration:
                 upstream=None,
                 parameters={"minimum": minimum, "maximum": maximum},
             )
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(
                 f"fixed reference persistence failed for round {self.imaging_round}"
@@ -487,7 +610,7 @@ class ImageRegistration:
             return image
 
         if not self.force_override:
-            cached = self._store().reuse(paths.fixed_reference, request, reader)
+            cached = self._reuse_artifact(paths.fixed_reference, request, reader)
             if cached is not None:
                 return
 
@@ -499,7 +622,7 @@ class ImageRegistration:
             return True
 
         try:
-            self._store().commit(
+            self._commit_artifact(
                 paths.fixed_reference,
                 request,
                 writer=lambda path: backend.write_tiff(
@@ -507,6 +630,8 @@ class ImageRegistration:
                 ),
                 validator=validator,
             )
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(
                 f"fixed reference persistence failed for round {self.imaging_round}"
@@ -548,11 +673,13 @@ class ImageRegistration:
                     "sampling_pct": 1.0,
                 },
             )
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(f"{stage} metrics stage failed") from error
         destination = path_by_stage[stage]
         if not self.force_override:
-            cached = self._store().reuse(destination, request, read_metrics)
+            cached = self._reuse_artifact(destination, request, read_metrics)
             if cached is not None:
                 return
         try:
@@ -564,12 +691,14 @@ class ImageRegistration:
                 sampling="regular",
                 sampling_pct=1.0,
             )
-            self._store().commit(
+            self._commit_artifact(
                 destination,
                 request,
                 writer=lambda path: write_metrics(metrics, path),
                 validator=lambda path: read_metrics(path) == metrics,
             )
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(f"{stage} metrics stage failed") from error
 
@@ -599,12 +728,14 @@ class ImageRegistration:
                     "registration_parameters": self._linear_parameters(),
                 },
             )
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(
                 f"affine registration failed for round {self.imaging_round}"
             ) from error
         if not self.force_override:
-            transform = self._store().reuse(paths.affine, request, backend.read_affine)
+            transform = self._reuse_artifact(paths.affine, request, backend.read_affine)
             if transform is not None:
                 try:
                     moving_linear = backend.apply_affine(
@@ -655,7 +786,7 @@ class ImageRegistration:
                     return False
                 return True
 
-            self._store().commit(
+            self._commit_artifact(
                 paths.affine,
                 request,
                 writer=lambda path: backend.write_affine(transform, path),
@@ -669,6 +800,8 @@ class ImageRegistration:
                     paths.registered,
                 ):
                     self._store().mark_stale(descendant)
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(
                 f"affine registration failed for round {self.imaging_round}"
@@ -732,13 +865,15 @@ class ImageRegistration:
                     upstream=affine_identity,
                     parameters=parameters,
                 )
+            except RegistrationStageError:
+                raise
             except Exception as error:
                 raise RegistrationStageError(
                     f"nonlinear registration failed for round {self.imaging_round}"
                 ) from error
 
             if not self.force_override:
-                warp = self._store().reuse(paths.warp, request, backend.read_warp)
+                warp = self._reuse_artifact(paths.warp, request, backend.read_warp)
                 if warp is not None:
                     try:
                         moving_nonlinear, moving_nonlinear_mask = (
@@ -779,7 +914,7 @@ class ImageRegistration:
                 return True
 
             warp_commit_attempted = True
-            self._store().commit(paths.warp, request, writer, validator)
+            self._commit_artifact(paths.warp, request, writer, validator)
             warp_committed = True
             moving_nonlinear, moving_nonlinear_mask = (
                 self._reconstruct_nonlinear_images(
@@ -887,6 +1022,8 @@ class ImageRegistration:
                     "maximum": maximum,
                 },
             )
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(
                 f"registered image persistence failed for round {self.imaging_round}"
@@ -901,7 +1038,7 @@ class ImageRegistration:
             return image
 
         if not self.force_override:
-            cached = self._store().reuse(paths.registered, request, reader)
+            cached = self._reuse_artifact(paths.registered, request, reader)
             if cached is not None:
                 return
 
@@ -913,7 +1050,7 @@ class ImageRegistration:
             return True
 
         try:
-            self._store().commit(
+            self._commit_artifact(
                 paths.registered,
                 request,
                 writer=lambda path: backend.write_tiff(
@@ -924,6 +1061,8 @@ class ImageRegistration:
                 ),
                 validator=validator,
             )
+        except RegistrationStageError:
+            raise
         except Exception as error:
             raise RegistrationStageError(
                 f"registered image persistence failed for round {self.imaging_round}"

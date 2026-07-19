@@ -280,6 +280,10 @@ def test_manifest_is_canonical_ordered_and_records_local_warp_identities(
     tmp_path: Path,
 ) -> None:
     registration = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+    expected_inputs = (
+        FileIdentity.from_path(tmp_path / "fixed.tif"),
+        FileIdentity.from_path(tmp_path / "moving.tif"),
+    )
 
     registration.register()
 
@@ -306,6 +310,7 @@ def test_manifest_is_canonical_ordered_and_records_local_warp_identities(
     completion_path = ArtifactStore().record_path(path)
     assert completion_path.is_file()
     request = CompletionRecord.read(completion_path).request
+    assert request.inputs == expected_inputs
     assert request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
 
 
@@ -317,12 +322,17 @@ def test_chunked_full_request_records_transitive_chunk_evidence(
         backend=FakeChunkBackend(),
         overlap_fraction=0.25,
     )
+    expected_inputs = (
+        FileIdentity.from_path(tmp_path / "fixed.tif"),
+        FileIdentity.from_path(tmp_path / "moving.tif"),
+    )
 
     registration.register()
 
     request = CompletionRecord.read(
         ArtifactStore().record_path(round_paths(tmp_path).warp)
     ).request
+    assert request.inputs == expected_inputs
     chunks = request.parameters["chunk_grid"]
     assert request.parameters["registration_mode"] == "serial-chunked"
     assert request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
@@ -337,6 +347,59 @@ def test_chunked_full_request_records_transitive_chunk_evidence(
         FileIdentity.from_path(registration.chunk_paths(chunk_id).warp).to_dict()
         for chunk_id in (0, 1, 2)
     ]
+
+
+def test_every_chunked_stage_request_uses_one_invocation_snapshot(
+    tmp_path: Path,
+) -> None:
+    registration = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
+    expected_inputs = (
+        FileIdentity.from_path(tmp_path / "fixed.tif"),
+        FileIdentity.from_path(tmp_path / "moving.tif"),
+    )
+
+    registration.register()
+
+    paths = round_paths(tmp_path)
+    artifacts = (
+        paths.fixed_reference,
+        paths.pre_metrics,
+        paths.affine,
+        paths.linear_metrics,
+        registration.chunk_paths(0).warp,
+        registration.chunk_paths(1).warp,
+        manifest_path(tmp_path),
+        paths.warp,
+        paths.nonlinear_metrics,
+        paths.registered,
+    )
+    requests = tuple(
+        CompletionRecord.read(ArtifactStore().record_path(path)).request
+        for path in artifacts
+    )
+
+    assert {request.stage for request in requests} == {
+        "fixed-reference",
+        "metrics:pre-registration",
+        "affine",
+        "metrics:linearly-registered",
+        "nonlinear-chunk:0",
+        "nonlinear-chunk:1",
+        "nonlinear-chunk-manifest",
+        "nonlinear",
+        "metrics:nonlinear-registered",
+        "registered-image",
+    }
+    assert all(request.inputs == expected_inputs for request in requests)
+
+
+def test_chunked_orchestration_does_not_bypass_cache_guard_helpers() -> None:
+    import inspect
+
+    source = inspect.getsource(ChunkedImageRegistration)
+
+    assert ".reuse(" not in source
+    assert ".commit(" not in source
 
 
 def test_whole_image_full_warp_cannot_be_reused_as_chunked(
@@ -501,16 +564,17 @@ def test_local_request_captures_sources_geometries_threads_affine_and_grid(
         backend=FakeChunkBackend(),
         overlap_fraction=0.25,
     )
+    expected_inputs = (
+        FileIdentity.from_path(tmp_path / "fixed.tif"),
+        FileIdentity.from_path(tmp_path / "moving.tif"),
+    )
 
     registration.register()
 
     request = CompletionRecord.read(
         registration.chunk_paths(0).completion_record
     ).request
-    assert request.inputs == (
-        FileIdentity.from_path(tmp_path / "fixed.tif"),
-        FileIdentity.from_path(tmp_path / "moving.tif"),
-    )
+    assert request.inputs == expected_inputs
     assert request.geometry.shape == (9, 8, 8)
     assert request.parameters["moving_geometry"] == request.geometry.to_dict()
     assert request.native_threads and set(request.native_threads.values()) == {1}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -108,6 +109,101 @@ class RejectingValidatorStore(ArtifactStore):
 
             validator = reject
         super().commit(artifact, request, writer, validator)
+
+
+class SourceMutatingStore(ArtifactStore):
+    def __init__(
+        self,
+        source: Path,
+        target_name: str,
+        operation: str,
+        *,
+        raise_after_mutation: bool = False,
+        raise_before_commit: bool = False,
+    ) -> None:
+        self.source = source
+        self.target_name = target_name
+        self.operation = operation
+        self.raise_after_mutation = raise_after_mutation
+        self.raise_before_commit = raise_before_commit
+        self.failure = RuntimeError("injected artifact-store failure")
+        self.changed = False
+
+    def _mutate_source(self, artifact: Path, operation: str) -> bool:
+        if (
+            not self.changed
+            and artifact.name == self.target_name
+            and operation == self.operation
+        ):
+            self.source.write_bytes(b"source-mutated-inside-artifact-store")
+            self.changed = True
+            return True
+        return False
+
+    def reuse(
+        self,
+        artifact: Path,
+        request: StageRequest,
+        reader: Callable[[Path], Any],
+    ) -> Any | None:
+        value = super().reuse(artifact, request, reader)
+        mutated = self._mutate_source(artifact, "reuse")
+        if mutated and self.raise_after_mutation:
+            raise self.failure
+        return value
+
+    def commit(
+        self,
+        artifact: Path,
+        request: StageRequest,
+        writer: Callable[[Path], None],
+        validator: Callable[[Path], bool],
+    ) -> None:
+        if (
+            self.raise_before_commit
+            and artifact.name == self.target_name
+            and self.operation == "commit"
+        ):
+            self._mutate_source(artifact, "commit")
+            raise self.failure
+        super().commit(artifact, request, writer, validator)
+        mutated = self._mutate_source(artifact, "commit")
+        if mutated and self.raise_after_mutation:
+            raise self.failure
+
+
+class StableRaisingStore(ArtifactStore):
+    def __init__(self, target_name: str, operation: str, failure: RuntimeError) -> None:
+        self.target_name = target_name
+        self.operation = operation
+        self.failure = failure
+
+    def reuse(
+        self,
+        artifact: Path,
+        request: StageRequest,
+        reader: Callable[[Path], Any],
+    ) -> Any | None:
+        if artifact.name == self.target_name and self.operation == "reuse":
+            raise self.failure
+        return super().reuse(artifact, request, reader)
+
+    def commit(
+        self,
+        artifact: Path,
+        request: StageRequest,
+        writer: Callable[[Path], None],
+        validator: Callable[[Path], bool],
+    ) -> None:
+        if artifact.name == self.target_name and self.operation == "commit":
+            raise self.failure
+        super().commit(artifact, request, writer, validator)
+
+
+def restore_file_identity(path: Path, contents: bytes, identity: FileIdentity) -> None:
+    path.write_bytes(contents)
+    os.utime(path, ns=(path.stat().st_atime_ns, identity.st_mtime_ns))
+    assert FileIdentity.from_path(path) == identity
 
 
 class GeometryMismatchingBackend(FakeBackend):
@@ -388,17 +484,41 @@ def test_register_resolves_threads_before_loading_any_image(
         events.append("configure")
         return resolved_native_threads
 
+    original_from_path = FileIdentity.from_path
+
+    def record_identity(cls: type[FileIdentity], path: Path) -> FileIdentity:
+        del cls
+        events.append(f"identity:{path.name}")
+        return original_from_path(path)
+
     class TrackingBackend(FakeBackend):
         def load_image(self, path: Path, pixel_size_xyz: tuple[float, float, float]):
             events.append(f"load:{path.name}")
             return super().load_image(path, pixel_size_xyz)
 
     monkeypatch.setattr(whole_image, "configure_native_threads", configure)
+    monkeypatch.setattr(FileIdentity, "from_path", classmethod(record_identity))
     backend = TrackingBackend()
 
     make_registration(tmp_path, backend=backend, native_threads=requested).register()
 
-    assert events[:3] == ["configure", "load:fixed.tif", "load:moving.tif"]
+    assert events[:7] == [
+        "configure",
+        "identity:fixed.tif",
+        "identity:moving.tif",
+        "load:fixed.tif",
+        "load:moving.tif",
+        "identity:fixed.tif",
+        "identity:moving.tif",
+    ]
+
+
+def test_orchestration_cache_calls_are_confined_to_guard_helpers() -> None:
+    source = inspect.getsource(ImageRegistration)
+
+    assert source.count("self._store().reuse(") == 1
+    assert source.count("store.commit(") == 1
+    assert "self._store().commit(" not in source
 
 
 def test_successful_registration_commits_every_artifact_in_stage_order(
@@ -441,12 +561,13 @@ def test_stage_records_capture_inputs_geometry_threads_policy_and_upstream(
     resolved_native_threads: ResolvedNativeThreads,
 ) -> None:
     backend = FakeBackend()
-    make_registration(tmp_path, backend=backend).register()
-    paths = round_paths(tmp_path)
+    registration = make_registration(tmp_path, backend=backend)
     expected_inputs = (
         FileIdentity.from_path(tmp_path / "fixed.tif"),
         FileIdentity.from_path(tmp_path / "moving.tif"),
     )
+    registration.register()
+    paths = round_paths(tmp_path)
 
     records = {
         "fixed": completion_request(paths.fixed_reference),
@@ -1351,7 +1472,9 @@ def test_corrupt_cached_artifacts_remain_cache_validation_errors(
     assert resumed.nonlinear_calls == 0
 
 
-def test_stage_requests_snapshot_input_identities_at_each_call(tmp_path: Path) -> None:
+def test_midrun_source_mutation_aborts_without_mislabeled_affine(
+    tmp_path: Path,
+) -> None:
     moving_path = tmp_path / "moving.tif"
 
     class InputChangingBackend(FakeBackend):
@@ -1366,16 +1489,295 @@ def test_stage_requests_snapshot_input_identities_at_each_call(tmp_path: Path) -
                 self.changed = True
             return metrics
 
-    make_registration(tmp_path, backend=InputChangingBackend()).register()
+    backend = InputChangingBackend()
+    registration = make_registration(tmp_path, backend=backend)
+    original_contents = moving_path.read_bytes()
+    original_identity = FileIdentity.from_path(moving_path)
+
+    with pytest.raises(
+        RegistrationStageError, match="source input identity changed"
+    ) as error:
+        registration.register()
+
     paths = round_paths(tmp_path)
     store = ArtifactStore()
     fixed_reference_request = CompletionRecord.read(
         store.record_path(paths.fixed_reference)
     ).request
-    affine_request = CompletionRecord.read(store.record_path(paths.affine)).request
 
-    assert fixed_reference_request.inputs[1] != affine_request.inputs[1]
-    assert affine_request.inputs[1] == FileIdentity.from_path(moving_path)
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert fixed_reference_request.inputs[1] == original_identity
+    assert not paths.pre_metrics.exists()
+    assert not store.record_path(paths.pre_metrics).exists()
+    assert not paths.affine.exists()
+    assert not store.record_path(paths.affine).exists()
+
+    restore_file_identity(moving_path, original_contents, original_identity)
+    registration.register()
+
+    assert CompletionRecord.read(store.record_path(paths.affine)).request.inputs[1] == (
+        original_identity
+    )
+
+
+def test_force_run_checks_snapshot_before_starting_next_expensive_stage(
+    tmp_path: Path,
+) -> None:
+    moving_path = tmp_path / "moving.tif"
+
+    class BetweenStagesMutationRegistration(ImageRegistration):
+        changed = False
+
+        def _commit_metrics(self, stage: str, *args: object, **kwargs: object) -> None:
+            super()._commit_metrics(stage, *args, **kwargs)  # type: ignore[arg-type]
+            if stage == "pre-registration" and not self.changed:
+                moving_path.write_bytes(b"moving-input-changed-between-stages")
+                self.changed = True
+
+    fixed_path = write_stub(tmp_path / "fixed.tif", b"fixed-input")
+    write_stub(moving_path, b"moving-input")
+    backend = FakeBackend()
+    registration = BetweenStagesMutationRegistration(
+        fixed_path,
+        moving_path,
+        tmp_path / "output",
+        2,
+        force_override=True,
+        _backend=backend,
+        _artifact_store=ArtifactStore(),
+    )
+
+    with pytest.raises(
+        RegistrationStageError, match="source input identity changed"
+    ) as error:
+        registration.register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert backend.linear_calls == 0
+
+
+@pytest.mark.parametrize("role", ["fixed", "moving"])
+@pytest.mark.parametrize("mutation", ["change", "remove"])
+def test_source_mutation_during_either_load_aborts_before_artifacts(
+    tmp_path: Path,
+    role: str,
+    mutation: str,
+) -> None:
+    class LoadMutatingBackend(FakeBackend):
+        def load_image(
+            self,
+            path: Path,
+            pixel_size_xyz: tuple[float, float, float],
+        ) -> object:
+            loaded = super().load_image(path, pixel_size_xyz)
+            if path.name == f"{role}.tif":
+                if mutation == "change":
+                    path.write_bytes(b"source-mutated-during-load")
+                else:
+                    path.unlink()
+            return loaded
+
+    backend = LoadMutatingBackend()
+
+    with pytest.raises(
+        RegistrationStageError, match="source input identity changed"
+    ) as error:
+        make_registration(tmp_path, backend=backend).register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert backend.linear_calls == 0
+    assert not any((tmp_path / "output").glob("*.complete.json"))
+
+
+def test_source_mutation_after_commit_stales_new_record_and_restarts(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    registration = make_registration(tmp_path, backend=backend)
+    moving_path = tmp_path / "moving.tif"
+    original_contents = moving_path.read_bytes()
+    original_identity = FileIdentity.from_path(moving_path)
+    paths = round_paths(tmp_path)
+    store = SourceMutatingStore(moving_path, paths.affine.name, "commit")
+    registration._artifact_store = store
+
+    with pytest.raises(
+        RegistrationStageError, match="source input identity changed"
+    ) as error:
+        registration.register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert paths.affine.is_file()
+    assert not store.record_path(paths.affine).exists()
+    assert store.stale_path(paths.affine).is_file()
+    stale = CompletionRecord.read(store.stale_path(paths.affine))
+    assert stale.request.inputs[1] == original_identity
+    assert not paths.linear_metrics.exists()
+
+    restore_file_identity(moving_path, original_contents, original_identity)
+    registration.register()
+
+    assert backend.linear_calls == 2
+    assert store.record_path(paths.affine).is_file()
+    assert not store.stale_path(paths.affine).exists()
+
+
+def test_source_mutation_after_reuse_aborts_without_staling_old_record(
+    tmp_path: Path,
+) -> None:
+    make_registration(tmp_path, backend=FakeBackend()).register()
+    paths = round_paths(tmp_path)
+    moving_path = tmp_path / "moving.tif"
+    original_contents = moving_path.read_bytes()
+    original_identity = FileIdentity.from_path(moving_path)
+    old_record = ArtifactStore().record_path(paths.affine).read_bytes()
+    store = SourceMutatingStore(moving_path, paths.affine.name, "reuse")
+    backend = FakeBackend()
+    registration = make_registration(
+        tmp_path,
+        backend=backend,
+        artifact_store=store,
+    )
+
+    with pytest.raises(
+        RegistrationStageError, match="source input identity changed"
+    ) as error:
+        registration.register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert store.record_path(paths.affine).read_bytes() == old_record
+    assert not store.stale_path(paths.affine).exists()
+    assert backend.linear_calls == 0
+
+    restore_file_identity(moving_path, original_contents, original_identity)
+    registration.register()
+
+    assert backend.linear_calls == 0
+    assert backend.nonlinear_calls == 0
+
+
+def test_source_mutation_then_reuse_error_still_runs_post_guard(
+    tmp_path: Path,
+) -> None:
+    make_registration(tmp_path, backend=FakeBackend()).register()
+    paths = round_paths(tmp_path)
+    moving_path = tmp_path / "moving.tif"
+    old_record = ArtifactStore().record_path(paths.affine).read_bytes()
+    store = SourceMutatingStore(
+        moving_path,
+        paths.affine.name,
+        "reuse",
+        raise_after_mutation=True,
+    )
+
+    with pytest.raises(
+        RegistrationStageError, match="source input identity changed"
+    ) as error:
+        make_registration(
+            tmp_path,
+            backend=FakeBackend(),
+            artifact_store=store,
+        ).register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert error.value.__context__ is store.failure
+    assert store.record_path(paths.affine).read_bytes() == old_record
+    assert not store.stale_path(paths.affine).exists()
+
+
+def test_source_mutation_then_late_commit_error_stales_promoted_record(
+    tmp_path: Path,
+) -> None:
+    paths = round_paths(tmp_path)
+    moving_path = tmp_path / "moving.tif"
+    store = SourceMutatingStore(
+        moving_path,
+        paths.affine.name,
+        "commit",
+        raise_after_mutation=True,
+    )
+
+    with pytest.raises(
+        RegistrationStageError, match="source input identity changed"
+    ) as error:
+        make_registration(
+            tmp_path,
+            backend=FakeBackend(),
+            artifact_store=store,
+        ).register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert error.value.__context__ is store.failure
+    assert paths.affine.is_file()
+    assert not store.record_path(paths.affine).exists()
+    assert store.stale_path(paths.affine).is_file()
+
+
+def test_source_mutation_before_failed_commit_preserves_preexisting_record(
+    tmp_path: Path,
+) -> None:
+    make_registration(tmp_path, backend=FakeBackend()).register()
+    paths = round_paths(tmp_path)
+    moving_path = tmp_path / "moving.tif"
+    old_record = ArtifactStore().record_path(paths.affine).read_bytes()
+    store = SourceMutatingStore(
+        moving_path,
+        paths.affine.name,
+        "commit",
+        raise_before_commit=True,
+    )
+
+    with pytest.raises(
+        RegistrationStageError, match="source input identity changed"
+    ) as error:
+        make_registration(
+            tmp_path,
+            backend=FakeBackend(),
+            artifact_store=store,
+            force_override=True,
+        ).register()
+
+    assert isinstance(error.value.__cause__, CacheValidationError)
+    assert error.value.__context__ is store.failure
+    assert store.record_path(paths.affine).read_bytes() == old_record
+    assert not store.stale_path(paths.affine).exists()
+
+
+def test_stable_source_reuse_error_is_re_raised_unchanged(tmp_path: Path) -> None:
+    make_registration(tmp_path, backend=FakeBackend()).register()
+    paths = round_paths(tmp_path)
+    failure = RuntimeError("stable reuse failure")
+    store = StableRaisingStore(paths.affine.name, "reuse", failure)
+
+    with pytest.raises(RuntimeError) as error:
+        make_registration(
+            tmp_path,
+            backend=FakeBackend(),
+            artifact_store=store,
+        ).register()
+
+    assert error.value is failure
+    assert store.record_path(paths.affine).is_file()
+    assert not store.stale_path(paths.affine).exists()
+
+
+def test_stable_source_commit_error_retains_stage_cause_identity(
+    tmp_path: Path,
+) -> None:
+    paths = round_paths(tmp_path)
+    failure = RuntimeError("stable commit failure")
+    store = StableRaisingStore(paths.affine.name, "commit", failure)
+
+    with pytest.raises(RegistrationStageError, match="affine") as error:
+        make_registration(
+            tmp_path,
+            backend=FakeBackend(),
+            artifact_store=store,
+        ).register()
+
+    assert error.value.__cause__ is failure
+    assert not store.record_path(paths.affine).exists()
+    assert not store.stale_path(paths.affine).exists()
 
 
 def test_register_creates_output_only_after_thread_resolution(
@@ -1420,12 +1822,13 @@ def test_crop_completion_records_capture_inputs_and_effective_threads(
     tmp_path: Path,
     resolved_native_threads: ResolvedNativeThreads,
 ) -> None:
-    make_registration(tmp_path, backend=FakeBackend(), crop=True).register()
-    paths = round_paths(tmp_path)
+    registration = make_registration(tmp_path, backend=FakeBackend(), crop=True)
     expected_inputs = (
         FileIdentity.from_path(tmp_path / "fixed.tif"),
         FileIdentity.from_path(tmp_path / "moving.tif"),
     )
+    registration.register()
+    paths = round_paths(tmp_path)
 
     for path, role in (
         (paths.fixed_crop, "fixed"),

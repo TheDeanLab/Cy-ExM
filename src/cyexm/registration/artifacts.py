@@ -133,6 +133,30 @@ class StageRequest:
     parameters: dict[str, JsonValue]
 
     @classmethod
+    def for_identities(
+        cls,
+        *,
+        stage: str,
+        inputs: Iterable[FileIdentity],
+        geometry: ImageGeometry,
+        method: str,
+        accuracy: str,
+        native_threads: Mapping[str, int],
+        upstream: FileIdentity | None,
+        parameters: Mapping[str, object],
+    ) -> Self:
+        return cls(
+            stage=stage,
+            inputs=tuple(inputs),
+            geometry=geometry,
+            method=method,
+            accuracy=accuracy,
+            native_threads=dict(native_threads),
+            upstream=upstream,
+            parameters=_json_mapping(parameters),
+        )
+
+    @classmethod
     def for_files(
         cls,
         *,
@@ -145,15 +169,15 @@ class StageRequest:
         upstream: FileIdentity | None,
         parameters: Mapping[str, object],
     ) -> Self:
-        return cls(
+        return cls.for_identities(
             stage=stage,
-            inputs=tuple(FileIdentity.from_path(path) for path in inputs),
+            inputs=(FileIdentity.from_path(path) for path in inputs),
             geometry=geometry,
             method=method,
             accuracy=accuracy,
-            native_threads=dict(native_threads),
+            native_threads=native_threads,
             upstream=upstream,
-            parameters=_json_mapping(parameters),
+            parameters=parameters,
         )
 
     def to_dict(self) -> dict[str, JsonValue]:

@@ -326,6 +326,16 @@ thread configuration, and upstream artifact identity. Full content hashing of
 multi-gigabyte images is not required. A cache entry is reusable only when its
 artifact is readable and its metadata matches the current request.
 
+**Cache-integrity correction (2026-07-19):** each registration invocation
+snapshots both resolved input identities before either backend load, uses that
+single immutable pair for whole-image, local-chunk, and manifest requests, and
+checks it after loading and immediately before and after every cache reuse or
+commit. A changed or missing input aborts without reloading. A completion record
+committed before a failing post-check is marked stale; a previously reused record
+is preserved. The snapshot remains stat-based (`path`, `st_size`, and
+`st_mtime_ns`) and does not hash file contents, so changes that preserve all three
+values are not detectable and inputs must remain immutable during a run.
+
 If an artifact exists without valid matching metadata, Cy-ExM raises a focused
 cache error instead of silently overwriting or reusing it. An explicit force
 option permits recomputation. After a replacement affine stage is committed,

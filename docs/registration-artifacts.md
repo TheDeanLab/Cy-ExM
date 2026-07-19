@@ -64,6 +64,19 @@ Every `<name>.complete.json` uses `schema_version: 1` and contains:
 - `artifact`, the normalized path, size, and modification-time identity committed
   after validation.
 
+Each `register()` invocation snapshots both input identities before either image is
+loaded. Every whole-image request, local-chunk request, and manifest request created
+by that invocation uses the same immutable pair. Cy-ExM verifies the pair after both
+loads and immediately before and after every artifact reuse or commit. It aborts with
+a registration-stage error if an input changes or disappears; it never silently
+reloads changed pixels. If the post-commit check fails, the new completion record is
+marked stale. A post-reuse failure leaves the previously valid cache record intact.
+
+Input identities are deliberately stat-based: resolved path, `st_size`, and
+`st_mtime_ns`. Cy-ExM does not content-hash source images, so an in-place content
+change that preserves all three values is outside this check. Keep source files
+immutable for the duration of registration.
+
 The chunk `manifest.json` has its own payload schema in addition to its completion
 record. Payload schema version 2 records
 `axis_convention_version: external-zyx-ants-xyz-v1`, `round_number`,

@@ -490,6 +490,7 @@ class ChunkedImageRegistration(ImageRegistration):
         native_threads: dict[str, int],
         affine_identity: FileIdentity,
     ) -> StageRequest:
+        self._verify_source_identities()
         parameters: dict[str, object] = {
             "axis_convention_version": AXIS_CONVENTION_VERSION,
             "chunk": self._chunk_dict(chunk),
@@ -514,9 +515,9 @@ class ChunkedImageRegistration(ImageRegistration):
             "registration_parameters": self._nonlinear_parameters(),
             "scalar_postprocessing": "histogram-match-to-moving-linear-chunk",
         }
-        return StageRequest.for_files(
+        return StageRequest.for_identities(
             stage=f"nonlinear-chunk:{chunk.chunk_id}",
-            inputs=(Path(self.fixed_image_path), Path(self.moving_image_path)),
+            inputs=self._input_identity_snapshot(),
             geometry=backend.geometry(fixed_chunk),
             method=self.nonlinear_type,
             accuracy=self.nonlinear_accuracy,
@@ -548,7 +549,7 @@ class ChunkedImageRegistration(ImageRegistration):
 
         cached = None
         if not self.force_override:
-            cached = self._store().reuse(paths.warp, request, reader)
+            cached = self._reuse_artifact(paths.warp, request, reader)
         if cached is not None:
             return cached[1], False
         if require_existing:
@@ -587,7 +588,7 @@ class ChunkedImageRegistration(ImageRegistration):
                     return False
                 return True
 
-            self._store().commit(paths.warp, request, writer, validator)
+            self._commit_artifact(paths.warp, request, writer, validator)
             try:
                 committed = reader(paths.warp)[1]
             except Exception:
@@ -684,12 +685,13 @@ class ChunkedImageRegistration(ImageRegistration):
         *,
         require_existing: bool,
     ) -> FileIdentity:
+        self._verify_source_identities()
         path = self._manifest_path()
         payload = self._manifest_payload(chunks, image_shape, warp_identities)
         text = self._canonical_json(payload)
-        request = StageRequest.for_files(
+        request = StageRequest.for_identities(
             stage="nonlinear-chunk-manifest",
-            inputs=(Path(self.fixed_image_path), Path(self.moving_image_path)),
+            inputs=self._input_identity_snapshot(),
             geometry=backend.geometry(fixed),
             method="serial-chunk-grid",
             accuracy="exact",
@@ -718,7 +720,7 @@ class ChunkedImageRegistration(ImageRegistration):
             return candidate
 
         if not self.force_override:
-            cached = self._store().reuse(path, request, reader)
+            cached = self._reuse_artifact(path, request, reader)
             if cached is not None:
                 return FileIdentity.from_path(path)
             if require_existing:
@@ -729,7 +731,7 @@ class ChunkedImageRegistration(ImageRegistration):
         def writer(destination: Path) -> None:
             destination.write_text(text, encoding="utf-8")
 
-        self._store().commit(
+        self._commit_artifact(
             path,
             request,
             writer=writer,

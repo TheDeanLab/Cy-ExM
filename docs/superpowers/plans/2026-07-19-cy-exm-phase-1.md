@@ -511,6 +511,13 @@ git commit -m "feat: add safe native thread configuration"
 - Consumes: cyexm.errors.CacheValidationError.
 - Produces: atomic_write(destination, writer, validator), dependency-neutral PixelSize and ImageGeometry, FileIdentity.from_path, StageRequest, CompletionRecord, ArtifactStore.reuse, ArtifactStore.commit, and ArtifactStore.mark_stale.
 
+> **Cache-integrity correction (2026-07-19):** `StageRequest.for_identities`
+> preserves an invocation-level immutable identity tuple while applying the same
+> JSON normalization as `for_files`; `for_files` retains call-time path snapshot
+> behavior by delegating to it. `FileIdentity` is stat-based (`path`, `st_size`,
+> `st_mtime_ns`) and does not content-hash files, so inputs must remain immutable
+> because a content change that preserves all three values is not detectable.
+
 - [ ] **Step 1: Write failing atomic-write tests**
 
 ~~~python
@@ -1414,6 +1421,16 @@ identity. Reuse calls ArtifactStore.reuse with the backend's real reader. New
 work writes through ArtifactStore.commit and validates by reopening the
 artifact. Catch lower-level exceptions only to add stage context with
 RegistrationStageError and raise from the original exception.
+
+> **Cache-integrity correction (2026-07-19):** before either backend load, each
+> `register()` call snapshots both source `FileIdentity` values. All whole-image,
+> local-chunk, and manifest requests use that exact pair. Verify it after both
+> loads and immediately before and after every orchestration-level
+> `ArtifactStore.reuse` or `ArtifactStore.commit`; do not silently reload. Abort on
+> change or disappearance, mark a just-committed record stale after a failing
+> post-commit check, and leave an old record intact after a failing post-reuse
+> check. This detects path/size/mtime changes, not content changes that preserve
+> all three stat values.
 
 When nonlinear registration returns a temporary warp path, copy its bytes only
 inside the ArtifactStore writer. Apply that committed warp to the linearly

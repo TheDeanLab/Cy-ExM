@@ -133,6 +133,40 @@ def test_stage_request_snapshots_input_identities(tmp_path: Path) -> None:
     assert make_request(source).inputs[0] != identity
 
 
+def test_stage_request_for_identities_preserves_snapshot_and_normalizes_json(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "moving.tif"
+    source.write_bytes(b"source")
+    identity = FileIdentity.from_path(source)
+
+    request = StageRequest.for_identities(
+        stage="affine",
+        inputs=(identity,),
+        geometry=ImageGeometry(
+            shape=(8, 16, 16),
+            origin=(0.0, 0.0, 0.0),
+            spacing=(0.15, 0.15, 0.4),
+            direction=(
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+        ),
+        method="TRSAA",
+        accuracy="low",
+        native_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1},
+        upstream=None,
+        parameters={"schedule": (4, 2, 1)},
+    )
+
+    source.write_bytes(b"changed-source")
+
+    assert request.inputs == (identity,)
+    assert request.native_threads == {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1}
+    assert request.parameters == {"schedule": [4, 2, 1]}
+
+
 def test_completion_record_is_canonical_json_with_fresh_identity(
     tmp_path: Path,
 ) -> None:

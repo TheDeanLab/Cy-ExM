@@ -1,6 +1,6 @@
 # Cy-ExM Phase 1 Registration Extraction Design
 
-- **Status:** Design approved; written specification awaiting user review
+- **Status:** Approved for implementation planning
 - **Date:** 2026-07-19
 - **Repository:** `TheDeanLab/Cy-ExM`
 - **Distribution name:** `cy-exm`

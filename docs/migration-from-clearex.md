@@ -124,6 +124,13 @@ could create incomplete or scientifically misleading results:
     `scalar_postprocessing_policy` evidence binds the full warp, nonlinear metrics,
     final TIFF, and local warps to that scope. Earlier records lacking this evidence
     fail closed and require an intentional forced recompute.
+19. `transform_directory.ipynb` validates selected artifacts as one provenance chain,
+    rather than accepting an arbitrary combination of individually valid records.
+    The affine-to-nonlinear upstream link, common registration inputs and fixed
+    geometry, round, both-or-neither crop policy and crop roles, XYZ pixel spacing,
+    and current fixed-image identity must agree before bounds or images are read. The
+    recorded moving input is compared across records but need not remain on disk, so
+    the verified transform chain can still be applied to other moving channels.
 
 The direct low-level ANTs parity fixtures intentionally remain native-only and are
 not transposed. These corrections apply where orchestration crosses external

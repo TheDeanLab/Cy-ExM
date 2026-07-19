@@ -147,8 +147,18 @@ The `transform_directory.ipynb` example applies the same minimum evidence rule b
 reading crop bounds or applying an existing transform: each supplied affine,
 nonlinear warp, and optional crop artifact must have a readable completion record,
 an exact current `FileIdentity`, the expected stage, and the current
-`axis_convention_version`. Copy each artifact together with its `.complete.json`
-record; an artifact file by itself is intentionally unusable in this notebook.
+`axis_convention_version`. It then validates the selected records as one provenance
+chain before reading bounds or loading an image: affine and nonlinear requests must
+name the same two registration inputs and fixed geometry, the nonlinear upstream
+must equal the selected affine artifact, and the affine must have no upstream.
+Round number, crop policy, and XYZ pixel spacing must match the notebook settings on
+every selected record. Crop use is both fixed and moving records or neither; crop
+inputs, stages, and fixed/moving roles must belong to the same chain. Finally, the
+current `FIXED_IMAGE` identity must equal the recorded fixed input. The original
+moving registration channel need not remain available because other moving channels
+are the intended transform targets. Copy each artifact together with its
+`.complete.json` record; an artifact file by itself, or individually valid artifacts
+from unrelated runs, are intentionally unusable in this notebook.
 
 ## Stale records and force
 

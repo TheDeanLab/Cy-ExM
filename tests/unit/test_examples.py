@@ -4,14 +4,21 @@ import ast
 import importlib.util
 import inspect
 import json
+import math
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
+from numbers import Real
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import get_type_hints
+from typing import TYPE_CHECKING, get_type_hints
 
 import pytest
+
+if TYPE_CHECKING:
+    from cyexm.registration.artifacts import CompletionRecord, FileIdentity
+    from cyexm.spatial import ImageGeometry
 
 pytestmark = pytest.mark.unit
 
@@ -130,6 +137,175 @@ def _write_notebook_completion_record(
     return record_path
 
 
+def _write_transform_directory_record(
+    artifact: Path,
+    *,
+    stage: str,
+    inputs: tuple[FileIdentity, ...],
+    geometry: ImageGeometry,
+    upstream: FileIdentity | None,
+    parameters: dict[str, object],
+) -> CompletionRecord:
+    from cyexm.registration.artifacts import (
+        ArtifactStore,
+        CompletionRecord,
+        FileIdentity,
+        StageRequest,
+    )
+
+    request = StageRequest.for_identities(
+        stage=stage,
+        inputs=inputs,
+        geometry=geometry,
+        method="test",
+        accuracy="exact",
+        native_threads={},
+        upstream=upstream,
+        parameters=parameters,
+    )
+    record = CompletionRecord(
+        schema_version=1,
+        request=request,
+        artifact=FileIdentity.from_path(artifact),
+    )
+    ArtifactStore().record_path(artifact).write_text(record.to_json(), encoding="utf-8")
+    return record
+
+
+def _write_transform_directory_chain(
+    tmp_path: Path,
+    *,
+    crop: bool,
+    round_number: int = 2,
+) -> SimpleNamespace:
+    from cyexm.registration.artifacts import FileIdentity
+    from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry
+
+    fixed_image = tmp_path / "fixed.tif"
+    moving_image = tmp_path / "moving.tif"
+    fixed_image.write_bytes(b"fixed")
+    moving_image.write_bytes(b"moving")
+    inputs = (
+        FileIdentity.from_path(fixed_image),
+        FileIdentity.from_path(moving_image),
+    )
+    geometry = ImageGeometry(
+        shape=(2, 3, 4),
+        origin=(0.0, 0.0, 0.0),
+        spacing=(0.15, 0.15, 0.15),
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    parameters = {
+        "axis_convention_version": AXIS_CONVENTION_VERSION,
+        "crop": crop,
+        "imaging_round": round_number,
+        "pixel_size_xyz": (0.15, 0.15, 0.15),
+    }
+    affine_path = tmp_path / f"linear_transform_{round_number}.mat"
+    affine_path.write_bytes(b"affine")
+    affine_record = _write_transform_directory_record(
+        affine_path,
+        stage="affine",
+        inputs=inputs,
+        geometry=geometry,
+        upstream=None,
+        parameters=parameters,
+    )
+    nonlinear_path = tmp_path / f"nonlinear_warp_{round_number}.nii.gz"
+    nonlinear_path.write_bytes(b"warp")
+    nonlinear_record = _write_transform_directory_record(
+        nonlinear_path,
+        stage="nonlinear",
+        inputs=inputs,
+        geometry=geometry,
+        upstream=affine_record.artifact,
+        parameters=parameters,
+    )
+    fixed_crop_path = None
+    moving_crop_path = None
+    fixed_crop_record = None
+    moving_crop_record = None
+    if crop:
+        fixed_crop_path = tmp_path / f"fixed_crop_indices_{round_number}.json"
+        moving_crop_path = tmp_path / f"moving_crop_indices_{round_number}.json"
+        fixed_crop_path.write_text("[0,2,0,3,0,4]\n", encoding="utf-8")
+        moving_crop_path.write_text("[0,2,0,3,0,4]\n", encoding="utf-8")
+        fixed_crop_record = _write_transform_directory_record(
+            fixed_crop_path,
+            stage="crop:fixed",
+            inputs=inputs,
+            geometry=geometry,
+            upstream=None,
+            parameters={**parameters, "image_role": "fixed"},
+        )
+        moving_crop_record = _write_transform_directory_record(
+            moving_crop_path,
+            stage="crop:moving",
+            inputs=inputs,
+            geometry=geometry,
+            upstream=None,
+            parameters={**parameters, "image_role": "moving"},
+        )
+    return SimpleNamespace(
+        fixed_image=fixed_image,
+        moving_image=moving_image,
+        affine_path=affine_path,
+        nonlinear_path=nonlinear_path,
+        fixed_crop_path=fixed_crop_path,
+        moving_crop_path=moving_crop_path,
+        affine_record=affine_record,
+        nonlinear_record=nonlinear_record,
+        fixed_crop_record=fixed_crop_record,
+        moving_crop_record=moving_crop_record,
+        round_number=round_number,
+    )
+
+
+def _rewrite_transform_directory_record(path: Path, record: object) -> None:
+    from cyexm.registration.artifacts import ArtifactStore, CompletionRecord
+
+    assert isinstance(record, CompletionRecord)
+    ArtifactStore().record_path(path).write_text(record.to_json(), encoding="utf-8")
+
+
+def _load_transform_directory_artifact_validator():
+    from cyexm.registration.artifacts import (
+        ArtifactStore,
+        CompletionRecord,
+        FileIdentity,
+    )
+    from cyexm.spatial import AXIS_CONVENTION_VERSION
+
+    return _load_notebook_function(
+        "validate_cached_artifact",
+        {
+            "ArtifactStore": ArtifactStore,
+            "CompletionRecord": CompletionRecord,
+            "FileIdentity": FileIdentity,
+            "AXIS_CONVENTION_VERSION": AXIS_CONVENTION_VERSION,
+        },
+    )
+
+
+def _load_transform_directory_chain_validator():
+    from cyexm.registration.artifacts import FileIdentity
+
+    namespace = {"FileIdentity": FileIdentity, "Real": Real, "math": math}
+    normalize = _load_notebook_function("normalize_pixel_size_xyz", namespace)
+    namespace["normalize_pixel_size_xyz"] = normalize
+    return _load_notebook_function("validate_registration_chain", namespace)
+
+
+def _validated_transform_directory_records(chain: SimpleNamespace) -> SimpleNamespace:
+    validate = _load_transform_directory_artifact_validator()
+    return SimpleNamespace(
+        affine=validate(chain.affine_path, "affine"),
+        nonlinear=validate(chain.nonlinear_path, "nonlinear"),
+        fixed_crop=validate(chain.fixed_crop_path, "crop:fixed"),
+        moving_crop=validate(chain.moving_crop_path, "crop:moving"),
+    )
+
+
 def test_expected_example_inventory_exists() -> None:
     assert {path.name for path in Path("examples/scripts").glob("*.py")} == set(
         SCRIPT_NAMES
@@ -207,15 +383,21 @@ def test_transform_directory_notebook_validates_every_reused_artifact_first() ->
     assert "FileIdentity" in source
     assert "AXIS_CONVENTION_VERSION" in source
     calls = (
-        'validate_cached_artifact(AFFINE_TRANSFORM, "affine")',
-        'validate_cached_artifact(NONLINEAR_WARP, "nonlinear")',
-        'validate_cached_artifact(FIXED_CROP_INDICES, "crop:fixed")',
-        'validate_cached_artifact(MOVING_CROP_INDICES, "crop:moving")',
+        'affine_record = validate_cached_artifact(AFFINE_TRANSFORM, "affine")',
+        'nonlinear_record = validate_cached_artifact(NONLINEAR_WARP, "nonlinear")',
+        "fixed_crop_record = validate_cached_artifact(",
+        "moving_crop_record = validate_cached_artifact(",
     )
     for call in calls:
         assert call in source
+    chain_validation = source.rindex("validate_registration_chain(")
     bounds_read = source.index("fixed_bounds = read_bounds")
-    assert all(source.index(call) < bounds_read for call in calls)
+    fixed_load = source.index("fixed_full = load_ants_image")
+    transform_application = source.index("registered = transform_image(")
+    assert all(source.index(call) < chain_validation for call in calls)
+    assert chain_validation < bounds_read
+    assert chain_validation < fixed_load
+    assert chain_validation < transform_application
 
 
 def test_transform_directory_artifact_validator_accepts_current_record(
@@ -245,7 +427,389 @@ def test_transform_directory_artifact_validator_accepts_current_record(
         },
     )
 
-    assert validator(artifact, "affine") == artifact
+    result = validator(artifact, "affine")
+
+    assert isinstance(result, CompletionRecord)
+    assert result == CompletionRecord.read(ArtifactStore().record_path(artifact))
+
+
+@pytest.mark.parametrize("crop", [False, True], ids=["no-crop", "crop"])
+def test_transform_directory_accepts_a_complete_provenance_chain(
+    tmp_path: Path,
+    crop: bool,
+) -> None:
+    chain = _write_transform_directory_chain(tmp_path, crop=crop)
+    chain.moving_image.unlink()
+    records = _validated_transform_directory_records(chain)
+    validate_chain = _load_transform_directory_chain_validator()
+
+    validate_chain(
+        records.affine,
+        records.nonlinear,
+        records.fixed_crop,
+        records.moving_crop,
+        chain.fixed_image,
+        chain.round_number,
+        (0.15, 0.15, 0.15),
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        pytest.param("nonlinear-upstream", "upstream", id="nonlinear-upstream"),
+        pytest.param("affine-upstream", "upstream", id="affine-upstream"),
+        pytest.param("input-count", "inputs", id="input-count"),
+        pytest.param("common-inputs", "inputs", id="common-inputs"),
+        pytest.param("round-value", "round", id="round-value"),
+        pytest.param("round-boolean", "round", id="round-boolean"),
+        pytest.param("round-non-integer", "round", id="round-non-integer"),
+        pytest.param("crop-flag", "crop policy", id="crop-flag"),
+        pytest.param("crop-boolean", "crop policy", id="crop-boolean"),
+        pytest.param("crop-inputs", "crop inputs", id="crop-inputs"),
+        pytest.param("crop-stage", "fixed crop stage", id="crop-stage"),
+        pytest.param("crop-role", "fixed crop role", id="crop-role"),
+        pytest.param("crop-upstream", "fixed crop upstream", id="crop-upstream"),
+        pytest.param("one-sided-crop", "crop policy", id="one-sided-crop"),
+        pytest.param("fixed-identity", "fixed image", id="fixed-identity"),
+        pytest.param("pixel-size", "pixel spacing", id="pixel-size"),
+        pytest.param("pixel-shape", "pixel spacing", id="pixel-shape"),
+        pytest.param("pixel-boolean", "pixel spacing", id="pixel-boolean"),
+        pytest.param("pixel-nonnumeric", "pixel spacing", id="pixel-nonnumeric"),
+        pytest.param("pixel-zero", "pixel spacing", id="pixel-zero"),
+        pytest.param("pixel-negative", "pixel spacing", id="pixel-negative"),
+        pytest.param("pixel-nan", "pixel spacing", id="pixel-nan"),
+        pytest.param("pixel-infinity", "pixel spacing", id="pixel-infinity"),
+        pytest.param("pixel-overflow", "pixel spacing", id="pixel-overflow"),
+        pytest.param("geometry", "geometry", id="geometry"),
+    ],
+)
+def test_transform_directory_rejects_mismatched_provenance_chain(
+    tmp_path: Path,
+    failure: str,
+    message: str,
+) -> None:
+    from cyexm.registration.artifacts import FileIdentity
+    from cyexm.spatial import ImageGeometry
+
+    uses_crop = failure in {
+        "crop-inputs",
+        "crop-role",
+        "crop-stage",
+        "crop-upstream",
+        "one-sided-crop",
+    }
+    round_number = 1 if failure == "round-boolean" else 2
+    chain = _write_transform_directory_chain(
+        tmp_path,
+        crop=uses_crop,
+        round_number=round_number,
+    )
+    fixed_image = chain.fixed_image
+    if failure == "nonlinear-upstream":
+        chain.nonlinear_record = replace(
+            chain.nonlinear_record,
+            request=replace(
+                chain.nonlinear_record.request,
+                upstream=chain.nonlinear_record.artifact,
+            ),
+        )
+        _rewrite_transform_directory_record(
+            chain.nonlinear_path, chain.nonlinear_record
+        )
+    elif failure == "affine-upstream":
+        chain.affine_record = replace(
+            chain.affine_record,
+            request=replace(
+                chain.affine_record.request,
+                upstream=chain.nonlinear_record.artifact,
+            ),
+        )
+        _rewrite_transform_directory_record(chain.affine_path, chain.affine_record)
+    elif failure == "input-count":
+        chain.affine_record = replace(
+            chain.affine_record,
+            request=replace(
+                chain.affine_record.request,
+                inputs=(chain.affine_record.request.inputs[0],),
+            ),
+        )
+        _rewrite_transform_directory_record(chain.affine_path, chain.affine_record)
+    elif failure == "common-inputs":
+        unrelated_moving = tmp_path / "unrelated-moving.tif"
+        unrelated_moving.write_bytes(b"unrelated")
+        chain.nonlinear_record = replace(
+            chain.nonlinear_record,
+            request=replace(
+                chain.nonlinear_record.request,
+                inputs=(
+                    chain.nonlinear_record.request.inputs[0],
+                    FileIdentity.from_path(unrelated_moving),
+                ),
+            ),
+        )
+        _rewrite_transform_directory_record(
+            chain.nonlinear_path, chain.nonlinear_record
+        )
+    elif failure in {"round-value", "round-boolean", "round-non-integer"}:
+        parameters = dict(chain.nonlinear_record.request.parameters)
+        parameters["imaging_round"] = {
+            "round-value": 3,
+            "round-boolean": True,
+            "round-non-integer": float(chain.round_number),
+        }[failure]
+        chain.nonlinear_record = replace(
+            chain.nonlinear_record,
+            request=replace(chain.nonlinear_record.request, parameters=parameters),
+        )
+        _rewrite_transform_directory_record(
+            chain.nonlinear_path, chain.nonlinear_record
+        )
+    elif failure in {"crop-flag", "crop-boolean"}:
+        parameters = dict(chain.nonlinear_record.request.parameters)
+        parameters["crop"] = True if failure == "crop-flag" else 0
+        chain.nonlinear_record = replace(
+            chain.nonlinear_record,
+            request=replace(chain.nonlinear_record.request, parameters=parameters),
+        )
+        _rewrite_transform_directory_record(
+            chain.nonlinear_path, chain.nonlinear_record
+        )
+    elif failure == "crop-inputs":
+        unrelated_moving = tmp_path / "unrelated-moving.tif"
+        unrelated_moving.write_bytes(b"unrelated")
+        chain.fixed_crop_record = replace(
+            chain.fixed_crop_record,
+            request=replace(
+                chain.fixed_crop_record.request,
+                inputs=(
+                    chain.fixed_crop_record.request.inputs[0],
+                    FileIdentity.from_path(unrelated_moving),
+                ),
+            ),
+        )
+        _rewrite_transform_directory_record(
+            chain.fixed_crop_path, chain.fixed_crop_record
+        )
+    elif failure == "crop-role":
+        parameters = dict(chain.fixed_crop_record.request.parameters)
+        parameters["image_role"] = "moving"
+        chain.fixed_crop_record = replace(
+            chain.fixed_crop_record,
+            request=replace(chain.fixed_crop_record.request, parameters=parameters),
+        )
+        _rewrite_transform_directory_record(
+            chain.fixed_crop_path, chain.fixed_crop_record
+        )
+    elif failure == "crop-upstream":
+        chain.fixed_crop_record = replace(
+            chain.fixed_crop_record,
+            request=replace(
+                chain.fixed_crop_record.request,
+                upstream=chain.affine_record.artifact,
+            ),
+        )
+        _rewrite_transform_directory_record(
+            chain.fixed_crop_path, chain.fixed_crop_record
+        )
+    elif failure == "fixed-identity":
+        fixed_image = tmp_path / "unrelated-fixed.tif"
+        fixed_image.write_bytes(b"unrelated-fixed")
+    elif failure in {
+        "pixel-size",
+        "pixel-shape",
+        "pixel-boolean",
+        "pixel-nonnumeric",
+        "pixel-zero",
+        "pixel-negative",
+        "pixel-overflow",
+    }:
+        parameters = dict(chain.nonlinear_record.request.parameters)
+        parameters["pixel_size_xyz"] = {
+            "pixel-size": [0.2, 0.15, 0.15],
+            "pixel-shape": [0.15, 0.15],
+            "pixel-boolean": [True, 0.15, 0.15],
+            "pixel-nonnumeric": ["0.15", 0.15, 0.15],
+            "pixel-zero": [0.0, 0.15, 0.15],
+            "pixel-negative": [-0.15, 0.15, 0.15],
+            "pixel-overflow": [10**400, 0.15, 0.15],
+        }[failure]
+        chain.nonlinear_record = replace(
+            chain.nonlinear_record,
+            request=replace(chain.nonlinear_record.request, parameters=parameters),
+        )
+        _rewrite_transform_directory_record(
+            chain.nonlinear_path, chain.nonlinear_record
+        )
+    elif failure == "geometry":
+        chain.nonlinear_record = replace(
+            chain.nonlinear_record,
+            request=replace(
+                chain.nonlinear_record.request,
+                geometry=ImageGeometry(
+                    shape=(3, 3, 4),
+                    origin=(0.0, 0.0, 0.0),
+                    spacing=(0.15, 0.15, 0.15),
+                    direction=(
+                        (1.0, 0.0, 0.0),
+                        (0.0, 1.0, 0.0),
+                        (0.0, 0.0, 1.0),
+                    ),
+                ),
+            ),
+        )
+        _rewrite_transform_directory_record(
+            chain.nonlinear_path, chain.nonlinear_record
+        )
+
+    records = _validated_transform_directory_records(chain)
+    if failure == "one-sided-crop":
+        records.moving_crop = None
+    elif failure == "crop-stage":
+        records.fixed_crop = replace(
+            records.fixed_crop,
+            request=replace(records.fixed_crop.request, stage="crop:moving"),
+        )
+    elif failure in {"pixel-nan", "pixel-infinity"}:
+        parameters = dict(records.nonlinear.request.parameters)
+        parameters["pixel_size_xyz"] = [
+            math.nan if failure == "pixel-nan" else math.inf,
+            0.15,
+            0.15,
+        ]
+        records.nonlinear = replace(
+            records.nonlinear,
+            request=replace(records.nonlinear.request, parameters=parameters),
+        )
+    validate_chain = _load_transform_directory_chain_validator()
+
+    with pytest.raises(ValueError, match=message):
+        validate_chain(
+            records.affine,
+            records.nonlinear,
+            records.fixed_crop,
+            records.moving_crop,
+            fixed_image,
+            chain.round_number,
+            (0.15, 0.15, 0.15),
+        )
+
+
+@pytest.mark.parametrize("target", ["fixed", "moving"])
+@pytest.mark.parametrize(
+    ("parameter", "value", "message"),
+    [
+        pytest.param("imaging_round", 3, "round", id="round"),
+        pytest.param("crop", 1, "crop policy", id="non-bool-crop"),
+        pytest.param(
+            "pixel_size_xyz",
+            [0.2, 0.15, 0.15],
+            "pixel spacing",
+            id="pixel-mismatch",
+        ),
+        pytest.param(
+            "pixel_size_xyz",
+            [0.15, 0.15],
+            "pixel spacing",
+            id="pixel-malformed",
+        ),
+    ],
+)
+def test_transform_directory_checks_every_selected_crop_record(
+    tmp_path: Path,
+    target: str,
+    parameter: str,
+    value: object,
+    message: str,
+) -> None:
+    chain = _write_transform_directory_chain(tmp_path, crop=True)
+    record = getattr(chain, f"{target}_crop_record")
+    path = getattr(chain, f"{target}_crop_path")
+    parameters = dict(record.request.parameters)
+    parameters[parameter] = value
+    record = replace(record, request=replace(record.request, parameters=parameters))
+    _rewrite_transform_directory_record(path, record)
+    records = _validated_transform_directory_records(chain)
+    validate_chain = _load_transform_directory_chain_validator()
+
+    with pytest.raises(ValueError, match=message):
+        validate_chain(
+            records.affine,
+            records.nonlinear,
+            records.fixed_crop,
+            records.moving_crop,
+            chain.fixed_image,
+            chain.round_number,
+            (0.15, 0.15, 0.15),
+        )
+
+
+@pytest.mark.parametrize(
+    ("configured_round", "recorded_round"),
+    [
+        pytest.param(True, 1, id="boolean"),
+        pytest.param(1.0, 1, id="float"),
+        pytest.param("1", 1, id="string"),
+        pytest.param(-1, -1, id="negative"),
+    ],
+)
+def test_transform_directory_rejects_invalid_configured_round(
+    tmp_path: Path,
+    configured_round: object,
+    recorded_round: int,
+) -> None:
+    chain = _write_transform_directory_chain(
+        tmp_path,
+        crop=False,
+        round_number=recorded_round,
+    )
+    records = _validated_transform_directory_records(chain)
+    validate_chain = _load_transform_directory_chain_validator()
+
+    with pytest.raises(ValueError, match="round"):
+        validate_chain(
+            records.affine,
+            records.nonlinear,
+            records.fixed_crop,
+            records.moving_crop,
+            chain.fixed_image,
+            configured_round,
+            (0.15, 0.15, 0.15),
+        )
+
+
+@pytest.mark.parametrize(
+    "pixel_size_xyz",
+    [
+        pytest.param((True, 0.15, 0.15), id="boolean"),
+        pytest.param(("0.15", 0.15, 0.15), id="nonnumeric"),
+        pytest.param((0.0, 0.15, 0.15), id="zero"),
+        pytest.param((-0.15, 0.15, 0.15), id="negative"),
+        pytest.param((math.nan, 0.15, 0.15), id="nan"),
+        pytest.param((math.inf, 0.15, 0.15), id="infinity"),
+        pytest.param((10**400, 0.15, 0.15), id="overflow"),
+        pytest.param((0.15, 0.15), id="wrong-length"),
+        pytest.param(None, id="noniterable"),
+    ],
+)
+def test_transform_directory_rejects_invalid_configured_pixel_spacing(
+    tmp_path: Path,
+    pixel_size_xyz: object,
+) -> None:
+    chain = _write_transform_directory_chain(tmp_path, crop=False)
+    records = _validated_transform_directory_records(chain)
+    validate_chain = _load_transform_directory_chain_validator()
+
+    with pytest.raises(ValueError, match="pixel spacing configuration"):
+        validate_chain(
+            records.affine,
+            records.nonlinear,
+            records.fixed_crop,
+            records.moving_crop,
+            chain.fixed_image,
+            chain.round_number,
+            pixel_size_xyz,
+        )
 
 
 @pytest.mark.parametrize(

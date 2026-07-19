@@ -142,7 +142,7 @@ def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> Non
         assert forbidden not in direct_dependencies
 
     acceptance = _read_repository_file("docs/phase-1-acceptance.md")
-    assert "0fb61ba42f86cc29c5beb6e0fe5b4b7aaef197a3" in acceptance
+    assert "5365d184fb3c712e22e79b4b211c474cbebbbb57" in acceptance
     assert "cannot contain its own commit hash" in acceptance
     normalized_acceptance = " ".join(acceptance.split()).lower()
     for required_evidence in (
@@ -171,19 +171,21 @@ def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> Non
         "| Python | 3.12.11 |",
         "| ANTSpyX | 0.6.3 |",
         "| ITK | 5.4.5 |",
-        "604 passed, 0 skipped, in 6.92 s",
-        "40 passed, 0 skipped, in 4.23 s",
+        "604 passed, 0 skipped, in 6.72 s",
+        "40 passed, 0 skipped, in 4.07 s",
         "59 files already formatted",
-        "644 passed in 8.86 s",
+        "644 passed in 8.77 s",
         "16 unit modules and 7 integration modules",
         "whole-image and serial-chunk workflow cache requests",
         "allowed grayscale ZYX, QYX, or singleton-Z layout",
         "affine, nonlinear, and optional fixed/moving crop records",
         "XYZ pixel spacing",
+        "object-based affine inspection",
     ):
         assert required_snapshot.lower() in normalized_acceptance
     for stale_snapshot in (
         "3768882870f1b163fbbef8c8447c409d98c44394",
+        "0fb61ba42f86cc29c5beb6e0fe5b4b7aaef197a3",
         "416 passed",
         "36 passed",
         "452 passed",

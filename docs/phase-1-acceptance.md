@@ -4,8 +4,8 @@
 
 - **Audit date:** 2026-07-19
 - **Committed implementation baseline under audit:**
-  `0fb61ba42f86cc29c5beb6e0fe5b4b7aaef197a3` (`fix: validate native thread
-  counts strictly`), committed 2026-07-19 at 16:13:13 -05:00.
+  `5365d184fb3c712e22e79b4b211c474cbebbbb57` (`fix: defer ANTs during
+  transform inspection`), committed 2026-07-19 at 16:39:22 -05:00.
 - **Acceptance-gate commit:** this document is committed as part of the acceptance
   gate, and a commit cannot contain its own commit hash. The resulting gate commit is
   identified by repository history and the audit handoff rather than by inventing a
@@ -47,13 +47,13 @@ All commands below ran on 2026-07-19 with uv's cache and managed-Python location
 | --- | --- |
 | `uv lock --check` | Exit 0; 133 packages resolved |
 | `uv sync --locked --group dev --extra examples` | Exit 0; 133 packages resolved and 130 packages audited |
-| `uv run pytest -m "unit and not hpc" tests/unit -v` | 604 passed, 0 skipped, in 6.92 s |
-| `uv run pytest -m "integration and not hpc" tests/integration -v` | 40 passed, 0 skipped, in 4.23 s |
+| `uv run pytest -m "unit and not hpc" tests/unit -v` | 604 passed, 0 skipped, in 6.72 s |
+| `uv run pytest -m "integration and not hpc" tests/integration -v` | 40 passed, 0 skipped, in 4.07 s |
 | `uv run ruff format --check .` | Exit 0; 59 files already formatted |
 | `uv run ruff check .` | Exit 0; all checks passed |
 | `uv run basedpyright` | Exit 0; 0 errors, 0 warnings, 0 notes |
 | `uv run pre-commit run --all-files` | 4 of 4 hooks passed |
-| `uv run pytest tests/unit tests/integration -q` | 644 passed in 8.86 s |
+| `uv run pytest tests/unit tests/integration -q` | 644 passed in 8.77 s |
 
 `uv run pre-commit validate-config .pre-commit-config.yaml` also exited zero. The
 pre-commit configuration and GitHub workflow both parsed as YAML using the already
@@ -81,7 +81,9 @@ and 7 integration modules.
 - **Import side effects:** all four tests in `test_import_contract.py` passed. They
   confirmed lightweight package/runtime/registration imports, unchanged environment
   and root logging state, no filesystem work during construction, and no eager ANTs,
-  NumPy, SciPy, or tifffile import.
+  NumPy, SciPy, or tifffile import. Object-based affine inspection configures native
+  threads and imports NumPy/SciPy without importing ANTs; only a transform path needs
+  the deferred ANTs reader.
 - **Thread defaults and overrides:** all 38 tests in `test_threads.py` passed. They
   confirmed one thread for every native runtime by default, explicit values over
   inherited values, inherited values over defaults per variable, stable reporting,

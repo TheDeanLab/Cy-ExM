@@ -10,7 +10,7 @@ from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
-from cyexm.errors import RegistrationStageError
+from cyexm.errors import ChunkRegistrationError, RegistrationStageError
 from cyexm.io.images import Bounds3D, robust_bounding_box
 from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
@@ -741,6 +741,10 @@ class ImageRegistration:
                     paths.warp,
                 )
             )
+        except ChunkRegistrationError:
+            if warp_committed:
+                self._store().mark_stale(paths.warp)
+            raise
         except Exception as error:
             if warp_committed:
                 self._store().mark_stale(paths.warp)

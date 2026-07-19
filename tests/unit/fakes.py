@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -520,6 +521,159 @@ class FakeBackend:
         return dict(self.metric_values)
 
 
+@dataclass
+class FakeChunkBackend(FakeBackend):
+    fail_chunk: int | None = None
+    missing_warp_chunk: int | None = None
+    invalid_warp_chunk: int | None = None
+    invalid_scalar_chunk: int | None = None
+    warp_origin_delta: float = 0.0
+    chunk_depth: int = 8
+    fixed_image: FakeImage = field(
+        default_factory=lambda: fake_image(
+            data=np.arange(16 * 8 * 8, dtype=np.float32).reshape(16, 8, 8)
+        )
+    )
+    moving_image: FakeImage = field(
+        default_factory=lambda: fake_image(
+            data=(np.arange(16 * 8 * 8, dtype=np.float32).reshape(16, 8, 8) + 100.0)
+        )
+    )
+    registered_chunk_ids: list[int] = field(default_factory=list)
+    identity_chunk_ids: list[int] = field(default_factory=list)
+    written_warp_paths: list[Path] = field(default_factory=list)
+
+    def _chunk_id(self, image: FakeImage) -> int:
+        spacing_z = image.spacing[2]
+        if spacing_z <= 0.0:
+            raise ValueError("spacing must be positive")
+        z_start = round((image.origin[2] - self.fixed_image.origin[2]) / spacing_z)
+        return int(z_start // self.chunk_depth)
+
+    @staticmethod
+    def _warp_payload(
+        image: FakeImage,
+        *,
+        chunk_id: int | None,
+        components: int = 3,
+    ) -> bytes:
+        payload = {
+            "chunk_id": chunk_id,
+            "components": components,
+            "direction": image.direction,
+            "origin": image.origin,
+            "shape": image.shape,
+            "spacing": image.spacing,
+        }
+        return ("warp-json:" + json.dumps(payload, sort_keys=True)).encode()
+
+    @staticmethod
+    def _decoded_warp(payload: bytes) -> dict[str, object] | None:
+        if not payload.startswith(b"warp-json:"):
+            return None
+        decoded = json.loads(payload.removeprefix(b"warp-json:").decode())
+        if not isinstance(decoded, dict):
+            raise TypeError("warp payload must be an object")
+        return decoded
+
+    def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
+        self.events.append("nonlinear")
+        self.nonlinear_calls += 1
+        self.nonlinear_kwargs.append(dict(kwargs))
+        fixed = kwargs["fixed_image"]
+        moving = kwargs["moving_image"]
+        if not isinstance(fixed, FakeImage) or not isinstance(moving, FakeImage):
+            raise TypeError("chunk images must be FakeImages")
+        chunk_id = self._chunk_id(fixed)
+        self.registered_chunk_ids.append(chunk_id)
+        if self.fail_chunk == chunk_id:
+            raise RuntimeError(f"injected chunk {chunk_id} failure")
+        if self._test_directory is None:
+            raise RuntimeError("no test directory was established")
+        warp_path = self._test_directory / (
+            f"temporary-chunk-{chunk_id}-{self.nonlinear_calls}.nii.gz"
+        )
+        components = 2 if self.invalid_warp_chunk == chunk_id else 3
+        if self.missing_warp_chunk == chunk_id:
+            warp_path.unlink(missing_ok=True)
+        else:
+            warp_path.write_bytes(
+                self._warp_payload(
+                    fixed,
+                    chunk_id=chunk_id,
+                    components=components,
+                )
+            )
+        self.temporary_warps.append(warp_path)
+        candidate = fake_image(
+            data=moving.data + 100.0,
+            origin=moving.origin,
+            spacing=moving.spacing,
+            direction=moving.direction,
+        )
+        self.nonlinear_candidates.append(candidate)
+        return candidate, warp_path
+
+    def write_identity_warp(self, reference: object, path: Path) -> None:
+        if not isinstance(reference, FakeImage):
+            raise TypeError("reference must be a FakeImage")
+        chunk_id = self._chunk_id(reference)
+        self.identity_chunk_ids.append(chunk_id)
+        path.write_bytes(self._warp_payload(reference, chunk_id=chunk_id))
+
+    def write_warp(self, warp: object, path: Path) -> None:
+        if not isinstance(warp, FakeImage):
+            raise TypeError("warp must be a FakeImage")
+        self.written_warp_paths.append(path)
+        path.write_bytes(self._warp_payload(warp, chunk_id=None))
+
+    def read_warp(self, path: Path) -> object:
+        self.events.append("read-warp")
+        self.read_warp_calls += 1
+        self.read_warp_paths.append(path)
+        decoded = self._decoded_warp(path.read_bytes())
+        if decoded is None:
+            return super().read_warp(path)
+        shape = tuple(int(value) for value in decoded["shape"])  # type: ignore[union-attr]
+        origin = tuple(float(value) for value in decoded["origin"])  # type: ignore[union-attr]
+        origin = (origin[0] + self.warp_origin_delta, origin[1], origin[2])
+        spacing = tuple(float(value) for value in decoded["spacing"])  # type: ignore[union-attr]
+        direction = tuple(
+            tuple(float(value) for value in row)
+            for row in decoded["direction"]  # type: ignore[union-attr]
+        )
+        components = int(decoded["components"])  # type: ignore[arg-type]
+        return fake_image(
+            data=np.zeros((*shape, components), dtype=np.float32),
+            origin=origin,  # type: ignore[arg-type]
+            spacing=spacing,  # type: ignore[arg-type]
+            direction=direction,  # type: ignore[arg-type]
+            has_components=True,
+        )
+
+    def apply_warp(
+        self,
+        *,
+        fixed: object,
+        moving: object,
+        warp_path: Path,
+        interpolation: str,
+    ) -> object:
+        transformed = super().apply_warp(
+            fixed=fixed,
+            moving=moving,
+            warp_path=warp_path,
+            interpolation=interpolation,
+        )
+        if not isinstance(transformed, FakeImage):
+            raise TypeError("transformed image must be a FakeImage")
+        decoded = self._decoded_warp(warp_path.read_bytes())
+        chunk_id = None if decoded is None else decoded.get("chunk_id")
+        if interpolation == "linear" and chunk_id == self.invalid_scalar_chunk:
+            transformed.data = transformed.data[:-1]
+        return transformed
+
+
 def install_fake_ants(
     monkeypatch: pytest.MonkeyPatch,
     module_name: str,
@@ -693,6 +847,7 @@ def install_fake_ants(
 __all__ = [
     "FakeAntsCalls",
     "FakeBackend",
+    "FakeChunkBackend",
     "FakeImage",
     "FakeTransform",
     "fake_image",

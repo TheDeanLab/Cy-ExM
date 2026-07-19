@@ -1,14 +1,10 @@
-"""Dependency-neutral registration kernels and backend boundary."""
+"""Stable whole-image and serial registration entry points."""
 
-from cyexm.registration.backend import (
-    AntsRegistrationBackend,
-    RegistrationBackend,
-)
+from cyexm.registration.chunked import ChunkedImageRegistration
 from cyexm.registration.whole_image import ImageRegistration, register_round
 
 __all__ = [
-    "AntsRegistrationBackend",
+    "ChunkedImageRegistration",
     "ImageRegistration",
-    "RegistrationBackend",
     "register_round",
 ]

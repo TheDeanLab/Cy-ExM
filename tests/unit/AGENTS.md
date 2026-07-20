@@ -15,3 +15,7 @@
   contracts must prove channel and round-task modules defer scheduler and scientific
   runtimes; real registration remains in integration tests. Scheduler adapter
   behavior starts at an approved integration boundary.
+- Scheduler-firewall regressions use inert scheduler shims ahead of host executables
+  so RED tests never reach host scheduler clients. Exercise direct, wrapped, shell,
+  child-Python, and representative standard-library launch surfaces with safe
+  sentinels; never test a missed guard by allowing an actual SLURM client call.

@@ -439,6 +439,9 @@ def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> 
         "bounded in-process or local-scheduler checks",
         "portable integration",
         "hpc",
+        "portable scheduler firewall",
+        "subprocess, `os.system`, and representative `os.exec*`/`os.spawn*`",
+        "hpc-marked tests are explicitly exempt",
     ):
         assert required in tests
 
@@ -449,6 +452,8 @@ def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> 
         "plain python data",
         "channel and round-task modules defer scheduler and scientific runtimes",
         "real registration remains in integration tests",
+        "inert scheduler shims",
+        "red tests never reach host scheduler clients",
     ):
         assert required in unit
 

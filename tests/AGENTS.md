@@ -13,3 +13,10 @@
   for pure geometry and metadata where numerical variability is not expected.
 - Portable unit and integration tests must not access lab storage or silently skip by
   hostname. HPC tests require a documented, explicitly selected command.
+- The portable scheduler firewall covers semantic command positions for subprocess,
+  `os.system`, and representative `os.exec*`/`os.spawn*` launch surfaces, propagates
+  into ordinary child Python interpreters, and prepends owned SLURM-client shims for
+  contained child shells. It is defense in depth for the exercised portable surfaces,
+  not a claim that arbitrary process-launch mechanisms are fail-closed. HPC-marked
+  tests are explicitly exempt and retain the environment needed for approved real
+  scheduler acceptance.

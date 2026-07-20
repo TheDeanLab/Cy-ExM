@@ -1188,6 +1188,7 @@ assert registration.__all__ == [
     "ChunkedImageRegistration",
     "ImageRegistration",
     "register_round",
+    "transform_channel",
 ]
 for root in ("ants", "numpy", "scipy", "tifffile"):
     assert not any(name == root or name.startswith(root + ".") for name in sys.modules)

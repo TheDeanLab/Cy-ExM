@@ -280,13 +280,16 @@ def test_documentation_and_examples_track_the_current_phase_two_boundary() -> No
 
     examples = _normalized_repository_file("examples/AGENTS.md")
     for required in (
-        "phase 1 examples are the current runnable surface",
-        "phase 2a yaml examples",
-        "implemented validation, planning, and sequential cli surface",
+        "phase 2b is the current runnable workflow surface",
+        "strict yaml validation",
+        "deterministic planning",
+        "real sequential round execution",
+        "restart-safe transformed channels",
+        "workflow cli",
         "examples never lead production behavior",
         "scientific manifest",
         "execution profile",
-        "dask or slurm execution",
+        "dask, slurm, and hpc acceptance remain deferred",
     ):
         assert required in examples
 
@@ -315,8 +318,10 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
     registration = _normalized_repository_file("src/cyexm/registration/AGENTS.md")
     for required in (
         "backend artifact writer methods",
-        "`artifacts.py`, `whole_image.py`, and `chunked.py`",
         "must not own workflow scheduling",
+        "completion-record primitives remain in `artifacts.py`",
+        "`whole_image.py`, `chunked.py`, and `channels.py` each own orchestration "
+        "of their scoped artifacts",
         "`channels.py` owns only one source channel's restart-safe transform "
         "artifact lifecycle",
         "configures native threads before requesting the lazy scientific backend",

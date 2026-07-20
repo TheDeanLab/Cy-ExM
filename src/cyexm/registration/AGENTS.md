@@ -18,8 +18,9 @@
   ZYX crop-bound convention when adapting ANTs images.
 - Backend artifact writer methods must write exactly to the supplied path so callers
   can provide atomic temporary destinations. `backend.py` must not own workflow
-  scheduling or artifact lifecycle; completion records and orchestration remain in
-  `artifacts.py`, `whole_image.py`, and `chunked.py`.
+  scheduling or artifact lifecycle. Completion-record primitives remain in
+  `artifacts.py`; `whole_image.py`, `chunked.py`, and `channels.py` each own
+  orchestration of their scoped artifacts.
 - `channels.py` owns only one source channel's restart-safe transform artifact
   lifecycle. It configures native threads before requesting the lazy scientific
   backend, transforms through the accepted warp-plus-affine chain, and must not

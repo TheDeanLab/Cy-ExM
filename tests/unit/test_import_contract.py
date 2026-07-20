@@ -145,7 +145,15 @@ import cyexm.registration.channels
 import cyexm.workflow.round_task
 
 assert before == dict(os.environ)
-for root in ("ants", "numpy", "scipy", "tifffile", "dask", "distributed"):
+for root in (
+    "ants",
+    "numpy",
+    "scipy",
+    "tifffile",
+    "dask",
+    "distributed",
+    "dask_jobqueue",
+):
     assert not any(name == root or name.startswith(root + ".") for name in sys.modules)
 """
     completed = subprocess.run(

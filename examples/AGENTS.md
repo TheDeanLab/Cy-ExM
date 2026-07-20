@@ -15,8 +15,8 @@
   interpolation.
 - Notebooks must have no saved outputs or execution counts. Scripts and notebooks
   must remain useful on local workstations without cluster services.
-- Phase 1 examples are the current runnable surface. Phase 2A YAML examples must match
-  the implemented validation, planning, and sequential CLI surface; examples never
-  lead production behavior. Keep each scientific manifest separate from its local or
-  HPC execution profile. Do not claim Dask or SLURM execution until the corresponding
-  runtime and acceptance milestone lands.
+- Phase 2B is the current runnable workflow surface: strict YAML validation,
+  deterministic planning, real sequential round execution, restart-safe transformed
+  channels, and the workflow CLI. Examples never lead production behavior. Keep each
+  scientific manifest separate from its local or HPC execution profile. Dask, SLURM,
+  and HPC acceptance remain deferred until the corresponding runtime milestone lands.

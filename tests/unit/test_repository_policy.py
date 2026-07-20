@@ -190,6 +190,37 @@ def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
         assert required in examples
 
 
+def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> None:
+    source = _normalized_repository_file("src/AGENTS.md")
+    for required in (
+        "future execution boundary",
+        "scheduler imports",
+        "module scope",
+        "no import-time cluster",
+    ):
+        assert required in source
+
+    package = _normalized_repository_file("src/cyexm/AGENTS.md")
+    assert "workflow or configuration namespace" in package
+    assert "scheduler concerns do not belong in `cyexm.registration`" in package
+
+    registration = _normalized_repository_file("src/cyexm/registration/AGENTS.md")
+    for required in (
+        "backend artifact writer methods",
+        "`artifacts.py`, `whole_image.py`, and `chunked.py`",
+        "must not own workflow scheduling",
+    ):
+        assert required in registration
+
+    runtime = _normalized_repository_file("src/cyexm/runtime/AGENTS.md")
+    for required in (
+        "worker process",
+        "before importing ants, numpy, or scipy",
+        "must not initialize or own a scheduler",
+    ):
+        assert required in runtime
+
+
 def test_every_maintained_directory_has_local_agent_guidance() -> None:
     actual = {
         str(path.relative_to(REPOSITORY_ROOT))

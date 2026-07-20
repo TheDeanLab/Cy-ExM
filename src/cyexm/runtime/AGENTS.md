@@ -7,3 +7,6 @@
 - Resolve each native runtime independently. Explicit values beat inherited values,
   inherited values beat the default of one, and late changes are safe only when
   every effective value is exactly idempotent.
+- Every local or distributed worker process must resolve and apply its explicit native
+  thread configuration before importing ANTs, NumPy, or SciPy. This package reports
+  thread policy; it must not initialize or own a scheduler.

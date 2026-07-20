@@ -56,7 +56,7 @@ native_threads:
 local_dask:
   workers: 4
   threads_per_worker: 1
-  processes: false
+  processes: true
   memory_limit: 24GB
   startup_timeout: "30s"
   task_retries: 2
@@ -149,7 +149,7 @@ def test_local_dask_profile_binds_exact_values(tmp_path: Path) -> None:
     assert profile.local_dask == LocalDaskSpec(
         workers=4,
         threads_per_worker=1,
-        processes=False,
+        processes=True,
         memory_limit="24GB",
         startup_timeout="30s",
         task_retries=2,
@@ -442,6 +442,31 @@ def test_local_processes_requires_a_builtin_boolean(
     with pytest.raises(
         ConfigurationValidationError,
         match=r"local_dask\.processes must be a built-in boolean",
+    ):
+        _load_profile(tmp_path, data)
+
+
+def test_local_dask_requires_worker_processes(tmp_path: Path) -> None:
+    data = _valid_data("local_dask")
+    _mapping_at(data, "local_dask")["processes"] = False
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=r"local_dask\.processes.*must be true",
+    ):
+        _load_profile(tmp_path, data)
+
+
+@pytest.mark.parametrize("value", [0, "", "8GB\n12GB", "8GB\x00bad"])
+def test_local_memory_limit_requires_a_nonempty_single_line_string(
+    tmp_path: Path, value: object
+) -> None:
+    data = _valid_data("local_dask")
+    _mapping_at(data, "local_dask")["memory_limit"] = value
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=r"local_dask\.memory_limit must be a nonempty single-line string",
     ):
         _load_profile(tmp_path, data)
 

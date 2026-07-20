@@ -243,6 +243,11 @@ def _local_dask(value: object) -> LocalDaskSpec:
         raise ConfigurationValidationError(
             f"local_dask.processes must be a built-in boolean; got {processes!r}"
         )
+    if not processes:
+        raise ConfigurationValidationError(
+            "local_dask.processes must be true for process-isolated workers; "
+            f"got {processes!r}"
+        )
     return LocalDaskSpec(
         workers=built_in_int(mapping["workers"], "local_dask.workers", minimum=1),
         threads_per_worker=built_in_int(

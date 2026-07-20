@@ -166,17 +166,23 @@ def _overlap_fraction(value: object, yaml_path: str) -> float:
 
 def _round(value: object, index: int) -> RoundSpec:
     yaml_path = f"rounds[{index}]"
-    raw_strategy = value.get("strategy") if isinstance(value, Mapping) else None
+    if isinstance(value, Mapping) and "strategy" in value:
+        raw_strategy = value["strategy"]
+    else:
+        preliminary_mapping = require_exact_keys(
+            value, _WHOLE_IMAGE_ROUND_KEYS, yaml_path
+        )
+        raw_strategy = preliminary_mapping["strategy"]
+    strategy = cast(
+        RegistrationStrategy,
+        _choice(raw_strategy, _STRATEGIES, f"{yaml_path}.strategy"),
+    )
     expected_keys = (
         _SERIAL_CHUNKED_ROUND_KEYS
-        if raw_strategy == "serial_chunked"
+        if strategy == "serial_chunked"
         else _WHOLE_IMAGE_ROUND_KEYS
     )
     mapping = require_exact_keys(value, expected_keys, yaml_path)
-    strategy = cast(
-        RegistrationStrategy,
-        _choice(mapping["strategy"], _STRATEGIES, f"{yaml_path}.strategy"),
-    )
     channels = tuple(
         _channel(item, f"{yaml_path}.channels[{channel_index}]")
         for channel_index, item in enumerate(

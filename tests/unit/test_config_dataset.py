@@ -316,6 +316,26 @@ def test_load_dataset_manifest_rejects_unsupported_registration_strategy(
         _load_data(tmp_path, data)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("parallel_chunked", id="invalid-string"),
+        pytest.param(1, id="invalid-type"),
+    ],
+)
+def test_load_dataset_manifest_reports_invalid_serial_shaped_strategy_at_field(
+    tmp_path: Path, value: object
+) -> None:
+    data = _valid_data()
+    _set_at(data, ("rounds", 1, "strategy"), value)
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=r"rounds\[1\]\.strategy must be one of",
+    ):
+        _load_data(tmp_path, data)
+
+
 @pytest.mark.parametrize("value", ["nearest", "Linear", 1])
 def test_load_dataset_manifest_rejects_unsupported_channel_interpolation(
     tmp_path: Path, value: object

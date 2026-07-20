@@ -19,6 +19,12 @@ THREAD_ENVIRONMENT = (
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 )
+PHASE_TWO_EXAMPLE_PATHS = (
+    "examples/spheroid-dataset.yaml",
+    "examples/execution-sequential.yaml",
+    "examples/execution-local-dask.yaml",
+    "examples/execution-slurm-512gb.yaml",
+)
 AGENT_GUIDANCE_PATHS = frozenset(
     {
         "AGENTS.md",
@@ -174,14 +180,14 @@ def test_pre_commit_runs_the_locked_portable_gates_through_uv() -> None:
     }
 
 
-def test_ci_runs_portable_phase_two_d_gates_with_distributed_dependencies() -> None:
+def test_ci_runs_portable_phase_two_gates_with_hpc_dependencies() -> None:
     assert _load_yaml(".github/workflows/ci.yml", github_actions=True) == {
         "name": "CI",
         "on": {"push": "", "pull_request": ""},
         "permissions": {"contents": "read"},
         "jobs": {
             "portable": {
-                "name": "Portable repository gates",
+                "name": "Portable Phase 2 repository gates",
                 "runs-on": "ubuntu-latest",
                 "timeout-minutes": "30",
                 "env": dict.fromkeys(THREAD_ENVIRONMENT, "1"),
@@ -202,8 +208,7 @@ def test_ci_runs_portable_phase_two_d_gates_with_distributed_dependencies() -> N
                     {
                         "name": "Sync locked environment",
                         "run": (
-                            "uv sync --locked --group dev --extra examples "
-                            "--extra distributed"
+                            "uv sync --locked --group dev --extra examples --extra hpc"
                         ),
                     },
                     {"name": "Ruff check", "run": "uv run ruff check ."},
@@ -229,7 +234,23 @@ def test_ci_runs_portable_phase_two_d_gates_with_distributed_dependencies() -> N
     }
 
     workflow = _read_repository_file(".github/workflows/ci.yml").lower()
-    for forbidden in ("clearex", "dask", "slurm", "/archive", "/project"):
+    for forbidden in (
+        "clearex",
+        "/archive",
+        "/project",
+        "-m hpc",
+        '-m "hpc"',
+        "--cyexm-dataset",
+        "--cyexm-execution",
+        "--cyexm-evidence-dir",
+        "sbatch",
+        "squeue",
+        "scontrol",
+        "scancel",
+        "sacct",
+        "sinfo",
+        "srun",
+    ):
         assert forbidden not in workflow
 
     configuration = tomllib.loads(_read_repository_file("pyproject.toml"))
@@ -238,26 +259,36 @@ def test_ci_runs_portable_phase_two_d_gates_with_distributed_dependencies() -> N
     assert "distributed==2025.1.0" in distributed
 
 
-def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_d() -> None:
+def test_root_guidance_tracks_current_phase_two_runtime() -> None:
     root = _normalized_repository_file("AGENTS.md")
     for required in (
-        "phase 1 is the current stable runtime",
-        "phase 2d is the current portable workflow surface",
+        "phase 2 is the current workflow runtime",
+        "phase 1 api",
+        "phase 1 artifact store remains the only restart authority",
         "approved phase 2 runtime design and implementation plans",
-        "scientific dataset manifests",
-        "execution profiles",
+        "strict scientific dataset manifests",
+        "separate strict execution profiles",
         "deterministic planning",
-        "sequential execution",
+        "`cyexm workflow validate`",
+        "`cyexm workflow plan`",
+        "`cyexm workflow run`",
+        "`cyexm workflow status`",
+        "sequential, bounded process-based local dask, and slurm executors",
         "real scheduler-neutral round runner",
         "restart-safe transformed-channel artifacts",
-        "bounded process-based local dask execution",
-        "slurmcluster construction",
+        "one coarse task per moving round",
+        "one `round_slot` per worker",
+        "one process per slurm job",
+        "one node per round",
         "all-worker preflight",
-        "real slurm submission and hpc acceptance remain phase 2e work",
+        "portable ci installs the hpc python extra",
+        "never contacts an external scheduler",
+        "explicitly selected `hpc` tests",
         "serial chunk workflow remains",
         "nested chunk multiprocessing",
+        "dask chunk graph",
         "uv lock --check",
-        "uv sync --locked --group dev --extra examples --extra distributed",
+        "uv sync --locked --group dev --extra examples --extra hpc",
     ):
         assert required in root
 
@@ -307,7 +338,7 @@ def test_documentation_and_examples_track_the_current_phase_two_boundary() -> No
 
     examples = _normalized_repository_file("examples/AGENTS.md")
     for required in (
-        "phase 2d is the current portable workflow surface",
+        "phase 2 is the current workflow runtime",
         "strict yaml validation",
         "deterministic planning",
         "real sequential round execution",
@@ -317,10 +348,12 @@ def test_documentation_and_examples_track_the_current_phase_two_boundary() -> No
         "examples never lead production behavior",
         "scientific manifest",
         "execution profile",
-        "slurmcluster adapter is implemented",
-        "real slurm submission and hpc acceptance remain phase 2e work",
+        "slurmcluster adapter",
+        "explicitly selected hpc acceptance",
     ):
         assert required in examples
+    for path in PHASE_TWO_EXAMPLE_PATHS:
+        assert path in examples
 
 
 def test_all_agent_guidance_is_free_of_stale_phase_two_c_slurm_claims() -> None:
@@ -501,13 +534,15 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "lab paths",
         ),
         ".github/workflows/AGENTS.md": (
-            "uv sync --locked --group dev --extra examples --extra distributed",
+            "uv sync --locked --group dev --extra examples --extra hpc",
             "python 3.12",
             "all six native-thread",
             "unit and not hpc",
             "integration and not hpc",
             "bounded process-based localcluster",
-            "slurm",
+            "portable slurm import, type, fake-construction, and preflight checks",
+            "never invoke external scheduler commands",
+            "explicitly selected hpc tests",
         ),
         "docs/superpowers/AGENTS.md": (
             "dated",

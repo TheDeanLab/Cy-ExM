@@ -1,11 +1,11 @@
 # Documentation guidance
 
-- Describe current behavior by separating merged Phase 1 behavior from the Phase 2B
+- Describe current behavior by separating merged Phase 1 behavior from the Phase 2C
   runtime available on this branch: strict YAML validation, deterministic planning
   and status inspection, real sequential round execution, restart-safe transformed
-  channels, and the workflow CLI. Clearly label Dask, SLURM, and HPC acceptance as
-  later Phase 2 milestones until their implementation and acceptance gates are
-  complete.
+  channels, the workflow CLI, and bounded process-based local Dask execution. Clearly
+  label SLURM execution and HPC acceptance as later Phase 2 milestones until their
+  implementation and acceptance gates are complete.
 - Design and plan documents may describe later Phase 2 decisions when they label
   status and assumptions explicitly. User guides and API examples describe only the
   runtime available on the referenced branch.

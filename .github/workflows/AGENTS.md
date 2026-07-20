@@ -8,9 +8,10 @@
   `VECLIB_MAXIMUM_THREADS`.
 - Keep explicit portable selectors: `unit and not hpc` for `tests/unit` and
   `integration and not hpc` for `tests/integration`. Retain a finite job timeout.
-- Do not access lab storage, submit SLURM jobs, initialize Dask clusters, or make a
-  portable check conditional on hostnames. Future HPC gates require an approved lab
-  runner or an explicit manual cluster command.
+- Do not access lab storage, submit SLURM jobs, connect to external Dask clusters, or
+  make a portable check conditional on hostnames. Bounded process-based LocalCluster
+  integration tests remain portable. Future HPC gates require an approved lab runner
+  or an explicit manual cluster command.
 - Keep workflow permissions read-only unless a reviewed job has a documented need for
   one additional permission. Never expose secrets to pull requests from untrusted
   code.

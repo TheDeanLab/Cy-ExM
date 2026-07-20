@@ -110,6 +110,27 @@ for root in (
     assert completed.returncode == 0, completed.stderr
 
 
+def test_import_local_dask_executor_is_scheduler_and_environment_neutral() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.execution.dask
+
+assert before == dict(os.environ)
+for root in ("dask", "distributed", "dask_jobqueue"):
+    assert not any(name == root or name.startswith(root + ".") for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_round_worker_import_defers_registration_operations_until_invocation() -> None:
     code = """
 import os

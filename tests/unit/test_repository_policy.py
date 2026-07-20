@@ -77,17 +77,23 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "initialize a scheduler",
     ),
     "src/cyexm/execution/AGENTS.md": (
-        "phase 2a implements the sequential executor only",
-        "dask and slurm adapters remain later phase 2 milestones",
+        "phase 2c implements sequential and bounded local-dask execution",
+        "slurm execution remains proposed for phase 2d",
         "executor protocol",
         "sequential, dask, and slurm adapter lifecycle",
         "never registration algorithms or artifact-validity decisions",
         "scheduler imports occur only inside the selected operation",
+        "process-isolated workers",
+        "min(pending rounds, configured workers)",
         "one coarse task per round",
         "each worker advertises one `round_slot`",
         "every submitted round task requests and consumes one",
+        "default retries are zero",
+        "failed round does not cancel independent round tasks",
         "no nested chunk scheduling or silent fallback",
-        "cleaned up on success, failure, and cancellation",
+        "cancel unfinished futures",
+        "client before its owned cluster",
+        "success, failure, and cancellation",
     ),
     "src/cyexm/workflow/AGENTS.md": (
         "phase 2b binds sequential execution to the real round worker",
@@ -218,11 +224,11 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
         assert forbidden not in workflow
 
 
-def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_b() -> None:
+def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_c() -> None:
     root = _normalized_repository_file("AGENTS.md")
     for required in (
         "phase 1 is the current stable runtime",
-        "phase 2b is the current workflow surface",
+        "phase 2c is the current workflow surface",
         "approved phase 2 runtime design and implementation plans",
         "scientific dataset manifests",
         "execution profiles",
@@ -230,7 +236,8 @@ def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_b() -> None
         "sequential execution",
         "real scheduler-neutral round runner",
         "restart-safe transformed-channel artifacts",
-        "dask and slurm executors remain later milestones",
+        "bounded process-based local dask execution",
+        "slurm execution and hpc acceptance remain later milestones",
         "serial chunk workflow remains",
         "nested chunk multiprocessing",
         "uv lock --check",
@@ -269,27 +276,30 @@ def test_documentation_and_examples_track_the_current_phase_two_boundary() -> No
     documentation = _normalized_repository_file("docs/AGENTS.md")
     for required in (
         "merged phase 1 behavior",
-        "phase 2b runtime available on this branch",
+        "phase 2c runtime available on this branch",
         "strict yaml validation",
         "deterministic planning",
         "real sequential round execution",
+        "bounded process-based local dask execution",
         "restart-safe transformed channels",
+        "slurm execution and hpc acceptance",
         "later phase 2 milestones",
     ):
         assert required in documentation
 
     examples = _normalized_repository_file("examples/AGENTS.md")
     for required in (
-        "phase 2b is the current runnable workflow surface",
+        "phase 2c is the current runnable workflow surface",
         "strict yaml validation",
         "deterministic planning",
         "real sequential round execution",
+        "bounded process-based local dask execution",
         "restart-safe transformed channels",
         "workflow cli",
         "examples never lead production behavior",
         "scientific manifest",
         "execution profile",
-        "dask, slurm, and hpc acceptance remain deferred",
+        "slurm execution and hpc acceptance remain deferred",
     ):
         assert required in examples
 
@@ -411,6 +421,7 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "all six native-thread",
             "unit and not hpc",
             "integration and not hpc",
+            "bounded process-based localcluster",
             "slurm",
         ),
         "docs/superpowers/AGENTS.md": (

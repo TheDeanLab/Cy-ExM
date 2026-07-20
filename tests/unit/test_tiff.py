@@ -8,10 +8,206 @@ import tifffile
 
 from cyexm.errors import CacheValidationError, InputValidationError
 from cyexm.io.images import ants_geometry, load_ants_image
-from cyexm.io.tiff import write_uint16_tiff
+from cyexm.io.tiff import write_clipped_uint16_tiff, write_uint16_tiff
 from cyexm.spatial import ImageGeometry
 
 pytestmark = pytest.mark.unit
+
+
+def test_write_clipped_uint16_tiff_does_not_normalize(tmp_path: Path) -> None:
+    source = np.asarray([[[-4.0, 0.0, 12.9, 65535.0, 70000.0]]], dtype=np.float32)
+    destination = tmp_path / "channel.tif"
+
+    write_clipped_uint16_tiff(source, destination)
+
+    written = tifffile.imread(destination)
+    assert written.dtype == np.dtype(np.uint16)
+    assert written.tolist() == [[[0, 0, 12, 65535, 65535]]]
+
+
+def test_write_clipped_uint16_tiff_maps_every_nonfinite_value_to_zero(
+    tmp_path: Path,
+) -> None:
+    source = np.asarray([[[np.nan, np.inf, -np.inf, 7.9]]], dtype=np.float64)
+    destination = tmp_path / "nonfinite.tiff"
+
+    write_clipped_uint16_tiff(source, destination)
+
+    np.testing.assert_array_equal(
+        tifffile.imread(destination),
+        np.asarray([[[0, 0, 0, 7]]], dtype=np.uint16),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param(
+            np.asarray([[[-2, 0, 42, 65535, 65536]]], dtype=np.int64),
+            [[[0, 0, 42, 65535, 65535]]],
+            id="signed",
+        ),
+        pytest.param(
+            np.asarray([[[0, 42, 65535, 65536, 2**64 - 1]]], dtype=np.uint64),
+            [[[0, 42, 65535, 65535, 65535]]],
+            id="unsigned",
+        ),
+    ],
+)
+def test_write_clipped_uint16_tiff_clips_integer_inputs_without_rescaling(
+    tmp_path: Path,
+    source: np.ndarray,
+    expected: list[list[list[int]]],
+) -> None:
+    destination = tmp_path / "integer.tif"
+
+    write_clipped_uint16_tiff(source, destination)
+
+    np.testing.assert_array_equal(
+        tifffile.imread(destination), np.asarray(expected, dtype=np.uint16)
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        pytest.param(np.ones((2, 2)), "three-dimensional", id="two-dimensional"),
+        pytest.param(np.empty((0, 2, 2)), "must not be empty", id="empty"),
+        pytest.param(np.ones((1, 1, 1), dtype=np.bool_), "real numeric", id="bool"),
+        pytest.param(
+            np.ones((1, 1, 1), dtype=np.complex64), "real numeric", id="complex"
+        ),
+        pytest.param(
+            np.full((1, 1, 1), "signal", dtype="U6"), "real numeric", id="string"
+        ),
+    ],
+)
+def test_write_clipped_uint16_tiff_rejects_invalid_array_data(
+    tmp_path: Path,
+    source: np.ndarray,
+    message: str,
+) -> None:
+    with pytest.raises(InputValidationError, match=message):
+        write_clipped_uint16_tiff(source, tmp_path / "channel.tif")
+
+
+def test_write_clipped_uint16_tiff_rejects_non_tiff_extension(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(InputValidationError, match=r"\.tif or \.tiff"):
+        write_clipped_uint16_tiff(np.ones((1, 1, 1)), tmp_path / "channel.png")
+
+
+def test_write_clipped_uint16_tiff_preserves_exact_ants_geometry(
+    tmp_path: Path,
+) -> None:
+    import ants
+
+    external_zyx = np.asarray([[[-4.0, 12.9], [65535.0, 70000.0]]], dtype=np.float32)
+    direction = np.asarray(
+        ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+    image = ants.from_numpy(
+        np.transpose(external_zyx, (2, 1, 0)),
+        origin=(10.0, 20.0, 30.0),
+        spacing=(0.2, 0.3, 0.5),
+        direction=direction,
+    )
+    destination = tmp_path / "channel-geometry.tif"
+
+    write_clipped_uint16_tiff(image, destination)
+
+    np.testing.assert_array_equal(
+        tifffile.imread(destination),
+        np.asarray([[[0, 12], [65535, 65535]]], dtype=np.uint16),
+    )
+    with tifffile.TiffFile(destination) as written:
+        metadata = written.shaped_metadata
+        assert metadata and metadata[0] == {
+            "shape": [1, 2, 2],
+            "axes": "ZYX",
+            "cyexm": {
+                "schema_version": 1,
+                "axis_convention_version": "external-zyx-ants-xyz-v1",
+                "geometry": {
+                    "shape": [1, 2, 2],
+                    "origin": [10.0, 20.0, 30.0],
+                    "spacing": list(image.spacing),
+                    "direction": [list(row) for row in image.direction],
+                },
+            },
+        }
+
+    restored = load_ants_image(destination, (0.2, 0.3, 0.5))
+    assert ants_geometry(restored) == ImageGeometry(
+        shape=(1, 2, 2),
+        origin=(10.0, 20.0, 30.0),
+        spacing=image.spacing,
+        direction=tuple(tuple(float(value) for value in row) for row in direction),
+    )
+
+
+def test_write_clipped_uint16_tiff_failure_is_atomic_and_cleans_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "channel.part.tiff"
+    destination.write_bytes(b"previous")
+    seen: list[Path] = []
+
+    def failing_imwrite(
+        path: Path,
+        data: np.ndarray,
+        *,
+        metadata: dict[str, object],
+        photometric: str,
+    ) -> None:
+        del data
+        assert metadata == {"axes": "ZYX"}
+        assert photometric == "minisblack"
+        temporary = Path(path)
+        seen.append(temporary)
+        temporary.write_bytes(b"partial")
+        raise RuntimeError("injected clipped TIFF failure")
+
+    monkeypatch.setattr(tifffile, "imwrite", failing_imwrite)
+
+    with pytest.raises(RuntimeError, match="injected clipped TIFF failure"):
+        write_clipped_uint16_tiff(np.ones((1, 1, 1)), destination)
+
+    assert len(seen) == 1
+    assert seen[0].name.endswith(".part.tiff")
+    assert destination.read_bytes() == b"previous"
+    assert list(tmp_path.glob(".*.tmp*")) == []
+
+
+def test_write_clipped_uint16_tiff_validates_exact_encoded_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "channel.tif"
+    destination.write_bytes(b"previous")
+    real_imwrite = tifffile.imwrite
+
+    def altered_imwrite(
+        path: Path,
+        data: np.ndarray,
+        *,
+        metadata: dict[str, object],
+        photometric: str,
+    ) -> None:
+        altered = np.array(data, copy=True)
+        altered[0, 0, 0] += 1
+        real_imwrite(path, altered, metadata=metadata, photometric=photometric)
+
+    monkeypatch.setattr(tifffile, "imwrite", altered_imwrite)
+
+    with pytest.raises(CacheValidationError, match="failed validation"):
+        write_clipped_uint16_tiff(np.ones((1, 1, 1)), destination)
+
+    assert destination.read_bytes() == b"previous"
+    assert list(tmp_path.glob(".*.tmp*")) == []
 
 
 def test_uint16_export_matches_legacy_range_mapping(tmp_path: Path) -> None:

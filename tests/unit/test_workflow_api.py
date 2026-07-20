@@ -25,7 +25,12 @@ from cyexm.config.models import (
     RoundSpec,
     SlurmSpec,
 )
-from cyexm.errors import RoundExecutionError, WorkflowExecutionError, WorkflowPlanError
+from cyexm.errors import (
+    ExecutorStartupError,
+    RoundExecutionError,
+    WorkflowExecutionError,
+    WorkflowPlanError,
+)
 from cyexm.execution.base import WorkflowExecutor
 from cyexm.execution.sequential import SequentialExecutor
 from cyexm.registration._request_policy import (
@@ -899,6 +904,134 @@ def test_run_workflow_lazily_uses_the_production_round_worker(
 
     assert calls == [2]
     assert tuple(item.status for item in result.rounds) == ("completed",)
+
+
+def test_run_workflow_selects_local_dask_and_records_operational_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.execution import dask as dask_execution
+
+    sequential_plan = _plan(tmp_path)
+    plan = replace(
+        sequential_plan,
+        execution=_local_execution(sequential_plan, tmp_path),
+    )
+    selected: list[tuple[str, tuple[int, ...]]] = []
+
+    def execute(
+        executor: dask_execution.LocalDaskExecutor,
+        tasks: tuple[RoundTask, ...],
+    ) -> tuple[RoundResult, ...]:
+        selected.append(
+            (executor.profile.executor, tuple(task.round for task in tasks))
+        )
+        return tuple(_result(task) for task in tasks)
+
+    monkeypatch.setattr(dask_execution.LocalDaskExecutor, "execute", execute)
+
+    result = run_workflow(plan)
+
+    assert selected == [("local_dask", (2, 3))]
+    assert result.succeeded
+    execution_evidence = json.loads(result.execution_evidence_json)
+    assert execution_evidence == {
+        "executor": "local_dask",
+        "local_dask": {
+            "configured_workers": 2,
+            "memory_limit": "2GB",
+            "processes": True,
+            "requested_workers": 2,
+            "resources": {"round_slot": 1},
+            "startup_timeout": "30s",
+            "task_retries": 0,
+            "threads_per_worker": 1,
+            "worker_local_directory": str(tmp_path / "scratch"),
+        },
+        "submitted_rounds": [2, 3],
+    }
+    run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] == execution_evidence
+    assert run_record["execution_profile"]["executor"] == "local_dask"
+    assert run_record["scientific_fingerprint"] == plan.scientific_fingerprint
+    assert plan.scientific_json == sequential_plan.scientific_json
+    assert plan.scientific_fingerprint == sequential_plan.scientific_fingerprint
+    assert "local_dask" not in plan.scientific_json
+
+
+def test_local_dask_constructor_failure_never_falls_back_to_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.execution import dask as dask_execution
+
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_local_execution(sequential_plan, tmp_path),
+    )
+    sequential_calls: list[tuple[int, ...]] = []
+
+    class FailingLocalDaskExecutor:
+        def __init__(self, profile: ExecutionProfile) -> None:
+            del profile
+            raise ExecutorStartupError("injected local Dask constructor failure")
+
+    monkeypatch.setattr(
+        dask_execution,
+        "LocalDaskExecutor",
+        FailingLocalDaskExecutor,
+    )
+    monkeypatch.setattr(
+        SequentialExecutor,
+        "execute",
+        lambda _self, tasks: (
+            sequential_calls.append(tuple(task.round for task in tasks))
+            or tuple(_result(task) for task in tasks)
+        ),
+    )
+
+    with pytest.raises(
+        ExecutorStartupError,
+        match="injected local Dask constructor failure",
+    ):
+        run_workflow(plan)
+
+    layout = WorkflowLayout.for_dataset(
+        plan.execution.paths.output_root,
+        plan.dataset_id,
+    )
+    assert sequential_calls == []
+    assert layout.plan_path.read_text(encoding="utf-8") == plan.scientific_json + "\n"
+    assert not layout.workflow_runs.exists()
+
+
+def test_run_workflow_rejects_slurm_without_falling_back_to_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    sequential_calls: list[tuple[int, ...]] = []
+    monkeypatch.setattr(
+        SequentialExecutor,
+        "execute",
+        lambda _self, tasks: (
+            sequential_calls.append(tuple(task.round for task in tasks))
+            or tuple(_result(task) for task in tasks)
+        ),
+    )
+
+    with pytest.raises(
+        ExecutorStartupError,
+        match=r"^SLURM execution is not available in this installed milestone$",
+    ):
+        run_workflow(plan)
+
+    assert sequential_calls == []
 
 
 def test_run_workflow_skips_a_complete_round_without_opening_execution(

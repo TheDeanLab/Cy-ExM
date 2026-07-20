@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import cyexm.cli._commands as cli_commands
+import cyexm.workflow.api as workflow_api
 from cyexm import __version__
 from cyexm.cli import main
 from cyexm.cli._parser import build_parser
@@ -520,6 +521,76 @@ def test_expected_exceptions_map_to_exact_exit_codes_and_one_line_diagnostics(
     assert captured.out == ""
     assert captured.err.count("\n") == 1
     assert "Traceback" not in captured.err
+
+
+def test_local_dask_constructor_failure_maps_to_exit_three_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cyexm.execution import dask as dask_execution
+    from cyexm.execution.sequential import SequentialExecutor
+
+    api = _FakeWorkflowApi()
+    api.execution = SimpleNamespace(
+        executor="local_dask",
+        paths=api.execution.paths,
+        native_threads=api.execution.native_threads,
+        local_dask=SimpleNamespace(
+            workers=2,
+            threads_per_worker=1,
+            processes=True,
+            memory_limit="2GB",
+            startup_timeout="30s",
+            task_retries=0,
+        ),
+        slurm=None,
+    )
+    api.plan.execution = api.execution
+    sequential_calls: list[object] = []
+
+    class FailingLocalDaskExecutor:
+        def __init__(self, profile: object) -> None:
+            del profile
+            raise ExecutorStartupError("injected local Dask constructor failure")
+
+    def run_through_production_factory(
+        plan: object,
+        *,
+        force_rounds: frozenset[int],
+        force_all: bool,
+    ) -> _StructuredResult:
+        del force_rounds, force_all
+        workflow_api._default_executor_factory(plan.execution)  # type: ignore[attr-defined]
+        raise AssertionError("local executor construction unexpectedly returned")
+
+    api.run_workflow = run_through_production_factory  # type: ignore[method-assign]
+    monkeypatch.setattr(cli_commands, "_load_workflow_api", lambda: api)
+    monkeypatch.setattr(
+        dask_execution,
+        "LocalDaskExecutor",
+        FailingLocalDaskExecutor,
+    )
+    monkeypatch.setattr(
+        SequentialExecutor,
+        "execute",
+        lambda _self, tasks: sequential_calls.append(tasks) or (),
+    )
+
+    exit_code = main(
+        [
+            "workflow",
+            "run",
+            "dataset.yaml",
+            "--execution",
+            "local.yaml",
+        ]
+    )
+
+    assert exit_code == 3
+    assert sequential_calls == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "cyexm: error: injected local Dask constructor failure\n"
 
 
 def test_run_restores_the_prior_sigterm_handler_after_success(

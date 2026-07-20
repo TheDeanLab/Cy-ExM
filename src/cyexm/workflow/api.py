@@ -517,30 +517,6 @@ def _execution_profile_mapping(profile: ExecutionProfile) -> dict[str, object]:
     }
 
 
-def _execution_evidence_mapping(
-    profile: ExecutionProfile,
-    submitted: tuple[RoundTask, ...],
-) -> dict[str, object]:
-    evidence: dict[str, object] = {
-        "executor": profile.executor,
-        "submitted_rounds": [task.round for task in submitted],
-    }
-    local_dask = profile.local_dask
-    if profile.executor == "local_dask" and local_dask is not None:
-        evidence["local_dask"] = {
-            "configured_workers": local_dask.workers,
-            "requested_workers": min(len(submitted), local_dask.workers),
-            "threads_per_worker": local_dask.threads_per_worker,
-            "processes": local_dask.processes,
-            "memory_limit": local_dask.memory_limit,
-            "startup_timeout": local_dask.startup_timeout,
-            "task_retries": local_dask.task_retries,
-            "worker_local_directory": str(profile.paths.worker_local_directory),
-            "resources": {"round_slot": 1},
-        }
-    return evidence
-
-
 def _task_artifact_paths(plan: WorkflowPlan, task: RoundTask) -> tuple[str, ...]:
     return tuple(
         str(path)
@@ -684,9 +660,6 @@ def run_workflow(
     )
     preserved_results: tuple[RoundResult, ...] = ()
     submitted: tuple[RoundTask, ...] = ()
-    execution_evidence_json = canonical_json(
-        _execution_evidence_mapping(plan.execution, submitted)
-    )
     try:
         _ensure_scientific_snapshot(plan, layout)
         status = _inspect_workflow_status(
@@ -728,9 +701,6 @@ def run_workflow(
             for task in plan.tasks
             if task.round not in reused_rounds
         )
-        execution_evidence_json = canonical_json(
-            _execution_evidence_mapping(plan.execution, submitted)
-        )
         if submitted:
             factory = _executor_factory or _default_executor_factory
             executor = factory(plan.execution)
@@ -755,7 +725,6 @@ def run_workflow(
             ended_at=_utc_now(),
             rounds=rounds,
             run_record=str(run_record),
-            execution_evidence_json=execution_evidence_json,
         )
         _write_run_record(
             run_record,
@@ -787,7 +756,6 @@ def run_workflow(
             ended_at=_utc_now(),
             rounds=preserved_results,
             run_record=str(run_record),
-            execution_evidence_json=execution_evidence_json,
         )
         _write_run_record(
             run_record,

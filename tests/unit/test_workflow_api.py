@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
@@ -906,7 +907,7 @@ def test_run_workflow_lazily_uses_the_production_round_worker(
     assert tuple(item.status for item in result.rounds) == ("completed",)
 
 
-def test_run_workflow_selects_local_dask_and_records_operational_evidence(
+def test_run_workflow_selects_local_dask_without_manufacturing_observations(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -934,29 +935,130 @@ def test_run_workflow_selects_local_dask_and_records_operational_evidence(
 
     assert selected == [("local_dask", (2, 3))]
     assert result.succeeded
-    execution_evidence = json.loads(result.execution_evidence_json)
-    assert execution_evidence == {
-        "executor": "local_dask",
-        "local_dask": {
-            "configured_workers": 2,
-            "memory_limit": "2GB",
-            "processes": True,
-            "requested_workers": 2,
-            "resources": {"round_slot": 1},
-            "startup_timeout": "30s",
-            "task_retries": 0,
-            "threads_per_worker": 1,
-            "worker_local_directory": str(tmp_path / "scratch"),
-        },
-        "submitted_rounds": [2, 3],
-    }
+    assert result.execution_evidence_json == "{}"
     run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
-    assert run_record["execution"] == execution_evidence
+    assert run_record["execution"] == {}
     assert run_record["execution_profile"]["executor"] == "local_dask"
+    assert run_record["execution_profile"]["local_dask"] == {
+        "memory_limit": "2GB",
+        "processes": True,
+        "startup_timeout": "30s",
+        "task_retries": 0,
+        "threads_per_worker": 1,
+        "workers": 2,
+    }
     assert run_record["scientific_fingerprint"] == plan.scientific_fingerprint
     assert plan.scientific_json == sequential_plan.scientific_json
     assert plan.scientific_fingerprint == sequential_plan.scientific_fingerprint
     assert "local_dask" not in plan.scientific_json
+
+
+def test_local_dask_failed_round_does_not_manufacture_cluster_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.execution import dask as dask_execution
+
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_local_execution(sequential_plan, tmp_path),
+    )
+    monkeypatch.setattr(
+        dask_execution.LocalDaskExecutor,
+        "execute",
+        lambda _self, tasks: tuple(_result(task, failed=True) for task in tasks),
+    )
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        run_workflow(plan)
+
+    run_record = json.loads(Path(captured.value.run_record).read_text(encoding="utf-8"))
+    assert run_record["status"] == "failed"
+    assert run_record["execution"] == {}
+    assert run_record["execution_profile"]["executor"] == "local_dask"
+
+
+def test_local_dask_cancellation_does_not_manufacture_cluster_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.execution import dask as dask_execution
+
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_local_execution(sequential_plan, tmp_path),
+    )
+
+    def interrupt(
+        _executor: dask_execution.LocalDaskExecutor,
+        _tasks: tuple[RoundTask, ...],
+    ) -> tuple[RoundResult, ...]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dask_execution.LocalDaskExecutor, "execute", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_workflow(plan)
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root,
+            plan.dataset_id,
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    run_record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert run_record["status"] == "cancelled"
+    assert run_record["execution"] == {}
+    assert run_record["execution_profile"]["executor"] == "local_dask"
+
+
+def test_all_reused_local_workflow_does_not_open_an_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_local_execution(sequential_plan, tmp_path),
+    )
+    for artifact in _artifacts(plan.tasks[0]):
+        _commit_artifact(artifact, plan)
+    factory_calls: list[str] = []
+    executor_calls: list[tuple[int, ...]] = []
+    scheduler_modules_before = {
+        name
+        for name in sys.modules
+        if name == "distributed" or name.startswith("distributed.")
+    }
+
+    class UnexpectedExecutor:
+        def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+            executor_calls.append(tuple(task.round for task in tasks))
+            return tuple(_result(task) for task in tasks)
+
+    def tracking_factory(profile: ExecutionProfile) -> WorkflowExecutor:
+        factory_calls.append(profile.executor)
+        return UnexpectedExecutor()
+
+    monkeypatch.setattr(workflow_api, "_default_executor_factory", tracking_factory)
+
+    result = run_workflow(plan)
+
+    assert factory_calls == []
+    assert executor_calls == []
+    assert {
+        name
+        for name in sys.modules
+        if name == "distributed" or name.startswith("distributed.")
+    } == scheduler_modules_before
+    assert tuple(round_result.status for round_result in result.rounds) == ("reused",)
+    assert result.execution_evidence_json == "{}"
+    run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] == {}
+    assert run_record["execution_profile"]["executor"] == "local_dask"
 
 
 def test_local_dask_constructor_failure_never_falls_back_to_sequential(

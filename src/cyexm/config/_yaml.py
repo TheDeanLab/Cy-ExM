@@ -68,10 +68,21 @@ def _reject_custom_tag(loader: _StrictSafeLoader, node: Node) -> object:
     )
 
 
+def _reject_specialized_collection_tag(loader: _StrictSafeLoader, node: Node) -> object:
+    raise ConstructorError(
+        None,
+        None,
+        f"specialized YAML collection tags are not allowed: {node.tag}",
+        node.start_mark,
+    )
+
+
 _StrictSafeLoader.add_constructor(
     None,  # pyright: ignore[reportArgumentType] -- PyYAML uses None for unknown tags.
     _reject_custom_tag,
 )
+for _tag in ("tag:yaml.org,2002:pairs", "tag:yaml.org,2002:omap"):
+    _StrictSafeLoader.add_constructor(_tag, _reject_specialized_collection_tag)
 
 
 def _yaml_error_detail(error: yaml.YAMLError) -> str:
@@ -90,7 +101,7 @@ def load_yaml_mapping(path: str | Path) -> Mapping[str, object]:
         if not isinstance(value, Mapping):
             raise yaml.YAMLError("YAML document must contain a top-level mapping")
         return cast(Mapping[str, object], value)
-    except OSError as error:
+    except (OSError, UnicodeDecodeError) as error:
         raise ManifestDecodeError(
             f"Could not decode YAML from {source}: {error}"
         ) from error

@@ -8,8 +8,14 @@ from cyexm.errors import ConfigurationValidationError
 def require_exact_keys(
     value: object, expected: frozenset[str], yaml_path: str
 ) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
-        raise ConfigurationValidationError(f"{yaml_path} must be a mapping")
+    if not isinstance(value, Mapping):
+        raise ConfigurationValidationError(
+            f"{yaml_path} must be a mapping; got {value!r}"
+        )
+    if not all(isinstance(key, str) for key in value):
+        raise ConfigurationValidationError(
+            f"{yaml_path} mapping keys must be strings; got {value!r}"
+        )
     actual = frozenset(value)
     if actual != expected:
         raise ConfigurationValidationError(
@@ -32,7 +38,12 @@ def finite_positive_float(value: object, yaml_path: str) -> float:
         raise ConfigurationValidationError(
             f"{yaml_path} must be a positive finite number; got {value!r}"
         )
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError as error:
+        raise ConfigurationValidationError(
+            f"{yaml_path} must be a positive finite number; got {value!r}"
+        ) from error
     if not math.isfinite(result) or result <= 0.0:
         raise ConfigurationValidationError(
             f"{yaml_path} must be a positive finite number; got {value!r}"
@@ -41,7 +52,13 @@ def finite_positive_float(value: object, yaml_path: str) -> float:
 
 
 def nonempty_string(value: object, yaml_path: str) -> str:
-    if not isinstance(value, str) or not value or "\x00" in value or "\n" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\x00" in value
+        or "\n" in value
+        or "\r" in value
+    ):
         raise ConfigurationValidationError(
             f"{yaml_path} must be a nonempty single-line string; got {value!r}"
         )

@@ -63,8 +63,39 @@ def test_strict_yaml_rejects_ambiguous_documents(
         load_yaml_mapping(path)
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "value: !!pairs\n  - ? [one, two]\n    : item\n",
+        "value: !!pairs\n  - one: first\n  - one: second\n",
+        "value: !!omap\n  - ? [one, two]\n    : item\n",
+        "value: !!omap\n  - one: first\n  - one: second\n",
+    ],
+)
+def test_strict_yaml_rejects_specialized_collection_key_bypasses(
+    tmp_path: Path, content: str
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(
+        ManifestDecodeError, match="specialized YAML collection tags"
+    ) as error:
+        load_yaml_mapping(path)
+
+    assert str(path) in str(error.value)
+
+
 def test_strict_yaml_wraps_missing_file_error_with_source_path(tmp_path: Path) -> None:
     path = tmp_path / "missing.yaml"
+
+    with pytest.raises(ManifestDecodeError, match=escape(str(path))):
+        load_yaml_mapping(path)
+
+
+def test_strict_yaml_wraps_invalid_utf8_with_source_path(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_bytes(b"schema_version: \xff\n")
 
     with pytest.raises(ManifestDecodeError, match=escape(str(path))):
         load_yaml_mapping(path)
@@ -102,10 +133,22 @@ def test_require_exact_keys_returns_a_matching_string_key_mapping() -> None:
     assert result is value
 
 
-@pytest.mark.parametrize("value", [[("name", "round-1")], {1: "round-1"}])
-def test_require_exact_keys_rejects_non_string_key_mappings(value: object) -> None:
-    with pytest.raises(ConfigurationValidationError, match="round must be a mapping"):
+def test_require_exact_keys_reports_a_nonmapping_value() -> None:
+    value = [("name", "round-1")]
+
+    with pytest.raises(ConfigurationValidationError) as error:
         require_exact_keys(value, frozenset({"name"}), "round")
+
+    assert str(error.value) == f"round must be a mapping; got {value!r}"
+
+
+def test_require_exact_keys_reports_non_string_mapping_keys() -> None:
+    value = {1: "round-1"}
+
+    with pytest.raises(ConfigurationValidationError) as error:
+        require_exact_keys(value, frozenset({"name"}), "round")
+
+    assert str(error.value) == f"round mapping keys must be strings; got {value!r}"
 
 
 def test_require_exact_keys_reports_expected_and_actual_keys() -> None:
@@ -154,11 +197,24 @@ def test_finite_positive_float_rejects_invalid_numbers(value: object) -> None:
         finite_positive_float(value, "voxel_size.x")
 
 
+def test_finite_positive_float_wraps_integer_conversion_overflow() -> None:
+    value = 10**400
+
+    with pytest.raises(ConfigurationValidationError) as error:
+        finite_positive_float(value, "voxel_size.x")
+
+    assert str(error.value) == (
+        f"voxel_size.x must be a positive finite number; got {value!r}"
+    )
+
+
 def test_nonempty_string_accepts_a_single_line_value() -> None:
     assert nonempty_string("round-1", "round.name") == "round-1"
 
 
-@pytest.mark.parametrize("value", [1, "", "round\x00name", "round\nname"])
+@pytest.mark.parametrize(
+    "value", [1, "", "round\x00name", "round\nname", "round\rname"]
+)
 def test_nonempty_string_rejects_invalid_values(value: object) -> None:
     with pytest.raises(
         ConfigurationValidationError,

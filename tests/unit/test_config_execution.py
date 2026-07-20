@@ -296,6 +296,23 @@ def test_worker_scratch_rejects_archive_paths(tmp_path: Path, scratch: str) -> N
         _load_profile(tmp_path, data)
 
 
+@pytest.mark.parametrize("executor", ["local_dask", "slurm"])
+def test_worker_backed_profiles_require_worker_scratch(
+    tmp_path: Path, executor: str
+) -> None:
+    data = _valid_data(executor)
+    _mapping_at(data, "paths")["worker_local_directory"] = None
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=(
+            r"paths\.worker_local_directory must be set for worker-backed executors; "
+            r"got None"
+        ),
+    ):
+        _load_profile(tmp_path, data)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -544,6 +561,49 @@ def test_slurm_extra_directives_reject_managed_options(
         match="conflicts with managed SLURM option",
     ):
         _load_profile(tmp_path, data)
+
+
+def test_slurm_extra_directives_reject_managed_option_later_in_directive(
+    tmp_path: Path,
+) -> None:
+    data = _valid_data("slurm")
+    _mapping_at(data, "slurm")["job_extra_directives"] = [
+        "--mail-type=FAIL",
+        "--exclusive --partition=debug",
+    ]
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=(
+            r"slurm\.job_extra_directives\[1\] conflicts with managed SLURM option "
+            r"--partition"
+        ),
+    ):
+        _load_profile(tmp_path, data)
+
+
+@pytest.mark.parametrize("directive", ["-vn1", "-n1", "-pdebug"])
+def test_slurm_extra_directives_reject_grouped_or_attached_short_options(
+    tmp_path: Path, directive: str
+) -> None:
+    data = _valid_data("slurm")
+    _mapping_at(data, "slurm")["job_extra_directives"] = [directive]
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=r"slurm\.job_extra_directives\[0\] conflicts with managed SLURM option",
+    ):
+        _load_profile(tmp_path, data)
+
+
+def test_slurm_extra_directives_accept_managed_prefix_neighbor(tmp_path: Path) -> None:
+    data = _valid_data("slurm")
+    _mapping_at(data, "slurm")["job_extra_directives"] = ["--mem-bind=local"]
+
+    profile = _load_profile(tmp_path, data)
+
+    assert profile.slurm is not None
+    assert profile.slurm.job_extra_directives == ("--mem-bind=local",)
 
 
 @pytest.mark.parametrize("directive", ["", "bad\nvalue", "bad\x00value", 1])

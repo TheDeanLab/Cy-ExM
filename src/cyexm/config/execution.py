@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
@@ -75,6 +76,12 @@ _MANAGED_SLURM_OPTIONS = (
     "--error",
     "-e",
 )
+_MANAGED_SLURM_LONG_OPTIONS = frozenset(
+    option for option in _MANAGED_SLURM_OPTIONS if option.startswith("--")
+)
+_MANAGED_SLURM_SHORT_OPTIONS = frozenset(
+    option for option in _MANAGED_SLURM_OPTIONS if not option.startswith("--")
+)
 
 
 def _choice(value: object, accepted: frozenset[str], yaml_path: str) -> str:
@@ -99,7 +106,12 @@ def _resolved_path(value: object, yaml_path: str, source_directory: Path) -> Pat
     return path.resolve(strict=False)
 
 
-def _paths(value: object, source_directory: Path) -> ExecutionPaths:
+def _paths(
+    value: object,
+    source_directory: Path,
+    *,
+    require_worker_scratch: bool,
+) -> ExecutionPaths:
     mapping = require_exact_keys(value, _PATH_KEYS, "paths")
     dataset_root = _resolved_path(
         mapping["dataset_root"], "paths.dataset_root", source_directory
@@ -116,6 +128,11 @@ def _paths(value: object, source_directory: Path) -> ExecutionPaths:
         )
 
     raw_worker_directory = mapping["worker_local_directory"]
+    if require_worker_scratch and raw_worker_directory is None:
+        raise ConfigurationValidationError(
+            "paths.worker_local_directory must be set for worker-backed executors; "
+            "got None"
+        )
     worker_local_directory = (
         None
         if raw_worker_directory is None
@@ -216,13 +233,37 @@ def _job_extra_directives(value: object) -> tuple[str, ...]:
     for index, item in enumerate(_list(value, "slurm.job_extra_directives")):
         yaml_path = f"slurm.job_extra_directives[{index}]"
         directive = nonempty_string(item, yaml_path)
-        normalized = directive.lstrip()
-        if normalized.startswith(_MANAGED_SLURM_OPTIONS):
+        managed_option = _managed_slurm_option(directive, yaml_path)
+        if managed_option is not None:
             raise ConfigurationValidationError(
-                f"{yaml_path} conflicts with managed SLURM option; got {directive!r}"
+                f"{yaml_path} conflicts with managed SLURM option "
+                f"{managed_option}; got {directive!r}"
             )
         directives.append(directive)
     return tuple(directives)
+
+
+def _managed_slurm_option(directive: str, yaml_path: str) -> str | None:
+    try:
+        tokens = shlex.split(directive)
+    except ValueError as error:
+        raise ConfigurationValidationError(
+            f"{yaml_path} must contain valid shell-style tokens; got {directive!r}"
+        ) from error
+
+    for token in tokens:
+        if token == "--":
+            break
+        if token.startswith("--"):
+            option = token.partition("=")[0]
+            if option in _MANAGED_SLURM_LONG_OPTIONS:
+                return option
+        elif token.startswith("-"):
+            for name in token[1:]:
+                option = f"-{name}"
+                if option in _MANAGED_SLURM_SHORT_OPTIONS:
+                    return option
+    return None
 
 
 def _slurm(value: object) -> SlurmSpec:
@@ -283,7 +324,11 @@ def load_execution_profile(path: str | Path) -> ExecutionProfile:
     return ExecutionProfile(
         schema_version=schema_version,
         executor=executor,
-        paths=_paths(mapping["paths"], source_path.parent),
+        paths=_paths(
+            mapping["paths"],
+            source_path.parent,
+            require_worker_scratch=executor != "sequential",
+        ),
         native_threads=native_threads,
         local_dask=(
             _local_dask(mapping["local_dask"]) if executor == "local_dask" else None

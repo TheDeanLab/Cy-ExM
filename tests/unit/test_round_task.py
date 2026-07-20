@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -14,6 +14,22 @@ from cyexm.config.models import (
     NativeThreadSpec,
     RegistrationSpec,
     RegistrationStageSpec,
+)
+from cyexm.registration._request_policy import (
+    affine_parameters,
+    canonical_compact_json,
+    channel_transform_parameters,
+    chunk_grid,
+    chunk_manifest_parameters,
+    chunk_manifest_payload,
+    common_parameters,
+    crop_geometry,
+    crop_parameters,
+    fixed_reference_parameters,
+    local_chunk_parameters,
+    nonlinear_stage_parameters,
+    registered_image_parameters,
+    scalar_policy,
 )
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
 from cyexm.runtime import (
@@ -27,15 +43,20 @@ from cyexm.workflow.round_task import run_round_task
 
 pytestmark = pytest.mark.unit
 
-_GEOMETRY = ImageGeometry(
-    shape=(2, 3, 4),
-    origin=(0.0, 0.0, 0.0),
+_FULL_FIXED_GEOMETRY = ImageGeometry(
+    shape=(6, 7, 8),
+    origin=(1.0, 2.0, 3.0),
     spacing=(0.3, 0.3, 0.9),
-    direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
 )
+_FULL_MOVING_GEOMETRY = replace(
+    _FULL_FIXED_GEOMETRY,
+    origin=(4.0, 5.0, 6.0),
+)
+_FIXED_CROP_BOUNDS = (1, 5, 1, 6, 2, 7)
+_MOVING_CROP_BOUNDS = (0, 4, 2, 7, 1, 6)
+_GEOMETRY = _FULL_FIXED_GEOMETRY
 ITK_THREAD_ENV_VAR, *BLAS_THREAD_ENV_VARS = NATIVE_THREAD_ENV_VARS
-_WHOLE_SCALAR_POLICY = "whole-global-histogram-match-v1"
-_CHUNK_SCALAR_POLICY = "serial-chunk-local-histogram-match-core-stitch-v1"
 
 
 def _native_thread_values(task: RoundTask) -> dict[str, int]:
@@ -45,9 +66,14 @@ def _native_thread_values(task: RoundTask) -> dict[str, int]:
     }
 
 
-def _write_completion(path: Path, request: StageRequest) -> None:
+def _write_completion(
+    path: Path,
+    request: StageRequest,
+    *,
+    contents: bytes | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(f"artifact:{path.name}".encode())
+    path.write_bytes(f"artifact:{path.name}".encode() if contents is None else contents)
     record = CompletionRecord(
         schema_version=1,
         request=request,
@@ -58,72 +84,32 @@ def _write_completion(path: Path, request: StageRequest) -> None:
     )
 
 
-def _ensure_completion(path: Path, request: StageRequest) -> None:
+def _ensure_completion(
+    path: Path,
+    request: StageRequest,
+    *,
+    contents: bytes | None = None,
+) -> None:
     record_path = path.with_name(f"{path.name}.complete.json")
     if path.is_file() and record_path.is_file():
         record = CompletionRecord.read(record_path)
-        if record.request == request and record.artifact == FileIdentity.from_path(
-            path
+        expected_contents = path.read_bytes() if contents is None else contents
+        if (
+            path.read_bytes() == expected_contents
+            and record.request == request
+            and record.artifact == FileIdentity.from_path(path)
         ):
             return
-    _write_completion(path, request)
+    _write_completion(path, request, contents=contents)
 
 
-def _common_parameters(task: RoundTask) -> dict[str, object]:
-    return {
-        "axis_convention_version": "external-zyx-ants-xyz-v1",
-        "crop": task.registration.crop,
-        "imaging_round": task.round,
-        "pixel_size_xyz": list(task.voxel_spacing_xyz),
-    }
-
-
-def _linear_parameters(task: RoundTask) -> dict[str, object]:
-    parameters: dict[str, object] = {
-        "aff_metric": "mattes",
-        "aff_random_sampling_rate": 0.5,
-        "aff_sampling": 32,
-        "mask_all_stages": True,
-        "verbose": True,
-    }
-    iterations = {
-        "high": [1000, 500, 250, 100],
-        "medium": [500, 250, 100, 50],
-        "low": [100, 50, 25, 10],
-    }
-    accuracy = task.registration.linear.accuracy
-    if task.registration.linear.type == "TRSAA" and accuracy != "dry run":
-        parameters["reg_iterations"] = iterations[accuracy]
-    if accuracy == "dry run":
-        parameters.update(
-            effective_registration_type="Rigid",
-            aff_iterations=[1],
-            aff_smoothing_sigmas=[0],
-            aff_shrink_factors=[8],
-            aff_random_sampling_rate=0.1,
-        )
-    return parameters
-
-
-def _nonlinear_parameters(task: RoundTask) -> dict[str, object]:
-    iterations = {
-        "high": [100, 70, 50],
-        "medium": [50, 35, 25],
-        "low": [5, 5, 5],
-        "dry run": [1, 1, 1],
-    }
-    return {
-        "aff_random_sampling_rate": 1.0,
-        "flow_sigma": 3.0,
-        "initial_transform": "Identity",
-        "mask_all_stages": True,
-        "reg_iterations": iterations[task.registration.nonlinear.accuracy],
-        "singleprecision": False,
-        "syn_metric": "mattes",
-        "syn_sampling": 32,
-        "total_sigma": 0.5,
-        "verbose": True,
-    }
+def _effective_geometries(task: RoundTask) -> tuple[ImageGeometry, ImageGeometry]:
+    if not task.registration.crop:
+        return _FULL_FIXED_GEOMETRY, _FULL_MOVING_GEOMETRY
+    return (
+        crop_geometry(_FULL_FIXED_GEOMETRY, _FIXED_CROP_BOUNDS),
+        crop_geometry(_FULL_MOVING_GEOMETRY, _MOVING_CROP_BOUNDS),
+    )
 
 
 def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) -> None:
@@ -132,21 +118,80 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
         FileIdentity.from_path(task.fixed_image),
         FileIdentity.from_path(task.moving_image),
     )
-    common = _common_parameters(task)
+    common = common_parameters(
+        crop=task.registration.crop,
+        imaging_round=task.round,
+        pixel_size_xyz=task.voxel_spacing_xyz,
+    )
+    fixed_geometry, moving_geometry = _effective_geometries(task)
+    if task.registration.crop:
+        crop_cases: tuple[
+            tuple[
+                Path,
+                Literal["fixed", "moving"],
+                ImageGeometry,
+                tuple[int, int, int, int, int, int],
+            ],
+            ...,
+        ] = (
+            (
+                paths.fixed_crop,
+                "fixed",
+                _FULL_FIXED_GEOMETRY,
+                _FIXED_CROP_BOUNDS,
+            ),
+            (
+                paths.moving_crop,
+                "moving",
+                _FULL_MOVING_GEOMETRY,
+                _MOVING_CROP_BOUNDS,
+            ),
+        )
+        for path, role, geometry, bounds in crop_cases:
+            crop_request = StageRequest.for_identities(
+                stage=f"crop:{role}",
+                inputs=inputs,
+                geometry=geometry,
+                method="robust-bounding-box",
+                accuracy="legacy-robust",
+                native_threads=_native_thread_values(task),
+                upstream=None,
+                parameters={**common, **crop_parameters(role)},
+            )
+            _ensure_completion(
+                path,
+                crop_request,
+                contents=canonical_compact_json(list(bounds)).encode(),
+            )
+    fixed_reference_request = StageRequest.for_identities(
+        stage="fixed-reference",
+        inputs=inputs,
+        geometry=fixed_geometry,
+        method="uint16-tiff",
+        accuracy="exact",
+        native_threads=_native_thread_values(task),
+        upstream=None,
+        parameters={
+            **common,
+            **fixed_reference_parameters(0.0, 100.0),
+        },
+    )
+    _ensure_completion(paths.fixed_reference, fixed_reference_request)
     affine_request = StageRequest.for_identities(
         stage="affine",
         inputs=inputs,
-        geometry=_GEOMETRY,
+        geometry=fixed_geometry,
         method=task.registration.linear.type,
         accuracy=task.registration.linear.accuracy,
         native_threads=_native_thread_values(task),
         upstream=None,
         parameters={
             **common,
-            "image_interpolation": "linear",
-            "mask_interpolation": "nearestNeighbor",
-            "moving_geometry": _GEOMETRY.to_dict(),
-            "registration_parameters": _linear_parameters(task),
+            **affine_parameters(
+                moving_geometry=moving_geometry,
+                linear_type=task.registration.linear.type,
+                accuracy=task.registration.linear.accuracy,
+            ),
         },
     )
     _ensure_completion(paths.affine, affine_request)
@@ -154,77 +199,133 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
         return
 
     affine_identity = FileIdentity.from_path(paths.affine)
-    scalar_policy = (
-        _WHOLE_SCALAR_POLICY if task.strategy == "whole_image" else _CHUNK_SCALAR_POLICY
-    )
+    selected_scalar_policy = scalar_policy(task.strategy)
     nonlinear_evidence: dict[str, object] = {}
     if task.strategy == "serial_chunked":
+        assert task.chunk_size_zyx is not None
+        assert task.overlap_fraction is not None
         chunk_directory = task.registration_directory / f"round_{task.round}_chunks"
-        local_warp = chunk_directory / "chunk_0000_warp.nii.gz"
+        chunks = chunk_grid(
+            fixed_geometry.shape,
+            task.chunk_size_zyx,
+            task.overlap_fraction,
+        )
+        local_identities: list[FileIdentity] = []
+        for chunk in chunks:
+            local_warp = chunk_directory / f"chunk_{chunk['chunk_id']:04d}_warp.nii.gz"
+            local_geometry = crop_geometry(
+                fixed_geometry,
+                (
+                    chunk["z_start_ext"],
+                    chunk["z_end_ext"],
+                    chunk["y_start_ext"],
+                    chunk["y_end_ext"],
+                    chunk["x_start_ext"],
+                    chunk["x_end_ext"],
+                ),
+            )
+            local_request = StageRequest.for_identities(
+                stage=f"nonlinear-chunk:{chunk['chunk_id']}",
+                inputs=inputs,
+                geometry=local_geometry,
+                method=task.registration.nonlinear.type,
+                accuracy=task.registration.nonlinear.accuracy,
+                native_threads=_native_thread_values(task),
+                upstream=affine_identity,
+                parameters=local_chunk_parameters(
+                    chunk=chunk,
+                    chunks=chunks,
+                    chunk_size_zyx=task.chunk_size_zyx,
+                    fixed_mask_geometry=local_geometry,
+                    image_shape_zyx=fixed_geometry.shape,
+                    moving_geometry=local_geometry,
+                    moving_mask_geometry=local_geometry,
+                    overlap_fraction=task.overlap_fraction,
+                    nonlinear_accuracy=task.registration.nonlinear.accuracy,
+                    scalar_postprocessing_policy=selected_scalar_policy,
+                ),
+            )
+            _ensure_completion(local_warp, local_request)
+            local_identities.append(FileIdentity.from_path(local_warp))
+
         manifest = chunk_directory / "manifest.json"
-        local_warp.parent.mkdir(parents=True, exist_ok=True)
-        if not local_warp.exists():
-            local_warp.write_bytes(b"local-warp")
-        if not manifest.exists():
-            manifest.write_bytes(b"chunk-manifest")
-        chunk = {
-            "chunk_id": 0,
-            "z_start": 0,
-            "z_end": 2,
-            "y_start": 0,
-            "y_end": 3,
-            "x_start": 0,
-            "x_end": 4,
-            "z_start_ext": 0,
-            "z_end_ext": 2,
-            "y_start_ext": 0,
-            "y_end_ext": 3,
-            "x_start_ext": 0,
-            "x_end_ext": 4,
-        }
+        local_dicts = [identity.to_dict() for identity in local_identities]
+        manifest_payload = chunk_manifest_payload(
+            round_number=task.round,
+            image_shape_zyx=fixed_geometry.shape,
+            chunk_size_zyx=task.chunk_size_zyx,
+            overlap_fraction=task.overlap_fraction,
+            chunks=chunks,
+            local_warps=local_dicts,
+        )
+        manifest_request = StageRequest.for_identities(
+            stage="nonlinear-chunk-manifest",
+            inputs=inputs,
+            geometry=fixed_geometry,
+            method="serial-chunk-grid",
+            accuracy="exact",
+            native_threads=_native_thread_values(task),
+            upstream=affine_identity,
+            parameters=chunk_manifest_parameters(
+                chunk_size_zyx=task.chunk_size_zyx,
+                image_shape_zyx=fixed_geometry.shape,
+                local_warps=local_dicts,
+                nonlinear_accuracy=task.registration.nonlinear.accuracy,
+                nonlinear_type=task.registration.nonlinear.type,
+                overlap_fraction=task.overlap_fraction,
+            ),
+        )
+        _ensure_completion(
+            manifest,
+            manifest_request,
+            contents=canonical_compact_json(manifest_payload).encode(),
+        )
         nonlinear_evidence = {
-            "chunk_grid": [chunk],
+            "chunk_grid": [dict(chunk) for chunk in chunks],
             "chunk_manifest": FileIdentity.from_path(manifest).to_dict(),
-            "chunk_size_zyx": list(task.chunk_size_zyx or ()),
-            "local_warps": [FileIdentity.from_path(local_warp).to_dict()],
+            "chunk_size_zyx": list(task.chunk_size_zyx),
+            "local_warps": local_dicts,
             "overlap_fraction": task.overlap_fraction,
         }
     warp_request = StageRequest.for_identities(
         stage="nonlinear",
         inputs=inputs,
-        geometry=_GEOMETRY,
+        geometry=fixed_geometry,
         method=task.registration.nonlinear.type,
         accuracy=task.registration.nonlinear.accuracy,
         native_threads=_native_thread_values(task),
         upstream=affine_identity,
         parameters={
             **common,
-            "image_interpolation": "linear",
-            "mask_interpolation": "nearestNeighbor",
-            "moving_geometry": _GEOMETRY.to_dict(),
-            "registration_mode": (
-                "whole-image" if task.strategy == "whole_image" else "serial-chunked"
+            **nonlinear_stage_parameters(
+                moving_geometry=fixed_geometry,
+                registration_mode=(
+                    "whole-image"
+                    if task.strategy == "whole_image"
+                    else "serial-chunked"
+                ),
+                nonlinear_accuracy=task.registration.nonlinear.accuracy,
+                scalar_postprocessing_policy=selected_scalar_policy,
+                evidence=nonlinear_evidence,
             ),
-            "registration_parameters": _nonlinear_parameters(task),
-            "scalar_postprocessing_policy": scalar_policy,
-            **nonlinear_evidence,
         },
     )
     _ensure_completion(paths.warp, warp_request)
     registered_request = StageRequest.for_identities(
         stage="registered-image",
         inputs=inputs,
-        geometry=_GEOMETRY,
+        geometry=fixed_geometry,
         method=task.registration.nonlinear.type,
         accuracy=task.registration.nonlinear.accuracy,
         native_threads=_native_thread_values(task),
         upstream=FileIdentity.from_path(paths.warp),
         parameters={
             **common,
-            "format": "uint16-tiff",
-            "minimum": 0.0,
-            "maximum": 100.0,
-            "scalar_postprocessing_policy": scalar_policy,
+            **registered_image_parameters(
+                minimum=0.0,
+                maximum=100.0,
+                scalar_postprocessing_policy=selected_scalar_policy,
+            ),
         },
     )
     _ensure_completion(paths.registered, registered_request)
@@ -235,20 +336,15 @@ def _commit_channel(task: RoundTask, channel: ChannelTask) -> None:
     request = StageRequest.for_files(
         stage="channel-transform-v1",
         inputs=(task.fixed_image, channel.source, paths.affine, paths.warp),
-        geometry=_GEOMETRY,
+        geometry=_FULL_FIXED_GEOMETRY,
         method="warp-affine",
         accuracy="not-applicable",
         native_threads=_native_thread_values(task),
         upstream=FileIdentity.from_path(paths.warp),
-        parameters={
-            "pixel_size_xyz_um": list(task.voxel_spacing_xyz),
-            "interpolation": channel.interpolation,
-            "transform_order": ["warp", "affine"],
-            "whichtoinvert": [False, False],
-            "axis_convention": "external-zyx-ants-xyz-v1",
-            "output_format": "ome-compatible-tiff-uint16-v1",
-            "postprocessing": "clip-uint16-no-normalization-v1",
-        },
+        parameters=channel_transform_parameters(
+            pixel_size_xyz=task.voxel_spacing_xyz,
+            interpolation=channel.interpolation,
+        ),
     )
     _ensure_completion(channel.output, request)
 
@@ -259,6 +355,7 @@ def _task(
     strategy: str = "whole_image",
     channel_names: tuple[str, ...] = ("b.tif", "a.tif"),
     force: bool = False,
+    crop: bool = True,
 ) -> RoundTask:
     fixed = tmp_path / "inputs" / "fixed.tif"
     moving = tmp_path / "inputs" / "registration.tif"
@@ -288,7 +385,7 @@ def _task(
         log_path=tmp_path / "output" / "logs" / "round-002.log",
         voxel_spacing_xyz=(0.3, 0.3, 0.9),
         registration=RegistrationSpec(
-            crop=True,
+            crop=crop,
             linear=RegistrationStageSpec(type="TRSAA", accuracy="low"),
             nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
         ),
@@ -311,9 +408,16 @@ def _resolved(task: RoundTask) -> ResolvedNativeThreads:
 def _registration_paths(task: RoundTask) -> SimpleNamespace:
     directory = task.registration_directory
     return SimpleNamespace(
+        output=directory,
         affine=directory / f"linear_transform_{task.round}.mat",
         warp=directory / f"nonlinear_warp_{task.round}.nii.gz",
         registered=directory / f"nonlinear_registered_{task.round}.tif",
+        fixed_reference=directory / "fixed_reference.tif",
+        pre_metrics=directory / "image_metrics_pre-registration.txt",
+        linear_metrics=directory / "image_metrics_linearly-registered.txt",
+        nonlinear_metrics=directory / "image_metrics_nonlinear-registered.txt",
+        fixed_crop=directory / f"fixed_crop_indices_{task.round}.json",
+        moving_crop=directory / f"moving_crop_indices_{task.round}.json",
     )
 
 
@@ -367,6 +471,16 @@ def _install_runtime(
 
     monkeypatch.setattr(
         module, "configure_native_threads", lambda config: _resolved(task)
+    )
+    geometry_by_path = {
+        task.fixed_image: _FULL_FIXED_GEOMETRY,
+        task.moving_image: _FULL_MOVING_GEOMETRY,
+        _registration_paths(task).fixed_reference: _effective_geometries(task)[0],
+    }
+    monkeypatch.setattr(
+        module,
+        "_inspect_image_geometry",
+        lambda path, spacing: geometry_by_path[Path(path)],
     )
     monkeypatch.setattr(
         module,
@@ -912,11 +1026,8 @@ def test_round_task_compares_all_registration_paths_from_runtime(
         @classmethod
         def for_round(cls, output: Path, round_number: int) -> SimpleNamespace:
             paths = _registration_paths(task)
-            return SimpleNamespace(
-                affine=paths.affine,
-                warp=paths.warp,
-                registered=output / f"wrong_registered_{round_number}.tif",
-            )
+            paths.registered = output / f"wrong_registered_{round_number}.tif"
+            return paths
 
     monkeypatch.setattr(
         module,
@@ -958,13 +1069,16 @@ def test_completion_prescan_failure_becomes_a_structured_round_failure(
     from cyexm.workflow import round_task as module
 
     task = _task(tmp_path, channel_names=())
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    _install_runtime(monkeypatch, task, calls, constructors)
     original = module._completion_snapshot
-    calls = 0
+    snapshot_calls = 0
 
     def fail_once(path: Path) -> object:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 1:
             raise RuntimeError("prescan unavailable")
         return original(path)
 
@@ -1003,3 +1117,164 @@ def test_unprintable_already_loaded_dask_key_is_treated_as_absent(
 
     assert result.status == "completed"
     assert result.dask_task_key is None
+
+
+def test_serial_chunk_completion_requires_local_and_manifest_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, strategy="serial_chunked", channel_names=())
+
+    def remove_records(task: RoundTask) -> None:
+        chunk_directory = task.registration_directory / f"round_{task.round}_chunks"
+        local_warp = chunk_directory / "chunk_0000_warp.nii.gz"
+        manifest = chunk_directory / "manifest.json"
+        for path in (local_warp, manifest):
+            path.with_name(f"{path.name}.complete.json").unlink()
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=remove_records,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "registration"
+
+
+def test_serial_chunk_completion_rejects_a_noncanonical_derived_grid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, strategy="serial_chunked", channel_names=())
+
+    def corrupt(task: RoundTask) -> None:
+        path = _registration_paths(task).warp
+
+        def mutation(request: StageRequest) -> StageRequest:
+            grid = [dict(item) for item in request.parameters["chunk_grid"]]  # type: ignore[union-attr]
+            grid[0]["x_end"] = 3
+            return replace(
+                request,
+                parameters={**request.parameters, "chunk_grid": grid},
+            )
+
+        _replace_completion_request(path, mutation)
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=corrupt,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "registration"
+
+
+@pytest.mark.parametrize("field", ["shape", "origin", "direction"])
+def test_registration_completion_rejects_wrong_full_geometry_provenance(
+    field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, crop=False, channel_names=())
+    changes = {
+        "shape": (9, 9, 9),
+        "origin": (10.0, 11.0, 12.0),
+        "direction": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0)),
+    }
+    wrong_geometry = replace(_GEOMETRY, **{field: changes[field]})
+
+    def corrupt(task: RoundTask) -> None:
+        paths = _registration_paths(task)
+        for path in (paths.affine, paths.warp, paths.registered):
+            _replace_completion_request(
+                path,
+                lambda request: replace(
+                    request,
+                    geometry=wrong_geometry,
+                    parameters={
+                        **request.parameters,
+                        **(
+                            {"moving_geometry": wrong_geometry.to_dict()}
+                            if "moving_geometry" in request.parameters
+                            else {}
+                        ),
+                    },
+                ),
+            )
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=corrupt,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "registration"
+
+
+@pytest.mark.parametrize("field", ["shape", "origin", "direction"])
+def test_channel_completion_rejects_wrong_fixed_geometry_provenance(
+    field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, crop=False, channel_names=("a.tif",))
+    changes = {
+        "shape": (9, 9, 9),
+        "origin": (10.0, 11.0, 12.0),
+        "direction": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0)),
+    }
+    wrong_geometry = replace(_GEOMETRY, **{field: changes[field]})
+
+    def corrupt(_task: RoundTask, channel: ChannelTask) -> None:
+        _replace_completion_request(
+            channel.output,
+            lambda request: replace(request, geometry=wrong_geometry),
+        )
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_channel=corrupt,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "channel:a.tif"
+
+
+@pytest.mark.parametrize("crop", [False, True])
+def test_round_task_accepts_authoritative_geometry_for_each_crop_mode(
+    crop: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, crop=crop, channel_names=())
+    _install_runtime(monkeypatch, task, calls, constructors)
+
+    result = run_round_task(task)
+
+    assert result.status == "completed"

@@ -19,6 +19,10 @@ from cyexm.errors import (
     InputValidationError,
     WorkflowPlanError,
 )
+from cyexm.registration._request_policy import (
+    CHANNEL_POSTPROCESSING_POLICY,
+    OUTPUT_FORMAT_POLICY,
+)
 from cyexm.spatial import AXIS_CONVENTION_VERSION, spacing_compatible
 from cyexm.workflow.layout import RoundLayout, WorkflowLayout
 from cyexm.workflow.models import (
@@ -29,9 +33,6 @@ from cyexm.workflow.models import (
     canonical_json,
     sha256_fingerprint,
 )
-
-_OUTPUT_FORMAT_POLICY = "ome-compatible-tiff-uint16-v1"
-_POSTPROCESSING_POLICY = "clip-uint16-no-normalization-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,8 +517,8 @@ def _scientific_mapping(
         ],
         "policies": {
             "axis_convention": AXIS_CONVENTION_VERSION,
-            "output_format": _OUTPUT_FORMAT_POLICY,
-            "postprocessing": _POSTPROCESSING_POLICY,
+            "output_format": OUTPUT_FORMAT_POLICY,
+            "postprocessing": CHANNEL_POSTPROCESSING_POLICY,
         },
     }
 

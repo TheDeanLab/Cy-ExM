@@ -9,17 +9,20 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from cyexm.errors import WorkflowPlanError
-from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
-from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
-from cyexm.workflow._registration_policy import (
+from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
     CHUNK_SCALAR_POLICY,
     OUTPUT_FORMAT_POLICY,
     WHOLE_SCALAR_POLICY,
-    linear_parameters,
-    nonlinear_parameters,
+    affine_parameters,
+    channel_transform_parameters,
+    common_parameters,
+    nonlinear_stage_parameters,
+    registered_image_parameters,
 )
+from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
+from cyexm.runtime import NATIVE_THREAD_ENV_VARS
+from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     RoundStatus,
@@ -803,17 +806,6 @@ def _valid_native_threads(value: Mapping[str, int]) -> bool:
     return len(set(blas_values)) == 1
 
 
-def _linear_parameters(registration: _RegistrationContract) -> dict[str, object]:
-    return linear_parameters(
-        registration.linear_type,
-        registration.linear_accuracy,
-    )
-
-
-def _nonlinear_parameters(registration: _RegistrationContract) -> dict[str, object]:
-    return nonlinear_parameters(registration.nonlinear_accuracy)
-
-
 def _valid_geometry(
     actual: ImageGeometry,
     expected: ImageGeometry,
@@ -838,12 +830,11 @@ def _common_parameters(
     snapshot: _ScientificSnapshot,
     round_contract: _RoundContract,
 ) -> dict[str, object]:
-    return {
-        "axis_convention_version": AXIS_CONVENTION_VERSION,
-        "crop": snapshot.registration.crop,
-        "imaging_round": round_contract.round,
-        "pixel_size_xyz": list(snapshot.voxel_spacing_xyz),
-    }
+    return common_parameters(
+        crop=snapshot.registration.crop,
+        imaging_round=round_contract.round,
+        pixel_size_xyz=snapshot.voxel_spacing_xyz,
+    )
 
 
 def _request_basics_valid(
@@ -897,10 +888,11 @@ def _whole_request_valid(
             return False
         expected_parameters = {
             **common,
-            "image_interpolation": "linear",
-            "mask_interpolation": "nearestNeighbor",
-            "moving_geometry": round_contract.registration_source.geometry.to_dict(),
-            "registration_parameters": _linear_parameters(snapshot.registration),
+            **affine_parameters(
+                moving_geometry=round_contract.registration_source.geometry,
+                linear_type=snapshot.registration.linear_type,
+                accuracy=snapshot.registration.linear_accuracy,
+            ),
         }
         return (
             request.stage == "affine"
@@ -928,12 +920,12 @@ def _whole_request_valid(
             return False
         expected_parameters = {
             **common,
-            "image_interpolation": "linear",
-            "mask_interpolation": "nearestNeighbor",
-            "moving_geometry": request.geometry.to_dict(),
-            "registration_mode": "whole-image",
-            "registration_parameters": _nonlinear_parameters(snapshot.registration),
-            "scalar_postprocessing_policy": scalar_policy,
+            **nonlinear_stage_parameters(
+                moving_geometry=request.geometry,
+                registration_mode="whole-image",
+                nonlinear_accuracy=snapshot.registration.nonlinear_accuracy,
+                scalar_postprocessing_policy=scalar_policy,
+            ),
         }
         return (
             request.stage == "nonlinear"
@@ -974,8 +966,15 @@ def _whole_request_valid(
             return False
         expected_static = {
             **common,
-            "format": "uint16-tiff",
-            "scalar_postprocessing_policy": scalar_policy,
+            **{
+                key: value
+                for key, value in registered_image_parameters(
+                    minimum=minimum_value,
+                    maximum=maximum_value,
+                    scalar_postprocessing_policy=scalar_policy,
+                ).items()
+                if key not in {"minimum", "maximum"}
+            },
         }
         actual_static = {
             key: value
@@ -1006,15 +1005,10 @@ def _whole_request_valid(
         crop=False,
     ):
         return False
-    expected_parameters = {
-        "pixel_size_xyz_um": list(snapshot.voxel_spacing_xyz),
-        "interpolation": channel.interpolation,
-        "transform_order": ["warp", "affine"],
-        "whichtoinvert": [False, False],
-        "axis_convention": AXIS_CONVENTION_VERSION,
-        "output_format": OUTPUT_FORMAT_POLICY,
-        "postprocessing": CHANNEL_POSTPROCESSING_POLICY,
-    }
+    expected_parameters = channel_transform_parameters(
+        pixel_size_xyz=snapshot.voxel_spacing_xyz,
+        interpolation=channel.interpolation,
+    )
     return (
         request.stage == "channel-transform-v1"
         and request.method == "warp-affine"

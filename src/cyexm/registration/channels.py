@@ -11,23 +11,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cyexm.errors import CacheValidationError, RegistrationStageError
+from cyexm.registration._request_policy import channel_transform_parameters
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
-from cyexm.spatial import (
-    AXIS_CONVENTION_VERSION,
-    ImageGeometry,
-    PixelSize,
-    geometry_compatible,
-)
+from cyexm.spatial import ImageGeometry, PixelSize, geometry_compatible
 
 if TYPE_CHECKING:
     from cyexm.registration.backend import RegistrationBackend
     from cyexm.runtime import ResolvedNativeThreads
 
 _INTERPOLATIONS = frozenset({"linear", "nearestNeighbor"})
-_OUTPUT_FORMAT_POLICY = "ome-compatible-tiff-uint16-v1"
-_POSTPROCESSING_POLICY = "clip-uint16-no-normalization-v1"
-
 logger = logging.getLogger(__name__)
 
 
@@ -255,15 +248,10 @@ def transform_channel(
             accuracy="not-applicable",
             native_threads=resolved.values,
             upstream=FileIdentity.from_path(warp),
-            parameters={
-                "pixel_size_xyz_um": list(spacing),
-                "interpolation": interpolation_name,
-                "transform_order": ["warp", "affine"],
-                "whichtoinvert": [False, False],
-                "axis_convention": AXIS_CONVENTION_VERSION,
-                "output_format": _OUTPUT_FORMAT_POLICY,
-                "postprocessing": _POSTPROCESSING_POLICY,
-            },
+            parameters=channel_transform_parameters(
+                pixel_size_xyz=spacing,
+                interpolation=interpolation_name,
+            ),
         )
         if request.inputs != input_identities:
             _verify_input_identities(input_paths, input_identities)

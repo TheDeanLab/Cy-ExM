@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from numbers import Integral, Real
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from cyexm.errors import (
     CacheValidationError,
@@ -19,6 +19,18 @@ from cyexm.errors import (
 from cyexm.io.images import Bounds3D, robust_bounding_box
 from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration._native_paths import discard_path
+from cyexm.registration._request_policy import (
+    CHUNK_SCALAR_POLICY,
+    WHOLE_SCALAR_POLICY,
+    affine_parameters,
+    common_parameters,
+    crop_parameters,
+    fixed_reference_parameters,
+    linear_parameters,
+    nonlinear_parameters,
+    nonlinear_stage_parameters,
+    registered_image_parameters,
+)
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import AntsRegistrationBackend, RegistrationBackend
 from cyexm.runtime import (
@@ -26,32 +38,13 @@ from cyexm.runtime import (
     ResolvedNativeThreads,
     configure_native_threads,
 )
-from cyexm.spatial import (
-    AXIS_CONVENTION_VERSION,
-    PixelSize,
-    geometry_compatible,
-)
+from cyexm.spatial import PixelSize, geometry_compatible
 
 logger = logging.getLogger(__name__)
 
 _LINEAR_TYPES = frozenset({"Translation", "Rigid", "Similarity", "Affine", "TRSAA"})
 _NONLINEAR_TYPES = frozenset({"Elastic", "SyNOnly", "SyN"})
 _ACCURACIES = frozenset({"high", "medium", "low", "dry run"})
-_LINEAR_ITERATIONS = {
-    "high": (1000, 500, 250, 100),
-    "medium": (500, 250, 100, 50),
-    "low": (100, 50, 25, 10),
-}
-_NONLINEAR_ITERATIONS = {
-    "high": (100, 70, 50),
-    "medium": (50, 35, 25),
-    "low": (5, 5, 5),
-    "dry run": (1, 1, 1),
-}
-_WHOLE_IMAGE_SCALAR_POSTPROCESSING_POLICY = "whole-global-histogram-match-v1"
-_SERIAL_CHUNK_SCALAR_POSTPROCESSING_POLICY = (
-    "serial-chunk-local-histogram-match-core-stitch-v1"
-)
 
 
 def _validated_pixel_size(value: object) -> PixelSize:
@@ -166,8 +159,8 @@ class ImageRegistration:
         self._backend = _backend
         self._artifact_store = _artifact_store
         self._log = logger
-        self._nonlinear_mode = "whole-image"
-        self._scalar_postprocessing_policy = _WHOLE_IMAGE_SCALAR_POSTPROCESSING_POLICY
+        self._nonlinear_mode: Literal["whole-image", "serial-chunked"] = "whole-image"
+        self._scalar_postprocessing_policy = WHOLE_SCALAR_POLICY
         self._nonlinear_request_evidence: dict[str, object] = {}
         self._prepare_nonlinear_before_reuse = False
         self._source_paths: tuple[Path, Path] | None = None
@@ -379,12 +372,11 @@ class ImageRegistration:
         parameters: dict[str, object],
     ) -> StageRequest:
         self._verify_source_identities()
-        evidence: dict[str, object] = {
-            "axis_convention_version": AXIS_CONVENTION_VERSION,
-            "crop": self.crop,
-            "imaging_round": self.imaging_round,
-            "pixel_size_xyz": self.pixel_size,
-        }
+        evidence = common_parameters(
+            crop=self.crop,
+            imaging_round=self.imaging_round,
+            pixel_size_xyz=self.pixel_size,
+        )
         evidence.update(parameters)
         return StageRequest.for_identities(
             stage=stage,
@@ -470,7 +462,7 @@ class ImageRegistration:
         backend: RegistrationBackend,
         image: object,
         path: Path,
-        role: str,
+        role: Literal["fixed", "moving"],
         resolved: ResolvedNativeThreads,
     ) -> object:
         try:
@@ -483,12 +475,7 @@ class ImageRegistration:
                 method="robust-bounding-box",
                 accuracy="legacy-robust",
                 upstream=None,
-                parameters={
-                    "down_sampling": 4,
-                    "image_role": role,
-                    "lower_pct": 0.1,
-                    "upper_pct": 99.9,
-                },
+                parameters=crop_parameters(role),
             )
         except RegistrationStageError:
             raise
@@ -546,38 +533,10 @@ class ImageRegistration:
         return float(array.min()), float(array.max())
 
     def _linear_parameters(self) -> dict[str, object]:
-        parameters: dict[str, object] = {
-            "aff_metric": "mattes",
-            "aff_random_sampling_rate": 0.5,
-            "aff_sampling": 32,
-            "mask_all_stages": True,
-            "verbose": True,
-        }
-        if self.linear_type == "TRSAA" and self.linear_accuracy != "dry run":
-            parameters["reg_iterations"] = _LINEAR_ITERATIONS[self.linear_accuracy]
-        if self.linear_accuracy == "dry run":
-            parameters.update(
-                effective_registration_type="Rigid",
-                aff_iterations=(1,),
-                aff_smoothing_sigmas=(0,),
-                aff_shrink_factors=(8,),
-                aff_random_sampling_rate=0.1,
-            )
-        return parameters
+        return linear_parameters(self.linear_type, self.linear_accuracy)
 
     def _nonlinear_parameters(self) -> dict[str, object]:
-        return {
-            "aff_random_sampling_rate": 1.0,
-            "flow_sigma": 3.0,
-            "initial_transform": "Identity",
-            "mask_all_stages": True,
-            "reg_iterations": _NONLINEAR_ITERATIONS[self.nonlinear_accuracy],
-            "singleprecision": False,
-            "syn_metric": "mattes",
-            "syn_sampling": 32,
-            "total_sigma": 0.5,
-            "verbose": True,
-        }
+        return nonlinear_parameters(self.nonlinear_accuracy)
 
     def _commit_fixed_reference(
         self,
@@ -597,7 +556,7 @@ class ImageRegistration:
                 method="uint16-tiff",
                 accuracy="exact",
                 upstream=None,
-                parameters={"minimum": minimum, "maximum": maximum},
+                parameters=fixed_reference_parameters(minimum, maximum),
             )
         except RegistrationStageError:
             raise
@@ -731,12 +690,11 @@ class ImageRegistration:
                 method=self.linear_type,
                 accuracy=self.linear_accuracy,
                 upstream=None,
-                parameters={
-                    "image_interpolation": "linear",
-                    "mask_interpolation": "nearestNeighbor",
-                    "moving_geometry": backend.geometry(moving).to_dict(),
-                    "registration_parameters": self._linear_parameters(),
-                },
+                parameters=affine_parameters(
+                    moving_geometry=backend.geometry(moving),
+                    linear_type=self.linear_type,
+                    accuracy=self.linear_accuracy,
+                ),
             )
         except RegistrationStageError:
             raise
@@ -857,17 +815,13 @@ class ImageRegistration:
 
             try:
                 affine_identity = FileIdentity.from_path(paths.affine)
-                parameters: dict[str, object] = {
-                    "image_interpolation": "linear",
-                    "mask_interpolation": "nearestNeighbor",
-                    "moving_geometry": backend.geometry(moving_linear).to_dict(),
-                    "registration_mode": self._nonlinear_mode,
-                    "registration_parameters": self._nonlinear_parameters(),
-                    "scalar_postprocessing_policy": (
-                        self._scalar_postprocessing_policy
-                    ),
-                }
-                parameters.update(self._nonlinear_request_evidence)
+                parameters = nonlinear_stage_parameters(
+                    moving_geometry=backend.geometry(moving_linear),
+                    registration_mode=self._nonlinear_mode,
+                    nonlinear_accuracy=self.nonlinear_accuracy,
+                    scalar_postprocessing_policy=self._scalar_postprocessing_policy,
+                    evidence=self._nonlinear_request_evidence,
+                )
                 request = self._request(
                     backend,
                     fixed,
@@ -977,10 +931,7 @@ class ImageRegistration:
         prepared_scalar: object | None,
     ) -> tuple[object, object]:
         """Apply the mode's scalar policy and rebuild the committed-warp mask."""
-        if (
-            self._scalar_postprocessing_policy
-            == _WHOLE_IMAGE_SCALAR_POSTPROCESSING_POLICY
-        ):
+        if self._scalar_postprocessing_policy == WHOLE_SCALAR_POLICY:
             raw_scalar = backend.apply_warp(
                 fixed=fixed,
                 moving=moving_linear,
@@ -991,10 +942,7 @@ class ImageRegistration:
                 source=raw_scalar,
                 reference=moving_linear,
             )
-        elif (
-            self._scalar_postprocessing_policy
-            == _SERIAL_CHUNK_SCALAR_POSTPROCESSING_POLICY
-        ):
+        elif self._scalar_postprocessing_policy == CHUNK_SCALAR_POLICY:
             if prepared_scalar is None:
                 raise RuntimeError(
                     "serial chunk scalar policy requires a prepared local core stitch"
@@ -1051,14 +999,11 @@ class ImageRegistration:
                 method=self.nonlinear_type,
                 accuracy=self.nonlinear_accuracy,
                 upstream=FileIdentity.from_path(warp_path),
-                parameters={
-                    "format": "uint16-tiff",
-                    "minimum": minimum,
-                    "maximum": maximum,
-                    "scalar_postprocessing_policy": (
-                        self._scalar_postprocessing_policy
-                    ),
-                },
+                parameters=registered_image_parameters(
+                    minimum=minimum,
+                    maximum=maximum,
+                    scalar_postprocessing_policy=self._scalar_postprocessing_policy,
+                ),
             )
         except RegistrationStageError:
             raise

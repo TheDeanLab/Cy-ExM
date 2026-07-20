@@ -273,9 +273,11 @@ def test_transform_channel_rejects_changed_postprocessing_policy(
         warp=sources[3],
         output=output,
     )
+    from cyexm.registration import _request_policy
+
     monkeypatch.setattr(
-        channels_module,
-        "_POSTPROCESSING_POLICY",
+        _request_policy,
+        "CHANNEL_POSTPROCESSING_POLICY",
         "clip-uint16-no-normalization-v2",
     )
 

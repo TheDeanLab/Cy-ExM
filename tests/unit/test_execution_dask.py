@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -17,6 +19,7 @@ from cyexm.config.models import (
     RegistrationStageSpec,
 )
 from cyexm.errors import ExecutorStartupError, RoundExecutionError
+from cyexm.execution import dask as dask_module
 from cyexm.execution.dask import LocalDaskExecutor
 from cyexm.workflow.models import (
     ChannelTask,
@@ -26,6 +29,29 @@ from cyexm.workflow.models import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_real_module_loader_gets_timeout_parser_from_dask_utils(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    distributed = ModuleType("distributed")
+    distributed.Client = object  # type: ignore[attr-defined]
+    distributed.LocalCluster = object  # type: ignore[attr-defined]
+    distributed.as_completed = object()  # type: ignore[attr-defined]
+    distributed_utils = ModuleType("distributed.utils")
+    dask = ModuleType("dask")
+    dask.__path__ = []  # type: ignore[attr-defined]
+    dask_utils = ModuleType("dask.utils")
+    timeout_parser = object()
+    dask_utils.parse_timedelta = timeout_parser  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "distributed", distributed)
+    monkeypatch.setitem(sys.modules, "distributed.utils", distributed_utils)
+    monkeypatch.setitem(sys.modules, "dask", dask)
+    monkeypatch.setitem(sys.modules, "dask.utils", dask_utils)
+
+    modules = dask_module._distributed_modules()
+
+    assert modules.parse_timedelta is timeout_parser
 
 
 def _profile(

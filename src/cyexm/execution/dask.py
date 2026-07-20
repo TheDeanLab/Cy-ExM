@@ -44,8 +44,8 @@ class _Submission:
 
 def _distributed_modules() -> _DistributedModules:
     """Load scheduler dependencies only when a local executor is opened."""
+    from dask.utils import parse_timedelta
     from distributed import Client, LocalCluster, as_completed
-    from distributed.utils import parse_timedelta
 
     return _DistributedModules(Client, LocalCluster, as_completed, parse_timedelta)
 

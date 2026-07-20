@@ -10,8 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
+from cyexm.config._validation import finite_positive_float
+from cyexm.config.dataset import _validate_dataset_manifest
+from cyexm.config.execution import _validate_execution_profile
 from cyexm.config.models import ExecutionProfile, RegistrationSpec
 from cyexm.errors import (
+    ConfigurationValidationError,
     ExecutorStartupError,
     RoundExecutionError,
     WorkflowExecutionError,
@@ -227,8 +231,12 @@ def _validate_workflow_plan(
         )
 
     execution = plan.execution
-    if type(execution.schema_version) is not int or execution.schema_version != 1:
-        raise WorkflowPlanError("WorkflowPlan execution schema_version must be 1")
+    try:
+        _validate_execution_profile(execution)
+    except ConfigurationValidationError as error:
+        raise WorkflowPlanError(
+            f"WorkflowPlan execution profile is invalid: {error}"
+        ) from error
     dataset_root = _canonical_path(
         execution.paths.dataset_root,
         "WorkflowPlan.execution.paths.dataset_root",
@@ -247,45 +255,9 @@ def _validate_workflow_plan(
             "WorkflowPlan.execution.paths.output_root must resolve to a "
             f"directory; got {output_root}"
         )
-    if dataset_root.is_relative_to(output_root) or output_root.is_relative_to(
-        dataset_root
-    ):
-        raise WorkflowPlanError(
-            "WorkflowPlan dataset and output roots must be disjoint"
-        )
     if layout.root != output_root / plan.dataset_id:
         raise WorkflowPlanError(
             "WorkflowPlan output layout does not match execution.paths.output_root"
-        )
-    worker_directory = execution.paths.worker_local_directory
-    if worker_directory is not None:
-        _canonical_path(
-            worker_directory,
-            "WorkflowPlan.execution.paths.worker_local_directory",
-        )
-    if execution.executor == "sequential":
-        if execution.local_dask is not None or execution.slurm is not None:
-            raise WorkflowPlanError(
-                "Sequential execution must not contain Dask or SLURM settings"
-            )
-    elif execution.executor == "local_dask":
-        if execution.local_dask is None or execution.slurm is not None:
-            raise WorkflowPlanError(
-                "local_dask execution requires only local_dask settings"
-            )
-    elif execution.executor == "slurm":
-        if execution.slurm is None or execution.local_dask is not None:
-            raise WorkflowPlanError("slurm execution requires only slurm settings")
-    else:
-        raise WorkflowPlanError(f"Unknown WorkflowPlan executor {execution.executor!r}")
-    if (
-        type(execution.native_threads.itk) is not int
-        or execution.native_threads.itk < 1
-        or type(execution.native_threads.blas) is not int
-        or execution.native_threads.blas < 1
-    ):
-        raise WorkflowPlanError(
-            "WorkflowPlan native thread counts must be positive integers"
         )
 
     for source in snapshot.sources:
@@ -306,6 +278,10 @@ def _validate_workflow_plan(
             )
 
     manifest = plan.manifest
+    try:
+        _validate_dataset_manifest(manifest)
+    except ConfigurationValidationError as error:
+        raise WorkflowPlanError(f"WorkflowPlan manifest is invalid: {error}") from error
     if (
         type(manifest.schema_version) is not int
         or manifest.schema_version != plan.schema_version
@@ -371,6 +347,24 @@ def _validate_workflow_plan(
             raise WorkflowPlanError(
                 f"WorkflowPlan task {task.round} log_path does not match its "
                 "output layout"
+            )
+        task_spacing = task.voxel_spacing_xyz
+        try:
+            valid_task_spacing = type(task_spacing) is tuple and len(task_spacing) == 3
+            if valid_task_spacing:
+                tuple(
+                    finite_positive_float(
+                        value,
+                        f"WorkflowPlan task {task.round} voxel_spacing_xyz[{index}]",
+                    )
+                    for index, value in enumerate(task_spacing)
+                )
+        except ConfigurationValidationError:
+            valid_task_spacing = False
+        if not valid_task_spacing:
+            raise WorkflowPlanError(
+                f"WorkflowPlan task {task.round} voxel_spacing_xyz must contain "
+                "three positive finite numbers"
             )
         if (
             task.dataset_id != plan.dataset_id
@@ -599,6 +593,24 @@ def _planned_task_artifacts(task: RoundTask) -> tuple[str, ...]:
     )
 
 
+def _parse_utc_timestamp(value: object, location: str) -> datetime:
+    if not isinstance(value, str) or "T" not in value or not value.endswith("Z"):
+        raise RoundExecutionError(
+            f"{location} must be an ISO 8601 UTC timestamp ending in Z"
+        )
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise RoundExecutionError(
+            f"{location} must be an ISO 8601 UTC timestamp ending in Z"
+        ) from error
+    if parsed.utcoffset() != UTC.utcoffset(None):
+        raise RoundExecutionError(
+            f"{location} must be an ISO 8601 UTC timestamp ending in Z"
+        )
+    return parsed
+
+
 def _validate_round_result(task: RoundTask, result: RoundResult) -> None:
     location = f"Executor result for round {task.round}"
     if result.dataset_id != task.dataset_id:
@@ -643,16 +655,16 @@ def _validate_round_result(task: RoundTask, result: RoundResult) -> None:
         and result.native_threads != expanded_threads
     ):
         raise RoundExecutionError(f"{location} native_threads do not match the task")
+    started_at = _parse_utc_timestamp(result.started_at, f"{location} started_at")
+    ended_at = _parse_utc_timestamp(result.ended_at, f"{location} ended_at")
+    if ended_at < started_at:
+        raise RoundExecutionError(f"{location} ended_at must not precede started_at")
     try:
         finite_duration = math.isfinite(float(result.duration_seconds))
     except (OverflowError, TypeError, ValueError):
         finite_duration = False
     if (
-        not isinstance(result.started_at, str)
-        or not result.started_at
-        or not isinstance(result.ended_at, str)
-        or not result.ended_at
-        or isinstance(result.duration_seconds, bool)
+        isinstance(result.duration_seconds, bool)
         or not isinstance(result.duration_seconds, int | float)
         or not finite_duration
         or result.duration_seconds < 0

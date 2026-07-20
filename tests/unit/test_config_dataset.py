@@ -283,6 +283,14 @@ def test_load_dataset_manifest_rejects_duplicate_moving_rounds(tmp_path: Path) -
         _load_data(tmp_path, data)
 
 
+def test_load_dataset_manifest_rejects_empty_moving_rounds(tmp_path: Path) -> None:
+    data = _valid_data()
+    data["rounds"] = []
+
+    with pytest.raises(ConfigurationValidationError, match="must not be empty"):
+        _load_data(tmp_path, data)
+
+
 def test_load_dataset_manifest_rejects_reference_round_reuse(tmp_path: Path) -> None:
     data = _valid_data()
     _set_at(data, ("rounds", 0, "round"), 1)

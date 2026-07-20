@@ -13,11 +13,13 @@ from cyexm.config.models import (
     DatasetManifest,
     ExecutionPaths,
     ExecutionProfile,
+    LocalDaskSpec,
     NativeThreadSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
     RoundSpec,
+    SlurmSpec,
 )
 from cyexm.errors import RoundExecutionError, WorkflowExecutionError, WorkflowPlanError
 from cyexm.execution.base import WorkflowExecutor
@@ -198,6 +200,163 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         scientific_json=scientific_json,
         scientific_fingerprint=sha256_fingerprint(scientific_json),
     )
+
+
+def _local_execution(plan: WorkflowPlan, tmp_path: Path) -> ExecutionProfile:
+    return replace(
+        plan.execution,
+        executor="local_dask",
+        paths=replace(
+            plan.execution.paths,
+            worker_local_directory=tmp_path / "scratch",
+        ),
+        local_dask=LocalDaskSpec(
+            workers=2,
+            threads_per_worker=1,
+            processes=True,
+            memory_limit="2GB",
+            startup_timeout="30s",
+            task_retries=0,
+        ),
+    )
+
+
+def _slurm_execution(plan: WorkflowPlan, tmp_path: Path) -> ExecutionProfile:
+    return replace(
+        plan.execution,
+        executor="slurm",
+        paths=replace(
+            plan.execution.paths,
+            worker_local_directory=tmp_path / "scratch",
+        ),
+        slurm=SlurmSpec(
+            queue="512GB",
+            workers=2,
+            cores_per_worker=72,
+            processes_per_worker=1,
+            memory="500GB",
+            walltime="72:00:00",
+            interface="ib0",
+            scheduler_interface="ib0",
+            startup_timeout="15m",
+            task_retries=0,
+            job_name="cyexm-registration",
+            job_extra_directives=(),
+        ),
+    )
+
+
+def _invalid_execution(
+    plan: WorkflowPlan,
+    tmp_path: Path,
+    case: str,
+) -> ExecutionProfile:
+    if case == "schema":
+        return replace(plan.execution, schema_version=True)  # type: ignore[arg-type]
+    if case == "executor":
+        return replace(plan.execution, executor="threads")  # type: ignore[arg-type]
+    if case == "source_relative":
+        return replace(plan.execution, source_path=Path("execution.yaml"))
+    if case == "source_noncanonical":
+        return replace(
+            plan.execution,
+            source_path=tmp_path / "profiles" / ".." / "execution.yaml",
+        )
+    if case == "path_overlap":
+        return replace(
+            plan.execution,
+            paths=replace(
+                plan.execution.paths,
+                output_root=plan.execution.paths.dataset_root / "output",
+            ),
+        )
+    if case == "native_itk":
+        return replace(
+            plan.execution,
+            native_threads=NativeThreadSpec(itk=True, blas=1),  # type: ignore[arg-type]
+        )
+    if case == "native_blas":
+        return replace(
+            plan.execution,
+            native_threads=NativeThreadSpec(itk=1, blas=0),
+        )
+    if case == "worker_missing":
+        profile = _local_execution(plan, tmp_path)
+        return replace(
+            profile,
+            paths=replace(profile.paths, worker_local_directory=None),
+        )
+    if case == "scratch_archive":
+        profile = _local_execution(plan, tmp_path)
+        return replace(
+            profile,
+            paths=replace(
+                profile.paths,
+                worker_local_directory=Path("/archive/cyexm/scratch"),
+            ),
+        )
+    if case.startswith("local_"):
+        profile = _local_execution(plan, tmp_path)
+        assert profile.local_dask is not None
+        field, value = {
+            "local_workers": ("workers", True),
+            "local_threads": ("threads_per_worker", 0),
+            "local_processes": ("processes", 1),
+            "local_memory": ("memory_limit", ""),
+            "local_timeout": ("startup_timeout", "bad\ntimeout"),
+            "local_retries": ("task_retries", True),
+            "local_negative_retries": ("task_retries", -1),
+        }[case]
+        return replace(
+            profile,
+            local_dask=replace(profile.local_dask, **{field: value}),
+        )
+    profile = _slurm_execution(plan, tmp_path)
+    assert profile.slurm is not None
+    if case == "section_exclusivity":
+        return replace(
+            profile,
+            local_dask=_local_execution(plan, tmp_path).local_dask,
+        )
+    if case == "slurm_directive":
+        return replace(
+            profile,
+            slurm=replace(
+                profile.slurm,
+                job_extra_directives=("--partition=debug",),
+            ),
+        )
+    if case == "slurm_directives_list":
+        return replace(
+            profile,
+            slurm=replace(
+                profile.slurm,
+                job_extra_directives=[],  # type: ignore[arg-type]
+            ),
+        )
+    if case == "slurm_directive_newline":
+        return replace(
+            profile,
+            slurm=replace(
+                profile.slurm,
+                job_extra_directives=("--account=lab\n--exclusive",),
+            ),
+        )
+    field, value = {
+        "slurm_workers": ("workers", True),
+        "slurm_cores": ("cores_per_worker", 0),
+        "slurm_processes": ("processes_per_worker", 2),
+        "slurm_queue": ("queue", ""),
+        "slurm_memory": ("memory", "bad\nvalue"),
+        "slurm_walltime": ("walltime", ""),
+        "slurm_interface": ("interface", ""),
+        "slurm_scheduler": ("scheduler_interface", ""),
+        "slurm_timeout": ("startup_timeout", ""),
+        "slurm_retries": ("task_retries", True),
+        "slurm_negative_retries": ("task_retries", -1),
+        "slurm_job_name": ("job_name", ""),
+    }[case]
+    return replace(profile, slurm=replace(profile.slurm, **{field: value}))
 
 
 def _result(task: RoundTask, *, failed: bool = False) -> RoundResult:
@@ -573,6 +732,112 @@ def test_run_workflow_rejects_expected_artifact_mismatch_before_mutation(
     assert fake.calls == []
 
 
+def test_run_workflow_rejects_boolean_manifest_spacing_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    forged_manifest = replace(
+        plan.manifest,
+        voxel_spacing_um=(True, 1.0, 1.0),  # type: ignore[arg-type]
+    )
+    forged = replace(plan, manifest=forged_manifest)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="voxel_spacing"):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_boolean_task_spacing_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    forged_task = replace(
+        plan.tasks[0],
+        voxel_spacing_xyz=(True, 1.0, 1.0),  # type: ignore[arg-type]
+    )
+    forged = replace(plan, tasks=(forged_task, *plan.tasks[1:]))
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="voxel_spacing"):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_wraps_overflowing_task_spacing_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    forged_task = replace(
+        plan.tasks[0],
+        voxel_spacing_xyz=(10**1000, 1.0, 1.0),
+    )
+    forged = replace(plan, tasks=(forged_task, *plan.tasks[1:]))
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="voxel_spacing"):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "schema",
+        "executor",
+        "source_relative",
+        "source_noncanonical",
+        "path_overlap",
+        "native_itk",
+        "native_blas",
+        "worker_missing",
+        "scratch_archive",
+        "local_workers",
+        "local_threads",
+        "local_processes",
+        "local_memory",
+        "local_timeout",
+        "local_retries",
+        "local_negative_retries",
+        "section_exclusivity",
+        "slurm_directive",
+        "slurm_directives_list",
+        "slurm_directive_newline",
+        "slurm_workers",
+        "slurm_cores",
+        "slurm_processes",
+        "slurm_queue",
+        "slurm_memory",
+        "slurm_walltime",
+        "slurm_interface",
+        "slurm_scheduler",
+        "slurm_timeout",
+        "slurm_retries",
+        "slurm_negative_retries",
+        "slurm_job_name",
+    ],
+)
+def test_run_workflow_revalidates_direct_execution_profile_before_mutation(
+    case: str,
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    forged = replace(plan, execution=_invalid_execution(plan, tmp_path, case))
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="execution profile is invalid"):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
 def test_run_workflow_rejects_incompatible_snapshot_without_changing_it(
     tmp_path: Path,
 ) -> None:
@@ -665,6 +930,24 @@ def test_run_workflow_writes_failed_summary_then_raises_sorted_rounds(
         (
             lambda result, _task: replace(result, status="failed", failure=None),
             "failure",
+        ),
+        (
+            lambda result, _task: replace(result, started_at="not-a-timestamp"),
+            "started_at",
+        ),
+        (
+            lambda result, _task: replace(
+                result,
+                ended_at="2026-07-20T10:00:01+00:00",
+            ),
+            "ended_at",
+        ),
+        (
+            lambda result, _task: replace(
+                result,
+                started_at="2026-07-20T10:00:02Z",
+            ),
+            "ended_at must not precede started_at",
         ),
     ],
 )

@@ -1,7 +1,7 @@
 import math
 import re
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 from cyexm.config._validation import (
@@ -227,6 +227,8 @@ def _rounds(value: object, reference_round: int) -> tuple[RoundSpec, ...]:
     rounds = tuple(
         _round(item, index) for index, item in enumerate(_list(value, "rounds"))
     )
+    if not rounds:
+        raise ConfigurationValidationError("rounds must not be empty")
     round_numbers = tuple(item.round for item in rounds)
     if len(set(round_numbers)) != len(round_numbers):
         raise ConfigurationValidationError(
@@ -240,6 +242,112 @@ def _rounds(value: object, reference_round: int) -> tuple[RoundSpec, ...]:
     return rounds
 
 
+def _model_relative_path(value: object) -> object:
+    return value.as_posix() if isinstance(value, PurePosixPath) else value
+
+
+def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
+    """Revalidate a directly constructed manifest against the YAML contract."""
+    if not isinstance(manifest, DatasetManifest):
+        raise ConfigurationValidationError(
+            f"manifest must be a DatasetManifest; got {manifest!r}"
+        )
+    if type(manifest.rounds) is not tuple:
+        raise ConfigurationValidationError("rounds must be an immutable tuple")
+    if (
+        not isinstance(manifest.reference, ReferenceSpec)
+        or not isinstance(manifest.registration, RegistrationSpec)
+        or not isinstance(manifest.registration.linear, RegistrationStageSpec)
+        or not isinstance(manifest.registration.nonlinear, RegistrationStageSpec)
+    ):
+        raise ConfigurationValidationError(
+            "manifest reference and registration values must use their model types"
+        )
+    spacing = manifest.voxel_spacing_um
+    if type(spacing) is not tuple or len(spacing) != 3:
+        raise ConfigurationValidationError(
+            f"voxel_spacing_um must contain exactly three values; got {spacing!r}"
+        )
+    parsed_reference = _reference(
+        {
+            "round": manifest.reference.round,
+            "channel": _model_relative_path(manifest.reference.channel),
+        }
+    )
+    parsed_registration = _registration(
+        {
+            "crop": manifest.registration.crop,
+            "linear": {
+                "type": manifest.registration.linear.type,
+                "accuracy": manifest.registration.linear.accuracy,
+            },
+            "nonlinear": {
+                "type": manifest.registration.nonlinear.type,
+                "accuracy": manifest.registration.nonlinear.accuracy,
+            },
+        }
+    )
+    round_mappings: list[dict[str, object]] = []
+    for index, round_spec in enumerate(manifest.rounds):
+        if (
+            not isinstance(round_spec, RoundSpec)
+            or type(round_spec.channels) is not tuple
+        ):
+            raise ConfigurationValidationError(
+                f"rounds[{index}] must be a RoundSpec with an immutable channels tuple"
+            )
+        channels: list[dict[str, object]] = []
+        for channel_index, channel in enumerate(round_spec.channels):
+            if not isinstance(channel, ChannelSpec):
+                raise ConfigurationValidationError(
+                    f"rounds[{index}].channels[{channel_index}] must be a ChannelSpec"
+                )
+            channels.append(
+                {
+                    "file": _model_relative_path(channel.file),
+                    "interpolation": channel.interpolation,
+                }
+            )
+        round_mapping: dict[str, object] = {
+            "round": round_spec.round,
+            "strategy": round_spec.strategy,
+            "registration_channel": _model_relative_path(
+                round_spec.registration_channel
+            ),
+            "channels": channels,
+        }
+        if round_spec.strategy == "serial_chunked":
+            chunk_size = round_spec.chunk_size_zyx
+            if type(chunk_size) is not tuple:
+                raise ConfigurationValidationError(
+                    f"rounds[{index}].chunk_size_zyx must be an immutable tuple"
+                )
+            round_mapping.update(
+                chunk_size_zyx=list(chunk_size),
+                overlap_fraction=round_spec.overlap_fraction,
+            )
+        round_mappings.append(round_mapping)
+    parsed = DatasetManifest(
+        schema_version=built_in_int(manifest.schema_version, "schema_version"),
+        dataset_id=_dataset_id(manifest.dataset_id),
+        voxel_spacing_um=_voxel_spacing(
+            {"x": spacing[0], "y": spacing[1], "z": spacing[2]}
+        ),
+        reference=parsed_reference,
+        registration=parsed_registration,
+        rounds=_rounds(round_mappings, parsed_reference.round),
+    )
+    if parsed.schema_version != 1:
+        raise ConfigurationValidationError(
+            "schema_version must be the built-in integer 1; "
+            f"got {parsed.schema_version!r}"
+        )
+    if parsed != manifest:
+        raise ConfigurationValidationError(
+            "directly constructed manifest does not match its normalized contract"
+        )
+
+
 def load_dataset_manifest(path: str | Path) -> DatasetManifest:
     mapping = require_exact_keys(load_yaml_mapping(path), _DATASET_KEYS, "dataset")
     schema_version = built_in_int(mapping["schema_version"], "schema_version")
@@ -248,7 +356,7 @@ def load_dataset_manifest(path: str | Path) -> DatasetManifest:
             f"schema_version must be the built-in integer 1; got {schema_version!r}"
         )
     reference = _reference(mapping["reference"])
-    return DatasetManifest(
+    manifest = DatasetManifest(
         schema_version=schema_version,
         dataset_id=_dataset_id(mapping["dataset_id"]),
         voxel_spacing_um=_voxel_spacing(mapping["voxel_spacing_um"]),
@@ -256,3 +364,5 @@ def load_dataset_manifest(path: str | Path) -> DatasetManifest:
         registration=_registration(mapping["registration"]),
         rounds=_rounds(mapping["rounds"], reference.round),
     )
+    _validate_dataset_manifest(manifest)
+    return manifest

@@ -16,7 +16,7 @@ from cyexm.registration.artifacts import (
     StageRequest,
 )
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.spatial import ImageGeometry
+from cyexm.spatial import TIFF_GEOMETRY_ATOL, ImageGeometry
 from cyexm.workflow import inspect_workflow_status
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import canonical_json, sha256_fingerprint
@@ -304,6 +304,116 @@ def test_status_rejects_boolean_scientific_schema_version(tmp_path: Path) -> Non
     plan_path.write_text(canonical_json(scientific), encoding="utf-8")
 
     with pytest.raises(WorkflowPlanError, match="schema_version"):
+        inspect_workflow_status(output_root, "dataset-1")
+
+
+def test_status_accepts_embedded_spacing_within_planner_tolerance(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    embedded_spacing = [1.0 + TIFF_GEOMETRY_ATOL / 2.0, 1.0, 1.0]
+    for source in scientific["sources"]:  # type: ignore[union-attr]
+        source["geometry"] = {  # type: ignore[index]
+            "shape": source["shape_zyx"],  # type: ignore[index]
+            "origin": [0.0, 0.0, 0.0],
+            "spacing": embedded_spacing,
+            "direction": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        }
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    status = inspect_workflow_status(output_root, "dataset-1")
+
+    assert status.rounds[0].status == "pending"
+
+
+def test_status_rejects_duplicate_channel_source_files(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    channel = scientific["rounds"][0]["channels"][0]  # type: ignore[index]
+    scientific["rounds"][0]["channels"].append(channel.copy())  # type: ignore[index]
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match=r"channel.*files.*unique"):
+        inspect_workflow_status(output_root, "dataset-1")
+
+
+def test_status_rejects_duplicate_channel_output_paths(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    fixed_path = scientific["reference"]["channel"]  # type: ignore[index]
+    scientific["rounds"][0]["channels"].append(  # type: ignore[index]
+        {
+            "file": fixed_path,
+            "manifest_file": "nested/round_2_488.tif",
+            "output": "rounds/round-002/channels/round_2_488.tif",
+            "interpolation": "linear",
+        }
+    )
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match=r"channel.*outputs.*unique"):
+        inspect_workflow_status(output_root, "dataset-1")
+
+
+def test_status_rejects_registration_of_the_reference_round(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root, rounds=(1,))
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match="reference round"):
+        inspect_workflow_status(output_root, "dataset-1")
+
+
+def test_status_rejects_unused_declared_sources(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    unused = output_root.parent / "dataset" / "unused.tif"
+    unused.write_bytes(b"unused")
+    stat = unused.stat()
+    scientific["sources"].append(  # type: ignore[union-attr]
+        {
+            "path": str(unused.resolve()),
+            "shape_zyx": [4, 8, 8],
+            "dtype": "uint16",
+            "axes": "ZYX",
+            "geometry": None,
+            "st_size": stat.st_size,
+            "st_mtime_ns": stat.st_mtime_ns,
+        }
+    )
+    scientific["sources"].sort(key=lambda item: item["path"])  # type: ignore[union-attr]
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match="unused"):
+        inspect_workflow_status(output_root, "dataset-1")
+
+
+def test_status_rejects_source_shape_incompatible_with_reference(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    moving_path = str((output_root.parent / "dataset" / "round_2_488.tif").resolve())
+    moving = next(  # type: ignore[union-attr]
+        source for source in scientific["sources"] if source["path"] == moving_path
+    )
+    moving["shape_zyx"] = [5, 8, 8]
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match=r"shape.*reference"):
         inspect_workflow_status(output_root, "dataset-1")
 
 

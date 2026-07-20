@@ -155,7 +155,8 @@ def _paths(
         dataset_root
     ):
         raise ConfigurationValidationError(
-            "paths.dataset_root and output_root must be disjoint after resolution; "
+            "dataset and output roots must be disjoint after resolution; "
+            "dataset_root and output_root must be disjoint; "
             f"got {dataset_root} and {output_root}"
         )
 
@@ -349,6 +350,123 @@ def _slurm(value: object) -> SlurmSpec:
     )
 
 
+def _validate_execution_profile(profile: ExecutionProfile) -> None:
+    """Revalidate an immutable profile against the complete YAML contract."""
+    if not isinstance(profile, ExecutionProfile):
+        raise ConfigurationValidationError(
+            f"execution profile must be an ExecutionProfile; got {profile!r}"
+        )
+    if type(profile.schema_version) is not int or profile.schema_version != 1:
+        raise ConfigurationValidationError(
+            "schema_version must be the built-in integer 1; "
+            f"got {profile.schema_version!r}"
+        )
+    executor = _choice(profile.executor, _EXECUTORS, "executor")
+    if (
+        not isinstance(profile.source_path, Path)
+        or not profile.source_path.is_absolute()
+    ):
+        raise ConfigurationValidationError(
+            f"source_path must be an absolute pathlib.Path; got {profile.source_path!r}"
+        )
+    source_path = profile.source_path.resolve(strict=False)
+    if source_path != profile.source_path:
+        raise ConfigurationValidationError(
+            f"source_path must be canonical; got {profile.source_path}, "
+            f"resolved {source_path}"
+        )
+    if not isinstance(profile.paths, ExecutionPaths):
+        raise ConfigurationValidationError(
+            f"paths must be an ExecutionPaths; got {profile.paths!r}"
+        )
+    paths = _paths(
+        {
+            "dataset_root": str(profile.paths.dataset_root),
+            "output_root": str(profile.paths.output_root),
+            "worker_local_directory": (
+                None
+                if profile.paths.worker_local_directory is None
+                else str(profile.paths.worker_local_directory)
+            ),
+        },
+        source_path.parent,
+        require_worker_scratch=executor != "sequential",
+    )
+    if paths != profile.paths:
+        raise ConfigurationValidationError(
+            "paths must contain canonical pathlib.Path values; "
+            f"got {profile.paths!r}, resolved {paths!r}"
+        )
+    if not isinstance(profile.native_threads, NativeThreadSpec):
+        raise ConfigurationValidationError(
+            f"native_threads must be a NativeThreadSpec; got {profile.native_threads!r}"
+        )
+    native_threads = _native_threads(
+        {
+            "itk": profile.native_threads.itk,
+            "blas": profile.native_threads.blas,
+        }
+    )
+    if native_threads != profile.native_threads:
+        raise ConfigurationValidationError("native_threads are invalid")
+
+    if executor == "sequential":
+        if profile.local_dask is not None or profile.slurm is not None:
+            raise ConfigurationValidationError(
+                "sequential execution must not contain local_dask or slurm settings"
+            )
+        return
+    if executor == "local_dask":
+        if (
+            not isinstance(profile.local_dask, LocalDaskSpec)
+            or profile.slurm is not None
+        ):
+            raise ConfigurationValidationError(
+                "local_dask execution requires only LocalDaskSpec settings"
+            )
+        local_dask = _local_dask(
+            {
+                "workers": profile.local_dask.workers,
+                "threads_per_worker": profile.local_dask.threads_per_worker,
+                "processes": profile.local_dask.processes,
+                "memory_limit": profile.local_dask.memory_limit,
+                "startup_timeout": profile.local_dask.startup_timeout,
+                "task_retries": profile.local_dask.task_retries,
+            }
+        )
+        if local_dask != profile.local_dask:
+            raise ConfigurationValidationError("local_dask settings are invalid")
+        return
+
+    if not isinstance(profile.slurm, SlurmSpec) or profile.local_dask is not None:
+        raise ConfigurationValidationError(
+            "slurm execution requires only SlurmSpec settings"
+        )
+    if type(profile.slurm.job_extra_directives) is not tuple:
+        raise ConfigurationValidationError(
+            "slurm.job_extra_directives must be an immutable tuple; "
+            f"got {profile.slurm.job_extra_directives!r}"
+        )
+    slurm = _slurm(
+        {
+            "queue": profile.slurm.queue,
+            "workers": profile.slurm.workers,
+            "cores_per_worker": profile.slurm.cores_per_worker,
+            "processes_per_worker": profile.slurm.processes_per_worker,
+            "memory": profile.slurm.memory,
+            "walltime": profile.slurm.walltime,
+            "interface": profile.slurm.interface,
+            "scheduler_interface": profile.slurm.scheduler_interface,
+            "startup_timeout": profile.slurm.startup_timeout,
+            "task_retries": profile.slurm.task_retries,
+            "job_name": profile.slurm.job_name,
+            "job_extra_directives": list(profile.slurm.job_extra_directives),
+        }
+    )
+    if slurm != profile.slurm:
+        raise ConfigurationValidationError("slurm settings are invalid")
+
+
 def load_execution_profile(path: str | Path) -> ExecutionProfile:
     source_path = Path(path).resolve(strict=False)
     raw_mapping = load_yaml_mapping(source_path)
@@ -374,7 +492,7 @@ def load_execution_profile(path: str | Path) -> ExecutionProfile:
         if "native_threads" in mapping
         else _resolve_inherited_native_threads(os.environ)
     )
-    return ExecutionProfile(
+    profile = ExecutionProfile(
         schema_version=schema_version,
         executor=executor,
         paths=_paths(
@@ -389,3 +507,5 @@ def load_execution_profile(path: str | Path) -> ExecutionProfile:
         slurm=_slurm(mapping["slurm"]) if executor == "slurm" else None,
         source_path=source_path,
     )
+    _validate_execution_profile(profile)
+    return profile

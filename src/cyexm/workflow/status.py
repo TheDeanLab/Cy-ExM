@@ -11,7 +11,7 @@ from typing import Literal
 from cyexm.errors import WorkflowPlanError
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry
+from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     RoundStatus,
@@ -375,7 +375,7 @@ def _parse_source(
             raise WorkflowPlanError(
                 f"{location}.geometry is invalid: {error}"
             ) from error
-        if geometry.shape != shape or geometry.spacing != spacing:
+        if geometry.shape != shape or not spacing_compatible(geometry.spacing, spacing):
             raise WorkflowPlanError(
                 f"{location}.geometry must match shape and voxel spacing"
             )
@@ -509,6 +509,18 @@ def _parse_round(
     )
     if not channels:
         raise WorkflowPlanError(f"{location}.channels must not be empty")
+    channel_files = tuple(channel.manifest_file for channel in channels)
+    if len(set(channel_files)) != len(channel_files):
+        raise WorkflowPlanError(
+            f"{location} channel manifest files must be unique; got {channel_files!r}"
+        )
+    channel_outputs = tuple(
+        channel.output.resolve(strict=False) for channel in channels
+    )
+    if len(set(channel_outputs)) != len(channel_outputs):
+        raise WorkflowPlanError(
+            f"{location} channel outputs must be unique; got {channel_outputs!r}"
+        )
     matches = tuple(
         channel
         for channel in channels
@@ -644,6 +656,45 @@ def _parse_scientific_snapshot(
         raise WorkflowPlanError(
             "scientific plan rounds must be nonempty, unique, and sorted; "
             f"got {round_numbers!r}"
+        )
+    if reference_round in round_numbers:
+        raise WorkflowPlanError(
+            f"scientific plan rounds must not reuse reference round {reference_round}"
+        )
+    used_sources = {
+        fixed_source.path,
+        *(
+            channel.source.path
+            for round_contract in rounds
+            for channel in round_contract.channels
+        ),
+    }
+    unused_sources = tuple(
+        source.path for source in sources if source.path not in used_sources
+    )
+    if unused_sources:
+        raise WorkflowPlanError(
+            f"scientific plan declares unused sources: {unused_sources!r}"
+        )
+    incompatible_shapes = tuple(
+        (source.path, source.shape_zyx)
+        for source in sources
+        if source.shape_zyx != fixed_source.shape_zyx
+    )
+    if incompatible_shapes:
+        raise WorkflowPlanError(
+            "scientific plan source shape must match the reference shape "
+            f"{fixed_source.shape_zyx!r}; got {incompatible_shapes!r}"
+        )
+    artifact_paths = tuple(
+        expectation.path.resolve(strict=False)
+        for round_contract in rounds
+        for expectation in round_contract.artifacts
+    )
+    if len(set(artifact_paths)) != len(artifact_paths):
+        raise WorkflowPlanError(
+            "scientific plan final artifact outputs must be unique; "
+            f"got {artifact_paths!r}"
         )
     policies = _exact_mapping(
         scientific["policies"], _POLICY_KEYS, "scientific plan policies"

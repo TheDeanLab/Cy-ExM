@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -158,6 +159,53 @@ def test_plan_resolves_inputs_orders_rounds_and_creates_nothing(
         "round_3_mask.tif",
         "round_3_488.tif",
     )
+    assert not execution.paths.output_root.exists()
+
+
+def test_plan_revalidates_directly_constructed_manifest_before_inspection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    forged = replace(
+        manifest,
+        reference=replace(manifest.reference, round=2),
+    )
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, forged)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: calls.append(path) or _header(path),
+    )
+
+    with pytest.raises(WorkflowPlanError, match="reference round"):
+        build_workflow_plan(forged, execution)
+
+    assert calls == []
+    assert not execution.paths.output_root.exists()
+
+
+def test_plan_revalidates_directly_constructed_execution_before_inspection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    execution = _execution(
+        tmp_path,
+        native_threads=NativeThreadSpec(itk=True, blas=1),  # type: ignore[arg-type]
+    )
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: calls.append(path) or _header(path),
+    )
+
+    with pytest.raises(WorkflowPlanError, match="Execution profile is invalid"):
+        build_workflow_plan(manifest, execution)
+
+    assert calls == []
     assert not execution.paths.output_root.exists()
 
 

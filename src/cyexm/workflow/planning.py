@@ -6,14 +6,20 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
+from cyexm.config.dataset import _validate_dataset_manifest
+from cyexm.config.execution import _validate_execution_profile
 from cyexm.config.models import (
     DatasetManifest,
     ExecutionPaths,
     ExecutionProfile,
     RoundSpec,
 )
-from cyexm.errors import InputValidationError, WorkflowPlanError
-from cyexm.spatial import AXIS_CONVENTION_VERSION, TIFF_GEOMETRY_ATOL
+from cyexm.errors import (
+    ConfigurationValidationError,
+    InputValidationError,
+    WorkflowPlanError,
+)
+from cyexm.spatial import AXIS_CONVENTION_VERSION, spacing_compatible
 from cyexm.workflow.layout import RoundLayout, WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
@@ -241,19 +247,7 @@ def _header_contract_error(
                 "embedded geometry shape must match the TIFF shape; "
                 f"got geometry={header.geometry.shape!r}, TIFF={shape!r}"
             )
-        if any(
-            not math.isclose(
-                embedded,
-                requested,
-                rel_tol=0.0,
-                abs_tol=TIFF_GEOMETRY_ATOL,
-            )
-            for embedded, requested in zip(
-                header.geometry.spacing,
-                expected_spacing,
-                strict=True,
-            )
-        ):
+        if not spacing_compatible(header.geometry.spacing, expected_spacing):
             return (
                 "embedded spacing must match manifest voxel_spacing_um; "
                 f"got embedded={header.geometry.spacing!r}, "
@@ -687,6 +681,14 @@ def build_workflow_plan(
     execution: ExecutionProfile,
 ) -> WorkflowPlan:
     """Validate inputs and construct a deterministic plan without filesystem writes."""
+    try:
+        _validate_dataset_manifest(manifest)
+    except ConfigurationValidationError as error:
+        raise WorkflowPlanError(f"Dataset manifest is invalid: {error}") from error
+    try:
+        _validate_execution_profile(execution)
+    except ConfigurationValidationError as error:
+        raise WorkflowPlanError(f"Execution profile is invalid: {error}") from error
     dataset_root, output_root = _resolved_roots(execution)
     normalized_execution = replace(
         execution,

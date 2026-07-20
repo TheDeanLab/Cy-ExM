@@ -1,0 +1,432 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path, PurePosixPath
+
+import pytest
+
+from cyexm.config.models import (
+    ChannelSpec,
+    DatasetManifest,
+    ExecutionPaths,
+    ExecutionProfile,
+    NativeThreadSpec,
+    ReferenceSpec,
+    RegistrationSpec,
+    RegistrationStageSpec,
+    RoundSpec,
+)
+from cyexm.errors import WorkflowExecutionError, WorkflowPlanError
+from cyexm.execution.base import WorkflowExecutor
+from cyexm.registration.artifacts import (
+    ArtifactStore,
+    CompletionRecord,
+    FileIdentity,
+    StageRequest,
+)
+from cyexm.spatial import ImageGeometry
+from cyexm.workflow import run_workflow
+from cyexm.workflow.layout import WorkflowLayout
+from cyexm.workflow.models import (
+    ChannelTask,
+    RoundFailure,
+    RoundResult,
+    RoundTask,
+    WorkflowPlan,
+    canonical_json,
+    sha256_fingerprint,
+)
+
+pytestmark = pytest.mark.unit
+
+
+def _registration() -> RegistrationSpec:
+    return RegistrationSpec(
+        crop=False,
+        linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
+        nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
+    )
+
+
+def _task(output_root: Path, round_number: int) -> RoundTask:
+    round_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(
+        round_number
+    )
+    return RoundTask(
+        dataset_id="dataset-1",
+        round=round_number,
+        strategy="whole_image",
+        fixed_image=output_root.parent / "dataset" / "fixed.tif",
+        moving_image=output_root.parent / "dataset" / f"moving-{round_number}.tif",
+        registration_directory=round_layout.registration,
+        log_path=round_layout.log,
+        voxel_spacing_xyz=(1.0, 1.0, 1.0),
+        registration=_registration(),
+        native_threads=NativeThreadSpec(itk=1, blas=1),
+        channels=(
+            ChannelTask(
+                source=output_root.parent / "dataset" / f"moving-{round_number}.tif",
+                output=round_layout.channels / f"moving-{round_number}.tif",
+                interpolation="linear",
+            ),
+        ),
+        chunk_size_zyx=None,
+        overlap_fraction=None,
+    )
+
+
+def _artifacts(task: RoundTask) -> tuple[Path, ...]:
+    return (
+        task.registration_directory / f"linear_transform_{task.round}.mat",
+        task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
+        task.registration_directory / f"nonlinear_registered_{task.round}.tif",
+        *(channel.output for channel in task.channels),
+    )
+
+
+def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
+    output_root = tmp_path / "output"
+    tasks = tuple(_task(output_root, round_number) for round_number in rounds)
+    manifest = DatasetManifest(
+        schema_version=1,
+        dataset_id="dataset-1",
+        voxel_spacing_um=(1.0, 1.0, 1.0),
+        reference=ReferenceSpec(round=1, channel=PurePosixPath("fixed.tif")),
+        registration=_registration(),
+        rounds=tuple(
+            RoundSpec(
+                round=task.round,
+                strategy=task.strategy,
+                registration_channel=PurePosixPath(f"moving-{task.round}.tif"),
+                channels=(
+                    ChannelSpec(PurePosixPath(f"moving-{task.round}.tif"), "linear"),
+                ),
+            )
+            for task in tasks
+        ),
+    )
+    execution = ExecutionProfile(
+        schema_version=1,
+        executor="sequential",
+        paths=ExecutionPaths(
+            dataset_root=tmp_path / "dataset",
+            output_root=output_root,
+            worker_local_directory=None,
+        ),
+        native_threads=NativeThreadSpec(itk=1, blas=1),
+        local_dask=None,
+        slurm=None,
+        source_path=tmp_path / "execution.yaml",
+    )
+    scientific_json = canonical_json(
+        {
+            "schema_version": 1,
+            "dataset_id": "dataset-1",
+            "rounds": [
+                {
+                    "round": task.round,
+                    "channels": [
+                        {
+                            "output": channel.output.relative_to(
+                                WorkflowLayout.for_dataset(
+                                    output_root, "dataset-1"
+                                ).root
+                            ).as_posix()
+                        }
+                        for channel in task.channels
+                    ],
+                }
+                for task in tasks
+            ],
+        }
+    )
+    return WorkflowPlan(
+        schema_version=1,
+        dataset_id="dataset-1",
+        manifest=manifest,
+        execution=execution,
+        fixed_image=tasks[0].fixed_image,
+        tasks=tasks,
+        expected_artifacts=tuple(
+            artifact for task in tasks for artifact in _artifacts(task)
+        ),
+        scientific_json=scientific_json,
+        scientific_fingerprint=sha256_fingerprint(scientific_json),
+    )
+
+
+def _result(task: RoundTask, *, failed: bool = False) -> RoundResult:
+    return RoundResult(
+        dataset_id=task.dataset_id,
+        round=task.round,
+        status="failed" if failed else "completed",
+        started_at="2026-07-20T10:00:00Z",
+        ended_at="2026-07-20T10:00:01Z",
+        duration_seconds=1.0,
+        hostname="worker-01",
+        pid=123,
+        dask_task_key=None,
+        slurm_job_id=None,
+        strategy=task.strategy,
+        native_threads=(("itk", 1), ("blas", 1)),
+        artifact_paths=tuple(str(path) for path in _artifacts(task)),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=(RoundFailure("round", "RuntimeError", "injected") if failed else None),
+    )
+
+
+class _FakeExecutor:
+    def __init__(
+        self,
+        callback: Callable[[tuple[RoundTask, ...]], tuple[RoundResult, ...]],
+    ) -> None:
+        self.callback = callback
+        self.calls: list[tuple[RoundTask, ...]] = []
+
+    def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        self.calls.append(tasks)
+        return self.callback(tasks)
+
+
+def _factory(
+    executor: WorkflowExecutor,
+) -> Callable[[ExecutionProfile], WorkflowExecutor]:
+    return lambda _profile: executor
+
+
+def _commit_artifact(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"artifact")
+    geometry = ImageGeometry(
+        shape=(1, 1, 1),
+        origin=(0.0, 0.0, 0.0),
+        spacing=(1.0, 1.0, 1.0),
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    record = CompletionRecord(
+        schema_version=1,
+        request=StageRequest.for_identities(
+            stage="test",
+            inputs=(),
+            geometry=geometry,
+            method="test",
+            accuracy="test",
+            native_threads={},
+            upstream=None,
+            parameters={},
+        ),
+        artifact=FileIdentity.from_path(path),
+    )
+    ArtifactStore().record_path(path).write_text(record.to_json(), encoding="utf-8")
+
+
+def test_run_workflow_writes_scientific_snapshot_before_execution(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    layout = WorkflowLayout.for_dataset(
+        plan.execution.paths.output_root, plan.dataset_id
+    )
+
+    def execute(tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        assert layout.plan_path.read_text(encoding="utf-8").strip() == (
+            plan.scientific_json
+        )
+        return tuple(_result(task) for task in tasks)
+
+    result = run_workflow(
+        plan,
+        _executor_factory=_factory(_FakeExecutor(execute)),
+    )
+
+    assert result.succeeded
+    assert Path(result.run_record).is_file()
+    assert (
+        json.loads(Path(result.run_record).read_text(encoding="utf-8"))["status"]
+        == "completed"
+    )
+    assert not tuple(layout.root.rglob(".*.tmp*"))
+
+
+def test_run_workflow_forces_only_selected_rounds(tmp_path: Path) -> None:
+    plan = _plan(tmp_path)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    run_workflow(
+        plan,
+        force_rounds=frozenset({3}),
+        _executor_factory=_factory(fake),
+    )
+
+    submitted = fake.calls[0]
+    assert tuple(task.round for task in submitted) == (2, 3)
+    assert tuple(task.force for task in submitted) == (False, True)
+    assert tuple(task.force for task in plan.tasks) == (False, False)
+
+
+def test_run_workflow_force_all_replaces_every_immutable_task(tmp_path: Path) -> None:
+    plan = _plan(tmp_path)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    run_workflow(plan, force_all=True, _executor_factory=_factory(fake))
+
+    assert all(task.force for task in fake.calls[0])
+    assert not any(task.force for task in plan.tasks)
+
+
+def test_run_workflow_rejects_both_force_modes_before_writing(tmp_path: Path) -> None:
+    plan = _plan(tmp_path)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="force_all"):
+        run_workflow(
+            plan,
+            force_all=True,
+            force_rounds=frozenset({2}),
+            _executor_factory=_factory(fake),
+        )
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_unknown_forced_round_before_writing(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match=r"unknown.*99"):
+        run_workflow(
+            plan,
+            force_rounds=frozenset({99}),
+            _executor_factory=_factory(fake),
+        )
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_unsafe_dataset_id_before_reading_or_writing(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    scientific = json.loads(plan.scientific_json)
+    scientific["dataset_id"] = "../outside"
+    scientific_json = canonical_json(scientific)
+    unsafe = replace(
+        plan,
+        dataset_id="../outside",
+        scientific_json=scientific_json,
+        scientific_fingerprint=sha256_fingerprint(scientific_json),
+    )
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="dataset_id"):
+        run_workflow(unsafe, _executor_factory=_factory(fake))
+
+    assert not (tmp_path / "outside").exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_incompatible_snapshot_without_changing_it(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    layout = WorkflowLayout.for_dataset(
+        plan.execution.paths.output_root, plan.dataset_id
+    )
+    layout.plan_path.parent.mkdir(parents=True)
+    before = b'{"dataset_id":"different","rounds":[],"schema_version":1}\n'
+    layout.plan_path.write_bytes(before)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="scientific-plan fingerprint"):
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert layout.plan_path.read_bytes() == before
+    assert not layout.workflow_runs.exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_excludes_complete_rounds_and_reports_them_reused(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    for artifact in _artifacts(plan.tasks[0]):
+        _commit_artifact(artifact)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    result = run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert tuple(task.round for task in fake.calls[0]) == (3,)
+    assert tuple(item.round for item in result.rounds) == (2, 3)
+    assert tuple(item.status for item in result.rounds) == ("reused", "completed")
+    assert result.rounds[0].reused_artifacts == tuple(
+        str(path) for path in _artifacts(plan.tasks[0])
+    )
+
+
+def test_run_workflow_force_submits_an_otherwise_complete_round(tmp_path: Path) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    for artifact in _artifacts(plan.tasks[0]):
+        _commit_artifact(artifact)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    result = run_workflow(
+        plan,
+        force_rounds=frozenset({2}),
+        _executor_factory=_factory(fake),
+    )
+
+    assert tuple(task.round for task in fake.calls[0]) == (2,)
+    assert fake.calls[0][0].force
+    assert result.rounds[0].status == "completed"
+
+
+def test_run_workflow_writes_failed_summary_then_raises_sorted_rounds(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    fake = _FakeExecutor(
+        lambda tasks: (_result(tasks[1]), _result(tasks[0], failed=True))
+    )
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert captured.value.failed_rounds == (2,)
+    record = Path(captured.value.run_record)
+    assert record.is_file()
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert [item["round"] for item in payload["rounds"]] == [2, 3]
+    assert not tuple(record.parent.glob(".*.tmp*"))
+
+
+def test_run_workflow_writes_cancelled_summary_and_reraises(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def cancel(_tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(_FakeExecutor(cancel)),
+        )
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root, plan.dataset_id
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    payload = json.loads(records[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "cancelled"
+    assert payload["rounds"] == []

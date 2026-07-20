@@ -15,14 +15,18 @@ SCHEDULER_COMMANDS = frozenset(
 SCHEDULER_FIREWALL_ENV = "CYEXM_PORTABLE_SCHEDULER_FIREWALL"
 _SHELL_COMMANDS = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
 _SHELL_SEPARATORS = frozenset({"&", "&&", "(", ")", ";", ";;", "|", "||"})
+_SHELL_REDIRECTION_OPERATORS = frozenset(
+    {"&>", "&>>", "<", "<&", "<<", "<<<", "<>", ">", ">&", ">>", ">|"}
+)
+_SHELL_REDIRECTION_MASK = {"<": "\ue000", ">": "\ue001"}
 _SHELL_PREFIX_KEYWORDS = frozenset(
     {"!", "do", "elif", "else", "if", "then", "until", "while"}
 )
 _SHELL_END_KEYWORDS = frozenset({"done", "esac", "fi"})
-_ENV_NO_VALUE_OPTIONS = frozenset(
-    {"-0", "--debug", "-i", "--ignore-environment", "--null", "-v"}
-)
-_ENV_VALUE_OPTIONS = frozenset({"-C", "--argv0", "--chdir", "-u", "--unset"})
+_ENV_LONG_NO_VALUE_OPTIONS = frozenset({"--debug", "--ignore-environment", "--null"})
+_ENV_LONG_VALUE_OPTIONS = frozenset({"--argv0", "--chdir", "--unset"})
+_ENV_SHORT_NO_VALUE_OPTIONS = frozenset({"0", "i", "v"})
+_ENV_SHORT_VALUE_OPTIONS = frozenset({"C", "u"})
 _SIMPLE_WRAPPERS = frozenset({"nohup", "setsid"})
 _WRAPPER_VALUE_OPTIONS = {
     "nice": frozenset({"-n", "--adjustment"}),
@@ -115,6 +119,34 @@ def _split_env_string(value: str) -> tuple[str, ...] | None:
         return None
 
 
+def _parse_env_short_cluster(
+    tokens: tuple[str, ...],
+    index: int,
+) -> tuple[int, str | None] | None:
+    cluster = tokens[index][1:]
+    option_index = 0
+    while option_index < len(cluster):
+        option = cluster[option_index]
+        if option in _ENV_SHORT_NO_VALUE_OPTIONS:
+            option_index += 1
+            continue
+        remainder = cluster[option_index + 1 :]
+        if option == "S":
+            if remainder:
+                return index + 1, remainder
+            if index + 1 >= len(tokens):
+                return None
+            return index + 2, tokens[index + 1]
+        if option in _ENV_SHORT_VALUE_OPTIONS:
+            if remainder:
+                return index + 1, None
+            if index + 1 >= len(tokens):
+                return None
+            return index + 2, None
+        return None
+    return index + 1, None
+
+
 def _parse_env(tokens: tuple[str, ...], *, depth: int) -> str | None:
     if depth > _MAX_PARSE_DEPTH:
         return _UNPARSEABLE_COMMAND
@@ -123,18 +155,16 @@ def _parse_env(tokens: tuple[str, ...], *, depth: int) -> str | None:
         token = tokens[index]
         if token == "--":
             return _parse_argv(tokens[index + 1 :], depth=depth + 1)
-        if _is_assignment(token) or token in _ENV_NO_VALUE_OPTIONS:
+        if _is_assignment(token) or token in _ENV_LONG_NO_VALUE_OPTIONS:
             index += 1
             continue
         split_value: str | None = None
         next_index = index + 1
-        if token in {"-S", "--split-string"}:
+        if token == "--split-string":
             if next_index >= len(tokens):
                 return _UNPARSEABLE_COMMAND
             split_value = tokens[next_index]
             next_index += 1
-        elif token.startswith("-S") and token != "-S":
-            split_value = token[2:]
         elif token.startswith("--split-string="):
             split_value = token.partition("=")[2]
         if split_value is not None:
@@ -146,7 +176,7 @@ def _parse_env(tokens: tuple[str, ...], *, depth: int) -> str | None:
                 depth=depth + 1,
             )
         option = token.split("=", 1)[0]
-        if option in _ENV_VALUE_OPTIONS:
+        if option in _ENV_LONG_VALUE_OPTIONS:
             if "=" in token:
                 index += 1
             elif index + 1 < len(tokens):
@@ -154,11 +184,25 @@ def _parse_env(tokens: tuple[str, ...], *, depth: int) -> str | None:
             else:
                 return _UNPARSEABLE_COMMAND
             continue
-        if token.startswith("-u") and token != "-u":
+        if token == "-":
             index += 1
             continue
+        if token.startswith("--"):
+            return _UNPARSEABLE_COMMAND
         if token.startswith("-"):
-            index += 1
+            parsed = _parse_env_short_cluster(tokens, index)
+            if parsed is None:
+                return _UNPARSEABLE_COMMAND
+            next_index, split_value = parsed
+            if split_value is not None:
+                split_tokens = _split_env_string(split_value)
+                if split_tokens is None:
+                    return _UNPARSEABLE_COMMAND
+                return _parse_env(
+                    (*split_tokens, *tokens[next_index:]),
+                    depth=depth + 1,
+                )
+            index = next_index
             continue
         return _parse_argv(tokens[index:], depth=depth + 1)
     return None
@@ -281,7 +325,36 @@ def _parse_shell_segment(tokens: tuple[str, ...], *, depth: int) -> str | None:
         tokens = tokens[1:]
     if not tokens or tokens[0] in _SHELL_END_KEYWORDS:
         return None
-    return _parse_argv(tokens, depth=depth + 1)
+    command = _strip_shell_command_prefixes(tokens)
+    if command is None:
+        return _UNPARSEABLE_COMMAND
+    return _parse_argv(command, depth=depth + 1)
+
+
+def _strip_shell_command_prefixes(
+    tokens: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    index = 0
+    while index < len(tokens):
+        if _is_assignment(tokens[index]):
+            index += 1
+            continue
+        if (
+            tokens[index].isdigit()
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in _SHELL_REDIRECTION_OPERATORS
+        ):
+            index += 1
+        if tokens[index] not in _SHELL_REDIRECTION_OPERATORS:
+            break
+        target_index = index + 1
+        if (
+            target_index >= len(tokens)
+            or tokens[target_index] in _SHELL_REDIRECTION_OPERATORS
+        ):
+            return None
+        index = target_index + 1
+    return tokens[index:]
 
 
 def _backtick_substitutions(command: str) -> tuple[tuple[str, ...], str] | None:
@@ -293,17 +366,21 @@ def _backtick_substitutions(command: str) -> tuple[tuple[str, ...], str] | None:
     while index < len(command):
         character = command[index]
         if quote == "'":
-            masked.append(character)
+            masked.append(_SHELL_REDIRECTION_MASK.get(character, character))
             if character == "'":
                 quote = None
             index += 1
             continue
         if character == "\\":
-            masked.append(character)
             if index + 1 < len(command):
-                masked.append(command[index + 1])
+                escaped = command[index + 1]
+                if escaped in _SHELL_REDIRECTION_MASK:
+                    masked.append(_SHELL_REDIRECTION_MASK[escaped])
+                else:
+                    masked.extend((character, escaped))
                 index += 2
             else:
+                masked.append(character)
                 index += 1
             comment_position = False
             continue
@@ -344,7 +421,11 @@ def _backtick_substitutions(command: str) -> tuple[tuple[str, ...], str] | None:
             comment_position = False
             index = closing + 1
             continue
-        masked.append(character)
+        masked.append(
+            _SHELL_REDIRECTION_MASK.get(character, character)
+            if quote is not None
+            else character
+        )
         if quote is None:
             comment_position = character.isspace() or character in ";&|()"
         index += 1
@@ -364,7 +445,7 @@ def _parse_shell(command: str, *, depth: int) -> str | None:
         if blocked is not None:
             return blocked
     try:
-        lexer = shlex.shlex(masked_command, posix=True, punctuation_chars=";&|()")
+        lexer = shlex.shlex(masked_command, posix=True, punctuation_chars=";&|()<>")
         lexer.whitespace_split = True
         lexer.commenters = "#"
         tokens = tuple(lexer)

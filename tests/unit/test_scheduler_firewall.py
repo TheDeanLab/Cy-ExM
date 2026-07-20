@@ -81,6 +81,54 @@ def test_scheduler_parser_recurses_through_env_split_string(
 
 
 @pytest.mark.parametrize(
+    ("arguments", "expected"),
+    (
+        (("env", "-iS", "/usr/bin/sbatch --parsable"), "sbatch"),
+        (("env", "-iS/usr/bin/squeue --json"), "squeue"),
+        (
+            ("env", "-viS", "CYEXM_TEST=1 /usr/bin/scontrol show config"),
+            "scontrol",
+        ),
+        (("env", "-iu", "PATH", "-S", "/usr/bin/scancel 123"), "scancel"),
+        (("env", "-iuPATH", "-S", "/usr/bin/sacct --starttime now"), "sacct"),
+        (("env", "-0iS", "/usr/bin/sinfo --json"), "sinfo"),
+    ),
+)
+def test_scheduler_parser_recurses_through_combined_env_short_options(
+    arguments: tuple[str, ...],
+    expected: str,
+) -> None:
+    assert suite_config._external_scheduler_command(arguments) == expected
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("env", "-iS", "CYEXM_TEST=1 printf '%s' '/usr/bin/sbatch'"),
+        ("env", "-iu", "PATH", "-S", "printf '%s' squeue"),
+    ),
+)
+def test_scheduler_parser_allows_combined_env_split_argument_data(
+    arguments: tuple[str, ...],
+) -> None:
+    assert suite_config._external_scheduler_command(arguments) is None
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("env", "-iS"),
+        ("env", "-iu"),
+        ("env", "-ixS", "/usr/bin/sbatch"),
+    ),
+)
+def test_scheduler_parser_fails_closed_on_malformed_env_short_clusters(
+    arguments: tuple[str, ...],
+) -> None:
+    assert suite_config._external_scheduler_command(arguments) is not None
+
+
+@pytest.mark.parametrize(
     "arguments",
     (
         ("env", "-S", 'printf "%s" "/usr/bin/sbatch"'),
@@ -177,6 +225,51 @@ def test_scheduler_parser_finds_shell_command_positions(
 @pytest.mark.parametrize(
     "command",
     (
+        "> /tmp/cyexm.log /usr/bin/squeue",
+        ">/tmp/cyexm.log /usr/bin/squeue",
+        "2> /tmp/cyexm.log /usr/bin/squeue",
+        "2>/tmp/cyexm.log /usr/bin/squeue",
+        "2>&1 /usr/bin/squeue",
+        "CYEXM_TEST=1 >/tmp/cyexm.log /usr/bin/squeue",
+    ),
+)
+def test_scheduler_parser_skips_leading_shell_redirections(command: str) -> None:
+    assert suite_config._external_scheduler_command(command, shell=True) == "squeue"
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "printf '%s' '> /tmp/cyexm.log /usr/bin/squeue'",
+        "echo /usr/bin/squeue > /tmp/cyexm.log",
+        "> /tmp/cyexm.log",
+        r"\> /usr/bin/squeue",
+        "'>' /usr/bin/squeue",
+    ),
+)
+def test_scheduler_parser_allows_literal_and_benign_redirections(
+    command: str,
+) -> None:
+    assert suite_config._external_scheduler_command(command, shell=True) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ">",
+        "2>",
+        "> > /usr/bin/squeue",
+    ),
+)
+def test_scheduler_parser_fails_closed_on_malformed_redirections(
+    command: str,
+) -> None:
+    assert suite_config._external_scheduler_command(command, shell=True) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
         "echo 'unterminated",
         "echo `unterminated",
     ),
@@ -232,6 +325,43 @@ def test_popen_blocks_env_split_string_before_execution(
             ["env", f"--split-string={executable} --parsable"],
             check=False,
         )
+
+
+@pytest.mark.parametrize("joined", [False, True])
+def test_popen_blocks_combined_env_split_options_before_execution(
+    safe_host_clients: Path,
+    joined: bool,
+) -> None:
+    executable = safe_host_clients / "sbatch"
+    arguments = (
+        ["env", f"-iS{executable} --parsable"]
+        if joined
+        else ["env", "-iS", f"{executable} --parsable"]
+    )
+    with pytest.raises(RuntimeError, match="scheduler command 'sbatch'"):
+        subprocess.run(arguments, check=False)
+
+
+@pytest.mark.parametrize(
+    "command_template",
+    (
+        "> {log} {client}",
+        ">{log} {client}",
+        "2>{log} {client}",
+        "2>&1 {client}",
+    ),
+)
+def test_popen_blocks_clients_after_leading_redirections_before_execution(
+    safe_host_clients: Path,
+    tmp_path: Path,
+    command_template: str,
+) -> None:
+    command = command_template.format(
+        log=tmp_path / "portable.log",
+        client=safe_host_clients / "squeue",
+    )
+    with pytest.raises(RuntimeError, match="scheduler command 'squeue'"):
+        subprocess.run(["/bin/sh", "-c", command], check=False)
 
 
 def test_popen_blocks_exec_argv0_wrapper_before_execution(

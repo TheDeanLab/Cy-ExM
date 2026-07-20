@@ -227,6 +227,9 @@ def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> 
         "narrow concrete-image exception",
         "real registration belongs in integration",
         "real slurm submission",
+        "external scheduler or cluster services",
+        "bounded in-process or local-scheduler checks",
+        "portable integration",
         "hpc",
     ):
         assert required in tests
@@ -243,9 +246,27 @@ def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> 
     for required in (
         "approved scheduler dependency",
         "bounded local-scheduler",
+        "access to an external scheduler or cluster service",
+        "bounded in-process or local-scheduler checks",
+        "portable integration",
         "actual slurm submission remains `hpc`",
     ):
         assert required in integration
+    assert (
+        "larger data, representative lab inputs, and scheduler access belong"
+        not in integration
+    )
+
+
+def test_completed_guidance_plan_records_execution_state() -> None:
+    plan_path = "docs/superpowers/plans/2026-07-19-phase-2-ready-agents-guidance.md"
+    plan = _read_repository_file(plan_path)
+    normalized_plan = " ".join(plan.split()).lower()
+
+    assert "execution status: implementation complete" in normalized_plan
+    assert "integration pending" in normalized_plan
+    assert "- [ ]" not in plan
+    assert plan.count("- [x]") == 39
 
 
 def test_every_maintained_directory_has_local_agent_guidance() -> None:

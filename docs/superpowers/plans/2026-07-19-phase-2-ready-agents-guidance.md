@@ -1,12 +1,27 @@
 # Phase 2-Ready AGENTS Guidance Refresh Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Checked steps record completed execution.
 
 **Goal:** Give every maintained Cy-ExM directory layer accurate local agent guidance while preserving Phase 1 as the stable runtime and recording safe boundaries for a separately designed Phase 2.
 
 **Architecture:** The root `AGENTS.md` remains the authoritative project contract, and child files add only directory-specific rules. Five new instruction files complete directory coverage; existing child guidance is corrected in focused groups. One repository-policy module mechanically enforces inventory, reproducible commands, current-versus-proposed language, and the critical cross-layer boundaries.
 
 **Tech Stack:** Markdown, Python 3.12, pytest, uv 0.7.13, Ruff, BasedPyright, pre-commit
+
+## Execution status
+
+Execution status: implementation complete; integration pending.
+
+All 39 steps below have fresh task evidence. The approved Task 4 phrase-order
+corrections produced `A future execution boundary for Phase 2` and `` `backend.py`
+must not own workflow scheduling or artifact lifecycle``; Task 5 likewise used
+`After an approved scheduler dependency is declared` to preserve its unchanged test
+intent. The separate `5caae8f` `current behavior` regression fix remains an explicit
+review-fix commit rather than being folded into Task 5 history.
+
+The initial acceptance matrix recorded 609 unit tests, 40 integration tests, and 649
+combined portable tests. This final-review correction adds one policy test and is
+reverified separately instead of rewriting that initial evidence.
 
 ## Global Constraints
 
@@ -68,7 +83,7 @@ a final accuracy review rather than gratuitous edits.
 - Consumes: `_read_repository_file(path: str) -> str`
 - Produces: `_normalized_repository_file(path: str) -> str` for all later policy tasks; a root contract that later child files inherit
 
-- [ ] **Step 1: Add the normalization helper and failing root-guidance test**
+- [x] **Step 1: Add the normalization helper and failing root-guidance test**
 
 Add this helper after `_read_repository_file`:
 
@@ -99,7 +114,7 @@ def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
     assert "uv sync --group dev --extra examples" not in root_lines
 ```
 
-- [ ] **Step 2: Run the focused test and observe the stale-root failure**
+- [x] **Step 2: Run the focused test and observe the stale-root failure**
 
 Run:
 
@@ -110,7 +125,7 @@ uv run pytest tests/unit/test_repository_policy.py::test_root_guidance_tracks_st
 Expected: FAIL first on `"phase 1 is the current stable runtime"` because the existing
 root file describes Phase 1 only as a permanent prohibition boundary.
 
-- [ ] **Step 3: Replace the Phase 1 scope bullets with the exact current/future contract**
+- [x] **Step 3: Replace the Phase 1 scope bullets with the exact current/future contract**
 
 Replace the existing Phase 1 prohibition bullet in the root `Project contract`
 section with:
@@ -136,7 +151,7 @@ section with:
 Leave the ClearEx pin, license, inheritance, scientific invariants, storage rules, and
 spheroid-process protection unchanged.
 
-- [ ] **Step 4: Replace mutable setup commands with locked validation commands**
+- [x] **Step 4: Replace mutable setup commands with locked validation commands**
 
 Change the root command block to begin with:
 
@@ -152,7 +167,7 @@ Run bare `uv lock` only when an approved dependency change intentionally regener
 `uv.lock`; inspect and commit that lockfile change with the dependency edit.
 ```
 
-- [ ] **Step 5: Run the focused root test and diff check**
+- [x] **Step 5: Run the focused root test and diff check**
 
 Run:
 
@@ -163,7 +178,7 @@ git diff --check
 
 Expected: `1 passed`; `git diff --check` prints nothing.
 
-- [ ] **Step 6: Commit the root contract**
+- [x] **Step 6: Commit the root contract**
 
 ```bash
 git add AGENTS.md tests/unit/test_repository_policy.py
@@ -186,7 +201,7 @@ git commit -m "docs: gate Phase 2 work in root guidance"
 - Consumes: `_normalized_repository_file(path: str) -> str`
 - Produces: `AGENT_GUIDANCE_PATHS: frozenset[str]`; exact local guidance at all 18 maintained layers
 
-- [ ] **Step 1: Add the expected inventory and failing coverage test**
+- [x] **Step 1: Add the expected inventory and failing coverage test**
 
 Add this constant below `THREAD_ENVIRONMENT`:
 
@@ -268,7 +283,7 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             assert fragment in guidance, (path, fragment)
 ```
 
-- [ ] **Step 2: Run the coverage test and observe the missing-file failure**
+- [x] **Step 2: Run the coverage test and observe the missing-file failure**
 
 Run:
 
@@ -278,7 +293,7 @@ uv run pytest tests/unit/test_repository_policy.py::test_every_maintained_direct
 
 Expected: FAIL because the five new guidance paths are absent from `actual`.
 
-- [ ] **Step 3: Create `.github/AGENTS.md`**
+- [x] **Step 3: Create `.github/AGENTS.md`**
 
 ```markdown
 # GitHub automation guidance
@@ -297,7 +312,7 @@ Expected: FAIL because the five new guidance paths are absent from `actual`.
   parsing plus the affected local commands before review.
 ```
 
-- [ ] **Step 4: Create `.github/workflows/AGENTS.md`**
+- [x] **Step 4: Create `.github/workflows/AGENTS.md`**
 
 ```markdown
 # GitHub Actions workflow guidance
@@ -318,7 +333,7 @@ Expected: FAIL because the five new guidance paths are absent from `actual`.
   code.
 ```
 
-- [ ] **Step 5: Create `docs/superpowers/AGENTS.md`**
+- [x] **Step 5: Create `docs/superpowers/AGENTS.md`**
 
 ```markdown
 # Design and implementation artifact guidance
@@ -336,7 +351,7 @@ Expected: FAIL because the five new guidance paths are absent from `actual`.
   may describe proposed work only when they label it clearly.
 ```
 
-- [ ] **Step 6: Create `docs/superpowers/plans/AGENTS.md`**
+- [x] **Step 6: Create `docs/superpowers/plans/AGENTS.md`**
 
 ```markdown
 # Implementation-plan guidance
@@ -355,7 +370,7 @@ Expected: FAIL because the five new guidance paths are absent from `actual`.
   historical plans to conceal that change.
 ```
 
-- [ ] **Step 7: Create `docs/superpowers/specs/AGENTS.md`**
+- [x] **Step 7: Create `docs/superpowers/specs/AGENTS.md`**
 
 ```markdown
 # Design-specification guidance
@@ -374,7 +389,7 @@ Expected: FAIL because the five new guidance paths are absent from `actual`.
   dated specification or add an explicitly labeled erratum that explains the change.
 ```
 
-- [ ] **Step 8: Run the coverage test and inspect inheritance**
+- [x] **Step 8: Run the coverage test and inspect inheritance**
 
 Run:
 
@@ -387,7 +402,7 @@ git diff --check
 Expected: `1 passed`; the file listing contains exactly the 18 paths in
 `AGENT_GUIDANCE_PATHS`; `git diff --check` prints nothing.
 
-- [ ] **Step 9: Commit complete directory coverage**
+- [x] **Step 9: Commit complete directory coverage**
 
 ```bash
 git add .github/AGENTS.md .github/workflows/AGENTS.md \
@@ -409,7 +424,7 @@ git commit -m "docs: add CI and planning agent guidance"
 - Consumes: `_normalized_repository_file(path: str) -> str`
 - Produces: unambiguous current-versus-proposed language for user documentation and teaching material
 
-- [ ] **Step 1: Add the failing docs/examples boundary test**
+- [x] **Step 1: Add the failing docs/examples boundary test**
 
 ```python
 def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
@@ -433,7 +448,7 @@ def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
         assert required in examples
 ```
 
-- [ ] **Step 2: Run the test and observe the indefinite-prohibition failure**
+- [x] **Step 2: Run the test and observe the indefinite-prohibition failure**
 
 Run:
 
@@ -443,7 +458,7 @@ uv run pytest tests/unit/test_repository_policy.py::test_documentation_and_examp
 
 Expected: FAIL first on `"merged phase 1 behavior"`.
 
-- [ ] **Step 3: Replace the first documentation bullet and add the runtime-design rule**
+- [x] **Step 3: Replace the first documentation bullet and add the runtime-design rule**
 
 Use these first two bullets in `docs/AGENTS.md`:
 
@@ -460,7 +475,7 @@ Use these first two bullets in `docs/AGENTS.md`:
 Keep the existing API synchronization, artifact/restart, scientific-statement,
 migration, and sensitive-data rules unchanged.
 
-- [ ] **Step 4: Replace the Phase 1-only example bullet with the exact transition**
+- [x] **Step 4: Replace the Phase 1-only example bullet with the exact transition**
 
 Replace the final `examples/AGENTS.md` bullet with:
 
@@ -472,7 +487,7 @@ Replace the final `examples/AGENTS.md` bullet with:
   the API permits.
 ```
 
-- [ ] **Step 5: Verify the boundary test and unchanged child accuracy**
+- [x] **Step 5: Verify the boundary test and unchanged child accuracy**
 
 Run:
 
@@ -485,7 +500,7 @@ git diff --check
 Expected: `1 passed`; the child files remain consistent with the refreshed parent;
 `git diff --check` prints nothing.
 
-- [ ] **Step 6: Commit documentation and example boundaries**
+- [x] **Step 6: Commit documentation and example boundaries**
 
 ```bash
 git add docs/AGENTS.md examples/AGENTS.md tests/unit/test_repository_policy.py
@@ -507,7 +522,7 @@ git commit -m "docs: distinguish current and proposed workflows"
 - Consumes: `_normalized_repository_file(path: str) -> str`
 - Produces: a future execution namespace boundary; correct backend/artifact ownership; explicit per-worker thread safety
 
-- [ ] **Step 1: Add the failing source-boundary test**
+- [x] **Step 1: Add the failing source-boundary test**
 
 ```python
 def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> None:
@@ -541,7 +556,7 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
         assert required in runtime
 ```
 
-- [ ] **Step 2: Run the test and observe the missing future-boundary failure**
+- [x] **Step 2: Run the test and observe the missing future-boundary failure**
 
 Run:
 
@@ -551,7 +566,7 @@ uv run pytest tests/unit/test_repository_policy.py::test_source_guidance_keeps_e
 
 Expected: FAIL first on `"future execution boundary"`.
 
-- [ ] **Step 3: Add the future execution boundary to `src/AGENTS.md`**
+- [x] **Step 3: Add the future execution boundary to `src/AGENTS.md`**
 
 Append these bullets:
 
@@ -565,7 +580,7 @@ Append these bullets:
   models, never the reverse.
 ```
 
-- [ ] **Step 4: Add the package namespace boundary to `src/cyexm/AGENTS.md`**
+- [x] **Step 4: Add the package namespace boundary to `src/cyexm/AGENTS.md`**
 
 Append:
 
@@ -576,7 +591,7 @@ Append:
   YAML workflow dependencies.
 ```
 
-- [ ] **Step 5: Correct the overbroad registration writer rule**
+- [x] **Step 5: Correct the overbroad registration writer rule**
 
 Replace the bullet beginning `Artifact writer methods` with:
 
@@ -587,7 +602,7 @@ Replace the bullet beginning `Artifact writer methods` with:
   `artifacts.py`, `whole_image.py`, and `chunked.py`.
 ```
 
-- [ ] **Step 6: Add the worker-process rule to runtime guidance**
+- [x] **Step 6: Add the worker-process rule to runtime guidance**
 
 Append to `src/cyexm/runtime/AGENTS.md`:
 
@@ -597,7 +612,7 @@ Append to `src/cyexm/runtime/AGENTS.md`:
   thread policy; it must not initialize or own a scheduler.
 ```
 
-- [ ] **Step 7: Run the source test, import-contract test, and diff check**
+- [x] **Step 7: Run the source test, import-contract test, and diff check**
 
 Run:
 
@@ -609,7 +624,7 @@ git diff --check
 
 Expected: source policy `1 passed`; import contract `4 passed`; no whitespace errors.
 
-- [ ] **Step 8: Commit source boundaries**
+- [x] **Step 8: Commit source boundaries**
 
 ```bash
 git add src/AGENTS.md src/cyexm/AGENTS.md \
@@ -632,7 +647,7 @@ git commit -m "docs: define future execution ownership"
 - Consumes: `_normalized_repository_file(path: str) -> str`; the root Phase 2 gate and future execution boundary
 - Produces: non-contradictory unit/integration/HPC classification for current and future tests; final executable acceptance evidence
 
-- [ ] **Step 1: Add the failing test-taxonomy guidance test**
+- [x] **Step 1: Add the failing test-taxonomy guidance test**
 
 ```python
 def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> None:
@@ -662,7 +677,7 @@ def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> 
         assert required in integration
 ```
 
-- [ ] **Step 2: Run the test and observe the parent-taxonomy failure**
+- [x] **Step 2: Run the test and observe the parent-taxonomy failure**
 
 Run:
 
@@ -672,7 +687,7 @@ uv run pytest tests/unit/test_repository_policy.py::test_test_guidance_separates
 
 Expected: FAIL first on `"narrow concrete-image exception"`.
 
-- [ ] **Step 3: Clarify the parent test taxonomy**
+- [x] **Step 3: Clarify the parent test taxonomy**
 
 Replace the first `tests/AGENTS.md` bullet with:
 
@@ -683,7 +698,7 @@ Replace the first `tests/AGENTS.md` bullet with:
   data, real SLURM submission, or cluster services are explicitly selected as `hpc`.
 ```
 
-- [ ] **Step 4: Add dependency-neutral future policy to unit guidance**
+- [x] **Step 4: Add dependency-neutral future policy to unit guidance**
 
 Append to `tests/unit/AGENTS.md`:
 
@@ -693,7 +708,7 @@ Append to `tests/unit/AGENTS.md`:
   starts at an approved integration boundary.
 ```
 
-- [ ] **Step 5: Add future local-scheduler versus SLURM guidance to integration tests**
+- [x] **Step 5: Add future local-scheduler versus SLURM guidance to integration tests**
 
 Append to `tests/integration/AGENTS.md`:
 
@@ -704,7 +719,7 @@ Append to `tests/integration/AGENTS.md`:
   assertions, and machine-readable job evidence.
 ```
 
-- [ ] **Step 6: Run every focused repository-policy test**
+- [x] **Step 6: Run every focused repository-policy test**
 
 Run:
 
@@ -714,7 +729,7 @@ uv run pytest tests/unit/test_repository_policy.py -q
 
 Expected: `8 passed` (the three existing policy tests plus five new tests).
 
-- [ ] **Step 7: Run the complete portable verification matrix**
+- [x] **Step 7: Run the complete portable verification matrix**
 
 Run:
 
@@ -741,7 +756,7 @@ Expected:
 - BasedPyright reports `0 errors, 0 warnings, 0 notes`;
 - all four pre-commit hooks pass.
 
-- [ ] **Step 8: Audit every instruction file and forbidden scope**
+- [x] **Step 8: Audit every instruction file and forbidden scope**
 
 Run:
 
@@ -761,7 +776,7 @@ git diff --exit-code main...HEAD -- pyproject.toml uv.lock \
 Expected: exactly 18 instruction files; every Phase 2 statement is clearly proposed or
 gated; the protected production/dependency/example/workflow diff is empty.
 
-- [ ] **Step 9: Commit test guidance**
+- [x] **Step 9: Commit test guidance**
 
 ```bash
 git add tests/AGENTS.md tests/integration/AGENTS.md tests/unit/AGENTS.md \
@@ -769,7 +784,7 @@ git add tests/AGENTS.md tests/integration/AGENTS.md tests/unit/AGENTS.md \
 git commit -m "docs: align test guidance for future execution"
 ```
 
-- [ ] **Step 10: Verify final branch state**
+- [x] **Step 10: Verify final branch state**
 
 Run:
 

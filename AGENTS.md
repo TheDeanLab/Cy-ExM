@@ -12,12 +12,15 @@
 - Phase 1 is the current stable runtime: whole-image and serial chunked registration,
   restart-safe artifacts, strict geometry/TIFF boundaries, and configurable native
   threads. Preserve that API and its acceptance evidence as Phase 2 is implemented.
-- Phase 2C is the current workflow surface: Phase 2A's strict scientific dataset
-  manifests and execution profiles, deterministic planning and status inspection,
+- Phase 2D is the current portable workflow surface: Phase 2A's strict scientific
+  dataset manifests and execution profiles, deterministic planning and status inspection,
   sequential execution, and `cyexm workflow` CLI now drive the real scheduler-neutral
   round runner and restart-safe transformed-channel artifacts. Bounded process-based
-  local Dask execution is accepted; SLURM execution and HPC acceptance remain later
-  milestones.
+  local Dask execution is accepted. Lazy SLURMCluster construction, bounded workers,
+  all-worker preflight, one-round-per-node resource policy, independent failure
+  collection, cancellation, owned cleanup, and operational evidence are accepted by
+  portable fake-based tests. Real SLURM submission and HPC acceptance remain Phase 2E
+  work.
 - All Phase 2 additions follow the approved Phase 2 runtime design and implementation
   plans. Keep optional workflow, distributed, and HPC dependencies out of the base
   installation, and do not advertise a later milestone before its acceptance gate.

@@ -15,9 +15,10 @@
   interpolation.
 - Notebooks must have no saved outputs or execution counts. Scripts and notebooks
   must remain useful on local workstations without cluster services.
-- Phase 2C is the current runnable workflow surface: strict YAML validation,
+- Phase 2D is the current portable workflow surface: strict YAML validation,
   deterministic planning, real sequential round execution, restart-safe transformed
-  channels, the workflow CLI, and bounded process-based local Dask execution.
-  Examples never lead production behavior. Keep each scientific manifest separate
-  from its local or HPC execution profile. SLURM execution and HPC acceptance remain
-  deferred until the corresponding runtime milestone lands.
+  channels, the workflow CLI, and bounded process-based local Dask execution. The
+  SLURMCluster adapter is implemented behind fake-based construction and preflight
+  gates. Examples never lead production behavior. Keep each scientific manifest
+  separate from its local or HPC execution profile. Real SLURM submission and HPC
+  acceptance remain Phase 2E work, so examples must not claim cluster acceptance.

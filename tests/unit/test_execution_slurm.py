@@ -399,12 +399,21 @@ class _FakeSlurmModules:
             raise self.cluster_error
         self.cluster_kwargs = kwargs
         prologue = "\n".join(cast(list[str], kwargs.get("job_script_prologue", [])))
+        directives = "\n".join(
+            f"#SBATCH {directive}"
+            for directive in cast(list[str], kwargs.get("job_extra_directives", []))
+        )
         python = str(kwargs.get("python", "python"))
         worker_command = str(
             kwargs.get("worker_command", "distributed.cli.dask_worker")
         )
         self.job_script_text = (
-            "#!/bin/bash\n#SBATCH --partition=512GB\n"
+            f"{kwargs.get('shebang', '#!/bin/bash')}\n"
+            f"#SBATCH -p {kwargs['queue']}\n"
+            f"#SBATCH --cpus-per-task={kwargs['job_cpu']}\n"
+            f"#SBATCH --mem={kwargs['job_mem']}\n"
+            f"#SBATCH -t {kwargs['walltime']}\n"
+            f"{directives}\n"
             f"{prologue}\n{python} -m {worker_command} tcp://scheduler:8786\n"
         )
         return _FakeCluster(self)
@@ -429,52 +438,6 @@ class _FakeSlurmModules:
     def parse_timedelta(self, value: str) -> float:
         assert value == "15m"
         return 900.0
-
-
-class _ConfiguredSlurmModules(_FakeSlurmModules):
-    """Render through the pinned SLURMJob while keeping scheduling faked."""
-
-    class _RealConfigContext(AbstractContextManager[None]):
-        def __init__(
-            self,
-            modules: _ConfiguredSlurmModules,
-            values: dict[str, object],
-        ) -> None:
-            from dask import config as dask_config
-
-            self._modules = modules
-            self._values = values
-            self._context = dask_config.set(values)
-
-        def __enter__(self) -> None:
-            self._modules.config_overlays.append(self._values)
-            self._modules.config_context_active = True
-            self._context.__enter__()
-
-        def __exit__(self, *exc_info: object) -> None:
-            try:
-                self._context.__exit__(*exc_info)
-            finally:
-                self._modules.config_context_active = False
-
-    def config_set(self, values: dict[str, object]) -> AbstractContextManager[None]:
-        return self._RealConfigContext(self, values)
-
-    def SLURMCluster(self, **kwargs: object) -> _FakeCluster:
-        from dask_jobqueue.slurm import SLURMJob
-
-        cluster = super().SLURMCluster(**kwargs)
-        cluster_only = {"scheduler_options", "shared_temp_directory"}
-        job_kwargs = {
-            name: value for name, value in kwargs.items() if name not in cluster_only
-        }
-        job = SLURMJob(
-            scheduler="tcp://scheduler:8786",
-            name="actual-worker",
-            **job_kwargs,
-        )
-        self.job_script_text = job.job_script()
-        return cluster
 
 
 def _executor(
@@ -522,7 +485,7 @@ def test_real_module_loader_gets_timeout_parser_from_pinned_dask_utils(
 def test_slurm_executor_builds_one_process_jobs_with_round_resource(
     tmp_path: Path,
 ) -> None:
-    modules = _ConfiguredSlurmModules()
+    modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:3]
     tasks = tuple(_task(tmp_path, number) for number in (2, 3, 4))
 
@@ -568,7 +531,7 @@ def test_slurm_executor_exports_resolved_threads_before_worker_launch(
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, "999")
-    modules = _ConfiguredSlurmModules()
+    modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
 
@@ -594,12 +557,10 @@ def test_slurm_executor_exports_resolved_threads_before_worker_launch(
 
 
 @pytest.mark.parametrize("directives", [(), ("--qos=lab",)])
-def test_slurm_executor_neutralizes_ambient_jobqueue_launch_configuration(
+def test_slurm_executor_supplies_isolated_jobqueue_launch_configuration(
     tmp_path: Path,
     directives: tuple[str, ...],
 ) -> None:
-    from dask import config as dask_config
-
     malicious = {
         "account": "evil-account",
         "project": "evil-project",
@@ -614,12 +575,7 @@ def test_slurm_executor_neutralizes_ambient_jobqueue_launch_configuration(
         "shebang": "#!/evil/shell",
         "log-directory": "/evil/logs",
     }
-    contaminated = {
-        f"jobqueue.{namespace}.{name}": value
-        for namespace in ("slurm", "cyexm-slurm")
-        for name, value in malicious.items()
-    }
-    modules = _ConfiguredSlurmModules()
+    modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:1]
     executor = SlurmExecutor(
         _profile(tmp_path, directives=directives),
@@ -627,8 +583,14 @@ def test_slurm_executor_neutralizes_ambient_jobqueue_launch_configuration(
         _version=lambda _name: "test-version",
     )
 
-    with dask_config.set(contaminated):
-        executor.execute((_task(tmp_path, 2),))
+    executor.execute((_task(tmp_path, 2),))
+
+    assert len(modules.config_overlays) == 1
+    overlay = modules.config_overlays[0]
+    for name, hostile_value in malicious.items():
+        key = f"jobqueue.cyexm-slurm.{name}"
+        assert key in overlay
+        assert overlay[key] != hostile_value
 
     rendered = cast(
         dict[str, str],

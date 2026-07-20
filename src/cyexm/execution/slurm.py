@@ -705,7 +705,9 @@ def _slurm_modules() -> _SlurmModules:
     """Load Dask and dask-jobqueue only when SLURM execution is selected."""
     from dask import config as dask_config
     from dask.utils import parse_timedelta
-    from dask_jobqueue import SLURMCluster  # pyright: ignore[reportPrivateImportUsage]
+    from dask_jobqueue import (  # pyright: ignore[reportMissingImports]
+        SLURMCluster,  # pyright: ignore[reportPrivateImportUsage]
+    )
     from distributed import Client, as_completed
 
     return _SlurmModules(

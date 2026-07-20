@@ -43,6 +43,60 @@ AGENT_GUIDANCE_PATHS = frozenset(
         "tests/unit/AGENTS.md",
     }
 )
+PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
+    "src/cyexm/cli/AGENTS.md": (
+        "parsing, logging setup, lifecycle, formatting, and exit-code mapping",
+        "public workflow api",
+        "diagnostics go to stderr",
+        "structured json and human results to stdout",
+        "no scientific algorithms",
+        "scheduler construction",
+        "filesystem or network activity",
+        "environment mutation at import time",
+        "0 success",
+        "2 config/plan",
+        "3 startup/preflight",
+        "4 round failure",
+        "130 interruption",
+    ),
+    "src/cyexm/config/AGENTS.md": (
+        "strict safe yaml decoding",
+        "frozen scientific-manifest and execution-profile models",
+        "two documents separate",
+        "unknown and duplicate keys",
+        "non-scalar yaml keys",
+        "aliases",
+        "custom tags",
+        "additional documents",
+        "unsafe paths",
+        "scientific and execution roots are disjoint, neither containing the other",
+        "must not import ants, numpy, scipy, dask, distributed, or dask-jobqueue",
+        "must not mutate the filesystem or environment",
+        "initialize a scheduler",
+    ),
+    "src/cyexm/execution/AGENTS.md": (
+        "executor protocol",
+        "sequential, dask, and slurm adapter lifecycle",
+        "never registration algorithms or artifact-validity decisions",
+        "scheduler imports occur only inside the selected operation",
+        "one coarse task per round",
+        "each worker advertises one `round_slot`",
+        "every submitted round task requests and consumes one",
+        "no nested chunk scheduling or silent fallback",
+        "cleaned up on success, failure, and cancellation",
+    ),
+    "src/cyexm/workflow/AGENTS.md": (
+        "immutable plans, tasks, and results",
+        "deterministic path and header validation",
+        "output layout, status, fingerprinting, and public orchestration",
+        "planning creates no files, directories, clients, clusters, or workers",
+        "workflow must not mutate a plan or create a scheduler",
+        "phase 1 completion records remain the only restart authority",
+        "scientific fingerprints exclude executor, resource, and logging settings",
+        "force never bypasses a scientific-plan fingerprint mismatch",
+        "no module-scope scientific or scheduler imports",
+    ),
+}
 
 
 def _read_repository_file(path: str) -> str:
@@ -338,58 +392,26 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "acceptance criteria",
             "erratum",
         ),
-        "src/cyexm/cli/AGENTS.md": (
-            "parsing, logging setup, lifecycle, formatting, and exit-code mapping",
-            "public workflow api",
-            "diagnostics go to stderr",
-            "structured json and human results to stdout",
-            "no scientific algorithms",
-            "scheduler construction",
-            "filesystem or network activity",
-            "environment mutation at import time",
-            "0 success",
-            "2 config/plan",
-            "3 startup/preflight",
-            "4 round failure",
-            "130 interruption",
-        ),
-        "src/cyexm/config/AGENTS.md": (
-            "strict safe yaml decoding",
-            "frozen scientific-manifest and execution-profile models",
-            "two documents separate",
-            "unknown and duplicate keys",
-            "aliases",
-            "custom tags",
-            "additional documents",
-            "unsafe paths",
-            "must not import ants, numpy, scipy, dask, distributed, or dask-jobqueue",
-            "must not mutate the filesystem or environment",
-            "initialize a scheduler",
-        ),
-        "src/cyexm/execution/AGENTS.md": (
-            "executor protocol",
-            "sequential, dask, and slurm adapter lifecycle",
-            "never registration algorithms or artifact-validity decisions",
-            "scheduler imports occur only inside the selected operation",
-            "one coarse task per round",
-            "one `round_slot` per worker or task",
-            "no nested chunk scheduling or silent fallback",
-            "cleaned up on success, failure, and cancellation",
-        ),
-        "src/cyexm/workflow/AGENTS.md": (
-            "immutable plans, tasks, and results",
-            "deterministic path and header validation",
-            "output layout, status, fingerprinting, and public orchestration",
-            "planning creates no files, directories, clients, clusters, or workers",
-            "phase 1 completion records remain the only restart authority",
-            "scientific fingerprints exclude executor, resource, and logging settings",
-            "no module-scope scientific or scheduler imports",
-        ),
     }
     for path, required_fragments in required_by_path.items():
         guidance = _normalized_repository_file(path)
         for fragment in required_fragments:
             assert fragment in guidance, (path, fragment)
+
+
+@pytest.mark.parametrize(
+    ("path", "required_fragment"),
+    tuple(
+        (path, required_fragment)
+        for path, required_fragments in PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS.items()
+        for required_fragment in required_fragments
+    ),
+)
+def test_phase_two_package_guidance_enforces_boundaries(
+    path: str, required_fragment: str
+) -> None:
+    guidance = _normalized_repository_file(path)
+    assert required_fragment in guidance, (path, required_fragment)
 
 
 def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> None:

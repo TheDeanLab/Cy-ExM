@@ -248,26 +248,74 @@ def _model_relative_path(value: object) -> object:
 
 def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
     """Revalidate a directly constructed manifest against the YAML contract."""
-    if not isinstance(manifest, DatasetManifest):
+    if type(manifest) is not DatasetManifest:
         raise ConfigurationValidationError(
             f"manifest must be a DatasetManifest; got {manifest!r}"
         )
-    if type(manifest.rounds) is not tuple:
-        raise ConfigurationValidationError("rounds must be an immutable tuple")
-    if (
-        not isinstance(manifest.reference, ReferenceSpec)
-        or not isinstance(manifest.registration, RegistrationSpec)
-        or not isinstance(manifest.registration.linear, RegistrationStageSpec)
-        or not isinstance(manifest.registration.nonlinear, RegistrationStageSpec)
-    ):
+    if type(manifest.schema_version) is not int or manifest.schema_version != 1:
         raise ConfigurationValidationError(
-            "manifest reference and registration values must use their model types"
+            "schema_version must be the built-in integer 1; "
+            f"got {manifest.schema_version!r}"
         )
+    if type(manifest.dataset_id) is not str:
+        raise ConfigurationValidationError(
+            f"dataset_id must be a built-in string; got {manifest.dataset_id!r}"
+        )
+    if type(manifest.rounds) is not tuple:
+        raise ConfigurationValidationError("rounds must be an exact immutable tuple")
+    if type(manifest.reference) is not ReferenceSpec:
+        raise ConfigurationValidationError(
+            f"reference must be a ReferenceSpec; got {manifest.reference!r}"
+        )
+    if type(manifest.reference.round) is not int or manifest.reference.round < 0:
+        raise ConfigurationValidationError(
+            "reference.round must be a nonnegative built-in integer; "
+            f"got {manifest.reference.round!r}"
+        )
+    if type(manifest.reference.channel) is not PurePosixPath:
+        raise ConfigurationValidationError(
+            "reference.channel must be a PurePosixPath; "
+            f"got {manifest.reference.channel!r}"
+        )
+    if type(manifest.registration) is not RegistrationSpec:
+        raise ConfigurationValidationError(
+            f"registration must be a RegistrationSpec; got {manifest.registration!r}"
+        )
+    if type(manifest.registration.crop) is not bool:
+        raise ConfigurationValidationError(
+            "registration.crop must be a built-in boolean; "
+            f"got {manifest.registration.crop!r}"
+        )
+    for stage_name, stage in (
+        ("linear", manifest.registration.linear),
+        ("nonlinear", manifest.registration.nonlinear),
+    ):
+        stage_path = f"registration.{stage_name}"
+        if type(stage) is not RegistrationStageSpec:
+            raise ConfigurationValidationError(
+                f"{stage_path} must be a RegistrationStageSpec; got {stage!r}"
+            )
+        for field_name, value in (
+            ("type", stage.type),
+            ("accuracy", stage.accuracy),
+        ):
+            if type(value) is not str:
+                raise ConfigurationValidationError(
+                    f"{stage_path}.{field_name} must be a built-in string; "
+                    f"got {value!r}"
+                )
     spacing = manifest.voxel_spacing_um
     if type(spacing) is not tuple or len(spacing) != 3:
         raise ConfigurationValidationError(
-            f"voxel_spacing_um must contain exactly three values; got {spacing!r}"
+            "voxel_spacing_um must be an exact tuple containing three built-in "
+            f"floats; got {spacing!r}"
         )
+    for index, value in enumerate(spacing):
+        if type(value) is not float or not math.isfinite(value) or value <= 0.0:
+            raise ConfigurationValidationError(
+                f"voxel_spacing_um[{index}] must be a positive finite built-in "
+                f"float; got {value!r}"
+            )
     parsed_reference = _reference(
         {
             "round": manifest.reference.round,
@@ -289,18 +337,45 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
     )
     round_mappings: list[dict[str, object]] = []
     for index, round_spec in enumerate(manifest.rounds):
-        if (
-            not isinstance(round_spec, RoundSpec)
-            or type(round_spec.channels) is not tuple
-        ):
+        round_path = f"rounds[{index}]"
+        if type(round_spec) is not RoundSpec:
             raise ConfigurationValidationError(
-                f"rounds[{index}] must be a RoundSpec with an immutable channels tuple"
+                f"{round_path} must be a RoundSpec; got {round_spec!r}"
+            )
+        if type(round_spec.round) is not int or round_spec.round < 0:
+            raise ConfigurationValidationError(
+                f"{round_path}.round must be a nonnegative built-in integer; "
+                f"got {round_spec.round!r}"
+            )
+        if type(round_spec.strategy) is not str:
+            raise ConfigurationValidationError(
+                f"{round_path}.strategy must be a built-in string; "
+                f"got {round_spec.strategy!r}"
+            )
+        if type(round_spec.registration_channel) is not PurePosixPath:
+            raise ConfigurationValidationError(
+                f"{round_path}.registration_channel must be a PurePosixPath; "
+                f"got {round_spec.registration_channel!r}"
+            )
+        if type(round_spec.channels) is not tuple:
+            raise ConfigurationValidationError(
+                f"{round_path}.channels must be an exact immutable tuple"
             )
         channels: list[dict[str, object]] = []
         for channel_index, channel in enumerate(round_spec.channels):
-            if not isinstance(channel, ChannelSpec):
+            channel_path = f"{round_path}.channels[{channel_index}]"
+            if type(channel) is not ChannelSpec:
                 raise ConfigurationValidationError(
-                    f"rounds[{index}].channels[{channel_index}] must be a ChannelSpec"
+                    f"{channel_path} must be a ChannelSpec; got {channel!r}"
+                )
+            if type(channel.file) is not PurePosixPath:
+                raise ConfigurationValidationError(
+                    f"{channel_path}.file must be a PurePosixPath; got {channel.file!r}"
+                )
+            if type(channel.interpolation) is not str:
+                raise ConfigurationValidationError(
+                    f"{channel_path}.interpolation must be a built-in string; "
+                    f"got {channel.interpolation!r}"
                 )
             channels.append(
                 {
@@ -318,13 +393,39 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
         }
         if round_spec.strategy == "serial_chunked":
             chunk_size = round_spec.chunk_size_zyx
-            if type(chunk_size) is not tuple:
+            if type(chunk_size) is not tuple or len(chunk_size) != 3:
                 raise ConfigurationValidationError(
-                    f"rounds[{index}].chunk_size_zyx must be an immutable tuple"
+                    f"{round_path}.chunk_size_zyx must be an exact tuple of three "
+                    "positive built-in integers"
+                )
+            for chunk_index, value in enumerate(chunk_size):
+                if type(value) is not int or value < 1:
+                    raise ConfigurationValidationError(
+                        f"{round_path}.chunk_size_zyx[{chunk_index}] must be a "
+                        f"positive built-in integer; got {value!r}"
+                    )
+            overlap = round_spec.overlap_fraction
+            if type(overlap) is not float or not math.isfinite(overlap):
+                raise ConfigurationValidationError(
+                    f"{round_path}.overlap_fraction must be a finite built-in "
+                    f"float; got {overlap!r}"
+                )
+            if not 0.0 <= overlap < 1.0:
+                raise ConfigurationValidationError(
+                    f"{round_path}.overlap_fraction must satisfy 0 <= value < 1; "
+                    f"got {overlap!r}"
                 )
             round_mapping.update(
                 chunk_size_zyx=list(chunk_size),
-                overlap_fraction=round_spec.overlap_fraction,
+                overlap_fraction=overlap,
+            )
+        elif round_spec.strategy == "whole_image" and (
+            round_spec.chunk_size_zyx is not None
+            or round_spec.overlap_fraction is not None
+        ):
+            raise ConfigurationValidationError(
+                f"{round_path}.chunk_size_zyx and overlap_fraction must be null "
+                "for whole_image"
             )
         round_mappings.append(round_mapping)
     parsed = DatasetManifest(
@@ -337,11 +438,6 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
         registration=parsed_registration,
         rounds=_rounds(round_mappings, parsed_reference.round),
     )
-    if parsed.schema_version != 1:
-        raise ConfigurationValidationError(
-            "schema_version must be the built-in integer 1; "
-            f"got {parsed.schema_version!r}"
-        )
     if parsed != manifest:
         raise ConfigurationValidationError(
             "directly constructed manifest does not match its normalized contract"

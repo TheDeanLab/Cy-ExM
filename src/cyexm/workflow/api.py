@@ -707,12 +707,12 @@ def _ordered_results(
     submitted: tuple[RoundTask, ...],
     results: tuple[RoundResult, ...],
 ) -> tuple[RoundResult, ...]:
-    if type(results) is not tuple or not all(
-        type(result) is RoundResult for result in results
-    ):
+    if type(results) is not tuple:
         raise RoundExecutionError(
             "Executor must return an exact tuple containing exact RoundResult values"
         )
+    for index, result in enumerate(results):
+        _validate_round_result_structure(result, f"Executor result at index {index}")
     expected = tuple(task.round for task in submitted)
     actual = tuple(result.round for result in results)
     if len(set(actual)) != len(actual) or set(actual) != set(expected):
@@ -914,11 +914,18 @@ def _validated_partial_results(
     submitted: tuple[RoundTask, ...],
     results: tuple[RoundResult, ...],
 ) -> tuple[RoundResult, ...]:
+    if type(results) is not tuple:
+        return ()
     tasks_by_round = {task.round: task for task in submitted}
     valid: list[RoundResult] = []
     seen: set[int] = set()
-    for result in results:
-        if type(result) is not RoundResult:
+    for index, result in enumerate(results):
+        try:
+            _validate_round_result_structure(
+                result,
+                f"Cancelled partial result at index {index}",
+            )
+        except RoundExecutionError:
             continue
         task = tasks_by_round.get(result.round)
         if task is None or result.round in seen:

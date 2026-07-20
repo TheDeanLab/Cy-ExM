@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +27,14 @@ from cyexm.workflow.models import ImageHeader
 from cyexm.workflow.planning import _inspect_tiff_header, build_workflow_plan
 
 pytestmark = pytest.mark.unit
+
+
+class _FloatAlias(float):
+    pass
+
+
+class _StringAlias(str):
+    pass
 
 
 def _registration() -> RegistrationSpec:
@@ -71,6 +81,168 @@ def _manifest(round_order: tuple[int, ...] = (3, 2)) -> DatasetManifest:
         registration=_registration(),
         rounds=tuple(_round(round_number) for round_number in round_order),
     )
+
+
+def _invalid_manifest(manifest: DatasetManifest, case: str) -> DatasetManifest:
+    if case == "schema":
+        return replace(manifest, schema_version=True)  # type: ignore[arg-type]
+    if case == "dataset_id":
+        return replace(manifest, dataset_id=_StringAlias(manifest.dataset_id))
+    if case == "spacing_container":
+        return replace(  # type: ignore[arg-type]
+            manifest,
+            voxel_spacing_um=list(manifest.voxel_spacing_um),
+        )
+    if case == "spacing_int":
+        return replace(manifest, voxel_spacing_um=(1, 0.324, 0.9))
+    if case == "spacing_subclass":
+        return replace(
+            manifest,
+            voxel_spacing_um=(_FloatAlias(0.324), 0.324, 0.9),
+        )
+    if case == "reference_model":
+        return replace(  # type: ignore[arg-type]
+            manifest,
+            reference=SimpleNamespace(
+                round=manifest.reference.round,
+                channel=manifest.reference.channel,
+            ),
+        )
+    if case == "reference_round":
+        return replace(
+            manifest,
+            reference=replace(manifest.reference, round=True),  # type: ignore[arg-type]
+        )
+    if case == "reference_channel":
+        return replace(
+            manifest,
+            reference=replace(  # type: ignore[arg-type]
+                manifest.reference,
+                channel=str(manifest.reference.channel),
+            ),
+        )
+    if case == "registration_model":
+        registration = manifest.registration
+        return replace(  # type: ignore[arg-type]
+            manifest,
+            registration=SimpleNamespace(
+                crop=registration.crop,
+                linear=registration.linear,
+                nonlinear=registration.nonlinear,
+            ),
+        )
+    if case == "registration_crop":
+        return replace(
+            manifest,
+            registration=replace(manifest.registration, crop=1),  # type: ignore[arg-type]
+        )
+    if case == "registration_stage_model":
+        stage = manifest.registration.linear
+        return replace(
+            manifest,
+            registration=replace(  # type: ignore[arg-type]
+                manifest.registration,
+                linear=SimpleNamespace(type=stage.type, accuracy=stage.accuracy),
+            ),
+        )
+    if case == "registration_type":
+        registration = manifest.registration
+        return replace(
+            manifest,
+            registration=replace(
+                registration,
+                linear=replace(
+                    registration.linear,
+                    type=_StringAlias(registration.linear.type),
+                ),
+            ),
+        )
+    if case == "registration_accuracy":
+        registration = manifest.registration
+        return replace(
+            manifest,
+            registration=replace(
+                registration,
+                nonlinear=replace(
+                    registration.nonlinear,
+                    accuracy=_StringAlias(registration.nonlinear.accuracy),
+                ),
+            ),
+        )
+    if case == "rounds_container":
+        return replace(manifest, rounds=list(manifest.rounds))  # type: ignore[arg-type]
+
+    serial_index = next(
+        index for index, item in enumerate(manifest.rounds) if item.round == 3
+    )
+    serial = manifest.rounds[serial_index]
+    channel = serial.channels[0]
+    if case == "round_model":
+        invalid_round = SimpleNamespace(
+            round=serial.round,
+            strategy=serial.strategy,
+            registration_channel=serial.registration_channel,
+            channels=serial.channels,
+            chunk_size_zyx=serial.chunk_size_zyx,
+            overlap_fraction=serial.overlap_fraction,
+        )
+    elif case == "round_number":
+        invalid_round = replace(serial, round=True)  # type: ignore[arg-type]
+    elif case == "strategy":
+        invalid_round = replace(serial, strategy=_StringAlias(serial.strategy))
+    elif case == "registration_channel":
+        invalid_round = replace(  # type: ignore[arg-type]
+            serial,
+            registration_channel=str(serial.registration_channel),
+        )
+    elif case == "channels_container":
+        invalid_round = replace(serial, channels=list(serial.channels))  # type: ignore[arg-type]
+    elif case == "channel_model":
+        invalid_round = replace(
+            serial,
+            channels=(
+                SimpleNamespace(
+                    file=channel.file,
+                    interpolation=channel.interpolation,
+                ),
+            ),  # type: ignore[arg-type]
+        )
+    elif case == "channel_file":
+        invalid_round = replace(
+            serial,
+            channels=(replace(channel, file=str(channel.file)),),  # type: ignore[arg-type]
+        )
+    elif case == "channel_interpolation":
+        invalid_round = replace(
+            serial,
+            channels=(
+                replace(
+                    channel,
+                    interpolation=_StringAlias(channel.interpolation),
+                ),
+            ),
+        )
+    elif case == "chunk_container":
+        invalid_round = replace(  # type: ignore[arg-type]
+            serial,
+            chunk_size_zyx=list(serial.chunk_size_zyx or ()),
+        )
+    elif case == "chunk_scalar":
+        invalid_round = replace(
+            serial,
+            chunk_size_zyx=(True, 4, 4),  # type: ignore[arg-type]
+        )
+    elif case == "overlap_int":
+        invalid_round = replace(serial, overlap_fraction=0)  # type: ignore[arg-type]
+    elif case == "overlap_bool":
+        invalid_round = replace(serial, overlap_fraction=False)  # type: ignore[arg-type]
+    elif case == "overlap_subclass":
+        invalid_round = replace(serial, overlap_fraction=_FloatAlias(0.25))
+    else:
+        raise AssertionError(f"unknown invalid manifest case: {case}")
+    rounds = list(manifest.rounds)
+    rounds[serial_index] = invalid_round  # type: ignore[assignment]
+    return replace(manifest, rounds=tuple(rounds))
 
 
 def _execution(
@@ -180,6 +352,64 @@ def test_plan_revalidates_directly_constructed_manifest_before_inspection(
     )
 
     with pytest.raises(WorkflowPlanError, match="reference round"):
+        build_workflow_plan(forged, execution)
+
+    assert calls == []
+    assert not execution.paths.output_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "field"),
+    [
+        ("schema", "schema_version"),
+        ("dataset_id", "dataset_id"),
+        ("spacing_container", "voxel_spacing_um"),
+        ("spacing_int", "voxel_spacing_um[0]"),
+        ("spacing_subclass", "voxel_spacing_um[0]"),
+        ("reference_model", "reference"),
+        ("reference_round", "reference.round"),
+        ("reference_channel", "reference.channel"),
+        ("registration_model", "registration"),
+        ("registration_crop", "registration.crop"),
+        ("registration_stage_model", "registration.linear"),
+        ("registration_type", "registration.linear.type"),
+        ("registration_accuracy", "registration.nonlinear.accuracy"),
+        ("rounds_container", "rounds"),
+        ("round_model", "rounds[0]"),
+        ("round_number", "round"),
+        ("strategy", "strategy"),
+        ("registration_channel", "registration_channel"),
+        ("channels_container", "channels"),
+        ("channel_model", "channels[0]"),
+        ("channel_file", "channels[0].file"),
+        ("channel_interpolation", "channels[0].interpolation"),
+        ("chunk_container", "chunk_size_zyx"),
+        ("chunk_scalar", "chunk_size_zyx[0]"),
+        ("overlap_int", "overlap_fraction"),
+        ("overlap_bool", "overlap_fraction"),
+        ("overlap_subclass", "overlap_fraction"),
+    ],
+)
+def test_plan_rejects_nonexact_direct_manifest_before_inspection(
+    case: str,
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    forged = _invalid_manifest(manifest, case)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: calls.append(path) or _header(path),
+    )
+
+    with pytest.raises(
+        WorkflowPlanError,
+        match=rf"Dataset manifest is invalid:.*{re.escape(field)}",
+    ):
         build_workflow_plan(forged, execution)
 
     assert calls == []

@@ -1360,6 +1360,31 @@ def test_run_workflow_rejects_nonexact_round_result_fields_before_persistence(
     assert records == ()
 
 
+@pytest.mark.parametrize("round_value", [[], "2"])
+def test_run_workflow_validates_result_round_before_indexing_results(
+    round_value: object,
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def execute(tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        invalid = replace(_result(tasks[0]), round=round_value)  # type: ignore[arg-type]
+        return (invalid, _result(tasks[1]))
+
+    with pytest.raises(RoundExecutionError, match=r"round.*built-in integer"):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(_FakeExecutor(execute)),
+        )
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root, plan.dataset_id
+        ).workflow_runs.glob("*.json")
+    )
+    assert records == ()
+
+
 def test_run_workflow_writes_cancelled_summary_and_reraises(
     tmp_path: Path,
 ) -> None:
@@ -1372,6 +1397,35 @@ def test_run_workflow_writes_cancelled_summary_and_reraises(
         run_workflow(
             plan,
             _executor_factory=_factory(_FakeExecutor(cancel)),
+        )
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root, plan.dataset_id
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    payload = json.loads(records[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "cancelled"
+    assert payload["rounds"] == []
+
+
+def test_run_workflow_skips_unhashable_partial_result_during_cancellation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def interrupt(tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        invalid = replace(_result(tasks[0]), round=[])  # type: ignore[arg-type]
+        raise workflow_api._SequentialExecutionInterrupted(
+            KeyboardInterrupt("injected"),
+            (invalid,),
+        )
+
+    with pytest.raises(KeyboardInterrupt, match="injected"):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(_FakeExecutor(interrupt)),
         )
 
     records = tuple(

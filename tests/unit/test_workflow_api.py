@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -1400,6 +1401,74 @@ def test_slurm_preflight_address_discrepancy_remains_truthful_operational_eviden
     fake = _FakeExecutor(fail, execution_evidence=evidence)
 
     with pytest.raises(WorkerPreflightError, match=message) as captured:
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert captured.value is raised
+    assert captured.value.run_record is not None
+    assert captured.value.execution_evidence_json == canonical_json(evidence)
+    run_record = json.loads(Path(captured.value.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] == evidence
+    assert run_record["operational_failure"]["phase"] == "preflight"
+
+
+@pytest.mark.parametrize(
+    "reported_addresses",
+    [
+        ("tcp://worker-b:1234", "tcp://worker-a:1234"),
+        ("tcp://worker-a:1234", "tcp://worker-a:1234"),
+    ],
+    ids=("swapped", "duplicate"),
+)
+def test_slurm_multiworker_probe_identity_failure_preserves_original_record(
+    reported_addresses: tuple[str, str],
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2, 3))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    evidence = _slurm_evidence(outcome="failed")
+    requested = evidence["requested"]
+    startup = evidence["startup"]
+    observed = evidence["observed"]
+    assert isinstance(requested, dict)
+    assert isinstance(startup, dict)
+    assert isinstance(observed, dict)
+    requested["workers"] = 2
+    startup.update(
+        {
+            "phase": "worker_validation",
+            "error": {
+                "type": "WorkerPreflightError",
+                "message": "probe identity mismatch",
+            },
+        }
+    )
+    evidence["attempt_counts"] = []
+    scheduler_addresses = ("tcp://worker-a:1234", "tcp://worker-b:1234")
+    observed["connected_workers"] = list(scheduler_addresses)
+    probes = observed["worker_probes"]
+    assert isinstance(probes, list)
+    first_probe = probes[0]
+    assert isinstance(first_probe, dict)
+    probes[:] = [deepcopy(first_probe), deepcopy(first_probe)]
+    for probe, reported_address in zip(probes, reported_addresses, strict=True):
+        assert isinstance(probe, dict)
+        hostname = reported_address.removeprefix("tcp://").split(":", 1)[0]
+        probe["worker_address"] = reported_address
+        probe["hostname"] = hostname
+        probe["network_host"] = hostname
+    raised = WorkerPreflightError("probe identity mismatch")
+
+    def fail(_tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        raise raised
+
+    fake = _FakeExecutor(fail, execution_evidence=evidence)
+
+    with pytest.raises(
+        WorkerPreflightError, match="probe identity mismatch"
+    ) as captured:
         run_workflow(plan, _executor_factory=_factory(fake))
 
     assert captured.value is raised

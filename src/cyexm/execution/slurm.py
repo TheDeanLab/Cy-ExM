@@ -240,7 +240,7 @@ def _validate_versions(value: object) -> dict[str, str]:
     return decoded
 
 
-def _validate_cancellation(value: object) -> None:
+def _validate_cancellation(value: object) -> int | None:
     cancellation = _evidence_object(
         value,
         "execution_evidence.observed.cancellation",
@@ -271,7 +271,7 @@ def _validate_cancellation(value: object) -> None:
                 "unattempted cancellation must have zero unfinished futures, null "
                 "success, and no force/error claims"
             )
-        return
+        return None
     if unfinished < 1:
         raise ValueError("attempted cancellation requires unfinished futures")
     if cancellation.get("force") is not True:
@@ -289,6 +289,7 @@ def _validate_cancellation(value: object) -> None:
             cancellation["error"],
             "execution_evidence.observed.cancellation.error",
         )
+    return unfinished
 
 
 def _validate_observed(
@@ -297,7 +298,7 @@ def _validate_observed(
     worker_count: int,
     startup_phase: str,
     startup_outcome: str,
-) -> bool:
+) -> tuple[bool, int | None]:
     observed = _evidence_object(
         value,
         "execution_evidence.observed",
@@ -350,8 +351,6 @@ def _validate_observed(
             for index, probe in enumerate(probe_values)
         )
         addresses = tuple(probe.worker_address for probe in probes)
-        if addresses != tuple(sorted(set(addresses))):
-            raise ValueError("worker_probes must be unique and sorted by address")
         validated_workers = _STARTUP_PHASES.index(
             startup_phase
         ) >= _STARTUP_PHASES.index("worker_stability_check")
@@ -370,8 +369,9 @@ def _validate_observed(
                 "worker probes must all be ok after successful worker validation"
             )
     cancellation_present = "cancellation" in observed
+    cancellation_unfinished: int | None = None
     if cancellation_present:
-        _validate_cancellation(observed["cancellation"])
+        cancellation_unfinished = _validate_cancellation(observed["cancellation"])
     phase_index = _STARTUP_PHASES.index(startup_phase)
     if "coordinator_versions" in observed and phase_index < _STARTUP_PHASES.index(
         "worker_snapshot"
@@ -399,7 +399,7 @@ def _validate_observed(
         }
         if not required <= set(observed):
             raise ValueError("completed startup is missing observed preflight evidence")
-    return cancellation_present
+    return cancellation_present, cancellation_unfinished
 
 
 def _validate_startup(value: object) -> tuple[str, str]:
@@ -480,6 +480,7 @@ def _validate_attempts(
     task_retries: int,
     startup_outcome: str,
     cancellation_present: bool,
+    cancellation_unfinished: int | None,
 ) -> None:
     attempts = _evidence_array(value, "execution_evidence.attempt_counts")
     decoded: list[tuple[str, int]] = []
@@ -512,6 +513,13 @@ def _validate_attempts(
                 "attempt count exceeds the configured executor retry policy"
             )
     decoded_identities = tuple(decoded)
+    if cancellation_unfinished is not None:
+        if not decoded_identities:
+            raise ValueError("attempted cancellation requires an accepted task attempt")
+        if cancellation_unfinished > len(decoded_identities):
+            raise ValueError(
+                "unfinished cancellation futures cannot exceed accepted task attempts"
+            )
     if startup_outcome != "succeeded":
         if decoded_identities:
             raise ValueError("round attempts cannot precede successful startup")
@@ -665,7 +673,7 @@ def _canonical_execution_evidence(
                 raise ValueError(f"zero-worker evidence must leave {key} empty")
     elif not expected_identities:
         raise ValueError("nonzero worker evidence requires submitted tasks")
-    cancellation_present = _validate_observed(
+    cancellation_present, cancellation_unfinished = _validate_observed(
         evidence["observed"],
         worker_count=workers,
         startup_phase=phase,
@@ -677,6 +685,7 @@ def _canonical_execution_evidence(
         task_retries=retries,
         startup_outcome=outcome,
         cancellation_present=cancellation_present,
+        cancellation_unfinished=cancellation_unfinished,
     )
     _validate_timestamps(evidence["timestamps"])
     _validate_cleanup(evidence["cleanup"], completed_startup=completed)

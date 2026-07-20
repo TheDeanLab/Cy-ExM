@@ -302,8 +302,12 @@ class _FakeClient:
     ) -> _FakeFuture:
         del runner
         self._modules.events.append(f"submit:{task.round}")
-        if self._modules.submit_error is not None:
-            raise self._modules.submit_error
+        submit_error = self._modules.submit_errors.get(
+            task.round,
+            self._modules.submit_error,
+        )
+        if submit_error is not None:
+            raise submit_error
         self._modules.submit_calls.append(
             _SubmitCall(task, key, pure, retries, resources)
         )
@@ -360,6 +364,7 @@ class _FakeSlurmModules:
         self.wait_error: BaseException | None = None
         self.run_error: BaseException | None = None
         self.submit_error: BaseException | None = None
+        self.submit_errors: dict[int, BaseException] = {}
         self.cancel_error: BaseException | None = None
         self.client_close_error: BaseException | None = None
         self.cluster_close_error: BaseException | None = None
@@ -979,6 +984,46 @@ def test_slurm_evidence_schema_preserves_truthful_failed_probe_mismatch(
 
 
 @pytest.mark.parametrize(
+    "reported_addresses",
+    [
+        ("tcp://node-b:1234", "tcp://node-a:1234"),
+        ("tcp://node-a:1234", "tcp://node-a:1234"),
+    ],
+    ids=("swapped", "duplicate"),
+)
+def test_slurm_evidence_schema_preserves_failed_probe_identity_diagnostics(
+    reported_addresses: tuple[str, str],
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    scheduler_addresses = ("tcp://node-a:1234", "tcp://node-b:1234")
+    modules.connected_workers = scheduler_addresses
+    modules.probe_results = {
+        scheduler_addresses[1]: _probe(reported_addresses[1]),
+        scheduler_addresses[0]: _probe(reported_addresses[0]),
+    }
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    executor = _executor(tmp_path, modules, workers=2)
+
+    with pytest.raises(WorkerPreflightError, match="reported worker address"):
+        executor.execute(tasks)
+
+    evidence = cast(dict[str, object], executor.execution_evidence)
+    observed = cast(dict[str, object], evidence["observed"])
+    probes = cast(list[dict[str, object]], observed["worker_probes"])
+    assert tuple(probe["worker_address"] for probe in probes) == reported_addresses
+    assert evidence["attempt_counts"] == []
+
+    encoded = slurm_module._canonical_execution_evidence(
+        evidence,
+        expected_tasks=tasks,
+        task_retries=0,
+    )
+
+    assert json.loads(encoded) == evidence
+
+
+@pytest.mark.parametrize(
     "case",
     [
         "root_missing",
@@ -1102,6 +1147,57 @@ def test_slurm_evidence_schema_accepts_canonical_submitted_subset_on_cancel(
     )
 
     assert json.loads(encoded)["attempt_counts"] == attempts
+
+
+@pytest.mark.parametrize(
+    ("attempts_to_keep", "unfinished_futures", "interrupt_startup"),
+    [(0, 1, False), (1, 2, False), (0, 1, True)],
+    ids=(
+        "no-accepted-task",
+        "more-futures-than-tasks",
+        "interrupted-preflight-without-accepted-task",
+    ),
+)
+def test_slurm_evidence_schema_rejects_impossible_cancellation_cardinality(
+    attempts_to_keep: int,
+    unfinished_futures: int,
+    interrupt_startup: bool,
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, workers=1)
+    executor.execute((task,))
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    observed = cast(dict[str, object], evidence["observed"])
+    observed["cancellation"] = {
+        "attempted": True,
+        "unfinished_futures": unfinished_futures,
+        "force": True,
+        "succeeded": True,
+    }
+    attempts = cast(list[dict[str, object]], evidence["attempt_counts"])
+    del attempts[attempts_to_keep:]
+    if interrupt_startup:
+        startup = cast(dict[str, object], evidence["startup"])
+        startup.update(
+            {
+                "phase": "worker_probe",
+                "outcome": "interrupted",
+                "error": {
+                    "type": "KeyboardInterrupt",
+                    "message": "interrupted preflight",
+                },
+            }
+        )
+
+    with pytest.raises(ValueError):
+        slurm_module._canonical_execution_evidence(
+            evidence,
+            expected_tasks=(task,),
+            task_retries=0,
+        )
 
 
 def test_slurm_executor_preflight_uses_exact_versions_threads_and_roots(
@@ -1233,6 +1329,61 @@ def test_slurm_executor_does_not_count_a_task_rejected_during_submission(
         executor.execute((_task(tmp_path, 2),))
 
     assert executor.execution_evidence["attempt_counts"] == []
+
+
+@pytest.mark.parametrize(
+    ("failed_round", "expected_attempts", "expected_cancellation"),
+    [
+        (
+            2,
+            [],
+            {
+                "attempted": False,
+                "unfinished_futures": 0,
+                "succeeded": None,
+            },
+        ),
+        (
+            3,
+            [{"dataset_id": "dataset-1", "round": 2, "attempts": 1}],
+            {
+                "attempted": True,
+                "unfinished_futures": 1,
+                "force": True,
+                "succeeded": True,
+            },
+        ),
+    ],
+    ids=("before-first-accept", "after-one-accept"),
+)
+def test_slurm_executor_cancellation_counts_only_scheduler_accepted_tasks(
+    failed_round: int,
+    expected_attempts: list[dict[str, object]],
+    expected_cancellation: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:2]
+    modules.pending_rounds = {2}
+    modules.submit_errors[failed_round] = KeyboardInterrupt(
+        "injected submission interruption"
+    )
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    executor = _executor(tmp_path, modules, workers=2)
+
+    with pytest.raises(KeyboardInterrupt, match="submission interruption"):
+        executor.execute(tasks)
+
+    evidence = cast(dict[str, object], executor.execution_evidence)
+    assert evidence["attempt_counts"] == expected_attempts
+    observed = cast(dict[str, object], evidence["observed"])
+    assert observed["cancellation"] == expected_cancellation
+    encoded = slurm_module._canonical_execution_evidence(
+        evidence,
+        expected_tasks=tasks,
+        task_retries=0,
+    )
+    assert json.loads(encoded) == evidence
 
 
 def test_slurm_executor_records_preflight_interrupt_without_fake_cancellation(

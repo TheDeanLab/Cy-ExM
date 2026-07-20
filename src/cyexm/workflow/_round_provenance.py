@@ -34,6 +34,14 @@ type ArtifactSnapshot = tuple[CompletionRecord, FileIdentity]
 type SnapshotReader = Callable[[Path], ArtifactSnapshot | None]
 type GeometryReader = Callable[[Path, PixelSize], ImageGeometry]
 
+_GEOMETRY_PARAMETER_NAMES = frozenset(
+    {
+        "fixed_mask_geometry",
+        "moving_geometry",
+        "moving_mask_geometry",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RegistrationArtifactPaths:
@@ -74,6 +82,15 @@ class RegistrationArtifactPaths:
 class SourceGeometries:
     fixed: ImageGeometry
     moving: ImageGeometry
+
+
+@dataclass(frozen=True, slots=True)
+class RoundCompletionEvidence:
+    """Accepted public artifacts and transform snapshots from one full scan."""
+
+    artifacts: tuple[Path, ...]
+    affine: ArtifactSnapshot | None
+    warp: ArtifactSnapshot | None
 
 
 def completion_snapshot(path: Path) -> ArtifactSnapshot | None:
@@ -142,7 +159,50 @@ def _request_matches(
         upstream=upstream,
         parameters=parameters,
     )
-    return snapshot[0].request == expected
+    actual = snapshot[0].request
+    return (
+        actual.stage == expected.stage
+        and actual.inputs == expected.inputs
+        and geometry_compatible(actual.geometry, expected.geometry)
+        and actual.method == expected.method
+        and actual.accuracy == expected.accuracy
+        and actual.native_threads == expected.native_threads
+        and actual.upstream == expected.upstream
+        and _parameters_match(actual.parameters, expected.parameters)
+    )
+
+
+def _parameter_geometry(value: object) -> ImageGeometry | None:
+    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
+        return None
+    try:
+        return ImageGeometry.from_dict(dict(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parameters_match(
+    actual: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> bool:
+    if set(actual) != set(expected):
+        return False
+    for name, expected_value in expected.items():
+        actual_value = actual[name]
+        if name in _GEOMETRY_PARAMETER_NAMES and isinstance(expected_value, Mapping):
+            actual_geometry = _parameter_geometry(actual_value)
+            expected_geometry = _parameter_geometry(expected_value)
+            if (
+                actual_geometry is None
+                or expected_geometry is None
+                or not geometry_compatible(actual_geometry, expected_geometry)
+            ):
+                return False
+        elif canonical_compact_json(actual_value) != canonical_compact_json(
+            expected_value
+        ):
+            return False
+    return True
 
 
 def _finite_range(parameters: Mapping[str, object]) -> tuple[float, float] | None:
@@ -516,8 +576,8 @@ def _channel_snapshot(
     path: Path,
     channel_index: int,
     geometry: ImageGeometry,
-    affine: ArtifactSnapshot,
-    warp: ArtifactSnapshot,
+    affine_identity: FileIdentity,
+    warp_identity: FileIdentity,
     snapshot_reader: SnapshotReader,
 ) -> ArtifactSnapshot | None:
     channel = task.channels[channel_index]
@@ -525,8 +585,8 @@ def _channel_snapshot(
         inputs = (
             FileIdentity.from_path(task.fixed_image),
             FileIdentity.from_path(channel.source),
-            affine[1],
-            warp[1],
+            affine_identity,
+            warp_identity,
         )
     except (OSError, RuntimeError):
         return None
@@ -539,7 +599,7 @@ def _channel_snapshot(
         method="warp-affine",
         accuracy="not-applicable",
         task=task,
-        upstream=warp[1],
+        upstream=warp_identity,
         parameters=channel_transform_parameters(
             pixel_size_xyz=task.voxel_spacing_xyz,
             interpolation=channel.interpolation,
@@ -549,18 +609,47 @@ def _channel_snapshot(
     return snapshot
 
 
-def completed_artifacts(
+def channel_artifact_valid(
+    task: RoundTask,
+    channel_index: int,
+    geometry: ImageGeometry,
+    affine: ArtifactSnapshot,
+    warp: ArtifactSnapshot,
+    *,
+    snapshot_reader: SnapshotReader = completion_snapshot,
+) -> bool:
+    """Validate one channel against an already accepted transform chain."""
+    channel = task.channels[channel_index]
+    current_affine = snapshot_reader(Path(affine[1].path))
+    current_warp = snapshot_reader(Path(warp[1].path))
+    return (
+        current_affine == affine
+        and current_warp == warp
+        and _channel_snapshot(
+            task,
+            channel.output,
+            channel_index,
+            geometry,
+            affine[1],
+            warp[1],
+            snapshot_reader,
+        )
+        is not None
+    )
+
+
+def completion_evidence(
     task: RoundTask,
     paths: RegistrationArtifactPaths,
     source_geometries: SourceGeometries,
     *,
     snapshot_reader: SnapshotReader = completion_snapshot,
     geometry_reader: GeometryReader,
-) -> tuple[Path, ...]:
-    """Return public artifacts backed by the exact authoritative Phase 1 chain."""
+) -> RoundCompletionEvidence:
+    """Return artifacts and transform snapshots accepted by one full-chain scan."""
     inputs = _registration_inputs(task)
     if inputs is None:
-        return ()
+        return RoundCompletionEvidence(artifacts=(), affine=None, warp=None)
     effective = _effective_geometries(
         task,
         paths,
@@ -576,7 +665,7 @@ def completed_artifacts(
         snapshot_reader=snapshot_reader,
         geometry_reader=geometry_reader,
     ):
-        return ()
+        return RoundCompletionEvidence(artifacts=(), affine=None, warp=None)
     complete: list[Path] = []
     affine = _affine_snapshot(
         task,
@@ -586,7 +675,7 @@ def completed_artifacts(
         snapshot_reader,
     )
     if affine is None:
-        return ()
+        return RoundCompletionEvidence(artifacts=(), affine=None, warp=None)
     complete.append(paths.affine)
     warp = _warp_snapshot(
         task,
@@ -598,7 +687,11 @@ def completed_artifacts(
         snapshot_reader,
     )
     if warp is None:
-        return tuple(complete)
+        return RoundCompletionEvidence(
+            artifacts=tuple(complete),
+            affine=affine,
+            warp=None,
+        )
     complete.append(paths.warp)
     registered = _registered_snapshot(
         task,
@@ -617,20 +710,45 @@ def completed_artifacts(
                 channel.output,
                 index,
                 source_geometries.fixed,
-                affine,
-                warp,
+                affine[1],
+                warp[1],
                 snapshot_reader,
             )
             is not None
         ):
             complete.append(channel.output)
-    return tuple(complete)
+    return RoundCompletionEvidence(
+        artifacts=tuple(complete),
+        affine=affine,
+        warp=warp,
+    )
+
+
+def completed_artifacts(
+    task: RoundTask,
+    paths: RegistrationArtifactPaths,
+    source_geometries: SourceGeometries,
+    *,
+    snapshot_reader: SnapshotReader = completion_snapshot,
+    geometry_reader: GeometryReader,
+) -> tuple[Path, ...]:
+    """Return public artifacts backed by the exact authoritative Phase 1 chain."""
+    return completion_evidence(
+        task,
+        paths,
+        source_geometries,
+        snapshot_reader=snapshot_reader,
+        geometry_reader=geometry_reader,
+    ).artifacts
 
 
 __all__ = [
     "ArtifactSnapshot",
     "RegistrationArtifactPaths",
+    "RoundCompletionEvidence",
     "SourceGeometries",
+    "channel_artifact_valid",
     "completed_artifacts",
+    "completion_evidence",
     "completion_snapshot",
 ]

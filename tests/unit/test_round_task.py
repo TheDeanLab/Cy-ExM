@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +37,7 @@ from cyexm.runtime import (
     NativeThreadConfig,
     ResolvedNativeThreads,
 )
-from cyexm.spatial import ImageGeometry
+from cyexm.spatial import TIFF_GEOMETRY_ATOL, ImageGeometry
 from cyexm.workflow.models import ChannelTask, RoundTask
 from cyexm.workflow.round_task import run_round_task
 
@@ -45,13 +45,17 @@ pytestmark = pytest.mark.unit
 
 _FULL_FIXED_GEOMETRY = ImageGeometry(
     shape=(6, 7, 8),
-    origin=(1.0, 2.0, 3.0),
-    spacing=(0.3, 0.3, 0.9),
-    direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    origin=(1.23456789, -2.34567891, 3.45678912),
+    spacing=(0.31, 0.27, 0.93),
+    direction=(
+        (0.813797681, -0.440969611, 0.378522306),
+        (0.469846310, 0.882564119, 0.018028311),
+        (-0.342020143, 0.163175911, 0.925416578),
+    ),
 )
 _FULL_MOVING_GEOMETRY = replace(
     _FULL_FIXED_GEOMETRY,
-    origin=(4.0, 5.0, 6.0),
+    origin=(4.56789123, -5.67891234, 6.78912345),
 )
 _FIXED_CROP_BOUNDS = (1, 5, 1, 6, 2, 7)
 _MOVING_CROP_BOUNDS = (0, 4, 2, 7, 1, 6)
@@ -383,7 +387,7 @@ def _task(
         moving_image=moving,
         registration_directory=tmp_path / "output" / "registration",
         log_path=tmp_path / "output" / "logs" / "round-002.log",
-        voxel_spacing_xyz=(0.3, 0.3, 0.9),
+        voxel_spacing_xyz=(0.31, 0.27, 0.93),
         registration=RegistrationSpec(
             crop=crop,
             linear=RegistrationStageSpec(type="TRSAA", accuracy="low"),
@@ -503,6 +507,55 @@ def _replace_completion_request(
     record_path.write_text(changed.to_json(), encoding="utf-8")
 
 
+def _perturb_geometry(
+    geometry: ImageGeometry,
+    field: str,
+    delta: float,
+) -> ImageGeometry:
+    if field == "origin":
+        return replace(
+            geometry,
+            origin=(geometry.origin[0] + delta, *geometry.origin[1:]),
+        )
+    if field == "spacing":
+        return replace(
+            geometry,
+            spacing=(geometry.spacing[0] + delta, *geometry.spacing[1:]),
+        )
+    if field == "direction":
+        first_row = geometry.direction[0]
+        return replace(
+            geometry,
+            direction=(
+                (first_row[0] + delta, *first_row[1:]),
+                *geometry.direction[1:],
+            ),
+        )
+    raise ValueError(f"unsupported geometry field: {field}")
+
+
+def _perturb_request_geometry(
+    request: StageRequest,
+    field: str,
+    delta: float,
+) -> StageRequest:
+    parameters: dict[str, Any] = dict(request.parameters)
+    for name in (
+        "fixed_mask_geometry",
+        "moving_geometry",
+        "moving_mask_geometry",
+    ):
+        value = parameters.get(name)
+        if isinstance(value, Mapping):
+            geometry = ImageGeometry.from_dict(dict(value))
+            parameters[name] = _perturb_geometry(geometry, field, delta).to_dict()
+    return replace(
+        request,
+        geometry=_perturb_geometry(request.geometry, field, delta),
+        parameters=parameters,
+    )
+
+
 def test_round_task_registers_then_transforms_channels_in_manifest_order(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -528,6 +581,114 @@ def test_round_task_registers_then_transforms_channels_in_manifest_order(
         str(task.registration_directory / "nonlinear_registered_2.tif"),
         *(str(channel.output) for channel in task.channels),
     )
+
+
+def test_round_task_uses_only_initial_post_registration_and_final_full_scans(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cyexm.workflow import round_task as module
+
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, channel_names=("a.tif", "b.tif", "c.tif"))
+    _install_runtime(monkeypatch, task, calls, constructors)
+    original = module._completed_artifacts
+    full_scans = 0
+
+    def count_full_scan(*args: object, **kwargs: object) -> Any:
+        nonlocal full_scans
+        full_scans += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(module, "_completed_artifacts", count_full_scan)
+
+    result = run_round_task(task)
+
+    assert result.status == "completed"
+    assert full_scans == 3
+
+
+@pytest.mark.parametrize("role", ["affine", "warp"])
+@pytest.mark.parametrize("change", ["delete", "mutate"])
+def test_channel_validation_rejects_changed_transform_completion_evidence(
+    role: str,
+    change: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, channel_names=("a.tif", "b.tif"))
+
+    def change_transform_evidence(task: RoundTask, channel: ChannelTask) -> None:
+        if channel != task.channels[0]:
+            return
+        path = Path(getattr(_registration_paths(task), role))
+        if change == "delete":
+            path.with_name(f"{path.name}.complete.json").unlink()
+        else:
+            _replace_completion_request(
+                path,
+                lambda request: replace(request, stage=f"changed-{request.stage}"),
+            )
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_channel=change_transform_evidence,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "channel:a.tif"
+    assert calls == [("register", "whole_image"), ("channel", "a.tif")]
+    assert not task.channels[1].output.exists()
+
+
+@pytest.mark.parametrize("role", ["affine", "warp"])
+def test_channel_validation_uses_snapshots_accepted_by_registration_scan(
+    role: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow import round_task as module
+
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, channel_names=("a.tif", "b.tif"))
+    _install_runtime(monkeypatch, task, calls, constructors)
+    original = module._completed_artifacts
+    full_scans = 0
+
+    def mutate_after_post_registration_scan(*args: object, **kwargs: object) -> Any:
+        nonlocal full_scans
+        evidence = original(*args, **kwargs)  # type: ignore[arg-type]
+        full_scans += 1
+        if full_scans == 2:
+            path = Path(getattr(_registration_paths(task), role))
+            _replace_completion_request(
+                path,
+                lambda request: replace(request, stage=f"changed-{request.stage}"),
+            )
+        return evidence
+
+    monkeypatch.setattr(
+        module,
+        "_completed_artifacts",
+        mutate_after_post_registration_scan,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "channel:a.tif"
+    assert calls == [("register", "whole_image"), ("channel", "a.tif")]
+    assert not task.channels[1].output.exists()
 
 
 @pytest.mark.parametrize("strategy", ["whole_image", "serial_chunked"])
@@ -1183,7 +1344,201 @@ def test_serial_chunk_completion_rejects_a_noncanonical_derived_grid(
     assert result.failure.stage == "registration"
 
 
-@pytest.mark.parametrize("field", ["shape", "origin", "direction"])
+@pytest.mark.parametrize("field", ["origin", "spacing", "direction"])
+def test_registration_completion_accepts_tiff_geometry_roundoff(
+    field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, crop=False, channel_names=())
+
+    def perturb(task: RoundTask) -> None:
+        paths = _registration_paths(task)
+        for path in (
+            paths.fixed_reference,
+            paths.affine,
+            paths.warp,
+            paths.registered,
+        ):
+            _replace_completion_request(
+                path,
+                lambda request: _perturb_request_geometry(
+                    request,
+                    field,
+                    TIFF_GEOMETRY_ATOL / 2.0,
+                ),
+            )
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=perturb,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "completed"
+
+
+@pytest.mark.parametrize("field", ["origin", "spacing", "direction"])
+def test_channel_completion_accepts_tiff_geometry_roundoff(
+    field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, crop=False, channel_names=("a.tif",))
+
+    def perturb(_task: RoundTask, channel: ChannelTask) -> None:
+        _replace_completion_request(
+            channel.output,
+            lambda request: _perturb_request_geometry(
+                request,
+                field,
+                TIFF_GEOMETRY_ATOL / 2.0,
+            ),
+        )
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_channel=perturb,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "completed"
+
+
+def test_serial_local_completion_accepts_nested_tiff_geometry_roundoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(
+        tmp_path,
+        strategy="serial_chunked",
+        crop=True,
+        channel_names=(),
+    )
+
+    def perturb(task: RoundTask) -> None:
+        local_warp = (
+            task.registration_directory
+            / f"round_{task.round}_chunks"
+            / "chunk_0000_warp.nii.gz"
+        )
+
+        def mutate(request: StageRequest) -> StageRequest:
+            changed = request
+            for field in ("origin", "spacing", "direction"):
+                changed = _perturb_request_geometry(
+                    changed,
+                    field,
+                    TIFF_GEOMETRY_ATOL / 2.0,
+                )
+            return changed
+
+        _replace_completion_request(local_warp, mutate)
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=perturb,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "completed"
+
+
+@pytest.mark.parametrize("field", ["origin", "spacing", "direction"])
+def test_serial_local_completion_rejects_geometry_beyond_tiff_tolerance(
+    field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(
+        tmp_path,
+        strategy="serial_chunked",
+        crop=True,
+        channel_names=(),
+    )
+
+    def perturb(task: RoundTask) -> None:
+        local_warp = (
+            task.registration_directory
+            / f"round_{task.round}_chunks"
+            / "chunk_0000_warp.nii.gz"
+        )
+        _replace_completion_request(
+            local_warp,
+            lambda request: _perturb_request_geometry(
+                request,
+                field,
+                2.0 * TIFF_GEOMETRY_ATOL,
+            ),
+        )
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=perturb,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "registration"
+
+
+def test_serial_completion_rejects_tiny_non_geometry_float_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, strategy="serial_chunked", channel_names=())
+
+    def perturb(task: RoundTask) -> None:
+        path = _registration_paths(task).warp
+
+        def mutate(request: StageRequest) -> StageRequest:
+            overlap = request.parameters["overlap_fraction"]
+            assert isinstance(overlap, float)
+            return replace(
+                request,
+                parameters={
+                    **request.parameters,
+                    "overlap_fraction": overlap + TIFF_GEOMETRY_ATOL / 2.0,
+                },
+            )
+
+        _replace_completion_request(path, mutate)
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=perturb,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "registration"
+
+
+@pytest.mark.parametrize("field", ["shape", "origin", "spacing", "direction"])
 def test_registration_completion_rejects_wrong_full_geometry_provenance(
     field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1192,8 +1547,21 @@ def test_registration_completion_rejects_wrong_full_geometry_provenance(
     task = _task(tmp_path, crop=False, channel_names=())
     changes = {
         "shape": (9, 9, 9),
-        "origin": (10.0, 11.0, 12.0),
-        "direction": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0)),
+        "origin": (
+            _GEOMETRY.origin[0] + 2.0 * TIFF_GEOMETRY_ATOL,
+            *_GEOMETRY.origin[1:],
+        ),
+        "spacing": (
+            _GEOMETRY.spacing[0] + 2.0 * TIFF_GEOMETRY_ATOL,
+            *_GEOMETRY.spacing[1:],
+        ),
+        "direction": (
+            (
+                _GEOMETRY.direction[0][0] + 2.0 * TIFF_GEOMETRY_ATOL,
+                *_GEOMETRY.direction[0][1:],
+            ),
+            *_GEOMETRY.direction[1:],
+        ),
     }
     wrong_geometry = replace(_GEOMETRY, **{field: changes[field]})
 
@@ -1231,7 +1599,7 @@ def test_registration_completion_rejects_wrong_full_geometry_provenance(
     assert result.failure.stage == "registration"
 
 
-@pytest.mark.parametrize("field", ["shape", "origin", "direction"])
+@pytest.mark.parametrize("field", ["shape", "origin", "spacing", "direction"])
 def test_channel_completion_rejects_wrong_fixed_geometry_provenance(
     field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1240,8 +1608,21 @@ def test_channel_completion_rejects_wrong_fixed_geometry_provenance(
     task = _task(tmp_path, crop=False, channel_names=("a.tif",))
     changes = {
         "shape": (9, 9, 9),
-        "origin": (10.0, 11.0, 12.0),
-        "direction": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0)),
+        "origin": (
+            _GEOMETRY.origin[0] + 2.0 * TIFF_GEOMETRY_ATOL,
+            *_GEOMETRY.origin[1:],
+        ),
+        "spacing": (
+            _GEOMETRY.spacing[0] + 2.0 * TIFF_GEOMETRY_ATOL,
+            *_GEOMETRY.spacing[1:],
+        ),
+        "direction": (
+            (
+                _GEOMETRY.direction[0][0] + 2.0 * TIFF_GEOMETRY_ATOL,
+                *_GEOMETRY.direction[0][1:],
+            ),
+            *_GEOMETRY.direction[1:],
+        ),
     }
     wrong_geometry = replace(_GEOMETRY, **{field: changes[field]})
 

@@ -23,6 +23,7 @@ from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
     WHOLE_SCALAR_POLICY,
     affine_parameters,
+    canonical_compact_json,
     common_parameters,
     crop_parameters,
     fixed_reference_parameters,
@@ -440,7 +441,7 @@ class ImageRegistration:
 
     @staticmethod
     def _bounds_text(bounds: Bounds3D) -> str:
-        return json.dumps(list(bounds), separators=(",", ":")) + "\n"
+        return canonical_compact_json(list(bounds))
 
     @classmethod
     def _read_bounds(

@@ -24,8 +24,12 @@ from cyexm.workflow._round_provenance import (
 from cyexm.workflow._round_provenance import (
     RegistrationArtifactPaths,
     SourceGeometries,
-    completed_artifacts,
+    channel_artifact_valid,
+    completion_evidence,
     completion_snapshot,
+)
+from cyexm.workflow._round_provenance import (
+    RoundCompletionEvidence as _RoundCompletionEvidence,
 )
 from cyexm.workflow.models import RoundFailure, RoundResult, RoundTask
 
@@ -109,8 +113,8 @@ def _completed_artifacts(
     task: RoundTask,
     paths: RegistrationArtifactPaths,
     source_geometries: SourceGeometries,
-) -> tuple[Path, ...]:
-    return completed_artifacts(
+) -> _RoundCompletionEvidence:
+    return completion_evidence(
         task,
         paths,
         source_geometries,
@@ -255,7 +259,7 @@ def run_round_task(task: RoundTask) -> RoundResult:
         ) = _runtime()
         initially_complete = _completed_artifacts(
             task, registration_paths, source_geometries
-        )
+        ).artifacts
         before = {
             path: snapshot
             for path in initially_complete
@@ -305,7 +309,10 @@ def run_round_task(task: RoundTask) -> RoundResult:
         affine_path, warp_path, _registered_path = (
             registration_paths.public_registration_artifacts
         )
-        completed = _completed_artifacts(task, registration_paths, source_geometries)
+        registration_evidence = _completed_artifacts(
+            task, registration_paths, source_geometries
+        )
+        completed = registration_evidence.artifacts
         invalid_registration = tuple(
             path
             for path in registration_paths.public_registration_artifacts
@@ -316,9 +323,15 @@ def run_round_task(task: RoundTask) -> RoundResult:
                 "registration artifacts lack task-consistent completion evidence: "
                 f"{tuple(str(path) for path in invalid_registration)!r}"
             )
+        affine_snapshot = registration_evidence.affine
+        warp_snapshot = registration_evidence.warp
+        if affine_snapshot is None or warp_snapshot is None:
+            raise RuntimeError(
+                "registration transform completion evidence was not accepted"
+            )
         _write_log(task.log_path, f"round {task.round} registration completed")
 
-        for channel in task.channels:
+        for channel_index, channel in enumerate(task.channels):
             stage = f"channel:{channel.source.name}"
             channel.output.parent.mkdir(parents=True, exist_ok=True)
             transformed = transform_channel(
@@ -336,8 +349,13 @@ def run_round_task(task: RoundTask) -> RoundResult:
                 raise RuntimeError(
                     "channel transform returned a path other than its planned output"
                 )
-            if channel.output not in _completed_artifacts(
-                task, registration_paths, source_geometries
+            if not channel_artifact_valid(
+                task,
+                channel_index,
+                source_geometries.fixed,
+                affine_snapshot,
+                warp_snapshot,
+                snapshot_reader=_completion_snapshot,
             ):
                 raise RuntimeError(
                     "channel artifact lacks task-consistent completion evidence: "
@@ -346,7 +364,9 @@ def run_round_task(task: RoundTask) -> RoundResult:
             _write_log(task.log_path, f"channel completed: {channel.source.name}")
 
         stage = "validation"
-        completed = _completed_artifacts(task, registration_paths, source_geometries)
+        completed = _completed_artifacts(
+            task, registration_paths, source_geometries
+        ).artifacts
         if completed != planned:
             missing = tuple(str(path) for path in planned if path not in completed)
             raise RuntimeError(f"round completion validation failed: {missing!r}")
@@ -375,7 +395,7 @@ def run_round_task(task: RoundTask) -> RoundResult:
             else:
                 completed = _completed_artifacts(
                     task, registration_paths, source_geometries
-                )
+                ).artifacts
                 reused = _reused_artifacts(completed, before, forced=task.force)
         except Exception:
             completed = ()

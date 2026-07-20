@@ -1,6 +1,7 @@
 # Documentation guidance
 
-- Describe merged Phase 1 behavior separately from proposed Phase 2 work. YAML
+- Describe merged Phase 1 behavior—the repository's current behavior—separately from
+  proposed Phase 2 work. YAML
   manifests, round-level schedulers, and cluster execution are not installable
   behavior until their dedicated runtime design, implementation, and acceptance gates
   are complete.

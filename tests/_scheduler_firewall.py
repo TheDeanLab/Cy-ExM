@@ -22,10 +22,8 @@ _SHELL_END_KEYWORDS = frozenset({"done", "esac", "fi"})
 _ENV_NO_VALUE_OPTIONS = frozenset(
     {"-0", "--debug", "-i", "--ignore-environment", "--null", "-v"}
 )
-_ENV_VALUE_OPTIONS = frozenset(
-    {"-C", "--argv0", "--chdir", "-S", "--split-string", "-u", "--unset"}
-)
-_SIMPLE_WRAPPERS = frozenset({"command", "exec", "nohup", "setsid"})
+_ENV_VALUE_OPTIONS = frozenset({"-C", "--argv0", "--chdir", "-u", "--unset"})
+_SIMPLE_WRAPPERS = frozenset({"nohup", "setsid"})
 _WRAPPER_VALUE_OPTIONS = {
     "nice": frozenset({"-n", "--adjustment"}),
     "stdbuf": frozenset({"-e", "--error", "-i", "--input", "-o", "--output"}),
@@ -58,6 +56,7 @@ _WRAPPER_VALUE_OPTIONS = {
     "time": frozenset({"-f", "--format", "-o", "--output"}),
 }
 _MAX_PARSE_DEPTH = 16
+_UNPARSEABLE_COMMAND = "<unparseable command>"
 
 
 def _command_arguments(arguments: object) -> tuple[str, ...]:
@@ -109,18 +108,51 @@ def _strip_generic_options(
     return ()
 
 
-def _unwrap_env(tokens: tuple[str, ...]) -> tuple[str, ...]:
+def _split_env_string(value: str) -> tuple[str, ...] | None:
+    try:
+        return tuple(shlex.split(value, comments=False, posix=True))
+    except ValueError:
+        return None
+
+
+def _parse_env(tokens: tuple[str, ...], *, depth: int) -> str | None:
+    if depth > _MAX_PARSE_DEPTH:
+        return _UNPARSEABLE_COMMAND
     index = 0
     while index < len(tokens):
         token = tokens[index]
         if token == "--":
-            return tokens[index + 1 :]
+            return _parse_argv(tokens[index + 1 :], depth=depth + 1)
         if _is_assignment(token) or token in _ENV_NO_VALUE_OPTIONS:
             index += 1
             continue
+        split_value: str | None = None
+        next_index = index + 1
+        if token in {"-S", "--split-string"}:
+            if next_index >= len(tokens):
+                return _UNPARSEABLE_COMMAND
+            split_value = tokens[next_index]
+            next_index += 1
+        elif token.startswith("-S") and token != "-S":
+            split_value = token[2:]
+        elif token.startswith("--split-string="):
+            split_value = token.partition("=")[2]
+        if split_value is not None:
+            split_tokens = _split_env_string(split_value)
+            if split_tokens is None:
+                return _UNPARSEABLE_COMMAND
+            return _parse_env(
+                (*split_tokens, *tokens[next_index:]),
+                depth=depth + 1,
+            )
         option = token.split("=", 1)[0]
         if option in _ENV_VALUE_OPTIONS:
-            index += 1 if "=" in token else 2
+            if "=" in token:
+                index += 1
+            elif index + 1 < len(tokens):
+                index += 2
+            else:
+                return _UNPARSEABLE_COMMAND
             continue
         if token.startswith("-u") and token != "-u":
             index += 1
@@ -128,8 +160,55 @@ def _unwrap_env(tokens: tuple[str, ...]) -> tuple[str, ...]:
         if token.startswith("-"):
             index += 1
             continue
+        return _parse_argv(tokens[index:], depth=depth + 1)
+    return None
+
+
+def _unwrap_exec(tokens: tuple[str, ...]) -> tuple[str, ...] | None:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return tokens[index + 1 :]
+        if token == "-a":
+            if index + 1 >= len(tokens):
+                return None
+            index += 2
+            continue
+        if token.startswith("-") and token != "-":
+            options = token[1:]
+            if options and set(options) <= {"c", "l"}:
+                index += 1
+                continue
+            if options.endswith("a") and set(options[:-1]) <= {"c", "l"}:
+                if index + 1 >= len(tokens):
+                    return None
+                index += 2
+                continue
+            return None
         return tokens[index:]
     return ()
+
+
+def _parse_command_wrapper(tokens: tuple[str, ...], *, depth: int) -> str | None:
+    index = 0
+    resolution_query = False
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            if resolution_query:
+                return None
+            return _parse_argv(tokens[index + 1 :], depth=depth + 1)
+        if not token.startswith("-") or token == "-":
+            break
+        options = token[1:]
+        if not options or not set(options) <= {"V", "p", "v"}:
+            return _UNPARSEABLE_COMMAND
+        resolution_query = resolution_query or "v" in options or "V" in options
+        index += 1
+    if resolution_query:
+        return None
+    return _parse_argv(tokens[index:], depth=depth + 1)
 
 
 def _shell_command_text(tokens: tuple[str, ...]) -> str | None:
@@ -159,7 +238,7 @@ def _unwrap_timeout(tokens: tuple[str, ...]) -> tuple[str, ...]:
 
 def _parse_argv(tokens: tuple[str, ...], *, depth: int) -> str | None:
     if depth > _MAX_PARSE_DEPTH:
-        return None
+        return _UNPARSEABLE_COMMAND
     tokens = _strip_leading_assignments(tokens)
     if not tokens:
         return None
@@ -168,10 +247,17 @@ def _parse_argv(tokens: tuple[str, ...], *, depth: int) -> str | None:
         return executable
     arguments = tokens[1:]
     if executable == "env":
-        return _parse_argv(_unwrap_env(arguments), depth=depth + 1)
+        return _parse_env(arguments, depth=depth + 1)
     if executable in _SHELL_COMMANDS:
         command = _shell_command_text(tokens)
         return None if command is None else _parse_shell(command, depth=depth + 1)
+    if executable == "exec":
+        command = _unwrap_exec(arguments)
+        if command is None:
+            return _UNPARSEABLE_COMMAND
+        return _parse_argv(command, depth=depth + 1)
+    if executable == "command":
+        return _parse_command_wrapper(arguments, depth=depth + 1)
     if executable in _SIMPLE_WRAPPERS:
         return _parse_argv(
             _strip_generic_options(arguments),
@@ -198,16 +284,92 @@ def _parse_shell_segment(tokens: tuple[str, ...], *, depth: int) -> str | None:
     return _parse_argv(tokens, depth=depth + 1)
 
 
+def _backtick_substitutions(command: str) -> tuple[tuple[str, ...], str] | None:
+    substitutions: list[str] = []
+    masked: list[str] = []
+    quote: str | None = None
+    comment_position = True
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if quote == "'":
+            masked.append(character)
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character == "\\":
+            masked.append(character)
+            if index + 1 < len(command):
+                masked.append(command[index + 1])
+                index += 2
+            else:
+                index += 1
+            comment_position = False
+            continue
+        if quote is None and character == "#" and comment_position:
+            newline = command.find("\n", index)
+            if newline < 0:
+                masked.append(command[index:])
+                break
+            masked.append(command[index : newline + 1])
+            index = newline + 1
+            comment_position = True
+            continue
+        if character == "'" and quote is None:
+            quote = "'"
+            masked.append(character)
+            comment_position = False
+            index += 1
+            continue
+        if character == '"':
+            quote = None if quote == '"' else '"'
+            masked.append(character)
+            comment_position = False
+            index += 1
+            continue
+        if character == "`":
+            closing = index + 1
+            while closing < len(command):
+                if command[closing] == "\\" and closing + 1 < len(command):
+                    closing += 2
+                    continue
+                if command[closing] == "`":
+                    break
+                closing += 1
+            if closing >= len(command):
+                return None
+            substitutions.append(command[index + 1 : closing])
+            masked.append("x")
+            comment_position = False
+            index = closing + 1
+            continue
+        masked.append(character)
+        if quote is None:
+            comment_position = character.isspace() or character in ";&|()"
+        index += 1
+    return tuple(substitutions), "".join(masked)
+
+
 def _parse_shell(command: str, *, depth: int) -> str | None:
     if depth > _MAX_PARSE_DEPTH:
-        return None
+        return _UNPARSEABLE_COMMAND
+    extracted = _backtick_substitutions(command)
+    if extracted is None:
+        return _UNPARSEABLE_COMMAND
+    substitutions, masked_command = extracted
+    for substitution in substitutions:
+        nested_command = substitution.replace("\\`", "`")
+        blocked = _parse_shell(nested_command, depth=depth + 1)
+        if blocked is not None:
+            return blocked
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        lexer = shlex.shlex(masked_command, posix=True, punctuation_chars=";&|()")
         lexer.whitespace_split = True
         lexer.commenters = "#"
         tokens = tuple(lexer)
     except ValueError:
-        return None
+        return _UNPARSEABLE_COMMAND
 
     segment: list[str] = []
     for token in (*tokens, ";"):
@@ -232,6 +394,11 @@ def scheduler_command(arguments: object, *, shell: bool = False) -> str | None:
 
 
 def _raise_blocked(command: str) -> None:
+    if command == _UNPARSEABLE_COMMAND:
+        raise RuntimeError(
+            "portable tests must not execute an unparseable or excessively nested "
+            "command"
+        )
     raise RuntimeError(
         f"portable tests must not invoke external scheduler command {command!r}"
     )

@@ -98,17 +98,23 @@ def _load_data(tmp_path: Path, data: dict[str, object]) -> DatasetManifest:
     return load_dataset_manifest(_write_manifest(tmp_path, data))
 
 
-def test_config_namespace_exports_only_the_scientific_manifest_api() -> None:
+def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
     import cyexm.config as config
 
     assert config.__all__ == (
         "ChannelSpec",
         "DatasetManifest",
+        "ExecutionPaths",
+        "ExecutionProfile",
+        "LocalDaskSpec",
+        "NativeThreadSpec",
         "ReferenceSpec",
         "RegistrationSpec",
         "RegistrationStageSpec",
         "RoundSpec",
+        "SlurmSpec",
         "load_dataset_manifest",
+        "load_execution_profile",
     )
 
 

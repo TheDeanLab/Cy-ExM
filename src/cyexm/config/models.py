@@ -1,11 +1,12 @@
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 type PixelSpacingXYZ = tuple[float, float, float]
 type ChunkSizeZYX = tuple[int, int, int]
 type RegistrationStrategy = Literal["whole_image", "serial_chunked"]
 type ChannelInterpolation = Literal["linear", "nearestNeighbor"]
+type ExecutorName = Literal["sequential", "local_dask", "slurm"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,3 +52,53 @@ class DatasetManifest:
     reference: ReferenceSpec
     registration: RegistrationSpec
     rounds: tuple[RoundSpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionPaths:
+    dataset_root: Path
+    output_root: Path
+    worker_local_directory: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class NativeThreadSpec:
+    itk: int
+    blas: int
+
+
+@dataclass(frozen=True, slots=True)
+class LocalDaskSpec:
+    workers: int
+    threads_per_worker: int
+    processes: bool
+    memory_limit: str
+    startup_timeout: str
+    task_retries: int
+
+
+@dataclass(frozen=True, slots=True)
+class SlurmSpec:
+    queue: str
+    workers: int
+    cores_per_worker: int
+    processes_per_worker: int
+    memory: str
+    walltime: str
+    interface: str
+    scheduler_interface: str
+    startup_timeout: str
+    task_retries: int
+    job_name: str
+    job_extra_directives: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionProfile:
+    schema_version: int
+    executor: ExecutorName
+    paths: ExecutionPaths
+    native_threads: NativeThreadSpec
+    local_dask: LocalDaskSpec | None
+    slurm: SlurmSpec | None
+    source_path: Path

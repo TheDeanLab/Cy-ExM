@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -45,6 +47,22 @@ from cyexm.workflow.models import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+class _StringAlias(str):
+    pass
+
+
+class _IntegerAlias(int):
+    pass
+
+
+class _TupleAlias(tuple[object, ...]):
+    pass
+
+
+class _RoundFailureAlias(RoundFailure):
+    pass
 
 
 def _registration() -> RegistrationSpec:
@@ -200,6 +218,156 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         scientific_json=scientific_json,
         scientific_fingerprint=sha256_fingerprint(scientific_json),
     )
+
+
+def _serial_plan(tmp_path: Path) -> WorkflowPlan:
+    plan = _plan(tmp_path, rounds=(2,))
+    task = replace(
+        plan.tasks[0],
+        strategy="serial_chunked",
+        chunk_size_zyx=(1, 2, 2),
+        overlap_fraction=0.0,
+    )
+    manifest_round = replace(
+        plan.manifest.rounds[0],
+        strategy="serial_chunked",
+        chunk_size_zyx=(1, 2, 2),
+        overlap_fraction=0.0,
+    )
+    manifest = replace(plan.manifest, rounds=(manifest_round,))
+    scientific = json.loads(plan.scientific_json)
+    scientific_round = scientific["rounds"][0]
+    scientific_round["strategy"] = "serial_chunked"
+    scientific_round["chunk_size_zyx"] = [1, 2, 2]
+    scientific_round["overlap_fraction"] = 0.0
+    scientific_json = canonical_json(scientific)
+    return replace(
+        plan,
+        manifest=manifest,
+        tasks=(task,),
+        scientific_json=scientific_json,
+        scientific_fingerprint=sha256_fingerprint(scientific_json),
+    )
+
+
+def _invalid_task(
+    tmp_path: Path,
+    case: str,
+) -> tuple[WorkflowPlan, RoundTask]:
+    plan = (
+        _serial_plan(tmp_path)
+        if case.startswith("chunk_") or case.startswith("overlap_")
+        else _plan(tmp_path)
+    )
+    task = plan.tasks[0]
+    channel = task.channels[0]
+    if case == "dataset_id":
+        return plan, replace(task, dataset_id=_StringAlias(task.dataset_id))
+    if case == "round_bool":
+        return plan, replace(task, round=True)  # type: ignore[arg-type]
+    if case == "round_alias":
+        return plan, replace(task, round=_IntegerAlias(task.round))
+    if case == "strategy":
+        return plan, replace(task, strategy=_StringAlias(task.strategy))
+    if case == "fixed_image":
+        return plan, replace(task, fixed_image=str(task.fixed_image))  # type: ignore[arg-type]
+    if case == "moving_image":
+        return plan, replace(task, moving_image=str(task.moving_image))  # type: ignore[arg-type]
+    if case == "registration_directory":
+        return plan, replace(  # type: ignore[arg-type]
+            task,
+            registration_directory=str(task.registration_directory),
+        )
+    if case == "log_path":
+        return plan, replace(task, log_path=str(task.log_path))  # type: ignore[arg-type]
+    if case == "spacing_container":
+        return plan, replace(  # type: ignore[arg-type]
+            task,
+            voxel_spacing_xyz=list(task.voxel_spacing_xyz),
+        )
+    if case == "spacing_scalar":
+        return plan, replace(task, voxel_spacing_xyz=(1, 1.0, 1.0))
+    if case == "registration_model":
+        registration = task.registration
+        return plan, replace(
+            task,
+            registration=SimpleNamespace(
+                crop=registration.crop,
+                linear=registration.linear,
+                nonlinear=registration.nonlinear,
+            ),  # type: ignore[arg-type]
+        )
+    if case == "registration_scalar":
+        registration = task.registration
+        return plan, replace(
+            task,
+            registration=replace(
+                registration,
+                linear=replace(
+                    registration.linear,
+                    type=_StringAlias(registration.linear.type),
+                ),
+            ),
+        )
+    if case == "native_model":
+        return plan, replace(  # type: ignore[arg-type]
+            task,
+            native_threads=SimpleNamespace(itk=1, blas=1),
+        )
+    if case == "native_itk":
+        return plan, replace(
+            task,
+            native_threads=NativeThreadSpec(itk=True, blas=1),  # type: ignore[arg-type]
+        )
+    if case == "native_blas":
+        return plan, replace(
+            task,
+            native_threads=NativeThreadSpec(itk=1, blas=True),  # type: ignore[arg-type]
+        )
+    if case == "channels_container":
+        return plan, replace(task, channels=list(task.channels))  # type: ignore[arg-type]
+    if case == "channel_model":
+        return plan, replace(
+            task,
+            channels=(
+                SimpleNamespace(
+                    source=channel.source,
+                    output=channel.output,
+                    interpolation=channel.interpolation,
+                ),
+            ),  # type: ignore[arg-type]
+        )
+    if case == "channel_source":
+        return plan, replace(
+            task,
+            channels=(replace(channel, source=str(channel.source)),),  # type: ignore[arg-type]
+        )
+    if case == "channel_output":
+        return plan, replace(
+            task,
+            channels=(replace(channel, output=str(channel.output)),),  # type: ignore[arg-type]
+        )
+    if case == "channel_interpolation":
+        return plan, replace(
+            task,
+            channels=(
+                replace(
+                    channel,
+                    interpolation=_StringAlias(channel.interpolation),
+                ),
+            ),
+        )
+    if case == "chunk_container":
+        return plan, replace(task, chunk_size_zyx=[1, 2, 2])  # type: ignore[arg-type]
+    if case == "chunk_scalar":
+        return plan, replace(task, chunk_size_zyx=(True, 2, 2))  # type: ignore[arg-type]
+    if case == "overlap_int":
+        return plan, replace(task, overlap_fraction=0)  # type: ignore[arg-type]
+    if case == "overlap_bool":
+        return plan, replace(task, overlap_fraction=False)  # type: ignore[arg-type]
+    if case == "force":
+        return plan, replace(task, force=0)  # type: ignore[arg-type]
+    raise AssertionError(f"unknown invalid task case: {case}")
 
 
 def _local_execution(plan: WorkflowPlan, tmp_path: Path) -> ExecutionProfile:
@@ -378,6 +546,119 @@ def _result(task: RoundTask, *, failed: bool = False) -> RoundResult:
         log_path=str(task.log_path),
         failure=(RoundFailure("round", "RuntimeError", "injected") if failed else None),
     )
+
+
+def _invalid_result(task: RoundTask, case: str) -> RoundResult:
+    result = _result(task, failed=case.startswith("failure_"))
+    if case == "dataset_id":
+        return replace(result, dataset_id=_StringAlias(result.dataset_id))
+    if case == "round":
+        return replace(result, round=_IntegerAlias(result.round))
+    if case == "status":
+        return replace(result, status=_StringAlias(result.status))
+    if case == "started_at":
+        return replace(result, started_at=_StringAlias(result.started_at))
+    if case == "ended_at":
+        return replace(result, ended_at=_StringAlias(result.ended_at))
+    if case == "duration":
+        return replace(result, duration_seconds=1)  # type: ignore[arg-type]
+    if case == "hostname":
+        return replace(result, hostname=_StringAlias(result.hostname))
+    if case == "pid":
+        return replace(result, pid=_IntegerAlias(result.pid))
+    if case == "dask_task_key":
+        return replace(result, dask_task_key=_StringAlias("task-key"))
+    if case == "slurm_job_id":
+        return replace(result, slurm_job_id=_StringAlias("123"))
+    if case == "strategy":
+        return replace(result, strategy=_StringAlias(result.strategy))
+    if case == "native_container":
+        return replace(  # type: ignore[arg-type]
+            result,
+            native_threads=_TupleAlias(result.native_threads),
+        )
+    if case == "native_entry":
+        return replace(
+            result,
+            native_threads=(
+                _TupleAlias(result.native_threads[0]),  # type: ignore[arg-type]
+                result.native_threads[1],
+            ),
+        )
+    if case == "native_name":
+        return replace(
+            result,
+            native_threads=(
+                (_StringAlias("itk"), 1),
+                ("blas", 1),
+            ),
+        )
+    if case == "native_value":
+        return replace(
+            result,
+            native_threads=(("itk", True), ("blas", 1)),  # type: ignore[arg-type]
+        )
+    if case == "native_zero":
+        return replace(result, native_threads=(("itk", 0), ("blas", 1)))
+    if case == "native_name_unknown":
+        return replace(result, native_threads=(("ITK", 1), ("blas", 1)))
+    if case == "artifact_container":
+        return replace(  # type: ignore[arg-type]
+            result,
+            artifact_paths=_TupleAlias(result.artifact_paths),
+        )
+    if case == "artifact_element":
+        return replace(
+            result,
+            artifact_paths=(
+                _StringAlias(result.artifact_paths[0]),
+                *result.artifact_paths[1:],
+            ),
+        )
+    if case == "reused_container":
+        return replace(  # type: ignore[arg-type]
+            result,
+            reused_artifacts=_TupleAlias(result.reused_artifacts),
+        )
+    if case == "reused_element":
+        return replace(
+            result,
+            reused_artifacts=(_StringAlias(result.artifact_paths[0]),),
+        )
+    if case == "log_path":
+        return replace(result, log_path=_StringAlias(result.log_path))
+    assert result.failure is not None
+    if case == "failure_model":
+        return replace(
+            result,
+            failure=_RoundFailureAlias(
+                result.failure.stage,
+                result.failure.exception_type,
+                result.failure.message,
+            ),
+        )
+    if case == "failure_stage":
+        return replace(
+            result,
+            failure=replace(result.failure, stage=_StringAlias(result.failure.stage)),
+        )
+    if case == "failure_exception_type":
+        return replace(
+            result,
+            failure=replace(
+                result.failure,
+                exception_type=_StringAlias(result.failure.exception_type),
+            ),
+        )
+    if case == "failure_message":
+        return replace(
+            result,
+            failure=replace(
+                result.failure,
+                message=_StringAlias(result.failure.message),
+            ),
+        )
+    raise AssertionError(f"unknown invalid result case: {case}")
 
 
 class _FakeExecutor:
@@ -787,6 +1068,55 @@ def test_run_workflow_wraps_overflowing_task_spacing_before_mutation(
 
 
 @pytest.mark.parametrize(
+    ("case", "field"),
+    [
+        ("dataset_id", "dataset_id"),
+        ("round_bool", "round"),
+        ("round_alias", "round"),
+        ("strategy", "strategy"),
+        ("fixed_image", "fixed_image"),
+        ("moving_image", "moving_image"),
+        ("registration_directory", "registration_directory"),
+        ("log_path", "log_path"),
+        ("spacing_container", "voxel_spacing_xyz"),
+        ("spacing_scalar", "voxel_spacing_xyz"),
+        ("registration_model", "registration"),
+        ("registration_scalar", "registration.linear.type"),
+        ("native_model", "native_threads"),
+        ("native_itk", "native_threads.itk"),
+        ("native_blas", "native_threads.blas"),
+        ("channels_container", "channels"),
+        ("channel_model", "channels[0]"),
+        ("channel_source", "channels[0].source"),
+        ("channel_output", "channels[0].output"),
+        ("channel_interpolation", "channels[0].interpolation"),
+        ("chunk_container", "chunk_size_zyx"),
+        ("chunk_scalar", "chunk_size_zyx[0]"),
+        ("overlap_int", "overlap_fraction"),
+        ("overlap_bool", "overlap_fraction"),
+        ("force", "force"),
+    ],
+)
+def test_run_workflow_rejects_nonexact_round_task_fields_before_mutation(
+    case: str,
+    field: str,
+    tmp_path: Path,
+) -> None:
+    plan, invalid_task = _invalid_task(tmp_path, case)
+    forged = replace(plan, tasks=(invalid_task, *plan.tasks[1:]))
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(
+        WorkflowPlanError,
+        match=rf"tasks\[0\].*{re.escape(field)}",
+    ):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
     "case",
     [
         "schema",
@@ -962,6 +1292,61 @@ def test_run_workflow_rejects_inconsistent_executor_results_before_persistence(
         return (mutate(_result(tasks[0]), tasks[0]), _result(tasks[1]))
 
     with pytest.raises(RoundExecutionError, match=message):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(_FakeExecutor(execute)),
+        )
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root, plan.dataset_id
+        ).workflow_runs.glob("*.json")
+    )
+    assert records == ()
+
+
+@pytest.mark.parametrize(
+    ("case", "field"),
+    [
+        ("dataset_id", "dataset_id"),
+        ("round", "round"),
+        ("status", "status"),
+        ("started_at", "started_at"),
+        ("ended_at", "ended_at"),
+        ("duration", "duration_seconds"),
+        ("hostname", "hostname"),
+        ("pid", "pid"),
+        ("dask_task_key", "dask_task_key"),
+        ("slurm_job_id", "slurm_job_id"),
+        ("strategy", "strategy"),
+        ("native_container", "native_threads"),
+        ("native_entry", "native_threads"),
+        ("native_name", "native_threads"),
+        ("native_value", "native_threads"),
+        ("native_zero", "native_threads"),
+        ("native_name_unknown", "native_threads"),
+        ("artifact_container", "artifact_paths"),
+        ("artifact_element", "artifact_paths"),
+        ("reused_container", "reused_artifacts"),
+        ("reused_element", "reused_artifacts"),
+        ("log_path", "log_path"),
+        ("failure_model", "failure"),
+        ("failure_stage", "failure.stage"),
+        ("failure_exception_type", "failure.exception_type"),
+        ("failure_message", "failure.message"),
+    ],
+)
+def test_run_workflow_rejects_nonexact_round_result_fields_before_persistence(
+    case: str,
+    field: str,
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def execute(tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        return (_invalid_result(tasks[0], case), _result(tasks[1]))
+
+    with pytest.raises(RoundExecutionError, match=re.escape(field)):
         run_workflow(
             plan,
             _executor_factory=_factory(_FakeExecutor(execute)),

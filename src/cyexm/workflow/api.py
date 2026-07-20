@@ -80,6 +80,19 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _configure_sequential_native_threads(profile: ExecutionProfile) -> None:
+    if profile.executor != "sequential":
+        return
+    from cyexm.runtime import NativeThreadConfig, configure_native_threads
+
+    configure_native_threads(
+        NativeThreadConfig(
+            itk_threads=profile.native_threads.itk,
+            blas_threads=profile.native_threads.blas,
+        )
+    )
+
+
 def _default_executor_factory(profile: ExecutionProfile) -> WorkflowExecutor:
     if profile.executor == "sequential":
         from cyexm.workflow.round_task import run_round_task
@@ -707,6 +720,7 @@ def run_workflow(
     _validate_operational_paths(layout)
     _validate_workflow_plan(plan, layout)
     _validate_force_arguments(plan, force_rounds, force_all)
+    _configure_sequential_native_threads(plan.execution)
     started_at = _utc_now()
     run_id = str(uuid4())
     run_record = layout.run_record(run_id)

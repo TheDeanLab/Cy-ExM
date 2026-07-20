@@ -215,6 +215,8 @@ status = inspect_workflow_status(
 
 `build_workflow_plan` performs path and TIFF-header validation but creates no files,
 directories, scheduler clients, clusters, or workers: planning is mutation-free.
+TIFF header inspection runs in an isolated read-only probe process, so planning does
+not import NumPy or tifffile in the coordinator or change its thread environment.
 `inspect_workflow_status` is also read-only. Scheduler libraries and scientific
 runtimes are imported lazily only at the selected execution boundary.
 
@@ -345,6 +347,14 @@ The resolved values are applied before ANTs, NumPy, or SciPy is imported in each
 worker. Dask worker threads, requested SLURM cores, and ITK/BLAS native threads are
 different controls. Keep ITK and BLAS at one until a particular dataset and runtime
 have been characterized safely.
+
+A sequential run applies the resolved native-thread environment in the coordinator
+before workflow status inspection or registration begins; the round boundary then
+reapplies the same values idempotently. Dask and SLURM coordinators do not apply task
+native-thread settings. Their separate worker processes receive and apply the values
+before scientific imports. If a caller has already imported ANTs, NumPy, or SciPy,
+`run_workflow` still rejects a conflicting late change before writing workflow
+outputs; only an exactly idempotent reapplication is safe.
 
 ### Validate, plan, run, and inspect
 

@@ -24,7 +24,11 @@ from cyexm.errors import WorkflowPlanError
 from cyexm.spatial import ImageGeometry
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import ImageHeader
-from cyexm.workflow.planning import _inspect_tiff_header, build_workflow_plan
+from cyexm.workflow.planning import (
+    _inspect_tiff_header,
+    _inspect_tiff_header_in_process,
+    build_workflow_plan,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -1158,7 +1162,7 @@ def test_private_header_inspection_rejects_a_file_changed_between_metadata_reads
     with pytest.raises(
         WorkflowPlanError, match="changed during TIFF header inspection"
     ):
-        _inspect_tiff_header(path)
+        _inspect_tiff_header_in_process(path)
 
 
 @pytest.mark.parametrize("layout", ["two_dimensional", "rgb"])
@@ -1182,3 +1186,72 @@ def test_private_header_inspection_rejects_non_scalar_or_non_3d_tiffs(
 
     with pytest.raises(WorkflowPlanError, match="scalar three-dimensional"):
         _inspect_tiff_header(path)
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("duplicate", "duplicate JSON key", id="duplicate-key"),
+        pytest.param(
+            "nonfinite",
+            "non-finite JSON constant",
+            id="nonfinite-constant",
+        ),
+        pytest.param("overflow", "finite JSON number", id="overflowing-float"),
+        pytest.param("syntax", "invalid data", id="invalid-syntax"),
+    ],
+)
+def test_header_probe_rejects_non_strict_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: str,
+    message: str,
+) -> None:
+    path = tmp_path / "image.tif"
+    encoded_path = json.dumps(str(path))
+    if case == "duplicate":
+        stdout = (
+            f'{{"path":{encoded_path},"path":{encoded_path},'
+            '"shape_zyx":[2,3,4],"dtype":"uint16","axes":"ZYX",'
+            '"geometry":null,"st_size":1,"st_mtime_ns":2}'
+        )
+    elif case == "nonfinite":
+        stdout = (
+            f'{{"path":{encoded_path},"shape_zyx":[2,3,4],'
+            '"dtype":"uint16","axes":"ZYX","geometry":null,'
+            '"st_size":NaN,"st_mtime_ns":2}'
+        )
+    elif case == "overflow":
+        stdout = (
+            f'{{"path":{encoded_path},"shape_zyx":[2,3,4],'
+            '"dtype":"uint16","axes":"ZYX","geometry":null,'
+            '"st_size":1e400,"st_mtime_ns":2}'
+        )
+    else:
+        assert case == "syntax"
+        stdout = "{"
+    completed = SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+    monkeypatch.setattr(
+        "cyexm.workflow.planning.subprocess.run",
+        lambda *args, **kwargs: completed,
+    )
+
+    with pytest.raises(WorkflowPlanError, match=message):
+        _inspect_tiff_header(path)
+
+
+def test_header_probe_maps_invalid_unicode_to_a_plan_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def invalid_output(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(
+        "cyexm.workflow.planning.subprocess.run",
+        invalid_output,
+    )
+
+    with pytest.raises(WorkflowPlanError, match="invalid output"):
+        _inspect_tiff_header(tmp_path / "image.tif")

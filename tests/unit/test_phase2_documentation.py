@@ -208,6 +208,18 @@ def test_readme_documents_the_exact_startup_timeout_scope() -> None:
         assert required in normalized
 
 
+def test_readme_documents_planning_and_execution_thread_boundaries() -> None:
+    normalized = _normalized_readme()
+    for required in (
+        "tiff header inspection runs in an isolated read-only probe process",
+        "does not import numpy or tifffile in the coordinator",
+        "sequential run applies the resolved native-thread environment",
+        "before workflow status inspection or registration begins",
+        "dask and slurm coordinators do not apply task native-thread settings",
+    ):
+        assert required in normalized
+
+
 def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
     readme = _readme()
     for output in (

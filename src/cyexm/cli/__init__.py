@@ -13,6 +13,7 @@ from cyexm.errors import (
     InputValidationError,
     ManifestDecodeError,
     RoundExecutionError,
+    ThreadConfigurationError,
     WorkflowExecutionError,
     WorkflowPlanError,
 )
@@ -63,6 +64,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ConfigurationValidationError,
         InputValidationError,
         ManifestDecodeError,
+        ThreadConfigurationError,
         WorkflowPlanError,
     ) as error:
         return _diagnostic(error, 2)

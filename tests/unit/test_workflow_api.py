@@ -2273,6 +2273,7 @@ def test_run_workflow_force_submits_an_otherwise_complete_round(tmp_path: Path) 
 
 
 def test_run_workflow_does_not_reuse_artifacts_from_other_native_threads(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     original = _plan(tmp_path, rounds=(2,))
@@ -2282,6 +2283,12 @@ def test_run_workflow_does_not_reuse_artifacts_from_other_native_threads(
     task = replace(original.tasks[0], native_threads=requested_threads)
     execution = replace(original.execution, native_threads=requested_threads)
     plan = replace(original, tasks=(task,), execution=execution)
+    configured: list[ExecutionProfile] = []
+    monkeypatch.setattr(
+        workflow_api,
+        "_configure_sequential_native_threads",
+        configured.append,
+    )
     fake = _FakeExecutor(
         lambda tasks: tuple(
             replace(
@@ -2299,6 +2306,7 @@ def test_run_workflow_does_not_reuse_artifacts_from_other_native_threads(
 
     assert tuple(item.round for item in fake.calls[0]) == (2,)
     assert result.rounds[0].status == "completed"
+    assert configured == [execution]
 
 
 def test_run_workflow_writes_failed_summary_then_raises_sorted_rounds(

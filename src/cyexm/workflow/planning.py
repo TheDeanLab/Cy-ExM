@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -23,7 +25,7 @@ from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
     OUTPUT_FORMAT_POLICY,
 )
-from cyexm.spatial import AXIS_CONVENTION_VERSION, spacing_compatible
+from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
 from cyexm.workflow.layout import RoundLayout, WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
@@ -171,7 +173,7 @@ def _shape_from_series(series: object, shaped_metadata: object) -> tuple[int, ..
     return raw_shape
 
 
-def _inspect_tiff_header(path: Path) -> ImageHeader:
+def _inspect_tiff_header_in_process(path: Path) -> ImageHeader:
     """Inspect one TIFF's scalar layout and strict geometry without voxel loading."""
     try:
         import tifffile
@@ -222,6 +224,93 @@ def _inspect_tiff_header(path: Path) -> ImageHeader:
         st_size=stat_after.st_size,
         st_mtime_ns=stat_after.st_mtime_ns,
     )
+
+
+def _header_from_probe(payload: object, expected_path: Path) -> ImageHeader:
+    expected_keys = {
+        "path",
+        "shape_zyx",
+        "dtype",
+        "axes",
+        "geometry",
+        "st_size",
+        "st_mtime_ns",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+        raise ValueError("header probe returned an invalid object")
+    raw_path = payload["path"]
+    if not isinstance(raw_path, str) or Path(raw_path) != expected_path:
+        raise ValueError("header probe returned the wrong path")
+    raw_shape = payload["shape_zyx"]
+    if (
+        not isinstance(raw_shape, list)
+        or len(raw_shape) != 3
+        or any(type(value) is not int or value < 1 for value in raw_shape)
+    ):
+        raise ValueError("header probe returned an invalid shape")
+    dtype = payload["dtype"]
+    axes = payload["axes"]
+    st_size = payload["st_size"]
+    st_mtime_ns = payload["st_mtime_ns"]
+    if not isinstance(dtype, str) or not dtype:
+        raise ValueError("header probe returned an invalid dtype")
+    if not isinstance(axes, str) or not axes:
+        raise ValueError("header probe returned invalid axes")
+    if type(st_size) is not int or st_size < 0:
+        raise ValueError("header probe returned an invalid file size")
+    if type(st_mtime_ns) is not int or st_mtime_ns < 0:
+        raise ValueError("header probe returned an invalid modification time")
+    raw_geometry = payload["geometry"]
+    geometry = None
+    if raw_geometry is not None:
+        if not isinstance(raw_geometry, Mapping):
+            raise ValueError("header probe returned invalid geometry")
+        geometry = ImageGeometry.from_dict(raw_geometry)
+    return ImageHeader(
+        path=expected_path,
+        shape_zyx=(raw_shape[0], raw_shape[1], raw_shape[2]),
+        dtype=dtype,
+        axes=axes,
+        geometry=geometry,
+        st_size=st_size,
+        st_mtime_ns=st_mtime_ns,
+    )
+
+
+def _inspect_tiff_header(path: Path) -> ImageHeader:
+    """Inspect a TIFF without importing scientific runtimes in the caller."""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "cyexm.workflow._header_probe", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise WorkflowPlanError(
+            f"TIFF header inspection process could not start for {path}: {error}"
+        ) from error
+    except UnicodeError as error:
+        raise WorkflowPlanError(
+            f"TIFF header inspection returned invalid output for {path}: {error}"
+        ) from error
+    if completed.returncode != 0:
+        detail = " ".join(completed.stderr.splitlines()) or (
+            f"probe exited with status {completed.returncode}"
+        )
+        raise WorkflowPlanError(f"TIFF header inspection failed for {path}: {detail}")
+    try:
+        payload = json.loads(
+            completed.stdout,
+            object_pairs_hook=_strict_json_object,
+            parse_float=_finite_json_float,
+            parse_constant=_reject_json_constant,
+        )
+        return _header_from_probe(payload, path)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise WorkflowPlanError(
+            f"TIFF header inspection returned invalid data for {path}: {error}"
+        ) from error
 
 
 def _header_contract_error(

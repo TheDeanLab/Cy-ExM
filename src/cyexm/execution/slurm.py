@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import copy
 import logging
+import shlex
+import sys
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from importlib.metadata import version as package_version
 from typing import Any, cast
@@ -38,6 +41,10 @@ _COORDINATOR_PACKAGES = (
     "scipy",
     "tifffile",
 )
+_CONFIG_NAME = "cyexm-slurm"
+_DEATH_TIMEOUT_SECONDS = 60
+_SHEBANG = "#!/usr/bin/env bash"
+_WORKER_COMMAND = "distributed.cli.dask_worker"
 _WORKER_EXTRA_ARGS = ["--resources", "round_slot=1"]
 
 
@@ -47,19 +54,76 @@ class _SlurmModules:
     Client: Any
     as_completed: Any
     parse_timedelta: Any
+    config_set: Any
 
 
 def _slurm_modules() -> _SlurmModules:
     """Load Dask and dask-jobqueue only when SLURM execution is selected."""
+    from dask import config as dask_config
     from dask.utils import parse_timedelta
     from dask_jobqueue import SLURMCluster  # pyright: ignore[reportPrivateImportUsage]
     from distributed import Client, as_completed
 
-    return _SlurmModules(SLURMCluster, Client, as_completed, parse_timedelta)
+    return _SlurmModules(
+        SLURMCluster,
+        Client,
+        as_completed,
+        parse_timedelta,
+        dask_config.set,
+    )
 
 
 def _error_payload(error: BaseException) -> dict[str, str]:
     return {"type": type(error).__name__, "message": str(error)}
+
+
+def _native_thread_values(profile: ExecutionProfile) -> dict[str, str]:
+    return {
+        name: str(
+            profile.native_threads.itk if index == 0 else profile.native_threads.blas
+        )
+        for index, name in enumerate(NATIVE_THREAD_ENV_VARS)
+    }
+
+
+def _native_thread_prologue(profile: ExecutionProfile) -> list[str]:
+    return [
+        f"export {name}={shlex.quote(value)}"
+        for name, value in _native_thread_values(profile).items()
+    ]
+
+
+def _jobqueue_config_overlay() -> dict[str, object]:
+    """Isolate worker rendering from ambient ``jobqueue.slurm`` settings."""
+    values: dict[str, object] = {
+        "account": None,
+        "project": None,
+        "cores": None,
+        "memory": None,
+        "processes": None,
+        "python": None,
+        "interface": None,
+        "death-timeout": _DEATH_TIMEOUT_SECONDS,
+        "local-directory": None,
+        "shared-temp-directory": None,
+        "extra": None,
+        "worker-command": _WORKER_COMMAND,
+        "worker-extra-args": [],
+        "shebang": _SHEBANG,
+        "queue": None,
+        "walltime": None,
+        "env-extra": None,
+        "job-script-prologue": [],
+        "job-cpu": None,
+        "job-mem": None,
+        "job-extra": None,
+        "job-extra-directives": [],
+        "header-skip": None,
+        "job-directives-skip": [],
+        "log-directory": None,
+        "scheduler-options": {},
+    }
+    return {f"jobqueue.{_CONFIG_NAME}.{name}": value for name, value in values.items()}
 
 
 def _scheduler_snapshot(
@@ -195,7 +259,13 @@ class SlurmExecutor:
         *,
         worker_count: int,
         spec: SlurmSpec | None,
-    ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    ) -> tuple[
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+    ]:
         requested: dict[str, object] = {"workers": worker_count}
         if spec is not None:
             requested.update(
@@ -205,17 +275,32 @@ class SlurmExecutor:
                     "task_retries": spec.task_retries,
                 }
             )
+        rendered: dict[str, object] = {}
         observed: dict[str, object] = {}
+        startup: dict[str, object] = {
+            "phase": "not_started" if spec is None else "module_loading",
+            "outcome": "not_started" if spec is None else "in_progress",
+            "scale_attempted": False,
+            "scale_succeeded": None,
+        }
         cleanup: dict[str, object] = {}
         self._execution_evidence = {
             "executor": "slurm",
             "requested": requested,
+            "rendered": rendered,
             "observed": observed,
+            "startup": startup,
             "attempt_counts": [],
             "timestamps": {"started_at": utc_now()},
             "cleanup": cleanup,
         }
-        return observed, cleanup, cast(dict[str, object], self._execution_evidence)
+        return (
+            rendered,
+            observed,
+            startup,
+            cleanup,
+            cast(dict[str, object], self._execution_evidence),
+        )
 
     @staticmethod
     def _attempt_evidence(
@@ -235,16 +320,17 @@ class SlurmExecutor:
     def _close_owned(
         client: Any | None,
         cluster: Any | None,
+        configuration: AbstractContextManager[Any] | None,
         cleanup: dict[str, object],
     ) -> None:
+        exit_info = sys.exc_info()
         order: list[str] = []
-        for name, resource in (("client", client), ("cluster", cluster)):
-            if resource is None:
-                continue
+
+        def record(name: str, close: Callable[[], object]) -> None:
             order.append(name)
             status: dict[str, object] = {"attempted": True}
             try:
-                resource.close()
+                close()
             except BaseException as error:
                 status["succeeded"] = False
                 status["error"] = _error_payload(error)
@@ -252,12 +338,22 @@ class SlurmExecutor:
             else:
                 status["succeeded"] = True
             cleanup[name] = status
+
+        for name, resource in (("client", client), ("cluster", cluster)):
+            if resource is None:
+                continue
+            record(name, resource.close)
+        if configuration is not None:
+            record(
+                "configuration",
+                lambda: configuration.__exit__(*exit_info),
+            )
         if order:
             cleanup["order"] = order
 
     def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
         if not tasks:
-            _observed, _cleanup, evidence = self._begin_evidence(
+            _rendered, _observed, _startup, _cleanup, evidence = self._begin_evidence(
                 worker_count=0,
                 spec=None,
             )
@@ -267,58 +363,88 @@ class SlurmExecutor:
         spec = self._spec()
         validate_distributed_tasks(tasks, executor_name="SlurmExecutor")
         worker_count = min(len(tasks), spec.workers)
-        observed, cleanup, evidence = self._begin_evidence(
+        rendered, observed, startup, cleanup, evidence = self._begin_evidence(
             worker_count=worker_count,
             spec=spec,
         )
         attempts = [0 for _task in tasks]
         cluster: Any | None = None
         client: Any | None = None
+        configuration: AbstractContextManager[Any] | None = None
         active: set[Any] = set()
 
         try:
             try:
+                startup["phase"] = "module_loading"
                 modules = self._modules()
+                startup["phase"] = "configuration"
+                opened_configuration = modules.config_set(_jobqueue_config_overlay())
+                opened_configuration.__enter__()
+                configuration = opened_configuration
+                startup["phase"] = "cluster_construction"
                 opened_cluster = modules.SLURMCluster(
+                    config_name=_CONFIG_NAME,
                     queue=spec.queue,
                     cores=spec.cores_per_worker,
                     processes=spec.processes_per_worker,
                     memory=spec.memory,
                     walltime=spec.walltime,
+                    job_cpu=spec.cores_per_worker,
+                    job_mem=spec.memory,
                     interface=spec.interface,
                     scheduler_options={"interface": spec.scheduler_interface},
                     local_directory=str(self.profile.paths.worker_local_directory),
+                    nanny=True,
+                    death_timeout=_DEATH_TIMEOUT_SECONDS,
+                    worker_command=_WORKER_COMMAND,
+                    python=sys.executable,
+                    shebang=_SHEBANG,
                     job_name=spec.job_name,
+                    job_script_prologue=_native_thread_prologue(self.profile),
                     job_extra_directives=list(spec.job_extra_directives),
+                    job_directives_skip=[],
                     worker_extra_args=list(_WORKER_EXTRA_ARGS),
                 )
                 cluster = opened_cluster
+                startup["phase"] = "template_rendering"
                 script = opened_cluster.job_script()
                 if type(script) is not str or not script:
                     raise TypeError(
                         "SLURMCluster.job_script() must return a nonempty built-in "
                         "string"
                     )
-                observed["submitted_job_script"] = script
-                opened_cluster.scale(jobs=worker_count)
+                rendered["rendered_job_script_template"] = script
+                startup["phase"] = "scaling"
+                startup["scale_attempted"] = True
+                try:
+                    opened_cluster.scale(jobs=worker_count)
+                except BaseException:
+                    startup["scale_succeeded"] = False
+                    raise
+                startup["scale_succeeded"] = True
+                startup["phase"] = "client_creation"
                 opened_client = modules.Client(
                     opened_cluster,
                     timeout=spec.startup_timeout,
                 )
                 client = opened_client
+                startup["phase"] = "worker_wait"
                 opened_client.wait_for_workers(
                     worker_count,
                     timeout=modules.parse_timedelta(spec.startup_timeout),
                 )
 
+                startup["phase"] = "coordinator_version_collection"
                 versions = self._coordinator_versions()
                 observed["coordinator_versions"] = dict(versions)
+                startup["phase"] = "worker_snapshot"
                 scheduler_address, connected = _scheduler_snapshot(
                     opened_client,
                     expected_workers=worker_count,
                 )
                 observed["scheduler_address"] = scheduler_address
                 observed["connected_workers"] = list(connected)
+                startup["phase"] = "worker_probe"
                 raw_probes = opened_client.run(
                     probe_worker,
                     dataset_root=str(self.profile.paths.dataset_root),
@@ -327,14 +453,7 @@ class SlurmExecutor:
                         self.profile.paths.worker_local_directory
                     ),
                     expected_versions=dict(versions),
-                    expected_threads={
-                        name: str(
-                            self.profile.native_threads.itk
-                            if index == 0
-                            else self.profile.native_threads.blas
-                        )
-                        for index, name in enumerate(NATIVE_THREAD_ENV_VARS)
-                    },
+                    expected_threads=_native_thread_values(self.profile),
                 )
                 if isinstance(raw_probes, Mapping):
                     observed["worker_probes"] = _decodable_probe_evidence(raw_probes)
@@ -346,6 +465,7 @@ class SlurmExecutor:
                         f"expected={connected!r}, "
                         f"returned={returned!r}"
                     )
+                startup["phase"] = "worker_validation"
                 probes = validate_worker_probes(
                     cast(Mapping[str, Mapping[str, object]], raw_probes)
                 )
@@ -360,6 +480,7 @@ class SlurmExecutor:
                         "Worker preflight reported worker address mismatches:\n- "
                         + "\n- ".join(mismatches)
                     )
+                startup["phase"] = "worker_stability_check"
                 scheduler_after, connected_after = _scheduler_snapshot(
                     opened_client,
                     expected_workers=None,
@@ -370,9 +491,15 @@ class SlurmExecutor:
                         f"before=({scheduler_address!r}, {connected!r}), "
                         f"after=({scheduler_after!r}, {connected_after!r})"
                     )
-            except ExecutorStartupError:
+                startup["phase"] = "complete"
+                startup["outcome"] = "succeeded"
+            except ExecutorStartupError as error:
+                startup["outcome"] = "failed"
+                startup["error"] = _error_payload(error)
                 raise
             except Exception as error:
+                startup["outcome"] = "failed"
+                startup["error"] = _error_payload(error)
                 raise ExecutorStartupError(
                     f"Failed to start and preflight {worker_count} SLURM workers "
                     f"within {spec.startup_timeout}: {error}"
@@ -390,33 +517,44 @@ class SlurmExecutor:
                 attempts=attempts,
             )
             return results
-        except KeyboardInterrupt:
-            if client is not None:
-                unfinished = tuple(
-                    future
-                    for future in active
-                    if future_is_unfinished(future, logger=_LOGGER)
+        except BaseException as error:
+            if startup["outcome"] == "in_progress":
+                startup["outcome"] = (
+                    "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
                 )
-                cancellation: dict[str, object] = {
-                    "unfinished_futures": len(unfinished),
-                    "force": True,
-                }
-                try:
-                    if unfinished:
-                        client.cancel(unfinished, force=True)
-                except BaseException as error:
-                    cancellation["succeeded"] = False
-                    cancellation["error"] = _error_payload(error)
-                    _LOGGER.warning(
-                        "Failed to cancel unfinished SLURM futures: %s", error
+                startup["error"] = _error_payload(error)
+            if isinstance(error, KeyboardInterrupt):
+                unfinished: tuple[Any, ...] = ()
+                if client is not None:
+                    unfinished = tuple(
+                        future
+                        for future in active
+                        if future_is_unfinished(future, logger=_LOGGER)
                     )
-                else:
-                    cancellation["succeeded"] = True
+                cancellation: dict[str, object] = {
+                    "attempted": False,
+                    "unfinished_futures": len(unfinished),
+                    "succeeded": None,
+                }
+                if client is not None and unfinished:
+                    cancellation["attempted"] = True
+                    cancellation["force"] = True
+                    try:
+                        client.cancel(unfinished, force=True)
+                    except BaseException as cancellation_error:
+                        cancellation["succeeded"] = False
+                        cancellation["error"] = _error_payload(cancellation_error)
+                        _LOGGER.warning(
+                            "Failed to cancel unfinished SLURM futures: %s",
+                            cancellation_error,
+                        )
+                    else:
+                        cancellation["succeeded"] = True
                 observed["cancellation"] = cancellation
             raise
         finally:
             evidence["attempt_counts"] = self._attempt_evidence(tasks, attempts)
-            self._close_owned(client, cluster, cleanup)
+            self._close_owned(client, cluster, configuration, cleanup)
             cast(dict[str, str], evidence["timestamps"])["ended_at"] = utc_now()
 
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
@@ -44,6 +46,7 @@ def _profile(
     *,
     workers: int = 4,
     retries: int = 0,
+    directives: tuple[str, ...] = (),
 ) -> ExecutionProfile:
     return ExecutionProfile(
         schema_version=1,
@@ -67,7 +70,7 @@ def _profile(
             startup_timeout="15m",
             task_retries=retries,
             job_name="cyexm-registration",
-            job_extra_directives=(),
+            job_extra_directives=directives,
         ),
         source_path=tmp_path / "execution.yaml",
     )
@@ -352,11 +355,45 @@ class _FakeSlurmModules:
         self.cancel_error: BaseException | None = None
         self.client_close_error: BaseException | None = None
         self.cluster_close_error: BaseException | None = None
+        self.config_exit_error: BaseException | None = None
+        self.config_overlays: list[dict[str, object]] = []
+        self.config_context_active = False
+
+    class _ConfigContext(AbstractContextManager[None]):
+        def __init__(
+            self,
+            modules: _FakeSlurmModules,
+            values: dict[str, object],
+        ) -> None:
+            self._modules = modules
+            self._values = values
+
+        def __enter__(self) -> None:
+            self._modules.config_overlays.append(self._values)
+            self._modules.config_context_active = True
+
+        def __exit__(self, *exc_info: object) -> None:
+            del exc_info
+            self._modules.config_context_active = False
+            if self._modules.config_exit_error is not None:
+                raise self._modules.config_exit_error
+
+    def config_set(self, values: dict[str, object]) -> AbstractContextManager[None]:
+        return self._ConfigContext(self, values)
 
     def SLURMCluster(self, **kwargs: object) -> _FakeCluster:
         if self.cluster_error is not None:
             raise self.cluster_error
         self.cluster_kwargs = kwargs
+        prologue = "\n".join(cast(list[str], kwargs.get("job_script_prologue", [])))
+        python = str(kwargs.get("python", "python"))
+        worker_command = str(
+            kwargs.get("worker_command", "distributed.cli.dask_worker")
+        )
+        self.job_script_text = (
+            "#!/bin/bash\n#SBATCH --partition=512GB\n"
+            f"{prologue}\n{python} -m {worker_command} tcp://scheduler:8786\n"
+        )
         return _FakeCluster(self)
 
     def Client(self, cluster: _FakeCluster, *, timeout: str) -> _FakeClient:
@@ -379,6 +416,52 @@ class _FakeSlurmModules:
     def parse_timedelta(self, value: str) -> float:
         assert value == "15m"
         return 900.0
+
+
+class _ConfiguredSlurmModules(_FakeSlurmModules):
+    """Render through the pinned SLURMJob while keeping scheduling faked."""
+
+    class _RealConfigContext(AbstractContextManager[None]):
+        def __init__(
+            self,
+            modules: _ConfiguredSlurmModules,
+            values: dict[str, object],
+        ) -> None:
+            from dask import config as dask_config
+
+            self._modules = modules
+            self._values = values
+            self._context = dask_config.set(values)
+
+        def __enter__(self) -> None:
+            self._modules.config_overlays.append(self._values)
+            self._modules.config_context_active = True
+            self._context.__enter__()
+
+        def __exit__(self, *exc_info: object) -> None:
+            try:
+                self._context.__exit__(*exc_info)
+            finally:
+                self._modules.config_context_active = False
+
+    def config_set(self, values: dict[str, object]) -> AbstractContextManager[None]:
+        return self._RealConfigContext(self, values)
+
+    def SLURMCluster(self, **kwargs: object) -> _FakeCluster:
+        from dask_jobqueue.slurm import SLURMJob
+
+        cluster = super().SLURMCluster(**kwargs)
+        cluster_only = {"scheduler_options", "shared_temp_directory"}
+        job_kwargs = {
+            name: value for name, value in kwargs.items() if name not in cluster_only
+        }
+        job = SLURMJob(
+            scheduler="tcp://scheduler:8786",
+            name="actual-worker",
+            **job_kwargs,
+        )
+        self.job_script_text = job.job_script()
+        return cluster
 
 
 def _executor(
@@ -405,6 +488,10 @@ def test_real_module_loader_gets_timeout_parser_from_pinned_dask_utils(
     distributed.as_completed = object()  # type: ignore[attr-defined]
     dask = ModuleType("dask")
     dask.__path__ = []  # type: ignore[attr-defined]
+    dask_config = ModuleType("dask.config")
+    config_set = object()
+    dask_config.set = config_set  # type: ignore[attr-defined]
+    dask.config = dask_config  # type: ignore[attr-defined]
     dask_utils = ModuleType("dask.utils")
     timeout_parser = object()
     dask_utils.parse_timedelta = timeout_parser  # type: ignore[attr-defined]
@@ -416,33 +503,145 @@ def test_real_module_loader_gets_timeout_parser_from_pinned_dask_utils(
     modules = slurm_module._slurm_modules()
 
     assert modules.parse_timedelta is timeout_parser
+    assert modules.config_set is config_set
 
 
 def test_slurm_executor_builds_one_process_jobs_with_round_resource(
     tmp_path: Path,
 ) -> None:
-    modules = _FakeSlurmModules()
+    modules = _ConfiguredSlurmModules()
     modules.connected_workers = modules.connected_workers[:3]
     tasks = tuple(_task(tmp_path, number) for number in (2, 3, 4))
 
     _executor(tmp_path, modules).execute(tasks)
 
     assert modules.cluster_kwargs == {
+        "config_name": "cyexm-slurm",
         "queue": "512GB",
         "cores": 72,
         "processes": 1,
         "memory": "500GB",
         "walltime": "72:00:00",
+        "job_cpu": 72,
+        "job_mem": "500GB",
         "interface": "ib0",
         "scheduler_options": {"interface": "ib0"},
         "local_directory": str(tmp_path / "scratch"),
+        "nanny": True,
+        "death_timeout": 60,
+        "worker_command": "distributed.cli.dask_worker",
+        "python": sys.executable,
+        "shebang": "#!/usr/bin/env bash",
         "job_name": "cyexm-registration",
+        "job_script_prologue": [
+            f"export {name}={'2' if index == 0 else '3'}"
+            for index, name in enumerate(NATIVE_THREAD_ENV_VARS)
+        ],
         "job_extra_directives": [],
+        "job_directives_skip": [],
         "worker_extra_args": ["--resources", "round_slot=1"],
     }
     assert modules.scale_calls == [{"jobs": 3}]
     assert modules.wait_for_workers_calls == [(3, 900.0)]
     assert modules.client_timeout == "15m"
+
+
+def test_slurm_executor_exports_resolved_threads_before_worker_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index, name in enumerate(NATIVE_THREAD_ENV_VARS):
+        if index % 2:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, "999")
+    modules = _ConfiguredSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    executor = _executor(tmp_path, modules)
+
+    executor.execute((_task(tmp_path, 2),))
+
+    assert modules.cluster_kwargs is not None
+    prologue = cast(list[str], modules.cluster_kwargs["job_script_prologue"])
+    assert prologue == [
+        f"export {name}={'2' if index == 0 else '3'}"
+        for index, name in enumerate(NATIVE_THREAD_ENV_VARS)
+    ]
+    script = cast(
+        dict[str, str],
+        cast(dict[str, object], executor.execution_evidence["rendered"]),
+    )["rendered_job_script_template"]
+    worker_command = " -m distributed.cli.dask_worker"
+    for line in prologue:
+        assert script.index(line) < script.index(worker_command)
+    assert modules.run_calls[0][1]["expected_threads"] == {
+        NATIVE_THREAD_ENV_VARS[0]: "2",
+        **dict.fromkeys(NATIVE_THREAD_ENV_VARS[1:], "3"),
+    }
+
+
+@pytest.mark.parametrize("directives", [(), ("--qos=lab",)])
+def test_slurm_executor_neutralizes_ambient_jobqueue_launch_configuration(
+    tmp_path: Path,
+    directives: tuple[str, ...],
+) -> None:
+    from dask import config as dask_config
+
+    malicious = {
+        "account": "evil-account",
+        "project": "evil-project",
+        "job-script-prologue": ["echo evil-prologue"],
+        "env-extra": ["echo evil-env-extra"],
+        "job-directives-skip": ["#SBATCH -p", "--cpus-per-task", "--mem"],
+        "header-skip": ["#SBATCH -t"],
+        "python": "/evil/python",
+        "worker-command": "evil.worker",
+        "job-extra": ["--constraint=evil-extra"],
+        "extra": ["--evil-worker-extra"],
+        "shebang": "#!/evil/shell",
+        "log-directory": "/evil/logs",
+    }
+    contaminated = {
+        f"jobqueue.{namespace}.{name}": value
+        for namespace in ("slurm", "cyexm-slurm")
+        for name, value in malicious.items()
+    }
+    modules = _ConfiguredSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    executor = SlurmExecutor(
+        _profile(tmp_path, directives=directives),
+        _modules=lambda: modules,
+        _version=lambda _name: "test-version",
+    )
+
+    with dask_config.set(contaminated):
+        executor.execute((_task(tmp_path, 2),))
+
+    rendered = cast(
+        dict[str, str],
+        cast(dict[str, object], executor.execution_evidence["rendered"]),
+    )["rendered_job_script_template"]
+    for forbidden in (
+        "evil-account",
+        "evil-project",
+        "evil-prologue",
+        "evil-env-extra",
+        "/evil/python",
+        "evil.worker",
+        "evil-extra",
+        "evil-worker-extra",
+        "#!/evil/shell",
+        "/evil/logs",
+    ):
+        assert forbidden not in rendered
+    for managed in (
+        "#SBATCH -p 512GB",
+        "#SBATCH --cpus-per-task=72",
+        "#SBATCH --mem=500GB",
+        "#SBATCH -t 72:00:00",
+    ):
+        assert managed in rendered
+    assert ("#SBATCH --qos=lab" in rendered) is bool(directives)
 
 
 def test_slurm_executor_bounds_jobs_by_configured_workers(tmp_path: Path) -> None:
@@ -472,6 +671,14 @@ def test_slurm_executor_returns_empty_without_loading_scheduler_modules(
     assert loaded is False
     evidence = executor.execution_evidence
     assert evidence["requested"] == {"workers": 0}
+    assert evidence["rendered"] == {}
+    assert evidence["observed"] == {}
+    assert evidence["startup"] == {
+        "phase": "not_started",
+        "outcome": "not_started",
+        "scale_attempted": False,
+        "scale_succeeded": None,
+    }
     assert evidence["attempt_counts"] == []
 
 
@@ -492,8 +699,10 @@ def test_slurm_executor_captures_exact_script_versions_scheduler_and_probes(
         "startup_timeout": "15m",
         "task_retries": 0,
     }
+    rendered = cast(dict[str, object], evidence["rendered"])
+    assert rendered["rendered_job_script_template"] == modules.job_script_text
     observed = cast(dict[str, object], evidence["observed"])
-    assert observed["submitted_job_script"] == modules.job_script_text
+    assert "submitted_job_script" not in observed
     assert observed["scheduler_address"] == modules.scheduler_address
     assert observed["connected_workers"] == ["tcp://node-a:1234"]
     assert cast(dict[str, str], observed["coordinator_versions"]) == dict.fromkeys(
@@ -511,11 +720,42 @@ def test_slurm_executor_captures_exact_script_versions_scheduler_and_probes(
     assert timestamps["started_at"].endswith("Z")
     assert timestamps["ended_at"].endswith("Z")
     assert timestamps["ended_at"] >= timestamps["started_at"]
+    assert evidence["startup"] == {
+        "phase": "complete",
+        "outcome": "succeeded",
+        "scale_attempted": True,
+        "scale_succeeded": True,
+    }
     assert evidence["cleanup"] == {
         "client": {"attempted": True, "succeeded": True},
         "cluster": {"attempted": True, "succeeded": True},
-        "order": ["client", "cluster"],
+        "configuration": {"attempted": True, "succeeded": True},
+        "order": ["client", "cluster", "configuration"],
     }
+
+
+def test_slurm_execution_evidence_is_detached_canonical_json(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    executor = _executor(tmp_path, modules)
+    executor.execute((_task(tmp_path, 2),))
+
+    first = cast(dict[str, object], executor.execution_evidence)
+    encoded = json.dumps(first, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    assert json.loads(encoded) == first
+    cast(dict[str, object], first["requested"])["workers"] = 999
+    cast(dict[str, object], first["rendered"])["rendered_job_script_template"] = (
+        "mutated"
+    )
+
+    second = executor.execution_evidence
+    assert cast(dict[str, object], second["requested"])["workers"] == 1
+    assert (
+        cast(dict[str, object], second["rendered"])["rendered_job_script_template"]
+        == modules.job_script_text
+    )
 
 
 def test_slurm_executor_preflight_uses_exact_versions_threads_and_roots(
@@ -598,6 +838,73 @@ def test_slurm_executor_wraps_startup_failures_and_cleans_partial_ownership(
     assert not modules.submit_calls
 
 
+@pytest.mark.parametrize(
+    ("failure_point", "phase", "scale_attempted", "scale_succeeded"),
+    [
+        ("cluster", "cluster_construction", False, None),
+        ("job_script", "template_rendering", False, None),
+        ("scale", "scaling", True, False),
+        ("client", "client_creation", True, True),
+        ("wait", "worker_wait", True, True),
+        ("run", "worker_probe", True, True),
+    ],
+)
+def test_slurm_executor_records_exact_failed_startup_phase_and_scale_outcome(
+    tmp_path: Path,
+    failure_point: str,
+    phase: str,
+    scale_attempted: bool,
+    scale_succeeded: bool | None,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    setattr(modules, f"{failure_point}_error", RuntimeError(f"{failure_point} failed"))
+    executor = _executor(tmp_path, modules)
+
+    with pytest.raises(ExecutorStartupError):
+        executor.execute((_task(tmp_path, 2),))
+
+    startup = cast(dict[str, object], executor.execution_evidence["startup"])
+    assert startup == {
+        "phase": phase,
+        "outcome": "failed",
+        "scale_attempted": scale_attempted,
+        "scale_succeeded": scale_succeeded,
+        "error": {"type": "RuntimeError", "message": f"{failure_point} failed"},
+    }
+
+
+def test_slurm_executor_records_preflight_interrupt_without_fake_cancellation(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    modules.run_error = KeyboardInterrupt("injected preflight interruption")
+    executor = _executor(tmp_path, modules)
+
+    with pytest.raises(KeyboardInterrupt, match="preflight interruption"):
+        executor.execute((_task(tmp_path, 2),))
+
+    assert executor.execution_evidence["startup"] == {
+        "phase": "worker_probe",
+        "outcome": "interrupted",
+        "scale_attempted": True,
+        "scale_succeeded": True,
+        "error": {
+            "type": "KeyboardInterrupt",
+            "message": "injected preflight interruption",
+        },
+    }
+    observed = cast(dict[str, object], executor.execution_evidence["observed"])
+    assert observed["cancellation"] == {
+        "attempted": False,
+        "unfinished_futures": 0,
+        "succeeded": None,
+    }
+    assert modules.cancel_call is None
+    assert modules.submit_calls == []
+
+
 def test_slurm_executor_aborts_before_submit_on_reported_probe_failure(
     tmp_path: Path,
 ) -> None:
@@ -606,11 +913,20 @@ def test_slurm_executor_aborts_before_submit_on_reported_probe_failure(
     modules.connected_workers = (address,)
     modules.probe_results = {address: _probe(address, ok=False)}
 
+    executor = _executor(tmp_path, modules)
     with pytest.raises(WorkerPreflightError, match="injected preflight failure"):
-        _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+        executor.execute((_task(tmp_path, 2),))
 
     assert modules.submit_calls == []
     assert modules.events[-2:] == ["client.close", "cluster.close"]
+    startup = cast(dict[str, object], executor.execution_evidence["startup"])
+    assert startup["phase"] == "worker_validation"
+    assert startup["outcome"] == "failed"
+    assert startup["scale_attempted"] is True
+    assert startup["scale_succeeded"] is True
+    error = cast(dict[str, str], startup["error"])
+    assert error["type"] == "WorkerPreflightError"
+    assert "injected preflight failure" in error["message"]
 
 
 @pytest.mark.parametrize(
@@ -800,6 +1116,7 @@ def test_slurm_executor_cancels_only_actual_unfinished_on_keyboard_interrupt(
     assert force is True
     observed = cast(dict[str, object], executor.execution_evidence["observed"])
     assert observed["cancellation"] == {
+        "attempted": True,
         "unfinished_futures": 1,
         "force": True,
         "succeeded": True,
@@ -818,6 +1135,7 @@ def test_slurm_executor_preserves_primary_baseexception_when_cleanup_fails(
     modules.cancel_error = SystemExit("cancel failed")
     modules.client_close_error = KeyboardInterrupt("client close failed")
     modules.cluster_close_error = SystemExit("cluster close failed")
+    modules.config_exit_error = RuntimeError("configuration cleanup failed")
     executor = _executor(tmp_path, modules)
 
     with (
@@ -829,9 +1147,11 @@ def test_slurm_executor_preserves_primary_baseexception_when_cleanup_fails(
     assert "cancel failed" in caplog.text
     assert "client close failed" in caplog.text
     assert "cluster close failed" in caplog.text
+    assert "configuration cleanup failed" in caplog.text
     cleanup = cast(dict[str, object], executor.execution_evidence["cleanup"])
     assert cast(dict[str, object], cleanup["client"])["succeeded"] is False
     assert cast(dict[str, object], cleanup["cluster"])["succeeded"] is False
+    assert cast(dict[str, object], cleanup["configuration"])["succeeded"] is False
     assert modules.events[-2:] == ["client.close", "cluster.close"]
 
 

@@ -222,13 +222,20 @@ def transform_channel(
     output = _path(output_path, "output_path").resolve()
     if output.suffix.lower() not in {".tif", ".tiff"}:
         raise ValueError("output_path must use a .tif or .tiff extension")
-    if output in input_paths:
-        raise ValueError("output_path must not alias a channel-transform input")
+    store = _artifact_store if _artifact_store is not None else ArtifactStore()
+    output_management_paths = {
+        output,
+        store.record_path(output).resolve(),
+        store.stale_path(output).resolve(),
+    }
+    if any(path in output_management_paths for path in input_paths):
+        raise ValueError(
+            "channel-transform input must not alias an output management path"
+        )
 
     resolved: ResolvedNativeThreads = configure_native_threads(native_threads)
     logger.info("Native thread settings: %s", resolved.describe())
     backend = _backend if _backend is not None else _production_backend(native_threads)
-    store = _artifact_store if _artifact_store is not None else ArtifactStore()
 
     try:
         fixed = backend.load_image(fixed_path, spacing)

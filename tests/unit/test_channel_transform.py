@@ -776,6 +776,111 @@ def test_transform_channel_rejects_an_output_that_aliases_an_input(
     assert configured is False
 
 
+def test_force_rejects_input_symlink_to_completion_record_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixed, moving, _, warp = source_files(tmp_path)
+    output = tmp_path / "channel.tif"
+    store = ArtifactStore()
+    record = store.record_path(output)
+    record.write_bytes(b"affine-input-owned-by-caller")
+    affine = tmp_path / "affine-link.mat"
+    affine.symlink_to(record)
+    input_paths = (fixed, moving, affine, warp)
+    identities_before = tuple(FileIdentity.from_path(path) for path in input_paths)
+    bytes_before = tuple(path.read_bytes() for path in input_paths)
+    events: list[str] = []
+
+    def configure(config: NativeThreadConfig | None) -> object:
+        del config
+        events.append("configure")
+        raise AssertionError("thread configuration must not run")
+
+    def production(config: NativeThreadConfig | None) -> FakeBackend:
+        del config
+        events.append("backend")
+        raise AssertionError("production backend must not be constructed")
+
+    monkeypatch.setattr(channels_module, "configure_native_threads", configure)
+    monkeypatch.setattr(channels_module, "_production_backend", production)
+
+    with pytest.raises(ValueError, match="output management path"):
+        transform_channel(
+            fixed_image_path=fixed,
+            moving_image_path=moving,
+            affine_path=affine,
+            warp_path=warp,
+            output_path=output,
+            pixel_size=(1.0, 1.0, 1.0),
+            interpolation="linear",
+            native_threads=NativeThreadConfig(1, 1),
+            force_override=True,
+            _artifact_store=store,
+        )
+
+    assert events == []
+    assert affine.is_symlink()
+    assert (
+        tuple(FileIdentity.from_path(path) for path in input_paths) == identities_before
+    )
+    assert tuple(path.read_bytes() for path in input_paths) == bytes_before
+    assert record.is_file()
+    assert not store.stale_path(output).exists()
+
+
+def test_resume_rejects_input_symlink_to_stale_path_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixed, moving, affine, _ = source_files(tmp_path)
+    output = tmp_path / "channel.tif"
+    store = ArtifactStore()
+    stale = store.stale_path(output)
+    stale.write_bytes(b"warp-input-owned-by-caller")
+    warp = tmp_path / "warp-link.nii.gz"
+    warp.symlink_to(stale)
+    input_paths = (fixed, moving, affine, warp)
+    identities_before = tuple(FileIdentity.from_path(path) for path in input_paths)
+    bytes_before = tuple(path.read_bytes() for path in input_paths)
+    events: list[str] = []
+
+    def configure(config: NativeThreadConfig | None) -> object:
+        del config
+        events.append("configure")
+        raise AssertionError("thread configuration must not run")
+
+    def production(config: NativeThreadConfig | None) -> FakeBackend:
+        del config
+        events.append("backend")
+        raise AssertionError("production backend must not be constructed")
+
+    monkeypatch.setattr(channels_module, "configure_native_threads", configure)
+    monkeypatch.setattr(channels_module, "_production_backend", production)
+
+    with pytest.raises(ValueError, match="output management path"):
+        transform_channel(
+            fixed_image_path=fixed,
+            moving_image_path=moving,
+            affine_path=affine,
+            warp_path=warp,
+            output_path=output,
+            pixel_size=(1.0, 1.0, 1.0),
+            interpolation="linear",
+            native_threads=NativeThreadConfig(1, 1),
+            _artifact_store=store,
+        )
+
+    assert events == []
+    assert warp.is_symlink()
+    assert (
+        tuple(FileIdentity.from_path(path) for path in input_paths) == identities_before
+    )
+    assert tuple(path.read_bytes() for path in input_paths) == bytes_before
+    assert stale.is_file()
+    assert not store.record_path(output).exists()
+
+
 def test_transform_channel_has_only_the_two_documented_test_injections() -> None:
     signature = inspect.signature(transform_channel)
 

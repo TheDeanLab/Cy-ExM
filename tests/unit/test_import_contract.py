@@ -110,6 +110,61 @@ for root in (
     assert completed.returncode == 0, completed.stderr
 
 
+def test_round_worker_import_defers_registration_operations_until_invocation() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.workflow.round_task
+
+assert before == dict(os.environ)
+for name in (
+    "cyexm.registration.channels",
+    "cyexm.registration.chunked",
+    "cyexm.registration.whole_image",
+):
+    assert name not in sys.modules, name
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_registration_namespace_resolves_stable_exports_lazily() -> None:
+    code = """
+import sys
+import cyexm.registration as registration
+
+assert registration.__all__ == [
+    "ChunkedImageRegistration",
+    "ImageRegistration",
+    "register_round",
+    "transform_channel",
+]
+for name in (
+    "cyexm.registration.channels",
+    "cyexm.registration.chunked",
+    "cyexm.registration.whole_image",
+):
+    assert name not in sys.modules, name
+
+assert registration.ImageRegistration.__name__ == "ImageRegistration"
+assert "cyexm.registration.whole_image" in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_whole_image_constructor_is_import_and_filesystem_neutral() -> None:
     code = """
 import logging

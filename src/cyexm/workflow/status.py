@@ -12,6 +12,14 @@ from cyexm.errors import WorkflowPlanError
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
+from cyexm.workflow._registration_policy import (
+    CHANNEL_POSTPROCESSING_POLICY,
+    CHUNK_SCALAR_POLICY,
+    OUTPUT_FORMAT_POLICY,
+    WHOLE_SCALAR_POLICY,
+    linear_parameters,
+    nonlinear_parameters,
+)
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     RoundStatus,
@@ -63,22 +71,6 @@ _POLICY_KEYS = frozenset({"axis_convention", "output_format", "postprocessing"})
 _LINEAR_TYPES = frozenset({"Translation", "Rigid", "Similarity", "Affine", "TRSAA"})
 _NONLINEAR_TYPES = frozenset({"Elastic", "SyNOnly", "SyN"})
 _ACCURACIES = frozenset({"high", "medium", "low", "dry run"})
-_LINEAR_ITERATIONS = {
-    "high": [1000, 500, 250, 100],
-    "medium": [500, 250, 100, 50],
-    "low": [100, 50, 25, 10],
-}
-_NONLINEAR_ITERATIONS = {
-    "high": [100, 70, 50],
-    "medium": [50, 35, 25],
-    "low": [5, 5, 5],
-    "dry run": [1, 1, 1],
-}
-_WHOLE_SCALAR_POLICY = "whole-global-histogram-match-v1"
-_CHUNK_SCALAR_POLICY = "serial-chunk-local-histogram-match-core-stitch-v1"
-_OUTPUT_FORMAT_POLICY = "ome-compatible-tiff-uint16-v1"
-_CHANNEL_POSTPROCESSING_POLICY = "clip-uint16-no-normalization-v1"
-
 type ArtifactRole = Literal["affine", "warp", "registered", "channel"]
 
 
@@ -701,8 +693,8 @@ def _parse_scientific_snapshot(
     )
     expected_policies = {
         "axis_convention": AXIS_CONVENTION_VERSION,
-        "output_format": _OUTPUT_FORMAT_POLICY,
-        "postprocessing": _CHANNEL_POSTPROCESSING_POLICY,
+        "output_format": OUTPUT_FORMAT_POLICY,
+        "postprocessing": CHANNEL_POSTPROCESSING_POLICY,
     }
     if canonical_json(policies) != canonical_json(expected_policies):
         raise WorkflowPlanError(
@@ -812,42 +804,14 @@ def _valid_native_threads(value: Mapping[str, int]) -> bool:
 
 
 def _linear_parameters(registration: _RegistrationContract) -> dict[str, object]:
-    parameters: dict[str, object] = {
-        "aff_metric": "mattes",
-        "aff_random_sampling_rate": 0.5,
-        "aff_sampling": 32,
-        "mask_all_stages": True,
-        "verbose": True,
-    }
-    if (
-        registration.linear_type == "TRSAA"
-        and registration.linear_accuracy != "dry run"
-    ):
-        parameters["reg_iterations"] = _LINEAR_ITERATIONS[registration.linear_accuracy]
-    if registration.linear_accuracy == "dry run":
-        parameters.update(
-            effective_registration_type="Rigid",
-            aff_iterations=[1],
-            aff_smoothing_sigmas=[0],
-            aff_shrink_factors=[8],
-            aff_random_sampling_rate=0.1,
-        )
-    return parameters
+    return linear_parameters(
+        registration.linear_type,
+        registration.linear_accuracy,
+    )
 
 
 def _nonlinear_parameters(registration: _RegistrationContract) -> dict[str, object]:
-    return {
-        "aff_random_sampling_rate": 1.0,
-        "flow_sigma": 3.0,
-        "initial_transform": "Identity",
-        "mask_all_stages": True,
-        "reg_iterations": _NONLINEAR_ITERATIONS[registration.nonlinear_accuracy],
-        "singleprecision": False,
-        "syn_metric": "mattes",
-        "syn_sampling": 32,
-        "total_sigma": 0.5,
-        "verbose": True,
-    }
+    return nonlinear_parameters(registration.nonlinear_accuracy)
 
 
 def _valid_geometry(
@@ -919,9 +883,9 @@ def _whole_request_valid(
     registration_inputs = (fixed_identity, moving_identity)
     common = _common_parameters(snapshot, round_contract)
     scalar_policy = (
-        _WHOLE_SCALAR_POLICY
+        WHOLE_SCALAR_POLICY
         if round_contract.strategy == "whole_image"
-        else _CHUNK_SCALAR_POLICY
+        else CHUNK_SCALAR_POLICY
     )
     if expectation.role == "affine":
         if not _request_basics_valid(
@@ -1048,8 +1012,8 @@ def _whole_request_valid(
         "transform_order": ["warp", "affine"],
         "whichtoinvert": [False, False],
         "axis_convention": AXIS_CONVENTION_VERSION,
-        "output_format": _OUTPUT_FORMAT_POLICY,
-        "postprocessing": _CHANNEL_POSTPROCESSING_POLICY,
+        "output_format": OUTPUT_FORMAT_POLICY,
+        "postprocessing": CHANNEL_POSTPROCESSING_POLICY,
     }
     return (
         request.stage == "channel-transform-v1"

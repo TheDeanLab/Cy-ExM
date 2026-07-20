@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -33,21 +34,20 @@ _GEOMETRY = ImageGeometry(
     direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
 )
 ITK_THREAD_ENV_VAR, *BLAS_THREAD_ENV_VARS = NATIVE_THREAD_ENV_VARS
+_WHOLE_SCALAR_POLICY = "whole-global-histogram-match-v1"
+_CHUNK_SCALAR_POLICY = "serial-chunk-local-histogram-match-core-stitch-v1"
 
 
-def _commit(path: Path, *, stage: str = "test") -> None:
+def _native_thread_values(task: RoundTask) -> dict[str, int]:
+    return {
+        ITK_THREAD_ENV_VAR: task.native_threads.itk,
+        **{name: task.native_threads.blas for name in BLAS_THREAD_ENV_VARS},
+    }
+
+
+def _write_completion(path: Path, request: StageRequest) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(f"artifact:{path.name}".encode())
-    request = StageRequest.for_identities(
-        stage=stage,
-        inputs=(),
-        geometry=_GEOMETRY,
-        method="test",
-        accuracy="test",
-        native_threads={ITK_THREAD_ENV_VAR: 1},
-        upstream=None,
-        parameters={},
-    )
     record = CompletionRecord(
         schema_version=1,
         request=request,
@@ -58,13 +58,199 @@ def _commit(path: Path, *, stage: str = "test") -> None:
     )
 
 
-def _ensure_commit(path: Path, *, stage: str = "test") -> None:
+def _ensure_completion(path: Path, request: StageRequest) -> None:
     record_path = path.with_name(f"{path.name}.complete.json")
     if path.is_file() and record_path.is_file():
         record = CompletionRecord.read(record_path)
-        if record.artifact == FileIdentity.from_path(path):
+        if record.request == request and record.artifact == FileIdentity.from_path(
+            path
+        ):
             return
-    _commit(path, stage=stage)
+    _write_completion(path, request)
+
+
+def _common_parameters(task: RoundTask) -> dict[str, object]:
+    return {
+        "axis_convention_version": "external-zyx-ants-xyz-v1",
+        "crop": task.registration.crop,
+        "imaging_round": task.round,
+        "pixel_size_xyz": list(task.voxel_spacing_xyz),
+    }
+
+
+def _linear_parameters(task: RoundTask) -> dict[str, object]:
+    parameters: dict[str, object] = {
+        "aff_metric": "mattes",
+        "aff_random_sampling_rate": 0.5,
+        "aff_sampling": 32,
+        "mask_all_stages": True,
+        "verbose": True,
+    }
+    iterations = {
+        "high": [1000, 500, 250, 100],
+        "medium": [500, 250, 100, 50],
+        "low": [100, 50, 25, 10],
+    }
+    accuracy = task.registration.linear.accuracy
+    if task.registration.linear.type == "TRSAA" and accuracy != "dry run":
+        parameters["reg_iterations"] = iterations[accuracy]
+    if accuracy == "dry run":
+        parameters.update(
+            effective_registration_type="Rigid",
+            aff_iterations=[1],
+            aff_smoothing_sigmas=[0],
+            aff_shrink_factors=[8],
+            aff_random_sampling_rate=0.1,
+        )
+    return parameters
+
+
+def _nonlinear_parameters(task: RoundTask) -> dict[str, object]:
+    iterations = {
+        "high": [100, 70, 50],
+        "medium": [50, 35, 25],
+        "low": [5, 5, 5],
+        "dry run": [1, 1, 1],
+    }
+    return {
+        "aff_random_sampling_rate": 1.0,
+        "flow_sigma": 3.0,
+        "initial_transform": "Identity",
+        "mask_all_stages": True,
+        "reg_iterations": iterations[task.registration.nonlinear.accuracy],
+        "singleprecision": False,
+        "syn_metric": "mattes",
+        "syn_sampling": 32,
+        "total_sigma": 0.5,
+        "verbose": True,
+    }
+
+
+def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) -> None:
+    paths = _registration_paths(task)
+    inputs = (
+        FileIdentity.from_path(task.fixed_image),
+        FileIdentity.from_path(task.moving_image),
+    )
+    common = _common_parameters(task)
+    affine_request = StageRequest.for_identities(
+        stage="affine",
+        inputs=inputs,
+        geometry=_GEOMETRY,
+        method=task.registration.linear.type,
+        accuracy=task.registration.linear.accuracy,
+        native_threads=_native_thread_values(task),
+        upstream=None,
+        parameters={
+            **common,
+            "image_interpolation": "linear",
+            "mask_interpolation": "nearestNeighbor",
+            "moving_geometry": _GEOMETRY.to_dict(),
+            "registration_parameters": _linear_parameters(task),
+        },
+    )
+    _ensure_completion(paths.affine, affine_request)
+    if affine_only:
+        return
+
+    affine_identity = FileIdentity.from_path(paths.affine)
+    scalar_policy = (
+        _WHOLE_SCALAR_POLICY if task.strategy == "whole_image" else _CHUNK_SCALAR_POLICY
+    )
+    nonlinear_evidence: dict[str, object] = {}
+    if task.strategy == "serial_chunked":
+        chunk_directory = task.registration_directory / f"round_{task.round}_chunks"
+        local_warp = chunk_directory / "chunk_0000_warp.nii.gz"
+        manifest = chunk_directory / "manifest.json"
+        local_warp.parent.mkdir(parents=True, exist_ok=True)
+        if not local_warp.exists():
+            local_warp.write_bytes(b"local-warp")
+        if not manifest.exists():
+            manifest.write_bytes(b"chunk-manifest")
+        chunk = {
+            "chunk_id": 0,
+            "z_start": 0,
+            "z_end": 2,
+            "y_start": 0,
+            "y_end": 3,
+            "x_start": 0,
+            "x_end": 4,
+            "z_start_ext": 0,
+            "z_end_ext": 2,
+            "y_start_ext": 0,
+            "y_end_ext": 3,
+            "x_start_ext": 0,
+            "x_end_ext": 4,
+        }
+        nonlinear_evidence = {
+            "chunk_grid": [chunk],
+            "chunk_manifest": FileIdentity.from_path(manifest).to_dict(),
+            "chunk_size_zyx": list(task.chunk_size_zyx or ()),
+            "local_warps": [FileIdentity.from_path(local_warp).to_dict()],
+            "overlap_fraction": task.overlap_fraction,
+        }
+    warp_request = StageRequest.for_identities(
+        stage="nonlinear",
+        inputs=inputs,
+        geometry=_GEOMETRY,
+        method=task.registration.nonlinear.type,
+        accuracy=task.registration.nonlinear.accuracy,
+        native_threads=_native_thread_values(task),
+        upstream=affine_identity,
+        parameters={
+            **common,
+            "image_interpolation": "linear",
+            "mask_interpolation": "nearestNeighbor",
+            "moving_geometry": _GEOMETRY.to_dict(),
+            "registration_mode": (
+                "whole-image" if task.strategy == "whole_image" else "serial-chunked"
+            ),
+            "registration_parameters": _nonlinear_parameters(task),
+            "scalar_postprocessing_policy": scalar_policy,
+            **nonlinear_evidence,
+        },
+    )
+    _ensure_completion(paths.warp, warp_request)
+    registered_request = StageRequest.for_identities(
+        stage="registered-image",
+        inputs=inputs,
+        geometry=_GEOMETRY,
+        method=task.registration.nonlinear.type,
+        accuracy=task.registration.nonlinear.accuracy,
+        native_threads=_native_thread_values(task),
+        upstream=FileIdentity.from_path(paths.warp),
+        parameters={
+            **common,
+            "format": "uint16-tiff",
+            "minimum": 0.0,
+            "maximum": 100.0,
+            "scalar_postprocessing_policy": scalar_policy,
+        },
+    )
+    _ensure_completion(paths.registered, registered_request)
+
+
+def _commit_channel(task: RoundTask, channel: ChannelTask) -> None:
+    paths = _registration_paths(task)
+    request = StageRequest.for_files(
+        stage="channel-transform-v1",
+        inputs=(task.fixed_image, channel.source, paths.affine, paths.warp),
+        geometry=_GEOMETRY,
+        method="warp-affine",
+        accuracy="not-applicable",
+        native_threads=_native_thread_values(task),
+        upstream=FileIdentity.from_path(paths.warp),
+        parameters={
+            "pixel_size_xyz_um": list(task.voxel_spacing_xyz),
+            "interpolation": channel.interpolation,
+            "transform_order": ["warp", "affine"],
+            "whichtoinvert": [False, False],
+            "axis_convention": "external-zyx-ants-xyz-v1",
+            "output_format": "ome-compatible-tiff-uint16-v1",
+            "postprocessing": "clip-uint16-no-normalization-v1",
+        },
+    )
+    _ensure_completion(channel.output, request)
 
 
 def _task(
@@ -115,10 +301,7 @@ def _task(
 
 
 def _resolved(task: RoundTask) -> ResolvedNativeThreads:
-    values = {
-        ITK_THREAD_ENV_VAR: task.native_threads.itk,
-        **{name: task.native_threads.blas for name in BLAS_THREAD_ENV_VARS},
-    }
+    values = _native_thread_values(task)
     return ResolvedNativeThreads(
         values=values,
         sources={name: "explicit" for name in values},
@@ -142,6 +325,8 @@ def _install_runtime(
     *,
     registration_failure: BaseException | None = None,
     channel_failure: str | None = None,
+    after_registration: Callable[[RoundTask], None] | None = None,
+    after_channel: Callable[[RoundTask, ChannelTask], None] | None = None,
 ) -> None:
     from cyexm.workflow import round_task as module
 
@@ -159,13 +344,12 @@ def _install_runtime(
 
             def register(self) -> None:
                 calls.append(("register", strategy))
-                paths = _registration_paths(task)
                 if registration_failure is not None:
-                    _commit(paths.affine, stage="affine")
+                    _commit_registration_chain(task, affine_only=True)
                     raise registration_failure
-                _ensure_commit(paths.affine, stage="affine")
-                _ensure_commit(paths.warp, stage="nonlinear")
-                _ensure_commit(paths.registered, stage="registered-image")
+                _commit_registration_chain(task)
+                if after_registration is not None:
+                    after_registration(task)
 
         return Registration
 
@@ -175,7 +359,10 @@ def _install_runtime(
         calls.append(("channel", source.name))
         if source.name == channel_failure:
             raise RuntimeError(f"failed {source.name}")
-        _ensure_commit(output, stage="channel-transform-v1")
+        channel = next(item for item in task.channels if item.output == output)
+        _commit_channel(task, channel)
+        if after_channel is not None:
+            after_channel(task, channel)
         return output
 
     monkeypatch.setattr(
@@ -191,6 +378,15 @@ def _install_runtime(
             transform_channel,
         ),
     )
+
+
+def _replace_completion_request(
+    path: Path, mutation: Callable[[StageRequest], StageRequest]
+) -> None:
+    record_path = path.with_name(f"{path.name}.complete.json")
+    record = CompletionRecord.read(record_path)
+    changed = replace(record, request=mutation(record.request))
+    record_path.write_text(changed.to_json(), encoding="utf-8")
 
 
 def test_round_task_registers_then_transforms_channels_in_manifest_order(
@@ -229,8 +425,9 @@ def test_round_task_passes_exact_strategy_constructor_arguments(
     task = _task(tmp_path, strategy=strategy, channel_names=("a.tif",), force=True)
     _install_runtime(monkeypatch, task, calls, constructors)
 
-    run_round_task(task)
+    result = run_round_task(task)
 
+    assert result.status == "completed"
     assert len(constructors) == 1
     selected, arguments = constructors[0]
     assert selected == strategy
@@ -423,6 +620,9 @@ def test_registration_failure_returns_structured_partial_result(
     assert calls == [("register", "whole_image")]
     assert affine.is_file()
     assert task.log_path.is_file()
+    log_text = task.log_path.read_text(encoding="utf-8")
+    assert "Traceback (most recent call last)" in log_text
+    assert "RuntimeError: injected registration failure" in log_text
 
 
 def test_middle_channel_failure_stops_later_channels_and_preserves_artifacts(
@@ -462,9 +662,8 @@ def test_round_task_reports_artifacts_reused_from_before_invocation(
     calls: list[tuple[str, str]] = []
     constructors: list[tuple[str, dict[str, object]]] = []
     task = _task(tmp_path, channel_names=("a.tif",))
-    paths = _registration_paths(task)
-    for path in (paths.affine, paths.warp, paths.registered, task.channels[0].output):
-        _commit(path)
+    _commit_registration_chain(task)
+    _commit_channel(task, task.channels[0])
     _install_runtime(monkeypatch, task, calls, constructors)
 
     result = run_round_task(task)
@@ -510,8 +709,14 @@ def test_round_task_rejects_registration_without_authoritative_completion_record
         def register(self) -> None:
             calls.append(("register", "whole_image"))
             registration_paths = _registration_paths(task)
-            registration_paths.affine.write_bytes(b"unrecorded")
-            _commit(registration_paths.warp)
+            _commit_registration_chain(task)
+            registration_paths.affine.with_name(
+                f"{registration_paths.affine.name}.complete.json"
+            ).unlink()
+            registration_paths.registered.unlink()
+            registration_paths.registered.with_name(
+                f"{registration_paths.registered.name}.complete.json"
+            ).unlink()
 
     monkeypatch.setattr(
         module, "_runtime", lambda: (InvalidRegistration, chunked, paths, transform)
@@ -522,9 +727,7 @@ def test_round_task_rejects_registration_without_authoritative_completion_record
     assert result.status == "failed"
     assert result.failure is not None
     assert result.failure.stage == "registration"
-    assert result.artifact_paths == (
-        str(task.registration_directory / "nonlinear_warp_2.nii.gz"),
-    )
+    assert result.artifact_paths == ()
     assert all(kind != "channel" for kind, _ in calls)
 
 
@@ -534,9 +737,8 @@ def test_force_run_does_not_report_preexisting_artifacts_as_reused(
     calls: list[tuple[str, str]] = []
     constructors: list[tuple[str, dict[str, object]]] = []
     task = _task(tmp_path, channel_names=("a.tif",), force=True)
-    paths = _registration_paths(task)
-    for path in (paths.affine, paths.warp, paths.registered, task.channels[0].output):
-        _commit(path)
+    _commit_registration_chain(task)
+    _commit_channel(task, task.channels[0])
     _install_runtime(monkeypatch, task, calls, constructors)
 
     result = run_round_task(task)
@@ -566,3 +768,238 @@ def test_round_task_evidence_does_not_report_blank_scheduler_identifiers(
     assert result.slurm_job_id is None
     assert result.dask_task_key is None
     assert os.environ["SLURM_JOB_ID"] == ""
+
+
+@pytest.mark.parametrize(
+    ("role", "mutation"),
+    [
+        ("affine", lambda request: replace(request, stage="not-affine")),
+        ("affine", lambda request: replace(request, inputs=())),
+        (
+            "affine",
+            lambda request: replace(
+                request,
+                native_threads={
+                    **request.native_threads,
+                    ITK_THREAD_ENV_VAR: 99,
+                },
+            ),
+        ),
+        (
+            "warp",
+            lambda request: replace(
+                request,
+                parameters={
+                    **request.parameters,
+                    "scalar_postprocessing_policy": "wrong-policy",
+                },
+            ),
+        ),
+        ("registered", lambda request: replace(request, upstream=None)),
+    ],
+)
+def test_round_task_rejects_semantically_invalid_registration_completion(
+    role: str,
+    mutation: Callable[[StageRequest], StageRequest],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, channel_names=("a.tif",))
+
+    def corrupt(task: RoundTask) -> None:
+        path = getattr(_registration_paths(task), role)
+        _replace_completion_request(path, mutation)
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=corrupt,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "registration"
+    assert str(getattr(_registration_paths(task), role)) not in result.artifact_paths
+    assert all(kind != "channel" for kind, _ in calls)
+
+
+def test_round_task_rejects_mismatched_serial_chunk_policy_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(
+        tmp_path,
+        strategy="serial_chunked",
+        channel_names=("a.tif",),
+    )
+
+    def corrupt(task: RoundTask) -> None:
+        _replace_completion_request(
+            _registration_paths(task).warp,
+            lambda request: replace(
+                request,
+                parameters={**request.parameters, "overlap_fraction": 0.5},
+            ),
+        )
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_registration=corrupt,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "registration"
+    assert str(_registration_paths(task).warp) not in result.artifact_paths
+
+
+def test_round_task_rejects_semantically_invalid_channel_completion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, channel_names=("a.tif",))
+
+    def corrupt(_task: RoundTask, channel: ChannelTask) -> None:
+        _replace_completion_request(
+            channel.output,
+            lambda request: replace(
+                request,
+                parameters={**request.parameters, "interpolation": "nearestNeighbor"},
+            ),
+        )
+
+    _install_runtime(
+        monkeypatch,
+        task,
+        calls,
+        constructors,
+        after_channel=corrupt,
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "channel:a.tif"
+    assert str(task.channels[0].output) not in result.artifact_paths
+
+
+def test_round_task_compares_all_registration_paths_from_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cyexm.workflow import round_task as module
+
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, channel_names=("a.tif",))
+    _install_runtime(monkeypatch, task, calls, constructors)
+    whole, chunked, _paths, transform = module._runtime()
+
+    class DivergentPaths:
+        @classmethod
+        def for_round(cls, output: Path, round_number: int) -> SimpleNamespace:
+            paths = _registration_paths(task)
+            return SimpleNamespace(
+                affine=paths.affine,
+                warp=paths.warp,
+                registered=output / f"wrong_registered_{round_number}.tif",
+            )
+
+    monkeypatch.setattr(
+        module,
+        "_runtime",
+        lambda: (whole, chunked, DivergentPaths, transform),
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "registration"
+    assert all(kind != "channel" for kind, _ in calls)
+
+
+def test_hostname_failure_becomes_a_structured_round_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cyexm.workflow import round_task as module
+
+    task = _task(tmp_path, channel_names=())
+    monkeypatch.setattr(
+        module.socket,
+        "gethostname",
+        lambda: (_ for _ in ()).throw(RuntimeError("hostname unavailable")),
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.message == "hostname unavailable"
+    assert result.hostname == "unknown"
+
+
+def test_completion_prescan_failure_becomes_a_structured_round_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cyexm.workflow import round_task as module
+
+    task = _task(tmp_path, channel_names=())
+    original = module._completion_snapshot
+    calls = 0
+
+    def fail_once(path: Path) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("prescan unavailable")
+        return original(path)
+
+    monkeypatch.setattr(module, "_completion_snapshot", fail_once)
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.message == "prescan unavailable"
+
+
+def test_unprintable_already_loaded_dask_key_is_treated_as_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    task = _task(tmp_path, channel_names=())
+    _install_runtime(monkeypatch, task, calls, constructors)
+
+    class UnprintableKey:
+        def __str__(self) -> str:
+            raise RuntimeError("cannot stringify key")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "distributed",
+        SimpleNamespace(
+            get_worker=lambda: SimpleNamespace(
+                get_current_task=lambda: UnprintableKey()
+            )
+        ),
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "completed"
+    assert result.dask_task_key is None

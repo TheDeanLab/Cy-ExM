@@ -31,9 +31,13 @@ AGENT_GUIDANCE_PATHS = frozenset(
         "examples/scripts/AGENTS.md",
         "src/AGENTS.md",
         "src/cyexm/AGENTS.md",
+        "src/cyexm/cli/AGENTS.md",
+        "src/cyexm/config/AGENTS.md",
+        "src/cyexm/execution/AGENTS.md",
         "src/cyexm/io/AGENTS.md",
         "src/cyexm/registration/AGENTS.md",
         "src/cyexm/runtime/AGENTS.md",
+        "src/cyexm/workflow/AGENTS.md",
         "tests/AGENTS.md",
         "tests/integration/AGENTS.md",
         "tests/unit/AGENTS.md",
@@ -167,6 +171,28 @@ def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
     root_lines = set(_read_repository_file("AGENTS.md").splitlines())
     assert "uv lock" not in root_lines
     assert "uv sync --group dev --extra examples" not in root_lines
+
+
+def test_phase_two_optional_dependencies_are_cumulative_and_pinned() -> None:
+    configuration = tomllib.loads(_read_repository_file("pyproject.toml"))
+    extras = configuration["project"]["optional-dependencies"]
+    assert extras["workflow"] == ["PyYAML>=6,<7"]
+    assert extras["distributed"] == [
+        "PyYAML>=6,<7",
+        "dask==2025.1.0",
+        "distributed==2025.1.0",
+    ]
+    assert extras["hpc"] == [
+        "PyYAML>=6,<7",
+        "dask==2025.1.0",
+        "distributed==2025.1.0",
+        "dask-jobqueue==0.9.0",
+    ]
+    assert configuration["project"]["scripts"] == {"cyexm": "cyexm.cli:main"}
+
+    direct = "\n".join(configuration["project"]["dependencies"]).lower()
+    for forbidden in ("pyyaml", "dask", "distributed", "dask-jobqueue"):
+        assert forbidden not in direct
 
 
 def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
@@ -311,6 +337,53 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "failure handling",
             "acceptance criteria",
             "erratum",
+        ),
+        "src/cyexm/cli/AGENTS.md": (
+            "parsing, logging setup, lifecycle, formatting, and exit-code mapping",
+            "public workflow api",
+            "diagnostics go to stderr",
+            "structured json and human results to stdout",
+            "no scientific algorithms",
+            "scheduler construction",
+            "filesystem or network activity",
+            "environment mutation at import time",
+            "0 success",
+            "2 config/plan",
+            "3 startup/preflight",
+            "4 round failure",
+            "130 interruption",
+        ),
+        "src/cyexm/config/AGENTS.md": (
+            "strict safe yaml decoding",
+            "frozen scientific-manifest and execution-profile models",
+            "two documents separate",
+            "unknown and duplicate keys",
+            "aliases",
+            "custom tags",
+            "additional documents",
+            "unsafe paths",
+            "must not import ants, numpy, scipy, dask, distributed, or dask-jobqueue",
+            "must not mutate the filesystem or environment",
+            "initialize a scheduler",
+        ),
+        "src/cyexm/execution/AGENTS.md": (
+            "executor protocol",
+            "sequential, dask, and slurm adapter lifecycle",
+            "never registration algorithms or artifact-validity decisions",
+            "scheduler imports occur only inside the selected operation",
+            "one coarse task per round",
+            "one `round_slot` per worker or task",
+            "no nested chunk scheduling or silent fallback",
+            "cleaned up on success, failure, and cancellation",
+        ),
+        "src/cyexm/workflow/AGENTS.md": (
+            "immutable plans, tasks, and results",
+            "deterministic path and header validation",
+            "output layout, status, fingerprinting, and public orchestration",
+            "planning creates no files, directories, clients, clusters, or workers",
+            "phase 1 completion records remain the only restart authority",
+            "scientific fingerprints exclude executor, resource, and logging settings",
+            "no module-scope scientific or scheduler imports",
         ),
     }
     for path, required_fragments in required_by_path.items():

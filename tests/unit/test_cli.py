@@ -191,6 +191,23 @@ def test_common_options_are_accepted_before_the_command() -> None:
     assert namespace.log_level == "WARNING"
 
 
+def test_common_options_are_accepted_between_workflow_and_the_action() -> None:
+    namespace = build_parser().parse_args(
+        [
+            "workflow",
+            "--json",
+            "--log-level",
+            "error",
+            "status",
+            "/output",
+            "dataset-1",
+        ]
+    )
+
+    assert namespace.json is True
+    assert namespace.log_level == "ERROR"
+
+
 def test_force_all_and_force_round_are_mutually_exclusive() -> None:
     with pytest.raises(SystemExit) as caught:
         build_parser().parse_args(
@@ -359,6 +376,34 @@ def test_run_delegates_force_arguments_and_prints_one_json_object(
     assert captured.err == ""
 
 
+def test_run_delegates_force_all_without_forced_rounds(
+    fake_api: _FakeWorkflowApi,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(
+        [
+            "workflow",
+            "run",
+            "dataset.yaml",
+            "--execution",
+            "execution.yaml",
+            "--force-all",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert fake_api.calls[-1] == (
+        "run_workflow",
+        fake_api.plan,
+        frozenset(),
+        True,
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == fake_api.result.to_dict()
+    assert captured.err == ""
+
+
 def test_status_uses_only_the_read_only_status_api(
     fake_api: _FakeWorkflowApi,
     capsys: pytest.CaptureFixture[str],
@@ -402,6 +447,26 @@ def test_version_uses_package_metadata_and_returns_success(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     exit_code = main(["--version"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert captured.out == f"cyexm {__version__}\n"
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["workflow", "--version"],
+        ["workflow", "status", "--version"],
+    ],
+    ids=("workflow", "workflow-action"),
+)
+def test_nested_version_uses_package_metadata_and_returns_success(
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> None:
+    exit_code = main(argv)
 
     assert exit_code == 0
     captured = capsys.readouterr()

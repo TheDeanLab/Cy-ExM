@@ -11,8 +11,10 @@ from cyexm.config.models import (
     RegistrationSpec,
     RegistrationStageSpec,
 )
+from cyexm.registration._request_policy import chunk_grid
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
 from cyexm.registration.backend import AntsRegistrationBackend
+from cyexm.registration.chunked import ChunkPaths
 from cyexm.registration.transforms import apply_transform_chain
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
 from cyexm.runtime import NativeThreadConfig
@@ -132,6 +134,80 @@ def _managed_identities(
     )
 
 
+def _assert_strategy_provenance(
+    store: ArtifactStore,
+    task: RoundTask,
+    nonlinear_record: CompletionRecord,
+) -> tuple[Path, ...]:
+    parameters = nonlinear_record.request.parameters
+    chunk_directory = ChunkPaths.for_chunk(
+        task.registration_directory, task.round, 0
+    ).directory
+    if task.strategy == "whole_image":
+        assert parameters["registration_mode"] == "whole-image"
+        assert "chunk_grid" not in parameters
+        assert "chunk_manifest" not in parameters
+        assert "chunk_size_zyx" not in parameters
+        assert "local_warps" not in parameters
+        assert "overlap_fraction" not in parameters
+        assert not chunk_directory.exists()
+        return ()
+
+    assert task.chunk_size_zyx is not None
+    assert task.overlap_fraction is not None
+    expected_grid = chunk_grid(
+        _SHAPE,
+        task.chunk_size_zyx,
+        task.overlap_fraction,
+    )
+    encoded_grid = [dict(chunk) for chunk in expected_grid]
+    assert parameters["registration_mode"] == "serial-chunked"
+    assert parameters["chunk_size_zyx"] == list(task.chunk_size_zyx)
+    assert parameters["overlap_fraction"] == task.overlap_fraction
+    assert parameters["chunk_grid"] == encoded_grid
+
+    local_paths = tuple(
+        ChunkPaths.for_chunk(task.registration_directory, task.round, index).warp
+        for index in range(len(expected_grid))
+    )
+    local_identities = [FileIdentity.from_path(path).to_dict() for path in local_paths]
+    for index, (local_path, expected_chunk) in enumerate(
+        zip(local_paths, encoded_grid, strict=True)
+    ):
+        local_record = _assert_valid_completion(
+            store,
+            local_path,
+            stage=f"nonlinear-chunk:{index}",
+        )
+        assert local_record.request.parameters["chunk"] == expected_chunk
+        assert local_record.request.parameters["chunk_grid"] == encoded_grid
+        assert local_record.request.parameters["chunk_size_zyx"] == list(
+            task.chunk_size_zyx
+        )
+        assert (
+            local_record.request.parameters["overlap_fraction"] == task.overlap_fraction
+        )
+
+    manifest_path = chunk_directory / "manifest.json"
+    manifest_record = _assert_valid_completion(
+        store,
+        manifest_path,
+        stage="nonlinear-chunk-manifest",
+    )
+    assert manifest_record.request.parameters["chunk_size_zyx"] == list(
+        task.chunk_size_zyx
+    )
+    assert (
+        manifest_record.request.parameters["overlap_fraction"] == task.overlap_fraction
+    )
+    assert manifest_record.request.parameters["local_warps"] == local_identities
+    assert parameters["local_warps"] == local_identities
+    assert (
+        parameters["chunk_manifest"] == FileIdentity.from_path(manifest_path).to_dict()
+    )
+    return (*local_paths, manifest_path)
+
+
 @pytest.mark.parametrize(
     ("strategy", "round_number"),
     (("whole_image", 2), ("serial_chunked", 3)),
@@ -175,7 +251,8 @@ def test_round_task_runs_real_strategy_transforms_channels_and_reuses(
 
     store = ArtifactStore()
     _assert_valid_completion(store, paths.affine, stage="affine")
-    _assert_valid_completion(store, paths.warp, stage="nonlinear")
+    nonlinear_record = _assert_valid_completion(store, paths.warp, stage="nonlinear")
+    strategy_artifacts = _assert_strategy_provenance(store, task, nonlinear_record)
     _assert_valid_completion(store, paths.registered, stage="registered-image")
     assert tifffile.imread(paths.registered).shape == _SHAPE
 
@@ -205,14 +282,15 @@ def test_round_task_runs_real_strategy_transforms_channels_and_reuses(
         # independently applying the estimated affine-plus-warp transform chain.
         np.testing.assert_allclose(written, expected, rtol=1e-4, atol=1e-5)
 
-    first_identities = _managed_identities(store, expected_artifacts)
+    managed_artifacts = (*expected_artifacts, *strategy_artifacts)
+    first_identities = _managed_identities(store, managed_artifacts)
     second = run_round_task(task)
 
     assert second.status == "completed", second.failure
     assert second.failure is None
     assert second.artifact_paths == first.artifact_paths
     assert second.reused_artifacts == tuple(str(path) for path in expected_artifacts)
-    assert _managed_identities(store, expected_artifacts) == first_identities
+    assert _managed_identities(store, managed_artifacts) == first_identities
 
 
 def test_round_task_reuses_real_affine_after_injected_nonlinear_failure(

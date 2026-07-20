@@ -5,6 +5,7 @@ import logging
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
@@ -39,6 +40,10 @@ _PACKAGES = (
     "scipy",
     "tifffile",
 )
+
+
+class _StringAlias(str):
+    pass
 
 
 def _profile(
@@ -756,6 +761,265 @@ def test_slurm_execution_evidence_is_detached_canonical_json(
         cast(dict[str, object], second["rendered"])["rendered_job_script_template"]
         == modules.job_script_text
     )
+
+
+def _invalid_execution_evidence(
+    evidence: dict[str, object],
+    case: str,
+) -> None:
+    requested = cast(dict[str, object], evidence["requested"])
+    rendered = cast(dict[str, object], evidence["rendered"])
+    observed = cast(dict[str, object], evidence["observed"])
+    startup = cast(dict[str, object], evidence["startup"])
+    attempts = cast(list[dict[str, object]], evidence["attempt_counts"])
+    timestamps = cast(dict[str, object], evidence["timestamps"])
+    cleanup = cast(dict[str, object], evidence["cleanup"])
+    if case == "root_missing":
+        evidence.pop("executor")
+    elif case == "root_extra":
+        evidence["submitted_job_script"] = "stale"
+    elif case == "root_key_alias":
+        value = evidence.pop("executor")
+        evidence[_StringAlias("executor")] = value
+    elif case == "executor":
+        evidence["executor"] = "local_dask"
+    elif case == "requested_missing":
+        requested.pop("workers")
+    elif case == "requested_extra":
+        requested["queue"] = "512GB"
+    elif case == "requested_bool":
+        requested["workers"] = True
+    elif case == "requested_bound":
+        requested["workers"] = 5
+    elif case == "rendered_stale":
+        rendered["submitted_job_script"] = rendered.pop("rendered_job_script_template")
+    elif case == "rendered_missing":
+        rendered.clear()
+    elif case == "rendered_alias":
+        rendered["rendered_job_script_template"] = _StringAlias("script")
+    elif case == "observed_extra":
+        observed["job_ids"] = ["98765"]
+    elif case == "scheduler_without_workers":
+        observed.pop("connected_workers")
+    elif case == "workers_unsorted":
+        observed["connected_workers"] = ["tcp://z:1", "tcp://a:1"]
+    elif case == "workers_duplicate":
+        worker = cast(list[str], observed["connected_workers"])[0]
+        observed["connected_workers"] = [worker, worker]
+    elif case == "version_key_alias":
+        versions = cast(dict[str, str], observed["coordinator_versions"])
+        value = versions.pop("cy-exm")
+        versions[_StringAlias("cy-exm")] = value
+    elif case == "version_missing":
+        cast(dict[str, str], observed["coordinator_versions"]).pop("scipy")
+    elif case == "probe_extra":
+        probe = cast(list[dict[str, object]], observed["worker_probes"])[0]
+        probe["unknown"] = True
+    elif case == "probe_address":
+        probe = cast(list[dict[str, object]], observed["worker_probes"])[0]
+        probe["worker_address"] = "tcp://different:1"
+    elif case == "probe_version_mismatch":
+        probe = cast(list[dict[str, object]], observed["worker_probes"])[0]
+        versions = cast(list[list[str]], probe["package_versions"])
+        versions[0][1] = "different-version"
+    elif case == "probe_not_ok_after_complete":
+        probe = cast(list[dict[str, object]], observed["worker_probes"])[0]
+        probe["ok"] = False
+        probe["errors"] = ["injected valid probe failure"]
+    elif case == "cancellation_not_attempted_success":
+        observed["cancellation"] = {
+            "attempted": False,
+            "unfinished_futures": 0,
+            "succeeded": True,
+        }
+    elif case == "cancellation_attempted_no_force":
+        observed["cancellation"] = {
+            "attempted": True,
+            "unfinished_futures": 1,
+            "succeeded": True,
+        }
+    elif case == "startup_phase":
+        startup["phase"] = "unknown"
+    elif case == "startup_outcome":
+        startup["outcome"] = "in_progress"
+    elif case == "startup_success_error":
+        startup["error"] = {"type": "RuntimeError", "message": "impossible"}
+    elif case == "startup_scale_attempted":
+        startup["scale_attempted"] = False
+    elif case == "startup_scale_succeeded":
+        startup["scale_succeeded"] = None
+    elif case == "early_observed_facts":
+        startup.update(
+            {
+                "phase": "worker_wait",
+                "outcome": "failed",
+                "error": {"type": "RuntimeError", "message": "wait failed"},
+            }
+        )
+        attempts[0]["attempts"] = 0
+    elif case == "interrupted_without_cancellation":
+        startup.update(
+            {
+                "phase": "worker_wait",
+                "outcome": "interrupted",
+                "error": {"type": "KeyboardInterrupt", "message": "stopped"},
+            }
+        )
+        observed.clear()
+        attempts[0]["attempts"] = 0
+    elif case == "attempt_missing":
+        attempts[0].pop("round")
+    elif case == "attempt_bool":
+        attempts[0]["attempts"] = True
+    elif case == "attempt_duplicate":
+        attempts.append(dict(attempts[0]))
+    elif case == "attempt_empty":
+        attempts.clear()
+    elif case == "attempt_zero_without_cancel":
+        attempts[0]["attempts"] = 0
+    elif case == "timestamps_missing":
+        timestamps.pop("ended_at")
+    elif case == "timestamps_non_utc":
+        timestamps["started_at"] = "2026-07-20T10:00:00+01:00"
+    elif case == "timestamps_reverse":
+        timestamps["started_at"] = "9999-07-20T10:00:00Z"
+    elif case == "cleanup_extra":
+        cleanup["scheduler"] = {"attempted": True, "succeeded": True}
+    elif case == "cleanup_order":
+        cleanup["order"] = ["cluster", "client", "configuration"]
+    elif case == "cleanup_attempted":
+        cast(dict[str, object], cleanup["client"])["attempted"] = False
+    elif case == "cleanup_nullable":
+        cast(dict[str, object], cleanup["client"])["succeeded"] = None
+    elif case == "cleanup_success_error":
+        cast(dict[str, object], cleanup["client"])["error"] = {
+            "type": "RuntimeError",
+            "message": "impossible",
+        }
+    elif case == "cleanup_failure_without_error":
+        cast(dict[str, object], cleanup["client"])["succeeded"] = False
+    else:
+        raise AssertionError(f"unknown invalid evidence case: {case}")
+
+
+def test_slurm_evidence_schema_returns_a_detached_canonical_snapshot(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    executor = _executor(tmp_path, modules)
+    executor.execute((_task(tmp_path, 2),))
+    evidence = cast(dict[str, object], executor.execution_evidence)
+
+    encoded = slurm_module._canonical_execution_evidence(evidence)
+
+    assert json.loads(encoded) == evidence
+    cast(dict[str, object], evidence["rendered"])["rendered_job_script_template"] = (
+        "mutated"
+    )
+    assert (
+        cast(dict[str, object], json.loads(encoded)["rendered"])[
+            "rendered_job_script_template"
+        ]
+        == modules.job_script_text
+    )
+
+
+def test_slurm_evidence_schema_preserves_truthful_failed_probe_mismatch(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    executor = _executor(tmp_path, modules)
+    executor.execute((_task(tmp_path, 2),))
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    startup = cast(dict[str, object], evidence["startup"])
+    startup.update(
+        {
+            "phase": "worker_validation",
+            "outcome": "failed",
+            "error": {
+                "type": "WorkerPreflightError",
+                "message": "package version mismatch",
+            },
+        }
+    )
+    attempts = cast(list[dict[str, object]], evidence["attempt_counts"])
+    attempts[0]["attempts"] = 0
+    observed = cast(dict[str, object], evidence["observed"])
+    probe = cast(list[dict[str, object]], observed["worker_probes"])[0]
+    probe["ok"] = False
+    probe["errors"] = ["package cy-exm expected test-version; got other-version"]
+    versions = cast(list[list[str]], probe["package_versions"])
+    versions[1][1] = "other-version"
+
+    encoded = slurm_module._canonical_execution_evidence(evidence)
+
+    assert json.loads(encoded) == evidence
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "root_missing",
+        "root_extra",
+        "root_key_alias",
+        "executor",
+        "requested_missing",
+        "requested_extra",
+        "requested_bool",
+        "requested_bound",
+        "rendered_stale",
+        "rendered_missing",
+        "rendered_alias",
+        "observed_extra",
+        "scheduler_without_workers",
+        "workers_unsorted",
+        "workers_duplicate",
+        "version_key_alias",
+        "version_missing",
+        "probe_extra",
+        "probe_address",
+        "probe_version_mismatch",
+        "probe_not_ok_after_complete",
+        "cancellation_not_attempted_success",
+        "cancellation_attempted_no_force",
+        "startup_phase",
+        "startup_outcome",
+        "startup_success_error",
+        "startup_scale_attempted",
+        "startup_scale_succeeded",
+        "early_observed_facts",
+        "interrupted_without_cancellation",
+        "attempt_missing",
+        "attempt_bool",
+        "attempt_duplicate",
+        "attempt_empty",
+        "attempt_zero_without_cancel",
+        "timestamps_missing",
+        "timestamps_non_utc",
+        "timestamps_reverse",
+        "cleanup_extra",
+        "cleanup_order",
+        "cleanup_attempted",
+        "cleanup_nullable",
+        "cleanup_success_error",
+        "cleanup_failure_without_error",
+    ],
+)
+def test_slurm_evidence_schema_fails_closed_on_malformed_or_inconsistent_values(
+    case: str,
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    executor = _executor(tmp_path, modules)
+    executor.execute((_task(tmp_path, 2),))
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    _invalid_execution_evidence(evidence, case)
+
+    with pytest.raises((TypeError, ValueError)):
+        slurm_module._canonical_execution_evidence(evidence)
 
 
 def test_slurm_executor_preflight_uses_exact_versions_threads_and_roots(

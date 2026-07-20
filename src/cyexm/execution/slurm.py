@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from typing import Any, cast
 
@@ -27,7 +28,7 @@ from cyexm.execution.preflight import (
     validate_worker_probes,
 )
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.workflow.models import RoundResult, RoundTask
+from cyexm.workflow.models import RoundResult, RoundTask, canonical_json
 from cyexm.workflow.round_task import run_round_task
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,6 +47,599 @@ _DEATH_TIMEOUT_SECONDS = 60
 _SHEBANG = "#!/usr/bin/env bash"
 _WORKER_COMMAND = "distributed.cli.dask_worker"
 _WORKER_EXTRA_ARGS = ["--resources", "round_slot=1"]
+_EVIDENCE_KEYS = frozenset(
+    {
+        "executor",
+        "requested",
+        "rendered",
+        "observed",
+        "startup",
+        "attempt_counts",
+        "timestamps",
+        "cleanup",
+    }
+)
+_REQUESTED_KEYS = frozenset(
+    {"workers", "configured_workers", "startup_timeout", "task_retries"}
+)
+_OBSERVED_KEYS = frozenset(
+    {
+        "coordinator_versions",
+        "scheduler_address",
+        "connected_workers",
+        "worker_probes",
+        "cancellation",
+    }
+)
+_STARTUP_PHASES = (
+    "not_started",
+    "module_loading",
+    "configuration",
+    "cluster_construction",
+    "template_rendering",
+    "scaling",
+    "client_creation",
+    "worker_wait",
+    "coordinator_version_collection",
+    "worker_snapshot",
+    "worker_probe",
+    "worker_validation",
+    "worker_stability_check",
+    "complete",
+)
+_CLEANUP_RESOURCES = ("client", "cluster", "configuration")
+
+
+def _evidence_object(
+    value: object,
+    location: str,
+    *,
+    exact_keys: frozenset[str] | None = None,
+    allowed_keys: frozenset[str] | None = None,
+) -> dict[str, object]:
+    if type(value) is not dict:
+        raise TypeError(f"{location} must be an exact JSON object")
+    result = cast(dict[object, object], value)
+    for key in result:
+        if type(key) is not str:
+            raise TypeError(f"{location} keys must be exact built-in strings")
+    keys = frozenset(cast(dict[str, object], result))
+    if exact_keys is not None and keys != exact_keys:
+        raise ValueError(
+            f"{location} keys must be exactly {sorted(exact_keys)!r}; got "
+            f"{sorted(keys)!r}"
+        )
+    if allowed_keys is not None and not keys <= allowed_keys:
+        raise ValueError(
+            f"{location} contains unsupported keys: {sorted(keys - allowed_keys)!r}"
+        )
+    return cast(dict[str, object], result)
+
+
+def _evidence_array(value: object, location: str) -> list[object]:
+    if type(value) is not list:
+        raise TypeError(f"{location} must be an exact JSON array")
+    return cast(list[object], value)
+
+
+def _evidence_string(value: object, location: str, *, empty: bool = False) -> str:
+    if type(value) is not str or (not empty and not value):
+        qualifier = "" if empty else "nonempty "
+        raise TypeError(f"{location} must be a {qualifier}exact built-in string")
+    return value
+
+
+def _evidence_integer(value: object, location: str, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        raise TypeError(
+            f"{location} must be an exact built-in integer of at least {minimum}"
+        )
+    return value
+
+
+def _evidence_boolean(value: object, location: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{location} must be an exact built-in boolean")
+    return value
+
+
+def _evidence_error(value: object, location: str) -> None:
+    error = _evidence_object(
+        value,
+        location,
+        exact_keys=frozenset({"type", "message"}),
+    )
+    _evidence_string(error["type"], f"{location}.type")
+    _evidence_string(error["message"], f"{location}.message", empty=True)
+
+
+def _evidence_timestamp(value: object, location: str) -> datetime:
+    encoded = _evidence_string(value, location)
+    if not encoded.endswith("Z"):
+        raise ValueError(f"{location} must use canonical UTC Z notation")
+    try:
+        parsed = datetime.fromisoformat(encoded[:-1] + "+00:00")
+    except ValueError as error:
+        raise ValueError(f"{location} must be an ISO 8601 timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise ValueError(f"{location} must be UTC")
+    return parsed
+
+
+def _validate_requested(value: object) -> tuple[int, int | None]:
+    requested = _evidence_object(value, "execution_evidence.requested")
+    if frozenset(requested) == frozenset({"workers"}):
+        workers = _evidence_integer(
+            requested["workers"],
+            "execution_evidence.requested.workers",
+            minimum=0,
+        )
+        if workers != 0:
+            raise ValueError(
+                "minimal requested evidence is valid only for zero workers"
+            )
+        return workers, None
+    if frozenset(requested) != _REQUESTED_KEYS:
+        raise ValueError(
+            "execution_evidence.requested keys must match the accepted SLURM schema"
+        )
+    workers = _evidence_integer(
+        requested["workers"],
+        "execution_evidence.requested.workers",
+        minimum=1,
+    )
+    configured = _evidence_integer(
+        requested["configured_workers"],
+        "execution_evidence.requested.configured_workers",
+        minimum=1,
+    )
+    if workers > configured:
+        raise ValueError("requested workers cannot exceed configured_workers")
+    _evidence_string(
+        requested["startup_timeout"],
+        "execution_evidence.requested.startup_timeout",
+    )
+    _evidence_integer(
+        requested["task_retries"],
+        "execution_evidence.requested.task_retries",
+        minimum=0,
+    )
+    return workers, configured
+
+
+def _validate_rendered(value: object) -> bool:
+    rendered = _evidence_object(
+        value,
+        "execution_evidence.rendered",
+        allowed_keys=frozenset({"rendered_job_script_template"}),
+    )
+    if not rendered:
+        return False
+    _evidence_string(
+        rendered["rendered_job_script_template"],
+        "execution_evidence.rendered.rendered_job_script_template",
+    )
+    return True
+
+
+def _validate_versions(value: object) -> dict[str, str]:
+    versions = _evidence_object(
+        value, "execution_evidence.observed.coordinator_versions"
+    )
+    if frozenset(versions) != frozenset(_COORDINATOR_PACKAGES):
+        raise ValueError(
+            "coordinator_versions must contain the exact probed package set"
+        )
+    decoded: dict[str, str] = {}
+    for name, version in versions.items():
+        _evidence_string(name, "coordinator_versions package name")
+        decoded[name] = _evidence_string(
+            version,
+            f"coordinator_versions[{name!r}]",
+        )
+    return decoded
+
+
+def _validate_cancellation(value: object) -> None:
+    cancellation = _evidence_object(
+        value,
+        "execution_evidence.observed.cancellation",
+        allowed_keys=frozenset(
+            {"attempted", "unfinished_futures", "force", "succeeded", "error"}
+        ),
+    )
+    required = frozenset({"attempted", "unfinished_futures", "succeeded"})
+    if not required <= frozenset(cancellation):
+        raise ValueError("cancellation evidence is missing required keys")
+    attempted = _evidence_boolean(
+        cancellation["attempted"],
+        "execution_evidence.observed.cancellation.attempted",
+    )
+    unfinished = _evidence_integer(
+        cancellation["unfinished_futures"],
+        "execution_evidence.observed.cancellation.unfinished_futures",
+        minimum=0,
+    )
+    succeeded = cancellation["succeeded"]
+    if not attempted:
+        if (
+            unfinished != 0
+            or succeeded is not None
+            or frozenset(cancellation) != required
+        ):
+            raise ValueError(
+                "unattempted cancellation must have zero unfinished futures, null "
+                "success, and no force/error claims"
+            )
+        return
+    if unfinished < 1:
+        raise ValueError("attempted cancellation requires unfinished futures")
+    if cancellation.get("force") is not True:
+        raise ValueError("attempted cancellation must truthfully record force=true")
+    success = _evidence_boolean(
+        succeeded,
+        "execution_evidence.observed.cancellation.succeeded",
+    )
+    if success and "error" in cancellation:
+        raise ValueError("successful cancellation cannot contain an error")
+    if not success:
+        if "error" not in cancellation:
+            raise ValueError("failed cancellation must contain an error")
+        _evidence_error(
+            cancellation["error"],
+            "execution_evidence.observed.cancellation.error",
+        )
+
+
+def _validate_observed(
+    value: object,
+    *,
+    worker_count: int,
+    startup_phase: str,
+    startup_outcome: str,
+) -> bool:
+    observed = _evidence_object(
+        value,
+        "execution_evidence.observed",
+        allowed_keys=_OBSERVED_KEYS,
+    )
+    versions: dict[str, str] | None = None
+    if "coordinator_versions" in observed:
+        versions = _validate_versions(observed["coordinator_versions"])
+    scheduler_present = "scheduler_address" in observed
+    workers_present = "connected_workers" in observed
+    if scheduler_present != workers_present:
+        raise ValueError(
+            "scheduler_address and connected_workers must be recorded together"
+        )
+    connected: tuple[str, ...] = ()
+    if scheduler_present:
+        _evidence_string(
+            observed["scheduler_address"],
+            "execution_evidence.observed.scheduler_address",
+        )
+        worker_values = _evidence_array(
+            observed["connected_workers"],
+            "execution_evidence.observed.connected_workers",
+        )
+        connected = tuple(
+            _evidence_string(
+                address,
+                f"execution_evidence.observed.connected_workers[{index}]",
+            )
+            for index, address in enumerate(worker_values)
+        )
+        if connected != tuple(sorted(set(connected))):
+            raise ValueError("connected_workers must be unique and canonically sorted")
+        if len(connected) != worker_count:
+            raise ValueError("connected_workers must match requested workers")
+    if "worker_probes" in observed:
+        if not connected:
+            raise ValueError("worker_probes require connected worker evidence")
+        probe_values = _evidence_array(
+            observed["worker_probes"],
+            "execution_evidence.observed.worker_probes",
+        )
+        probes = tuple(
+            WorkerProbe.from_dict(
+                _evidence_object(
+                    probe,
+                    f"execution_evidence.observed.worker_probes[{index}]",
+                )
+            )
+            for index, probe in enumerate(probe_values)
+        )
+        addresses = tuple(probe.worker_address for probe in probes)
+        if addresses != tuple(sorted(set(addresses))):
+            raise ValueError("worker_probes must be unique and sorted by address")
+        if not set(addresses) <= set(connected):
+            raise ValueError("worker probe addresses must belong to connected_workers")
+        completed_startup = (
+            startup_phase == "complete" and startup_outcome == "succeeded"
+        )
+        if completed_startup and versions is not None:
+            expected_versions = tuple(sorted(versions.items()))
+            if any(probe.package_versions != expected_versions for probe in probes):
+                raise ValueError(
+                    "worker probe package versions must match coordinator_versions"
+                )
+        if completed_startup and addresses != connected:
+            raise ValueError(
+                "completed startup requires one probe per connected worker"
+            )
+        if completed_startup and any(not probe.ok for probe in probes):
+            raise ValueError("completed startup requires every worker probe to be ok")
+    cancellation_present = "cancellation" in observed
+    if cancellation_present:
+        _validate_cancellation(observed["cancellation"])
+    phase_index = _STARTUP_PHASES.index(startup_phase)
+    if "coordinator_versions" in observed and phase_index < _STARTUP_PHASES.index(
+        "worker_snapshot"
+    ):
+        raise ValueError(
+            "coordinator versions were claimed before collection completed"
+        )
+    if scheduler_present and phase_index < _STARTUP_PHASES.index("worker_probe"):
+        raise ValueError("scheduler workers were claimed before the worker snapshot")
+    if "worker_probes" in observed and phase_index < _STARTUP_PHASES.index(
+        "worker_probe"
+    ):
+        raise ValueError("worker probes were claimed before the probe phase")
+    if startup_outcome == "interrupted" and not cancellation_present:
+        raise ValueError("interrupted startup requires cancellation evidence")
+    if startup_outcome not in {"interrupted", "succeeded"} and cancellation_present:
+        raise ValueError("cancellation evidence requires an interrupted execution")
+    completed_startup = startup_phase == "complete" and startup_outcome == "succeeded"
+    if completed_startup:
+        required = {
+            "coordinator_versions",
+            "scheduler_address",
+            "connected_workers",
+            "worker_probes",
+        }
+        if not required <= set(observed):
+            raise ValueError("completed startup is missing observed preflight evidence")
+    return cancellation_present
+
+
+def _validate_startup(value: object) -> tuple[str, str]:
+    startup = _evidence_object(
+        value,
+        "execution_evidence.startup",
+        allowed_keys=frozenset(
+            {"phase", "outcome", "scale_attempted", "scale_succeeded", "error"}
+        ),
+    )
+    required = frozenset({"phase", "outcome", "scale_attempted", "scale_succeeded"})
+    if not required <= frozenset(startup):
+        raise ValueError("startup evidence is missing required keys")
+    phase = _evidence_string(startup["phase"], "execution_evidence.startup.phase")
+    if phase not in _STARTUP_PHASES:
+        raise ValueError(f"unsupported startup phase: {phase!r}")
+    outcome = _evidence_string(
+        startup["outcome"],
+        "execution_evidence.startup.outcome",
+    )
+    if outcome not in {"not_started", "succeeded", "failed", "interrupted"}:
+        raise ValueError(f"unsupported terminal startup outcome: {outcome!r}")
+    attempted = _evidence_boolean(
+        startup["scale_attempted"],
+        "execution_evidence.startup.scale_attempted",
+    )
+    succeeded = startup["scale_succeeded"]
+    if succeeded is not None:
+        _evidence_boolean(succeeded, "execution_evidence.startup.scale_succeeded")
+    error_present = "error" in startup
+    if outcome == "not_started":
+        if (
+            phase != "not_started"
+            or attempted
+            or succeeded is not None
+            or error_present
+        ):
+            raise ValueError(
+                "not_started outcome contains contradictory startup claims"
+            )
+    elif outcome == "succeeded":
+        if (
+            phase != "complete"
+            or not attempted
+            or succeeded is not True
+            or error_present
+        ):
+            raise ValueError(
+                "successful startup contains contradictory phase/scale/error"
+            )
+    else:
+        if phase == "complete" or not error_present:
+            raise ValueError(
+                "failed/interrupted startup requires a non-complete phase and error"
+            )
+        _evidence_error(startup["error"], "execution_evidence.startup.error")
+    phase_index = _STARTUP_PHASES.index(phase)
+    scaling_index = _STARTUP_PHASES.index("scaling")
+    if phase_index < scaling_index and (attempted or succeeded is not None):
+        raise ValueError("startup claims scaling before the scaling phase")
+    if phase_index == scaling_index and (not attempted or succeeded is not False):
+        raise ValueError("terminal scaling-phase evidence must record a failed scale")
+    if (
+        phase_index > scaling_index
+        and phase != "not_started"
+        and (not attempted or succeeded is not True)
+    ):
+        raise ValueError(
+            "post-scaling startup phase requires successful scale evidence"
+        )
+    return phase, outcome
+
+
+def _validate_attempts(
+    value: object,
+    *,
+    worker_count: int,
+    startup_outcome: str,
+    cancellation_present: bool,
+) -> None:
+    attempts = _evidence_array(value, "execution_evidence.attempt_counts")
+    seen: set[tuple[str, int]] = set()
+    for index, item in enumerate(attempts):
+        attempt = _evidence_object(
+            item,
+            f"execution_evidence.attempt_counts[{index}]",
+            exact_keys=frozenset({"dataset_id", "round", "attempts"}),
+        )
+        dataset_id = _evidence_string(
+            attempt["dataset_id"],
+            f"execution_evidence.attempt_counts[{index}].dataset_id",
+        )
+        round_number = _evidence_integer(
+            attempt["round"],
+            f"execution_evidence.attempt_counts[{index}].round",
+            minimum=0,
+        )
+        count = _evidence_integer(
+            attempt["attempts"],
+            f"execution_evidence.attempt_counts[{index}].attempts",
+            minimum=0,
+        )
+        identity = (dataset_id, round_number)
+        if identity in seen:
+            raise ValueError(f"duplicate attempt identity: {identity!r}")
+        seen.add(identity)
+        if startup_outcome in {"failed", "interrupted", "not_started"} and count:
+            raise ValueError("round attempts cannot precede successful startup")
+        if startup_outcome == "succeeded" and not cancellation_present and count < 1:
+            raise ValueError(
+                "settled execution requires at least one attempt per round"
+            )
+    if worker_count and len(attempts) < worker_count:
+        raise ValueError("attempt evidence cannot contain fewer tasks than workers")
+
+
+def _validate_timestamps(value: object) -> None:
+    timestamps = _evidence_object(
+        value,
+        "execution_evidence.timestamps",
+        exact_keys=frozenset({"started_at", "ended_at"}),
+    )
+    started = _evidence_timestamp(
+        timestamps["started_at"],
+        "execution_evidence.timestamps.started_at",
+    )
+    ended = _evidence_timestamp(
+        timestamps["ended_at"],
+        "execution_evidence.timestamps.ended_at",
+    )
+    if ended < started:
+        raise ValueError("execution evidence ended_at cannot precede started_at")
+
+
+def _validate_cleanup(value: object, *, completed_startup: bool) -> None:
+    cleanup = _evidence_object(
+        value,
+        "execution_evidence.cleanup",
+        allowed_keys=frozenset((*_CLEANUP_RESOURCES, "order")),
+    )
+    resources = [name for name in _CLEANUP_RESOURCES if name in cleanup]
+    if not resources:
+        if cleanup:
+            raise ValueError("cleanup order cannot exist without owned resources")
+        if completed_startup:
+            raise ValueError(
+                "completed startup requires owned-resource cleanup evidence"
+            )
+        return
+    order = _evidence_array(
+        cleanup.get("order"),
+        "execution_evidence.cleanup.order",
+    )
+    decoded_order = [
+        _evidence_string(item, f"execution_evidence.cleanup.order[{index}]")
+        for index, item in enumerate(order)
+    ]
+    if decoded_order != resources:
+        raise ValueError(
+            "cleanup order must match exact client/cluster/configuration order"
+        )
+    for name in resources:
+        status = _evidence_object(
+            cleanup[name],
+            f"execution_evidence.cleanup.{name}",
+            allowed_keys=frozenset({"attempted", "succeeded", "error"}),
+        )
+        if not {"attempted", "succeeded"} <= set(status):
+            raise ValueError(f"cleanup {name} is missing attempted/succeeded")
+        if (
+            _evidence_boolean(
+                status["attempted"],
+                f"execution_evidence.cleanup.{name}.attempted",
+            )
+            is not True
+        ):
+            raise ValueError(f"cleanup {name} must have been attempted")
+        succeeded = _evidence_boolean(
+            status["succeeded"],
+            f"execution_evidence.cleanup.{name}.succeeded",
+        )
+        if succeeded and "error" in status:
+            raise ValueError(f"successful cleanup {name} cannot contain an error")
+        if not succeeded:
+            if "error" not in status:
+                raise ValueError(f"failed cleanup {name} must contain an error")
+            _evidence_error(
+                status["error"],
+                f"execution_evidence.cleanup.{name}.error",
+            )
+    if completed_startup and resources != list(_CLEANUP_RESOURCES):
+        raise ValueError(
+            "completed startup requires client, cluster, and configuration cleanup"
+        )
+
+
+def _canonical_execution_evidence(value: object) -> str:
+    """Validate and detach the exact Task 2 SLURM evidence schema."""
+    evidence = _evidence_object(
+        value,
+        "execution_evidence",
+        exact_keys=_EVIDENCE_KEYS,
+    )
+    if _evidence_string(evidence["executor"], "execution_evidence.executor") != "slurm":
+        raise ValueError("execution_evidence.executor must be 'slurm'")
+    workers, configured = _validate_requested(evidence["requested"])
+    rendered = _validate_rendered(evidence["rendered"])
+    phase, outcome = _validate_startup(evidence["startup"])
+    completed = phase == "complete" and outcome == "succeeded"
+    template_index = _STARTUP_PHASES.index("template_rendering")
+    phase_index = _STARTUP_PHASES.index(phase)
+    if phase_index > template_index and not rendered:
+        raise ValueError(
+            "post-template startup evidence is missing its rendered template"
+        )
+    if phase_index <= template_index and rendered:
+        raise ValueError(
+            "rendered template cannot precede successful template rendering"
+        )
+    if workers == 0:
+        if configured is not None or outcome != "not_started":
+            raise ValueError("zero-worker evidence must remain not_started")
+        for key in ("rendered", "observed", "attempt_counts", "cleanup"):
+            if evidence[key] != {} and evidence[key] != []:
+                raise ValueError(f"zero-worker evidence must leave {key} empty")
+    cancellation_present = _validate_observed(
+        evidence["observed"],
+        worker_count=workers,
+        startup_phase=phase,
+        startup_outcome=outcome,
+    )
+    _validate_attempts(
+        evidence["attempt_counts"],
+        worker_count=workers,
+        startup_outcome=outcome,
+        cancellation_present=cancellation_present,
+    )
+    _validate_timestamps(evidence["timestamps"])
+    _validate_cleanup(evidence["cleanup"], completed_startup=completed)
+    return canonical_json(copy.deepcopy(evidence))
 
 
 @dataclass(frozen=True, slots=True)

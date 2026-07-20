@@ -22,6 +22,7 @@ from cyexm.errors import (
     ConfigurationValidationError,
     ExecutorStartupError,
     RoundExecutionError,
+    WorkerPreflightError,
     WorkflowExecutionError,
     WorkflowPlanError,
 )
@@ -44,7 +45,6 @@ from cyexm.workflow.models import (
     RoundTask,
     WorkflowPlan,
     WorkflowResult,
-    _canonical_execution_evidence,
     canonical_json,
     sha256_fingerprint,
 )
@@ -65,6 +65,15 @@ _LOGGER = logging.getLogger(__name__)
 class _ExecutionEvidenceOwner(Protocol):
     @property
     def execution_evidence(self) -> object: ...
+
+
+class _ExecutorEvidenceError(ExecutorStartupError):
+    def __init__(self, validation_error: BaseException) -> None:
+        self.validation_error = validation_error
+        super().__init__(
+            "invalid SLURM execution evidence: "
+            f"{type(validation_error).__name__}: {validation_error}"
+        )
 
 
 def _utc_now() -> str:
@@ -627,6 +636,8 @@ def _write_run_record(
     result: WorkflowResult,
     force_all: bool,
     force_rounds: frozenset[int],
+    operational_failure: Mapping[str, object] | None = None,
+    execution_evidence_error: Mapping[str, object] | None = None,
 ) -> None:
     payload = {
         "schema_version": 1,
@@ -639,9 +650,17 @@ def _write_run_record(
         "force_all": force_all,
         "force_rounds": sorted(force_rounds),
         "execution_profile": _execution_profile_mapping(plan.execution),
-        "execution": json.loads(result.execution_evidence_json),
+        "execution": (
+            None
+            if execution_evidence_error is not None
+            else json.loads(result.execution_evidence_json)
+        ),
         "rounds": [round_result.to_dict() for round_result in result.rounds],
     }
+    if operational_failure is not None:
+        payload["operational_failure"] = dict(operational_failure)
+    if execution_evidence_error is not None:
+        payload["execution_evidence_error"] = dict(execution_evidence_error)
     _write_text_atomically(path, canonical_json(payload) + "\n")
 
 
@@ -652,15 +671,18 @@ def _executor_execution_evidence_json(
     if profile.executor != "slurm" or executor is None:
         return "{}"
     try:
+        from cyexm.execution.slurm import _canonical_execution_evidence
+
         evidence = cast(_ExecutionEvidenceOwner, executor).execution_evidence
         return _canonical_execution_evidence(evidence)
-    except Exception as error:
-        _LOGGER.warning(
-            "Ignoring unsupported SLURM execution evidence: %s: %s",
-            type(error).__name__,
-            error,
-        )
-        return "{}"
+    except KeyboardInterrupt:
+        raise
+    except BaseException as error:
+        raise _ExecutorEvidenceError(error) from error
+
+
+def _evidence_error_payload(error: BaseException) -> dict[str, str]:
+    return {"exception_type": type(error).__name__, "message": str(error)}
 
 
 def run_workflow(
@@ -735,11 +757,14 @@ def run_workflow(
             factory = _executor_factory or _default_executor_factory
             executor = factory(plan.execution)
             raw_results = executor.execute(submitted)
+            executed = _ordered_results(submitted, raw_results)
+            preserved_results = tuple(
+                sorted((*reused, *executed), key=lambda result: result.round)
+            )
             execution_evidence_json = _executor_execution_evidence_json(
                 plan.execution,
                 executor,
             )
-            executed = _ordered_results(submitted, raw_results)
         else:
             executed = ()
         rounds = tuple(sorted((*reused, *executed), key=lambda result: result.round))
@@ -770,11 +795,82 @@ def run_workflow(
             force_all=force_all,
             force_rounds=force_rounds,
         )
-    except KeyboardInterrupt as interruption:
-        execution_evidence_json = _executor_execution_evidence_json(
-            plan.execution,
-            executor,
+    except ExecutorStartupError as startup_error:
+        if executor is None:
+            raise
+        active_error = startup_error
+        evidence_error: _ExecutorEvidenceError | None = None
+        if isinstance(startup_error, _ExecutorEvidenceError):
+            evidence_error = startup_error
+        else:
+            try:
+                execution_evidence_json = _executor_execution_evidence_json(
+                    plan.execution,
+                    executor,
+                )
+            except _ExecutorEvidenceError as contract_error:
+                evidence_error = contract_error
+                active_error = contract_error
+        if evidence_error is not None:
+            failure_phase = "execution_evidence"
+        elif isinstance(startup_error, WorkerPreflightError):
+            failure_phase = "preflight"
+        else:
+            failure_phase = "startup"
+        failed = WorkflowResult(
+            dataset_id=plan.dataset_id,
+            scientific_fingerprint=plan.scientific_fingerprint,
+            status="failed",
+            started_at=started_at,
+            ended_at=_utc_now(),
+            rounds=preserved_results,
+            run_record=str(run_record),
+            execution_evidence_json=execution_evidence_json,
         )
+        _write_run_record(
+            run_record,
+            run_id=run_id,
+            plan=plan,
+            result=failed,
+            force_all=force_all,
+            force_rounds=force_rounds,
+            operational_failure={
+                "phase": failure_phase,
+                "exception_type": type(active_error).__name__,
+                "message": str(active_error),
+            },
+            execution_evidence_error=(
+                None
+                if evidence_error is None
+                else _evidence_error_payload(evidence_error.validation_error)
+            ),
+        )
+        active_error._attach_operational_record(
+            run_record=str(run_record),
+            execution_evidence_json=(
+                execution_evidence_json if evidence_error is None else None
+            ),
+        )
+        if active_error is startup_error:
+            raise
+        raise active_error from startup_error
+    except KeyboardInterrupt as interruption:
+        evidence_error = None
+        try:
+            execution_evidence_json = _executor_execution_evidence_json(
+                plan.execution,
+                executor,
+            )
+        except BaseException as evidence_access_error:
+            evidence_error = (
+                evidence_access_error
+                if isinstance(evidence_access_error, _ExecutorEvidenceError)
+                else _ExecutorEvidenceError(evidence_access_error)
+            )
+            _LOGGER.error(
+                "invalid SLURM execution evidence during cancellation: %s",
+                evidence_error,
+            )
         original_interruption = interruption
         if isinstance(interruption, _SequentialExecutionInterrupted):
             partial_results = _validated_partial_results(
@@ -805,6 +901,11 @@ def run_workflow(
             result=cancelled,
             force_all=force_all,
             force_rounds=force_rounds,
+            execution_evidence_error=(
+                None
+                if evidence_error is None
+                else _evidence_error_payload(evidence_error.validation_error)
+            ),
         )
         if original_interruption is interruption:
             raise

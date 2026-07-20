@@ -41,6 +41,20 @@ class WorkflowPlanError(CyExMError):
 class ExecutorStartupError(CyExMError):
     """The requested execution backend did not become usable."""
 
+    def __init__(self, message: str) -> None:
+        self.run_record: str | None = None
+        self.execution_evidence_json: str | None = None
+        super().__init__(message)
+
+    def _attach_operational_record(
+        self,
+        *,
+        run_record: str,
+        execution_evidence_json: str | None,
+    ) -> None:
+        self.run_record = run_record
+        self.execution_evidence_json = execution_evidence_json
+
 
 class WorkerPreflightError(ExecutorStartupError):
     """One or more workers failed environment preflight."""

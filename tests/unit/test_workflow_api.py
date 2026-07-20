@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -29,6 +30,7 @@ from cyexm.config.models import (
 from cyexm.errors import (
     ExecutorStartupError,
     RoundExecutionError,
+    WorkerPreflightError,
     WorkflowExecutionError,
     WorkflowPlanError,
 )
@@ -430,7 +432,7 @@ def _slurm_evidence(*, outcome: str = "succeeded") -> dict[str, object]:
     return {
         "executor": "slurm",
         "requested": {
-            "workers": 2,
+            "workers": 1,
             "configured_workers": 2,
             "startup_timeout": "15m",
             "task_retries": 0,
@@ -440,7 +442,49 @@ def _slurm_evidence(*, outcome: str = "succeeded") -> dict[str, object]:
                 "#!/usr/bin/env bash\n#SBATCH --partition=512GB\n"
             )
         },
-        "observed": {"scheduler_address": "tcp://scheduler:8786"},
+        "observed": {
+            "coordinator_versions": {
+                "cy-exm": "0.1.0",
+                "dask": "2025.1.0",
+                "distributed": "2025.1.0",
+                "dask-jobqueue": "0.9.0",
+                "antspyx": "0.5.4",
+                "numpy": "2.0.2",
+                "scipy": "1.16.0",
+                "tifffile": "2026.7.17",
+            },
+            "scheduler_address": "tcp://scheduler:8786",
+            "connected_workers": ["tcp://worker:1234"],
+            "worker_probes": [
+                {
+                    "ok": True,
+                    "worker_address": "tcp://worker:1234",
+                    "hostname": "worker",
+                    "pid": 1234,
+                    "slurm_job_id": "98765",
+                    "package_versions": [
+                        ["antspyx", "0.5.4"],
+                        ["cy-exm", "0.1.0"],
+                        ["dask", "2025.1.0"],
+                        ["dask-jobqueue", "0.9.0"],
+                        ["distributed", "2025.1.0"],
+                        ["numpy", "2.0.2"],
+                        ["scipy", "1.16.0"],
+                        ["tifffile", "2026.7.17"],
+                    ],
+                    "native_threads": [
+                        ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", "1"],
+                        ["OMP_NUM_THREADS", "1"],
+                    ],
+                    "dataset_visible": True,
+                    "output_writable": True,
+                    "scratch_usable": True,
+                    "memory_limit_bytes": 500_000_000_000,
+                    "network_host": "worker",
+                    "errors": [],
+                }
+            ],
+        },
         "startup": {
             "phase": "complete",
             "outcome": outcome,
@@ -455,7 +499,8 @@ def _slurm_evidence(*, outcome: str = "succeeded") -> dict[str, object]:
         "cleanup": {
             "client": {"attempted": True, "succeeded": True},
             "cluster": {"attempted": True, "succeeded": True},
-            "order": ["client", "cluster"],
+            "configuration": {"attempted": True, "succeeded": True},
+            "order": ["client", "cluster", "configuration"],
         },
     }
 
@@ -1249,6 +1294,72 @@ def test_slurm_failed_round_persists_post_preflight_execution_evidence(
     assert run_record["execution"]["startup"]["outcome"] == "succeeded"
 
 
+@pytest.mark.parametrize(
+    ("error_type", "evidence_phase", "failure_phase"),
+    [
+        (ExecutorStartupError, "worker_wait", "startup"),
+        (WorkerPreflightError, "worker_validation", "preflight"),
+    ],
+    ids=("startup", "preflight"),
+)
+def test_slurm_startup_failure_writes_operational_summary_and_re_raises_same_error(
+    error_type: type[ExecutorStartupError],
+    evidence_phase: str,
+    failure_phase: str,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2, 3))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    for artifact in _artifacts(plan.tasks[0]):
+        _commit_artifact(artifact, plan)
+    evidence = _slurm_evidence(outcome="failed")
+    startup = evidence["startup"]
+    assert isinstance(startup, dict)
+    startup.update(
+        {
+            "phase": evidence_phase,
+            "error": {"type": error_type.__name__, "message": "injected failure"},
+        }
+    )
+    if evidence_phase == "worker_wait":
+        evidence["observed"] = {}
+    evidence["attempt_counts"] = [
+        {"dataset_id": "dataset-1", "round": 3, "attempts": 0}
+    ]
+    cause = RuntimeError("preserved cause")
+    raised = error_type("injected failure")
+    raised.__cause__ = cause
+
+    def fail(_tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        raise raised
+
+    fake = _FakeExecutor(fail, execution_evidence=evidence)
+
+    with pytest.raises(error_type, match="injected failure") as captured:
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert captured.value is raised
+    assert captured.value.__cause__ is cause
+    assert captured.value.run_record is not None
+    assert captured.value.execution_evidence_json == canonical_json(evidence)
+    run_record = json.loads(Path(captured.value.run_record).read_text(encoding="utf-8"))
+    assert run_record["status"] == "failed"
+    assert run_record["execution"] == evidence
+    assert run_record["operational_failure"] == {
+        "phase": failure_phase,
+        "exception_type": error_type.__name__,
+        "message": "injected failure",
+    }
+    assert [item["round"] for item in run_record["rounds"]] == [2]
+    assert run_record["rounds"][0]["status"] == "reused"
+    assert run_record["execution"]["attempt_counts"] == [
+        {"dataset_id": "dataset-1", "round": 3, "attempts": 0}
+    ]
+
+
 def test_slurm_interruption_persists_cancelled_execution_evidence(
     tmp_path: Path,
 ) -> None:
@@ -1288,18 +1399,10 @@ def test_slurm_interruption_persists_cancelled_execution_evidence(
 
 
 @pytest.mark.parametrize(
-    "unsupported",
-    [
-        ["not-an-object"],
-        {_StringAlias("executor"): "slurm"},
-        {"elapsed": float("nan")},
-        {"tuple": (1, 2)},
-        {"opaque": object()},
-    ],
-    ids=("root-list", "string-alias-key", "nonfinite", "tuple", "opaque"),
+    "round_failed", [False, True], ids=("success", "round-failure")
 )
-def test_slurm_unsupported_injected_evidence_is_ignored_safely(
-    unsupported: object,
+def test_slurm_invalid_evidence_fails_closed_with_a_durable_operational_summary(
+    round_failed: bool,
     tmp_path: Path,
 ) -> None:
     sequential_plan = _plan(tmp_path, rounds=(2,))
@@ -1307,16 +1410,186 @@ def test_slurm_unsupported_injected_evidence_is_ignored_safely(
         sequential_plan,
         execution=_slurm_execution(sequential_plan, tmp_path),
     )
+    invalid = _slurm_evidence()
+    rendered = invalid["rendered"]
+    assert isinstance(rendered, dict)
+    rendered["submitted_job_script"] = rendered.pop("rendered_job_script_template")
     fake = _FakeExecutor(
-        lambda tasks: tuple(_result(task) for task in tasks),
-        execution_evidence=unsupported,
+        lambda tasks: tuple(_result(task, failed=round_failed) for task in tasks),
+        execution_evidence=invalid,
     )
 
-    result = run_workflow(plan, _executor_factory=_factory(fake))
+    with pytest.raises(
+        ExecutorStartupError,
+        match="invalid SLURM execution evidence",
+    ) as captured:
+        run_workflow(plan, _executor_factory=_factory(fake))
 
-    assert result.execution_evidence_json == "{}"
-    run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
-    assert run_record["execution"] == {}
+    assert captured.value.run_record is not None
+    assert captured.value.execution_evidence_json is None
+    run_record = json.loads(Path(captured.value.run_record).read_text(encoding="utf-8"))
+    assert run_record["status"] == "failed"
+    assert run_record["execution"] is None
+    assert run_record["execution_evidence_error"]["exception_type"] in {
+        "TypeError",
+        "ValueError",
+    }
+    assert run_record["operational_failure"]["phase"] == "execution_evidence"
+    assert [item["status"] for item in run_record["rounds"]] == [
+        "failed" if round_failed else "completed"
+    ]
+
+
+def test_slurm_invalid_evidence_during_interruption_preserves_the_primary_cancel(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    invalid = _slurm_evidence()
+    invalid["submitted_job_script"] = "stale"
+    interruption = KeyboardInterrupt("primary cancellation")
+
+    def interrupt(_tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        raise interruption
+
+    fake = _FakeExecutor(interrupt, execution_evidence=invalid)
+
+    with (
+        caplog.at_level(logging.ERROR, logger="cyexm.workflow.api"),
+        pytest.raises(KeyboardInterrupt, match="primary cancellation") as captured,
+    ):
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert captured.value is interruption
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root,
+            plan.dataset_id,
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    run_record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert run_record["status"] == "cancelled"
+    assert run_record["execution"] is None
+    assert run_record["execution_evidence_error"]["exception_type"] in {
+        "TypeError",
+        "ValueError",
+    }
+    assert "invalid SLURM execution evidence during cancellation" in caplog.text
+
+
+def test_slurm_evidence_property_baseexception_cannot_replace_primary_cancel(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    interruption = KeyboardInterrupt("primary cancellation")
+
+    class BrokenEvidenceExecutor:
+        @property
+        def execution_evidence(self) -> object:
+            raise SystemExit("injected evidence property defect")
+
+        def execute(self, _tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+            raise interruption
+
+    with (
+        caplog.at_level(logging.ERROR, logger="cyexm.workflow.api"),
+        pytest.raises(KeyboardInterrupt, match="primary cancellation") as captured,
+    ):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(BrokenEvidenceExecutor()),
+        )
+
+    assert captured.value is interruption
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root,
+            plan.dataset_id,
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    run_record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert run_record["status"] == "cancelled"
+    assert run_record["execution"] is None
+    assert run_record["execution_evidence_error"] == {
+        "exception_type": "SystemExit",
+        "message": "injected evidence property defect",
+    }
+
+
+def test_slurm_evidence_property_system_exit_is_a_mapped_contract_failure(
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+
+    class BrokenEvidenceExecutor:
+        @property
+        def execution_evidence(self) -> object:
+            raise SystemExit("injected evidence property defect")
+
+        def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+            return tuple(_result(task) for task in tasks)
+
+    with pytest.raises(
+        ExecutorStartupError,
+        match="invalid SLURM execution evidence",
+    ) as captured:
+        run_workflow(
+            plan,
+            _executor_factory=_factory(BrokenEvidenceExecutor()),
+        )
+
+    assert captured.value.run_record is not None
+    assert captured.value.execution_evidence_json is None
+    run_record = json.loads(Path(captured.value.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] is None
+    assert run_record["execution_evidence_error"] == {
+        "exception_type": "SystemExit",
+        "message": "injected evidence property defect",
+    }
+
+
+def test_slurm_invalid_evidence_replaces_startup_error_with_contract_error(
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    invalid = _slurm_evidence(outcome="failed")
+    invalid["unknown"] = True
+    startup_error = WorkerPreflightError("primary preflight failure")
+
+    def fail(_tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        raise startup_error
+
+    fake = _FakeExecutor(fail, execution_evidence=invalid)
+
+    with pytest.raises(
+        ExecutorStartupError,
+        match="invalid SLURM execution evidence",
+    ) as captured:
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert captured.value is not startup_error
+    assert captured.value.__cause__ is startup_error
+    assert captured.value.run_record is not None
+    assert captured.value.execution_evidence_json is None
 
 
 def test_local_dask_does_not_claim_injected_slurm_evidence(tmp_path: Path) -> None:

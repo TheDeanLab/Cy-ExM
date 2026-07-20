@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -34,41 +32,6 @@ def canonical_json(value: object) -> str:
 def sha256_fingerprint(encoded: str) -> str:
     """Hash a canonical UTF-8 JSON string with SHA-256."""
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _detached_json_value(value: object, *, location: str) -> object:
-    if isinstance(value, Mapping):
-        detached: dict[str, object] = {}
-        for key, item in value.items():
-            if type(key) is not str:
-                raise TypeError(
-                    f"{location} keys must be exact built-in strings; got {key!r}"
-                )
-            detached[key] = _detached_json_value(
-                item,
-                location=f"{location}.{key}",
-            )
-        return detached
-    if type(value) is list:
-        return [
-            _detached_json_value(item, location=f"{location}[{index}]")
-            for index, item in enumerate(value)
-        ]
-    if value is None or type(value) in {str, bool, int}:
-        return value
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ValueError(f"{location} must contain only finite floats")
-        return value
-    raise TypeError(f"{location} contains a non-JSON-compatible value: {value!r}")
-
-
-def _canonical_execution_evidence(value: object) -> str:
-    """Detach and canonically encode executor-owned operational evidence."""
-    detached = _detached_json_value(value, location="execution_evidence")
-    if type(detached) is not dict:
-        raise TypeError("execution_evidence must be a JSON object")
-    return canonical_json(detached)
 
 
 @dataclass(frozen=True, slots=True)

@@ -78,6 +78,38 @@ for root in ("ants", "numpy", "scipy", "tifffile"):
     assert completed.returncode == 0, completed.stderr
 
 
+def test_phase_two_configuration_and_planning_imports_are_lightweight() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.config
+import cyexm.workflow
+import cyexm.execution
+import cyexm.cli
+
+assert before == dict(os.environ)
+for root in (
+    "ants",
+    "numpy",
+    "scipy",
+    "tifffile",
+    "dask",
+    "distributed",
+    "dask_jobqueue",
+):
+    assert not any(name == root or name.startswith(root + ".") for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_whole_image_constructor_is_import_and_filesystem_neutral() -> None:
     code = """
 import logging

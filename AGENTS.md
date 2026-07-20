@@ -11,11 +11,15 @@
   exactly.
 - Phase 1 is the current stable runtime: whole-image and serial chunked registration,
   restart-safe artifacts, strict geometry/TIFF boundaries, and configurable native
-  threads. Preserve that API and its acceptance evidence while Phase 2 is designed.
-- Do not add Phase 2 runtime code, dependencies, or public APIs until a dedicated
-  Phase 2 runtime design and implementation plan are approved. This gate covers YAML
-  scientific dataset manifests, execution profiles, Dask/distributed execution,
-  dask-jobqueue/SLURM integration, and new workflow CLIs.
+  threads. Preserve that API and its acceptance evidence as Phase 2 is implemented.
+- Phase 2A is the current workflow surface: strict scientific dataset manifests and
+  execution profiles, deterministic planning and status inspection, sequential
+  execution through an injected task runner, and the `cyexm workflow` CLI. It does
+  not yet provide the real round runner, transformed-channel artifacts, or a
+  distributed executor. Dask and SLURM executors remain later milestones.
+- All Phase 2 additions follow the approved Phase 2 runtime design and implementation
+  plans. Keep optional workflow, distributed, and HPC dependencies out of the base
+  installation, and do not advertise a later milestone before its acceptance gate.
 - Scientific dataset manifests describe rounds, channels, registration inputs, voxel
   spacing, and scientific choices; machine-specific local or HPC settings belong in
   separate execution profiles. The Phase 1 artifact store remains the only restart

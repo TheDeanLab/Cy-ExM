@@ -2,6 +2,8 @@
 
 - Execution owns the executor protocol and sequential, Dask, and SLURM adapter
   lifecycle, never registration algorithms or artifact-validity decisions.
+- Phase 2A implements the sequential executor only. Dask and SLURM adapters remain
+  later Phase 2 milestones and must follow their approved plans before landing here.
 - Scheduler imports occur only inside the selected operation.
 - Schedule one coarse task per round. Each worker advertises one `round_slot`, and
   every submitted round task requests and consumes one.

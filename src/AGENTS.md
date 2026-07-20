@@ -11,10 +11,10 @@
   scientific libraries.
 - Do not import ClearEx at runtime. Extract only the focused behavior approved by the
   plan and record provenance instead of creating cross-repository coupling.
-- A future execution boundary for Phase 2 may import scheduler libraries only inside the
-  operation that creates or connects to a scheduler. Keep scheduler imports out of
-  module scope and preserve no import-time cluster, client, worker, filesystem, or
-  network activity.
-- Scientific manifest models and planning policy must remain usable without importing
-  ANTs or scheduler libraries. Machine-specific execution adapters depend on those
-  models, never the reverse.
+- Scheduler-enabled execution adapters may import scheduler libraries only inside
+  the operation that creates or connects to a scheduler. Keep scheduler imports out
+  of module scope and preserve no import-time cluster, client, worker, filesystem,
+  or network activity.
+- Phase 2A scientific manifest models, planning policy, sequential execution, and CLI
+  imports must remain usable without importing ANTs or scheduler libraries.
+  Machine-specific execution adapters depend on those models, never the reverse.

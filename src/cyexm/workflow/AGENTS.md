@@ -1,7 +1,8 @@
 # Workflow package guidance
 
-- Workflow owns immutable plans, tasks, and results; deterministic path and header
-  validation; output layout, status, fingerprinting, and public orchestration.
+- Phase 2A workflow owns immutable plans, tasks, and results; deterministic path and
+  header validation; output layout, status, fingerprinting, and public
+  orchestration.
 - Planning creates no files, directories, clients, clusters, or workers.
 - Workflow must not mutate a plan or create a scheduler.
 - Phase 1 completion records remain the only restart authority.

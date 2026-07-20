@@ -45,6 +45,7 @@ AGENT_GUIDANCE_PATHS = frozenset(
 )
 PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
     "src/cyexm/cli/AGENTS.md": (
+        "phase 2a",
         "parsing, logging setup, lifecycle, formatting, and exit-code mapping",
         "public workflow api",
         "diagnostics go to stderr",
@@ -60,6 +61,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "130 interruption",
     ),
     "src/cyexm/config/AGENTS.md": (
+        "phase 2a",
         "strict safe yaml decoding",
         "frozen scientific-manifest and execution-profile models",
         "two documents separate",
@@ -75,6 +77,8 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "initialize a scheduler",
     ),
     "src/cyexm/execution/AGENTS.md": (
+        "phase 2a implements the sequential executor only",
+        "dask and slurm adapters remain later phase 2 milestones",
         "executor protocol",
         "sequential, dask, and slurm adapter lifecycle",
         "never registration algorithms or artifact-validity decisions",
@@ -86,6 +90,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "cleaned up on success, failure, and cancellation",
     ),
     "src/cyexm/workflow/AGENTS.md": (
+        "phase 2a",
         "immutable plans, tasks, and results",
         "deterministic path and header validation",
         "output layout, status, fingerprinting, and public orchestration",
@@ -208,13 +213,17 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
         assert forbidden not in workflow
 
 
-def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
+def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_a() -> None:
     root = _normalized_repository_file("AGENTS.md")
     for required in (
         "phase 1 is the current stable runtime",
-        "dedicated phase 2 runtime design and implementation plan",
+        "phase 2a is the current workflow surface",
+        "approved phase 2 runtime design and implementation plans",
         "scientific dataset manifests",
         "execution profiles",
+        "deterministic planning",
+        "sequential execution",
+        "dask and slurm executors remain later milestones",
         "serial chunk workflow remains",
         "nested chunk multiprocessing",
         "uv lock --check",
@@ -249,23 +258,27 @@ def test_phase_two_optional_dependencies_are_cumulative_and_pinned() -> None:
         assert forbidden not in direct
 
 
-def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
+def test_documentation_and_examples_track_the_current_phase_two_boundary() -> None:
     documentation = _normalized_repository_file("docs/AGENTS.md")
     for required in (
         "merged phase 1 behavior",
-        "proposed phase 2",
-        "not installable behavior",
-        "dedicated runtime design",
+        "phase 2a runtime available on this branch",
+        "strict yaml validation",
+        "deterministic planning",
+        "sequential execution",
+        "later phase 2 milestones",
     ):
         assert required in documentation
 
     examples = _normalized_repository_file("examples/AGENTS.md")
     for required in (
         "phase 1 examples are the current runnable surface",
-        "runtime api is implemented and accepted",
+        "phase 2a yaml examples",
+        "implemented validation, planning, and sequential cli surface",
         "examples never lead production behavior",
         "scientific manifest",
         "execution profile",
+        "dask or slurm execution",
     ):
         assert required in examples
 
@@ -273,7 +286,7 @@ def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
 def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> None:
     source = _normalized_repository_file("src/AGENTS.md")
     for required in (
-        "future execution boundary",
+        "scheduler-enabled execution adapters",
         "scheduler imports",
         "module scope",
         "no import-time cluster",
@@ -281,7 +294,11 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
         assert required in source
 
     package = _normalized_repository_file("src/cyexm/AGENTS.md")
-    assert "workflow or configuration namespace" in package
+    for required in (
+        "configuration, workflow, execution, and cli namespaces implement phase 2a",
+        "must not become package-root exports",
+    ):
+        assert required in package
     assert "scheduler concerns do not belong in `cyexm.registration`" in package
 
     registration = _normalized_repository_file("src/cyexm/registration/AGENTS.md")
@@ -316,7 +333,8 @@ def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> 
 
     unit = _normalized_repository_file("tests/unit/AGENTS.md")
     for required in (
-        "future manifest and planning policy",
+        "phase 2a manifest, execution-profile, planning, sequential-executor, "
+        "and cli policy",
         "plain python data",
         "must not import scheduler",
     ):

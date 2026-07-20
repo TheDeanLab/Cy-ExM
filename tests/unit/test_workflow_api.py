@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Callable
 from dataclasses import replace
@@ -8,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
+from tiff_bytes import write_cyexm_uint16_tiff
 
 import cyexm.workflow.api as workflow_api
 from cyexm.config.models import (
@@ -709,7 +711,7 @@ def _commit_artifact(path: Path, plan: WorkflowPlan) -> None:
     if path == affine:
         fixed_reference = task.registration_directory / "fixed_reference.tif"
         fixed_reference.parent.mkdir(parents=True, exist_ok=True)
-        fixed_reference.write_bytes(b"fixed-reference")
+        write_cyexm_uint16_tiff(fixed_reference, geometry)
         fixed_request = StageRequest.for_identities(
             stage="fixed-reference",
             inputs=inputs,
@@ -838,6 +840,17 @@ def _commit_artifact(path: Path, plan: WorkflowPlan) -> None:
     ArtifactStore().record_path(path).write_text(record.to_json(), encoding="utf-8")
 
 
+def _corrupt_tiff_while_preserving_record_identity(path: Path) -> None:
+    record = CompletionRecord.read(ArtifactStore().record_path(path))
+    contents = bytearray(path.read_bytes())
+    assert len(contents) >= 8
+    contents[:4] = b"NOPE"
+    path.write_bytes(contents)
+    accessed = path.stat().st_atime_ns
+    os.utime(path, ns=(accessed, record.artifact.st_mtime_ns))
+    assert FileIdentity.from_path(path) == record.artifact
+
+
 def test_run_workflow_writes_scientific_snapshot_before_execution(
     tmp_path: Path,
 ) -> None:
@@ -953,6 +966,30 @@ def test_run_workflow_executes_when_registration_evidence_is_stale(
 
     assert calls == [2]
     assert tuple(item.status for item in result.rounds) == ("completed",)
+
+
+def test_run_workflow_executes_when_fixed_reference_tiff_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow import round_task as round_task_module
+
+    plan = _plan(tmp_path, rounds=(2,))
+    for artifact in _artifacts(plan.tasks[0]):
+        _commit_artifact(artifact, plan)
+    fixed_reference = plan.tasks[0].registration_directory / "fixed_reference.tif"
+    _corrupt_tiff_while_preserving_record_identity(fixed_reference)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        round_task_module,
+        "run_round_task",
+        lambda task: calls.append(task.round) or _result(task),
+    )
+
+    result = run_workflow(plan)
+
+    assert calls == [2]
+    assert result.rounds[0].status == "completed"
 
 
 def test_run_workflow_forces_only_selected_rounds(tmp_path: Path) -> None:

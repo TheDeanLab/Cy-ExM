@@ -8,7 +8,11 @@ import tifffile
 
 from cyexm.errors import CacheValidationError, InputValidationError
 from cyexm.io.images import ants_geometry, load_ants_image
-from cyexm.io.tiff import write_clipped_uint16_tiff, write_uint16_tiff
+from cyexm.io.tiff import (
+    _read_uint16_tiff_geometry_without_runtime,
+    write_clipped_uint16_tiff,
+    write_uint16_tiff,
+)
 from cyexm.spatial import ImageGeometry
 
 pytestmark = pytest.mark.unit
@@ -140,6 +144,9 @@ def test_write_clipped_uint16_tiff_preserves_exact_ants_geometry(
         }
 
     restored = load_ants_image(destination, (0.2, 0.3, 0.5))
+    assert _read_uint16_tiff_geometry_without_runtime(destination) == ants_geometry(
+        image
+    )
     assert ants_geometry(restored) == ImageGeometry(
         shape=(1, 2, 2),
         origin=(10.0, 20.0, 30.0),

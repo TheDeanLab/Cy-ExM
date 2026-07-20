@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -14,6 +15,7 @@ from cyexm.config.models import (
     RegistrationStageSpec,
 )
 from cyexm.errors import WorkflowPlanError
+from cyexm.io.tiff import _read_uint16_tiff_geometry_without_runtime
 from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
     OUTPUT_FORMAT_POLICY,
@@ -769,13 +771,13 @@ def _read_artifact_evidence(
         root=layout.root,
         location=f"{expectation.role} completion record",
     )
-    artifact_present = artifact.exists() or artifact.is_symlink()
-    record_present = record_path.exists() or record_path.is_symlink()
-    if not artifact_present and not record_present:
+    artifact_state = _filesystem_entry_state(artifact)
+    record_state = _filesystem_entry_state(record_path)
+    if artifact_state == "missing" and record_state == "missing":
         return _ArtifactEvidence("incomplete")
-    if artifact_present and not record_present:
+    if artifact_state == "regular" and record_state == "missing":
         return _ArtifactEvidence("incomplete")
-    if not artifact_present or not artifact.is_file() or not record_path.is_file():
+    if artifact_state != "regular" or record_state != "regular":
         return _ArtifactEvidence("invalid")
     try:
         record_text = record_path.read_text(encoding="utf-8")
@@ -787,6 +789,16 @@ def _read_artifact_evidence(
     if record.to_json() != record_text or record.artifact != identity:
         return _ArtifactEvidence("invalid")
     return _ArtifactEvidence("recorded", identity, record)
+
+
+def _filesystem_entry_state(path: Path) -> Literal["missing", "regular", "invalid"]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "invalid"
+    return "regular" if stat.S_ISREG(metadata.st_mode) else "invalid"
 
 
 def _valid_native_threads(value: Mapping[str, int]) -> bool:
@@ -869,6 +881,12 @@ def _safe_completion_snapshot(
         root=layout.root,
         location="authoritative round completion record",
     )
+    record = artifact.with_name(f"{artifact.name}.complete.json")
+    if (
+        _filesystem_entry_state(artifact) != "regular"
+        or _filesystem_entry_state(record) != "regular"
+    ):
+        return None
     return completion_snapshot(artifact)
 
 
@@ -902,10 +920,7 @@ def _round_status(
         path: Path,
         _spacing: tuple[float, float, float],
     ) -> ImageGeometry:
-        evidence = snapshot_reader(path)
-        if evidence is None:
-            raise ValueError(f"Missing fixed-reference completion evidence: {path}")
-        return evidence[0].request.geometry
+        return _read_uint16_tiff_geometry_without_runtime(path)
 
     authoritative = completion_evidence(
         task,

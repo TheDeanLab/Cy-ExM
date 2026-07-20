@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from tiff_bytes import write_cyexm_uint16_tiff
 
 import cyexm.workflow.status as workflow_status
 from cyexm.errors import WorkflowPlanError
@@ -291,7 +293,7 @@ def _commit_artifact(
             FileIdentity.from_path(dataset_root / f"round_{round_number}_488.tif"),
         )
         fixed_reference.parent.mkdir(parents=True, exist_ok=True)
-        fixed_reference.write_bytes(b"fixed-reference")
+        write_cyexm_uint16_tiff(fixed_reference, _geometry())
         fixed_request = StageRequest.for_identities(
             stage="fixed-reference",
             inputs=inputs,
@@ -337,13 +339,37 @@ def _write_request_artifact(
     contents: bytes = b"artifact",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(contents)
+    if path.name == "fixed_reference.tif" and contents == b"artifact":
+        write_cyexm_uint16_tiff(path, request.geometry)
+    else:
+        path.write_bytes(contents)
     record = CompletionRecord(
         schema_version=1,
         request=request,
         artifact=FileIdentity.from_path(path),
     )
     ArtifactStore().record_path(path).write_text(record.to_json(), encoding="utf-8")
+
+
+def _corrupt_tiff_while_preserving_record_identity(path: Path) -> None:
+    record = CompletionRecord.read(ArtifactStore().record_path(path))
+    original = bytearray(path.read_bytes())
+    assert len(original) >= 8
+    original[:4] = b"NOPE"
+    path.write_bytes(original)
+    accessed = path.stat().st_atime_ns
+    os.utime(path, ns=(accessed, record.artifact.st_mtime_ns))
+    assert FileIdentity.from_path(path) == record.artifact
+
+
+def _replace_fixed_reference_geometry(path: Path, geometry: ImageGeometry) -> None:
+    record_path = ArtifactStore().record_path(path)
+    record = CompletionRecord.read(record_path)
+    write_cyexm_uint16_tiff(path, geometry)
+    record_path.write_text(
+        replace(record, artifact=FileIdentity.from_path(path)).to_json(),
+        encoding="utf-8",
+    )
 
 
 def _commit_serial_round(output_root: Path) -> tuple[Path, ...]:
@@ -928,6 +954,88 @@ def test_status_requires_every_artifact_completion_record(tmp_path: Path) -> Non
     assert status.complete
 
 
+def test_status_rejects_a_corrupt_fixed_reference_with_restored_identity(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    artifacts = _expected_artifacts(output_root, 2)
+    for artifact in artifacts:
+        _commit_artifact(artifact, output_root)
+    fixed_reference = (
+        WorkflowLayout.for_dataset(output_root, "dataset-1").round(2).registration
+        / "fixed_reference.tif"
+    )
+    _corrupt_tiff_while_preserving_record_identity(fixed_reference)
+
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert round_status.status == "invalid"
+    assert round_status.complete_artifacts == ()
+    assert round_status.invalid_artifacts == tuple(map(str, artifacts))
+
+
+@pytest.mark.parametrize(
+    ("origin_delta", "expected_status"),
+    [
+        (TIFF_GEOMETRY_ATOL / 2.0, "complete"),
+        (TIFF_GEOMETRY_ATOL * 2.0, "invalid"),
+    ],
+)
+def test_status_compares_fixed_reference_tiff_geometry_with_tolerance(
+    tmp_path: Path,
+    origin_delta: float,
+    expected_status: str,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    artifacts = _expected_artifacts(output_root, 2)
+    for artifact in artifacts:
+        _commit_artifact(artifact, output_root)
+    fixed_reference = (
+        WorkflowLayout.for_dataset(output_root, "dataset-1").round(2).registration
+        / "fixed_reference.tif"
+    )
+    original = _geometry()
+    _replace_fixed_reference_geometry(
+        fixed_reference,
+        replace(original, origin=(origin_delta, *original.origin[1:])),
+    )
+
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert round_status.status == expected_status
+
+
+def test_status_marks_an_artifact_directory_without_a_record_invalid(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    artifacts = _expected_artifacts(output_root, 2)
+    artifacts[0].mkdir(parents=True)
+
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert round_status.status == "invalid"
+    assert round_status.invalid_artifacts == (str(artifacts[0]),)
+    assert round_status.incomplete_artifacts == tuple(map(str, artifacts[1:]))
+
+
+def test_status_marks_a_completion_record_directory_invalid(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    artifact = _expected_artifacts(output_root, 2)[0]
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"artifact")
+    ArtifactStore().record_path(artifact).mkdir()
+
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert round_status.status == "invalid"
+    assert round_status.invalid_artifacts == (str(artifact),)
+
+
 def test_status_uses_the_shared_authoritative_completion_scan(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1304,6 +1412,37 @@ from cyexm.workflow import inspect_workflow_status
 with tempfile.TemporaryDirectory() as directory:
     inspect_workflow_status(Path(directory) / "output", "dataset-1")
 
+for root in (
+    "ants", "numpy", "scipy", "tifffile", "dask", "distributed", "dask_jobqueue"
+):
+    assert not any(
+        name == root or name.startswith(root + ".") for name in sys.modules
+    ), root
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_complete_status_invocation_keeps_heavy_runtimes_unloaded(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    for artifact in _expected_artifacts(output_root, 2):
+        _commit_artifact(artifact, output_root)
+    code = f"""
+import sys
+from pathlib import Path
+from cyexm.workflow import inspect_workflow_status
+
+status = inspect_workflow_status(Path({str(output_root)!r}), "dataset-1")
+assert status.complete
 for root in (
     "ants", "numpy", "scipy", "tifffile", "dask", "distributed", "dask_jobqueue"
 ):

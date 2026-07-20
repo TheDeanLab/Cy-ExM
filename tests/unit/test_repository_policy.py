@@ -168,14 +168,14 @@ def test_pre_commit_runs_the_locked_portable_gates_through_uv() -> None:
     }
 
 
-def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> None:
+def test_ci_runs_portable_phase_two_c_gates_with_distributed_dependencies() -> None:
     assert _load_yaml(".github/workflows/ci.yml", github_actions=True) == {
         "name": "CI",
         "on": {"push": "", "pull_request": ""},
         "permissions": {"contents": "read"},
         "jobs": {
             "portable": {
-                "name": "Portable Phase 1 gates",
+                "name": "Portable repository gates",
                 "runs-on": "ubuntu-latest",
                 "timeout-minutes": "30",
                 "env": dict.fromkeys(THREAD_ENVIRONMENT, "1"),
@@ -195,7 +195,10 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
                     },
                     {
                         "name": "Sync locked environment",
-                        "run": "uv sync --locked --group dev --extra examples",
+                        "run": (
+                            "uv sync --locked --group dev --extra examples "
+                            "--extra distributed"
+                        ),
                     },
                     {"name": "Ruff check", "run": "uv run ruff check ."},
                     {
@@ -223,6 +226,11 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
     for forbidden in ("clearex", "dask", "slurm", "/archive", "/project"):
         assert forbidden not in workflow
 
+    configuration = tomllib.loads(_read_repository_file("pyproject.toml"))
+    distributed = configuration["project"]["optional-dependencies"]["distributed"]
+    assert "dask==2025.1.0" in distributed
+    assert "distributed==2025.1.0" in distributed
+
 
 def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_c() -> None:
     root = _normalized_repository_file("AGENTS.md")
@@ -241,7 +249,7 @@ def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_c() -> None
         "serial chunk workflow remains",
         "nested chunk multiprocessing",
         "uv lock --check",
-        "uv sync --locked --group dev --extra examples",
+        "uv sync --locked --group dev --extra examples --extra distributed",
     ):
         assert required in root
 
@@ -416,7 +424,7 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "lab paths",
         ),
         ".github/workflows/AGENTS.md": (
-            "uv sync --locked --group dev --extra examples",
+            "uv sync --locked --group dev --extra examples --extra distributed",
             "python 3.12",
             "all six native-thread",
             "unit and not hpc",

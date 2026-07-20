@@ -1,7 +1,9 @@
 # GitHub Actions workflow guidance
 
 - Preserve Python 3.12, the repository-pinned uv version, and
-  `uv sync --locked --group dev --extra examples`; CI must never regenerate the lock.
+  `uv sync --locked --group dev --extra examples --extra distributed`; CI must never
+  regenerate the lock. The distributed extra is required by the accepted portable
+  LocalCluster integration suite.
 - Set all six native-thread variables to `1` at job scope before Python starts:
   `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS`, `OMP_NUM_THREADS`,
   `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, and

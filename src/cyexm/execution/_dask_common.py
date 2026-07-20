@@ -142,8 +142,7 @@ def collect_distributed_results(
     submissions: dict[Any, Submission] = {}
 
     def submit(task_index: int, task: RoundTask) -> Any:
-        attempt_counts[task_index] += 1
-        attempt = attempt_counts[task_index]
+        attempt = attempt_counts[task_index] + 1
         started_at = utc_now()
         started = time.monotonic()
         key = task_key(task, attempt)
@@ -155,6 +154,7 @@ def collect_distributed_results(
             retries=0,
             resources=dict(ROUND_RESOURCE),
         )
+        attempt_counts[task_index] = attempt
         submissions[future] = Submission(
             task_index,
             task,

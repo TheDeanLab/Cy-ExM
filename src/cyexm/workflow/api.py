@@ -667,14 +667,21 @@ def _write_run_record(
 def _executor_execution_evidence_json(
     profile: ExecutionProfile,
     executor: object | None,
+    expected_tasks: tuple[RoundTask, ...],
 ) -> str:
     if profile.executor != "slurm" or executor is None:
         return "{}"
     try:
         from cyexm.execution.slurm import _canonical_execution_evidence
 
+        if profile.slurm is None:
+            raise TypeError("SLURM execution evidence requires a SlurmSpec")
         evidence = cast(_ExecutionEvidenceOwner, executor).execution_evidence
-        return _canonical_execution_evidence(evidence)
+        return _canonical_execution_evidence(
+            evidence,
+            expected_tasks=expected_tasks,
+            task_retries=profile.slurm.task_retries,
+        )
     except KeyboardInterrupt:
         raise
     except BaseException as error:
@@ -764,6 +771,7 @@ def run_workflow(
             execution_evidence_json = _executor_execution_evidence_json(
                 plan.execution,
                 executor,
+                submitted,
             )
         else:
             executed = ()
@@ -807,6 +815,7 @@ def run_workflow(
                 execution_evidence_json = _executor_execution_evidence_json(
                     plan.execution,
                     executor,
+                    submitted,
                 )
             except _ExecutorEvidenceError as contract_error:
                 evidence_error = contract_error
@@ -860,6 +869,7 @@ def run_workflow(
             execution_evidence_json = _executor_execution_evidence_json(
                 plan.execution,
                 executor,
+                submitted,
             )
         except BaseException as evidence_access_error:
             evidence_error = (

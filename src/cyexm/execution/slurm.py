@@ -166,7 +166,7 @@ def _evidence_timestamp(value: object, location: str) -> datetime:
     return parsed
 
 
-def _validate_requested(value: object) -> tuple[int, int | None]:
+def _validate_requested(value: object) -> tuple[int, int | None, int | None]:
     requested = _evidence_object(value, "execution_evidence.requested")
     if frozenset(requested) == frozenset({"workers"}):
         workers = _evidence_integer(
@@ -178,7 +178,7 @@ def _validate_requested(value: object) -> tuple[int, int | None]:
             raise ValueError(
                 "minimal requested evidence is valid only for zero workers"
             )
-        return workers, None
+        return workers, None, None
     if frozenset(requested) != _REQUESTED_KEYS:
         raise ValueError(
             "execution_evidence.requested keys must match the accepted SLURM schema"
@@ -199,12 +199,12 @@ def _validate_requested(value: object) -> tuple[int, int | None]:
         requested["startup_timeout"],
         "execution_evidence.requested.startup_timeout",
     )
-    _evidence_integer(
+    retries = _evidence_integer(
         requested["task_retries"],
         "execution_evidence.requested.task_retries",
         minimum=0,
     )
-    return workers, configured
+    return workers, configured, retries
 
 
 def _validate_rendered(value: object) -> bool:
@@ -352,23 +352,23 @@ def _validate_observed(
         addresses = tuple(probe.worker_address for probe in probes)
         if addresses != tuple(sorted(set(addresses))):
             raise ValueError("worker_probes must be unique and sorted by address")
-        if not set(addresses) <= set(connected):
-            raise ValueError("worker probe addresses must belong to connected_workers")
-        completed_startup = (
-            startup_phase == "complete" and startup_outcome == "succeeded"
-        )
-        if completed_startup and versions is not None:
+        validated_workers = _STARTUP_PHASES.index(
+            startup_phase
+        ) >= _STARTUP_PHASES.index("worker_stability_check")
+        if validated_workers and addresses != connected:
+            raise ValueError(
+                "validated worker probe addresses must exactly match connected_workers"
+            )
+        if validated_workers and versions is not None:
             expected_versions = tuple(sorted(versions.items()))
             if any(probe.package_versions != expected_versions for probe in probes):
                 raise ValueError(
-                    "worker probe package versions must match coordinator_versions"
+                    "validated worker package versions must match coordinator_versions"
                 )
-        if completed_startup and addresses != connected:
+        if validated_workers and any(not probe.ok for probe in probes):
             raise ValueError(
-                "completed startup requires one probe per connected worker"
+                "worker probes must all be ok after successful worker validation"
             )
-        if completed_startup and any(not probe.ok for probe in probes):
-            raise ValueError("completed startup requires every worker probe to be ok")
     cancellation_present = "cancellation" in observed
     if cancellation_present:
         _validate_cancellation(observed["cancellation"])
@@ -476,12 +476,13 @@ def _validate_startup(value: object) -> tuple[str, str]:
 def _validate_attempts(
     value: object,
     *,
-    worker_count: int,
+    expected_identities: tuple[tuple[str, int], ...],
+    task_retries: int,
     startup_outcome: str,
     cancellation_present: bool,
 ) -> None:
     attempts = _evidence_array(value, "execution_evidence.attempt_counts")
-    seen: set[tuple[str, int]] = set()
+    decoded: list[tuple[str, int]] = []
     for index, item in enumerate(attempts):
         attempt = _evidence_object(
             item,
@@ -500,20 +501,37 @@ def _validate_attempts(
         count = _evidence_integer(
             attempt["attempts"],
             f"execution_evidence.attempt_counts[{index}].attempts",
-            minimum=0,
+            minimum=1,
         )
         identity = (dataset_id, round_number)
-        if identity in seen:
+        if identity in decoded:
             raise ValueError(f"duplicate attempt identity: {identity!r}")
-        seen.add(identity)
-        if startup_outcome in {"failed", "interrupted", "not_started"} and count:
-            raise ValueError("round attempts cannot precede successful startup")
-        if startup_outcome == "succeeded" and not cancellation_present and count < 1:
+        decoded.append(identity)
+        if count > task_retries + 1:
             raise ValueError(
-                "settled execution requires at least one attempt per round"
+                "attempt count exceeds the configured executor retry policy"
             )
-    if worker_count and len(attempts) < worker_count:
-        raise ValueError("attempt evidence cannot contain fewer tasks than workers")
+    decoded_identities = tuple(decoded)
+    if startup_outcome != "succeeded":
+        if decoded_identities:
+            raise ValueError("round attempts cannot precede successful startup")
+        return
+    if cancellation_present:
+        submitted = set(decoded_identities)
+        canonical_subset = tuple(
+            identity for identity in expected_identities if identity in submitted
+        )
+        if decoded_identities != canonical_subset:
+            raise ValueError(
+                "cancelled attempt evidence must be a canonical subset of submitted "
+                "tasks"
+            )
+        return
+    if decoded_identities != expected_identities:
+        raise ValueError(
+            "settled attempt evidence must exactly match submitted tasks in "
+            "canonical order"
+        )
 
 
 def _validate_timestamps(value: object) -> None:
@@ -596,8 +614,24 @@ def _validate_cleanup(value: object, *, completed_startup: bool) -> None:
         )
 
 
-def _canonical_execution_evidence(value: object) -> str:
-    """Validate and detach the exact Task 2 SLURM evidence schema."""
+def _canonical_execution_evidence(
+    value: object,
+    *,
+    expected_tasks: tuple[RoundTask, ...],
+    task_retries: int,
+) -> str:
+    """Validate and detach Task 2 evidence against the submitted work context."""
+    if type(expected_tasks) is not tuple:
+        raise TypeError("expected_tasks must be an exact tuple")
+    expected_identities: list[tuple[str, int]] = []
+    for index, task in enumerate(expected_tasks):
+        if type(task) is not RoundTask:
+            raise TypeError(f"expected_tasks[{index}] must be an exact RoundTask")
+        identity = (task.dataset_id, task.round)
+        if identity in expected_identities:
+            raise ValueError(f"duplicate submitted task identity: {identity!r}")
+        expected_identities.append(identity)
+    retries = _evidence_integer(task_retries, "task_retries", minimum=0)
     evidence = _evidence_object(
         value,
         "execution_evidence",
@@ -605,7 +639,11 @@ def _canonical_execution_evidence(value: object) -> str:
     )
     if _evidence_string(evidence["executor"], "execution_evidence.executor") != "slurm":
         raise ValueError("execution_evidence.executor must be 'slurm'")
-    workers, configured = _validate_requested(evidence["requested"])
+    workers, configured, requested_retries = _validate_requested(evidence["requested"])
+    if requested_retries is not None and requested_retries != retries:
+        raise ValueError(
+            "execution evidence task_retries does not match the execution profile"
+        )
     rendered = _validate_rendered(evidence["rendered"])
     phase, outcome = _validate_startup(evidence["startup"])
     completed = phase == "complete" and outcome == "succeeded"
@@ -620,11 +658,13 @@ def _canonical_execution_evidence(value: object) -> str:
             "rendered template cannot precede successful template rendering"
         )
     if workers == 0:
-        if configured is not None or outcome != "not_started":
+        if configured is not None or outcome != "not_started" or expected_identities:
             raise ValueError("zero-worker evidence must remain not_started")
         for key in ("rendered", "observed", "attempt_counts", "cleanup"):
             if evidence[key] != {} and evidence[key] != []:
                 raise ValueError(f"zero-worker evidence must leave {key} empty")
+    elif not expected_identities:
+        raise ValueError("nonzero worker evidence requires submitted tasks")
     cancellation_present = _validate_observed(
         evidence["observed"],
         worker_count=workers,
@@ -633,7 +673,8 @@ def _canonical_execution_evidence(value: object) -> str:
     )
     _validate_attempts(
         evidence["attempt_counts"],
-        worker_count=workers,
+        expected_identities=tuple(expected_identities),
+        task_retries=retries,
         startup_outcome=outcome,
         cancellation_present=cancellation_present,
     )
@@ -908,6 +949,7 @@ class SlurmExecutor:
                 "attempts": attempts[index],
             }
             for index, task in enumerate(tasks)
+            if attempts[index] > 0
         ]
 
     @staticmethod

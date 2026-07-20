@@ -1326,9 +1326,7 @@ def test_slurm_startup_failure_writes_operational_summary_and_re_raises_same_err
     )
     if evidence_phase == "worker_wait":
         evidence["observed"] = {}
-    evidence["attempt_counts"] = [
-        {"dataset_id": "dataset-1", "round": 3, "attempts": 0}
-    ]
+    evidence["attempt_counts"] = []
     cause = RuntimeError("preserved cause")
     raised = error_type("injected failure")
     raised.__cause__ = cause
@@ -1355,9 +1353,61 @@ def test_slurm_startup_failure_writes_operational_summary_and_re_raises_same_err
     }
     assert [item["round"] for item in run_record["rounds"]] == [2]
     assert run_record["rounds"][0]["status"] == "reused"
-    assert run_record["execution"]["attempt_counts"] == [
-        {"dataset_id": "dataset-1", "round": 3, "attempts": 0}
-    ]
+    assert run_record["execution"]["attempt_counts"] == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "returned worker addresses differ from the scheduler snapshot",
+        "probe reported worker address different from its scheduler key",
+    ],
+    ids=("returned-set", "probe-identity"),
+)
+def test_slurm_preflight_address_discrepancy_remains_truthful_operational_evidence(
+    message: str,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    evidence = _slurm_evidence(outcome="failed")
+    startup = evidence["startup"]
+    assert isinstance(startup, dict)
+    startup.update(
+        {
+            "phase": "worker_validation",
+            "error": {"type": "WorkerPreflightError", "message": message},
+        }
+    )
+    evidence["attempt_counts"] = []
+    observed = evidence["observed"]
+    assert isinstance(observed, dict)
+    probes = observed["worker_probes"]
+    assert isinstance(probes, list)
+    probe = probes[0]
+    assert isinstance(probe, dict)
+    probe["worker_address"] = "tcp://unexpected-worker:1234"
+    probe["hostname"] = "unexpected-worker"
+    probe["network_host"] = "unexpected-worker"
+    raised = WorkerPreflightError(message)
+
+    def fail(_tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        raise raised
+
+    fake = _FakeExecutor(fail, execution_evidence=evidence)
+
+    with pytest.raises(WorkerPreflightError, match=message) as captured:
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert captured.value is raised
+    assert captured.value.run_record is not None
+    assert captured.value.execution_evidence_json == canonical_json(evidence)
+    run_record = json.loads(Path(captured.value.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] == evidence
+    assert run_record["operational_failure"]["phase"] == "preflight"
 
 
 def test_slurm_interruption_persists_cancelled_execution_evidence(
@@ -1438,6 +1488,42 @@ def test_slurm_invalid_evidence_fails_closed_with_a_durable_operational_summary(
     assert [item["status"] for item in run_record["rounds"]] == [
         "failed" if round_failed else "completed"
     ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["dataset", "round", "retry-overflow", "profile-retry-mismatch"],
+)
+def test_slurm_attempt_evidence_is_validated_against_submitted_work_and_profile(
+    case: str,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    evidence = _slurm_evidence()
+    attempts = evidence["attempt_counts"]
+    requested = evidence["requested"]
+    assert isinstance(attempts, list)
+    assert isinstance(attempts[0], dict)
+    assert isinstance(requested, dict)
+    if case == "dataset":
+        attempts[0]["dataset_id"] = "unrelated-dataset"
+    elif case == "round":
+        attempts[0]["round"] = 999
+    elif case == "retry-overflow":
+        attempts[0]["attempts"] = 100
+    else:
+        requested["task_retries"] = 1
+    fake = _FakeExecutor(
+        lambda tasks: tuple(_result(task) for task in tasks),
+        execution_evidence=evidence,
+    )
+
+    with pytest.raises(ExecutorStartupError, match="invalid SLURM execution evidence"):
+        run_workflow(plan, _executor_factory=_factory(fake))
 
 
 def test_slurm_invalid_evidence_during_interruption_preserves_the_primary_cancel(

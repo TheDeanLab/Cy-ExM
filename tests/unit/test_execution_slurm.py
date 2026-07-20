@@ -302,6 +302,8 @@ class _FakeClient:
     ) -> _FakeFuture:
         del runner
         self._modules.events.append(f"submit:{task.round}")
+        if self._modules.submit_error is not None:
+            raise self._modules.submit_error
         self._modules.submit_calls.append(
             _SubmitCall(task, key, pure, retries, resources)
         )
@@ -357,6 +359,7 @@ class _FakeSlurmModules:
         self.client_error: BaseException | None = None
         self.wait_error: BaseException | None = None
         self.run_error: BaseException | None = None
+        self.submit_error: BaseException | None = None
         self.cancel_error: BaseException | None = None
         self.client_close_error: BaseException | None = None
         self.cluster_close_error: BaseException | None = None
@@ -791,6 +794,8 @@ def _invalid_execution_evidence(
         requested["workers"] = True
     elif case == "requested_bound":
         requested["workers"] = 5
+    elif case == "requested_retry_mismatch":
+        requested["task_retries"] = 1
     elif case == "rendered_stale":
         rendered["submitted_job_script"] = rendered.pop("rendered_job_script_template")
     elif case == "rendered_missing":
@@ -856,7 +861,7 @@ def _invalid_execution_evidence(
                 "error": {"type": "RuntimeError", "message": "wait failed"},
             }
         )
-        attempts[0]["attempts"] = 0
+        attempts.clear()
     elif case == "interrupted_without_cancellation":
         startup.update(
             {
@@ -866,13 +871,19 @@ def _invalid_execution_evidence(
             }
         )
         observed.clear()
-        attempts[0]["attempts"] = 0
+        attempts.clear()
     elif case == "attempt_missing":
         attempts[0].pop("round")
     elif case == "attempt_bool":
         attempts[0]["attempts"] = True
     elif case == "attempt_duplicate":
         attempts.append(dict(attempts[0]))
+    elif case == "attempt_dataset":
+        attempts[0]["dataset_id"] = "unrelated-dataset"
+    elif case == "attempt_round":
+        attempts[0]["round"] = 999
+    elif case == "attempt_retry_overflow":
+        attempts[0]["attempts"] = 100
     elif case == "attempt_empty":
         attempts.clear()
     elif case == "attempt_zero_without_cancel":
@@ -908,10 +919,15 @@ def test_slurm_evidence_schema_returns_a_detached_canonical_snapshot(
     modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
-    executor.execute((_task(tmp_path, 2),))
+    task = _task(tmp_path, 2)
+    executor.execute((task,))
     evidence = cast(dict[str, object], executor.execution_evidence)
 
-    encoded = slurm_module._canonical_execution_evidence(evidence)
+    encoded = slurm_module._canonical_execution_evidence(
+        evidence,
+        expected_tasks=(task,),
+        task_retries=0,
+    )
 
     assert json.loads(encoded) == evidence
     cast(dict[str, object], evidence["rendered"])["rendered_job_script_template"] = (
@@ -931,7 +947,8 @@ def test_slurm_evidence_schema_preserves_truthful_failed_probe_mismatch(
     modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
-    executor.execute((_task(tmp_path, 2),))
+    task = _task(tmp_path, 2)
+    executor.execute((task,))
     evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
     startup = cast(dict[str, object], evidence["startup"])
     startup.update(
@@ -944,8 +961,7 @@ def test_slurm_evidence_schema_preserves_truthful_failed_probe_mismatch(
             },
         }
     )
-    attempts = cast(list[dict[str, object]], evidence["attempt_counts"])
-    attempts[0]["attempts"] = 0
+    evidence["attempt_counts"] = []
     observed = cast(dict[str, object], evidence["observed"])
     probe = cast(list[dict[str, object]], observed["worker_probes"])[0]
     probe["ok"] = False
@@ -953,7 +969,11 @@ def test_slurm_evidence_schema_preserves_truthful_failed_probe_mismatch(
     versions = cast(list[list[str]], probe["package_versions"])
     versions[1][1] = "other-version"
 
-    encoded = slurm_module._canonical_execution_evidence(evidence)
+    encoded = slurm_module._canonical_execution_evidence(
+        evidence,
+        expected_tasks=(task,),
+        task_retries=0,
+    )
 
     assert json.loads(encoded) == evidence
 
@@ -969,6 +989,7 @@ def test_slurm_evidence_schema_preserves_truthful_failed_probe_mismatch(
         "requested_extra",
         "requested_bool",
         "requested_bound",
+        "requested_retry_mismatch",
         "rendered_stale",
         "rendered_missing",
         "rendered_alias",
@@ -994,6 +1015,9 @@ def test_slurm_evidence_schema_preserves_truthful_failed_probe_mismatch(
         "attempt_missing",
         "attempt_bool",
         "attempt_duplicate",
+        "attempt_dataset",
+        "attempt_round",
+        "attempt_retry_overflow",
         "attempt_empty",
         "attempt_zero_without_cancel",
         "timestamps_missing",
@@ -1014,12 +1038,70 @@ def test_slurm_evidence_schema_fails_closed_on_malformed_or_inconsistent_values(
     modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
-    executor.execute((_task(tmp_path, 2),))
+    task = _task(tmp_path, 2)
+    executor.execute((task,))
     evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
     _invalid_execution_evidence(evidence, case)
 
     with pytest.raises((TypeError, ValueError)):
-        slurm_module._canonical_execution_evidence(evidence)
+        slurm_module._canonical_execution_evidence(
+            evidence,
+            expected_tasks=(task,),
+            task_retries=0,
+        )
+
+
+@pytest.mark.parametrize("case", ["missing", "reordered"])
+def test_slurm_evidence_schema_requires_every_submitted_task_in_canonical_order(
+    case: str,
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    executor = _executor(tmp_path, modules, workers=1)
+    executor.execute(tasks)
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    attempts = cast(list[dict[str, object]], evidence["attempt_counts"])
+    if case == "missing":
+        attempts.pop()
+    else:
+        attempts.reverse()
+
+    with pytest.raises(ValueError):
+        slurm_module._canonical_execution_evidence(
+            evidence,
+            expected_tasks=tasks,
+            task_retries=0,
+        )
+
+
+def test_slurm_evidence_schema_accepts_canonical_submitted_subset_on_cancel(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    executor = _executor(tmp_path, modules, workers=1)
+    executor.execute(tasks)
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    observed = cast(dict[str, object], evidence["observed"])
+    observed["cancellation"] = {
+        "attempted": True,
+        "unfinished_futures": 1,
+        "force": True,
+        "succeeded": True,
+    }
+    attempts = cast(list[dict[str, object]], evidence["attempt_counts"])
+    attempts.pop()
+
+    encoded = slurm_module._canonical_execution_evidence(
+        evidence,
+        expected_tasks=tasks,
+        task_retries=0,
+    )
+
+    assert json.loads(encoded)["attempt_counts"] == attempts
 
 
 def test_slurm_executor_preflight_uses_exact_versions_threads_and_roots(
@@ -1136,6 +1218,21 @@ def test_slurm_executor_records_exact_failed_startup_phase_and_scale_outcome(
         "scale_succeeded": scale_succeeded,
         "error": {"type": "RuntimeError", "message": f"{failure_point} failed"},
     }
+    assert executor.execution_evidence["attempt_counts"] == []
+
+
+def test_slurm_executor_does_not_count_a_task_rejected_during_submission(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    modules.submit_error = RuntimeError("scheduler rejected submission")
+    executor = _executor(tmp_path, modules)
+
+    with pytest.raises(RuntimeError, match="scheduler rejected submission"):
+        executor.execute((_task(tmp_path, 2),))
+
+    assert executor.execution_evidence["attempt_counts"] == []
 
 
 def test_slurm_executor_records_preflight_interrupt_without_fake_cancellation(

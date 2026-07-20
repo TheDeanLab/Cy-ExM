@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ from cyexm.config.models import (
     RegistrationSpec,
     RegistrationStageSpec,
 )
-from cyexm.errors import ExecutorStartupError
+from cyexm.errors import ExecutorStartupError, RoundExecutionError
 from cyexm.execution.dask import LocalDaskExecutor
 from cyexm.workflow.models import (
     ChannelTask,
@@ -109,7 +109,12 @@ def _result(task: RoundTask, *, status: str = "completed") -> RoundResult:
         slurm_job_id=None,
         strategy=task.strategy,
         native_threads=(("itk", 2), ("blas", 3)),
-        artifact_paths=tuple(str(channel.output) for channel in task.channels),
+        artifact_paths=(
+            str(task.registration_directory / f"linear_transform_{task.round}.mat"),
+            str(task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz"),
+            str(task.registration_directory / f"nonlinear_registered_{task.round}.tif"),
+            *(str(channel.output) for channel in task.channels),
+        ),
         reused_artifacts=(),
         log_path=str(task.log_path),
         failure=failure,
@@ -126,10 +131,21 @@ class _SubmitCall:
 
 
 class _FakeFuture:
-    def __init__(self, task: RoundTask, key: str, outcome: object) -> None:
+    def __init__(
+        self,
+        task: RoundTask,
+        key: str,
+        outcome: object,
+        *,
+        done: bool,
+    ) -> None:
         self.task = task
         self.key = key
         self.outcome = outcome
+        self._done = done
+
+    def done(self) -> bool:
+        return self._done
 
 
 class _FakeAsCompleted(Iterator[tuple[_FakeFuture, object]]):
@@ -162,6 +178,7 @@ class _FakeAsCompleted(Iterator[tuple[_FakeFuture, object]]):
             raise StopIteration
         self._yielded += 1
         future = self._queue.pop(0)
+        future._done = True
         return future, future.outcome
 
     def add(self, future: _FakeFuture) -> None:
@@ -203,7 +220,12 @@ class _FakeClient:
         )
         configured = self._modules.outcomes.setdefault(task.round, [])
         outcome = configured.pop(0) if configured else _result(task)
-        return _FakeFuture(task, key, outcome)
+        return _FakeFuture(
+            task,
+            key,
+            outcome,
+            done=task.round not in self._modules.pending_rounds,
+        )
 
     def cancel(self, futures: tuple[_FakeFuture, ...], *, force: bool) -> None:
         self._modules.cancel_call = (futures, force)
@@ -231,9 +253,10 @@ class _FakeDistributedModules:
         self.cluster_error: Exception | None = None
         self.client_error: Exception | None = None
         self.wait_error: Exception | None = None
-        self.cancel_error: Exception | None = None
-        self.client_close_error: Exception | None = None
-        self.cluster_close_error: Exception | None = None
+        self.pending_rounds: set[int] = set()
+        self.cancel_error: BaseException | None = None
+        self.client_close_error: BaseException | None = None
+        self.cluster_close_error: BaseException | None = None
 
     def LocalCluster(self, **kwargs: object) -> _FakeCluster:
         if self.cluster_error is not None:
@@ -352,7 +375,10 @@ def test_local_executor_resubmits_future_exceptions_and_structures_exhaustion(
 ) -> None:
     modules = _FakeDistributedModules()
     task = _task(tmp_path, 2)
-    modules.outcomes[2] = [ValueError("first"), RuntimeError("second")]
+    modules.outcomes[2] = [
+        (ValueError, ValueError("first"), None),
+        (RuntimeError, RuntimeError("second"), None),
+    ]
 
     result = LocalDaskExecutor(
         _profile(tmp_path, retries=1), _modules=lambda: modules
@@ -363,11 +389,129 @@ def test_local_executor_resubmits_future_exceptions_and_structures_exhaustion(
     assert result.round == 2
     assert result.dask_task_key == "cyexm-dataset-1-round-002-attempt-002"
     assert result.hostname == "unknown"
-    assert result.pid == 0
+    assert result.pid > 0
     assert result.failure == RoundFailure(
         stage="round",
         exception_type="RuntimeError",
         message="second",
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        (RuntimeError, "not an exception", None),
+        ("RuntimeError", RuntimeError("bad type"), None),
+        (RuntimeError, RuntimeError("missing traceback slot")),
+    ],
+)
+def test_local_executor_defensively_structures_malformed_error_payloads(
+    tmp_path: Path,
+    outcome: object,
+) -> None:
+    modules = _FakeDistributedModules()
+    modules.outcomes[2] = [outcome]
+
+    result = LocalDaskExecutor(_profile(tmp_path), _modules=lambda: modules).execute(
+        (_task(tmp_path, 2),)
+    )[0]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.exception_type == "TypeError"
+    assert "malformed distributed error payload" in result.failure.message
+    assert result.pid > 0
+
+
+class _RoundResultSubclass(RoundResult):
+    pass
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        lambda value: replace(value, dataset_id="wrong-dataset"),
+        lambda value: replace(value, round=99),
+        lambda value: replace(value, native_threads=(("itk", 999), ("blas", 3))),
+        lambda value: replace(value, pid=0),
+        lambda value: replace(
+            value,
+            started_at="2026-07-20T10:00:02Z",
+            ended_at="2026-07-20T10:00:01Z",
+        ),
+        lambda value: _RoundResultSubclass(
+            **{
+                field: getattr(value, field)
+                for field in RoundResult.__dataclass_fields__
+            }
+        ),
+    ],
+)
+def test_local_executor_rejects_malformed_or_wrong_task_round_results(
+    tmp_path: Path,
+    malformed: Callable[[RoundResult], RoundResult],
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+    modules.outcomes[2] = [malformed(_result(task))]
+
+    result = LocalDaskExecutor(_profile(tmp_path), _modules=lambda: modules).execute(
+        (task,)
+    )[0]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.exception_type == "RoundExecutionError"
+
+
+def test_local_executor_validates_tasks_before_loading_scheduler_modules(
+    tmp_path: Path,
+) -> None:
+    loaded = False
+
+    def modules() -> _FakeDistributedModules:
+        nonlocal loaded
+        loaded = True
+        return _FakeDistributedModules()
+
+    malformed = replace(_task(tmp_path, 2), round=True)
+    with pytest.raises(RoundExecutionError, match=r"tasks\[0\].*round"):
+        LocalDaskExecutor(_profile(tmp_path), _modules=modules).execute((malformed,))
+
+    assert loaded is False
+
+
+def test_local_executor_rejects_duplicate_task_identities_before_cluster_mutation(
+    tmp_path: Path,
+) -> None:
+    loaded = False
+
+    def modules() -> _FakeDistributedModules:
+        nonlocal loaded
+        loaded = True
+        return _FakeDistributedModules()
+
+    task = _task(tmp_path, 2)
+    with pytest.raises(RoundExecutionError, match="duplicate task identity"):
+        LocalDaskExecutor(_profile(tmp_path), _modules=modules).execute((task, task))
+
+    assert loaded is False
+
+
+def test_local_executor_bookkeeping_uses_task_identity_not_round_only(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    first = _task(tmp_path, 2, dataset_id="dataset-1")
+    second = _task(tmp_path, 2, dataset_id="dataset-2")
+
+    results = LocalDaskExecutor(_profile(tmp_path), _modules=lambda: modules).execute(
+        (first, second)
+    )
+
+    assert tuple(result.dataset_id for result in results) == (
+        "dataset-1",
+        "dataset-2",
     )
 
 
@@ -447,6 +591,7 @@ def test_local_executor_cancels_only_unfinished_futures_on_keyboard_interrupt(
     modules = _FakeDistributedModules()
     modules.order = (2, 3, 4)
     modules.interrupt_after = 1
+    modules.pending_rounds = {4}
 
     with pytest.raises(KeyboardInterrupt, match="collection interruption"):
         LocalDaskExecutor(_profile(tmp_path), _modules=lambda: modules).execute(
@@ -455,7 +600,7 @@ def test_local_executor_cancels_only_unfinished_futures_on_keyboard_interrupt(
 
     assert modules.cancel_call is not None
     cancelled, force = modules.cancel_call
-    assert {future.task.round for future in cancelled} == {3, 4}
+    assert {future.task.round for future in cancelled} == {4}
     assert force is True
     assert modules.events == ["client.close", "cluster.close"]
 
@@ -466,8 +611,10 @@ def test_local_executor_preserves_interrupt_when_cancel_and_cleanup_fail(
 ) -> None:
     modules = _FakeDistributedModules()
     modules.interrupt_after = 0
-    modules.cancel_error = RuntimeError("cancel failed")
-    modules.client_close_error = RuntimeError("close failed")
+    modules.pending_rounds = {2}
+    modules.cancel_error = SystemExit("cancel failed")
+    modules.client_close_error = KeyboardInterrupt("client close failed")
+    modules.cluster_close_error = SystemExit("cluster close failed")
 
     with (
         caplog.at_level(logging.WARNING, logger="cyexm.execution.dask"),
@@ -478,7 +625,8 @@ def test_local_executor_preserves_interrupt_when_cancel_and_cleanup_fail(
         )
 
     assert "cancel failed" in caplog.text
-    assert "close failed" in caplog.text
+    assert "client close failed" in caplog.text
+    assert "cluster close failed" in caplog.text
     assert modules.events == ["client.close", "cluster.close"]
 
 

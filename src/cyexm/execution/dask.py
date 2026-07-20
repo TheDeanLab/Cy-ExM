@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from types import TracebackType
+from typing import Any, cast
 
 from cyexm.config.models import ExecutionProfile, LocalDaskSpec
-from cyexm.errors import ExecutorStartupError
+from cyexm.errors import ExecutorStartupError, RoundExecutionError
 from cyexm.execution.base import RoundTaskRunner
+from cyexm.workflow._execution_validation import (
+    _validate_executor_round_task,
+    _validate_round_result,
+)
 from cyexm.workflow.models import RoundFailure, RoundResult, RoundTask
 from cyexm.workflow.round_task import run_round_task
 
@@ -25,6 +31,15 @@ class _DistributedModules:
     LocalCluster: Any
     as_completed: Any
     parse_timedelta: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _Submission:
+    task_index: int
+    task: RoundTask
+    key: str
+    started_at: str
+    started: float
 
 
 def _distributed_modules() -> _DistributedModules:
@@ -62,7 +77,7 @@ def _exception_result(
         ended_at=_utc_now(),
         duration_seconds=max(0.0, time.monotonic() - started),
         hostname="unknown",
-        pid=0,
+        pid=os.getpid(),
         dask_task_key=key,
         slurm_job_id=None,
         strategy=task.strategy,
@@ -85,13 +100,45 @@ def _close_owned(client: Any | None, cluster: Any | None) -> None:
     if client is not None:
         try:
             client.close()
-        except Exception as error:
+        except BaseException as error:
             _LOGGER.warning("Failed to close owned Dask client: %s", error)
     if cluster is not None:
         try:
             cluster.close()
-        except Exception as error:
+        except BaseException as error:
             _LOGGER.warning("Failed to close owned local Dask cluster: %s", error)
+
+
+def _distributed_error(outcome: object) -> BaseException:
+    if isinstance(outcome, BaseException):
+        return outcome
+    if type(outcome) is not tuple:
+        return TypeError(f"Dask round task returned an unsupported result: {outcome!r}")
+    if len(outcome) != 3:
+        return TypeError(
+            f"malformed distributed error payload: expected 3 entries; got {outcome!r}"
+        )
+    exception_type, exception, traceback = outcome
+    if (
+        not isinstance(exception_type, type)
+        or not issubclass(exception_type, BaseException)
+        or not isinstance(exception, BaseException)
+        or type(exception) is not exception_type
+        or (traceback is not None and type(traceback) is not TracebackType)
+    ):
+        return TypeError(f"malformed distributed error payload: {outcome!r}")
+    return exception
+
+
+def _future_is_unfinished(future: Any) -> bool:
+    try:
+        return not bool(future.done())
+    except BaseException as error:
+        status = getattr(future, "status", None)
+        if status in {"finished", "error", "cancelled"}:
+            return False
+        _LOGGER.warning("Could not inspect Dask future completion state: %s", error)
+        return True
 
 
 class LocalDaskExecutor:
@@ -124,6 +171,16 @@ class LocalDaskExecutor:
             return ()
 
         spec = self._spec()
+        identities: set[tuple[str, int]] = set()
+        for index, task in enumerate(tasks):
+            _validate_executor_round_task(task, index)
+            identity = (task.dataset_id, task.round)
+            if identity in identities:
+                raise RoundExecutionError(
+                    "LocalDaskExecutor received a duplicate task identity: "
+                    f"{identity!r}"
+                )
+            identities.add(identity)
         worker_count = min(len(tasks), spec.workers)
         cluster: Any | None = None
         client: Any | None = None
@@ -152,17 +209,16 @@ class LocalDaskExecutor:
                     f"{spec.startup_timeout}: {error}"
                 ) from error
 
-            attempts: dict[int, int] = {}
-            attempt_started: dict[int, tuple[str, float]] = {}
-            tasks_by_future: dict[Any, RoundTask] = {}
-            keys_by_future: dict[Any, str] = {}
+            attempts = [0 for _task in tasks]
+            submissions: dict[Any, _Submission] = {}
             execution_client = client
             assert execution_client is not None
 
-            def submit(task: RoundTask) -> Any:
-                attempt = attempts.get(task.round, 0) + 1
-                attempts[task.round] = attempt
-                attempt_started[task.round] = (_utc_now(), time.monotonic())
+            def submit(task_index: int, task: RoundTask) -> Any:
+                attempts[task_index] += 1
+                attempt = attempts[task_index]
+                started_at = _utc_now()
+                started = time.monotonic()
                 key = _task_key(task, attempt)
                 future = execution_client.submit(
                     self._runner,
@@ -172,60 +228,71 @@ class LocalDaskExecutor:
                     retries=0,
                     resources=dict(_ROUND_RESOURCE),
                 )
-                tasks_by_future[future] = task
-                keys_by_future[future] = key
+                submissions[future] = _Submission(
+                    task_index,
+                    task,
+                    key,
+                    started_at,
+                    started,
+                )
                 active.add(future)
                 return future
 
-            initial = [submit(task) for task in tasks]
+            initial = [submit(index, task) for index, task in enumerate(tasks)]
             completed = modules.as_completed(
                 initial,
                 with_results=True,
                 raise_errors=False,
             )
-            terminal: dict[int, RoundResult] = {}
+            terminal: list[RoundResult | None] = [None for _task in tasks]
             for future, outcome in completed:
                 active.discard(future)
-                task = tasks_by_future[future]
-                key = keys_by_future[future]
+                submission = submissions[future]
+                task = submission.task
                 if isinstance(outcome, RoundResult):
                     result = outcome
-                elif isinstance(outcome, BaseException):
-                    started_at, started = attempt_started[task.round]
-                    result = _exception_result(
-                        task,
-                        outcome,
-                        key=key,
-                        started_at=started_at,
-                        started=started,
-                    )
+                    try:
+                        _validate_round_result(task, result)
+                    except RoundExecutionError as error:
+                        result = _exception_result(
+                            task,
+                            error,
+                            key=submission.key,
+                            started_at=submission.started_at,
+                            started=submission.started,
+                        )
                 else:
-                    started_at, started = attempt_started[task.round]
                     result = _exception_result(
                         task,
-                        TypeError(
-                            "Dask round task returned an unsupported result: "
-                            f"{outcome!r}"
-                        ),
-                        key=key,
-                        started_at=started_at,
-                        started=started,
+                        _distributed_error(outcome),
+                        key=submission.key,
+                        started_at=submission.started_at,
+                        started=submission.started,
                     )
+                _validate_round_result(task, result)
 
                 if (
                     result.status == "failed"
-                    and attempts[task.round] <= spec.task_retries
+                    and attempts[submission.task_index] <= spec.task_retries
                 ):
-                    completed.add(submit(task))
+                    completed.add(submit(submission.task_index, task))
                     continue
-                terminal[task.round] = result
+                terminal[submission.task_index] = result
 
-            return tuple(terminal[task.round] for task in tasks)
+            if any(result is None for result in terminal):
+                raise RoundExecutionError(
+                    "Local Dask completion ended before every task settled"
+                )
+            return cast(tuple[RoundResult, ...], tuple(terminal))
         except KeyboardInterrupt:
             if client is not None and active:
+                unfinished = tuple(
+                    future for future in active if _future_is_unfinished(future)
+                )
                 try:
-                    client.cancel(tuple(active), force=True)
-                except Exception as error:
+                    if unfinished:
+                        client.cancel(unfinished, force=True)
+                except BaseException as error:
                     _LOGGER.warning(
                         "Failed to cancel unfinished local Dask futures: %s", error
                     )

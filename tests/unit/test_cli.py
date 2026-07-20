@@ -593,6 +593,128 @@ def test_local_dask_constructor_failure_maps_to_exit_three_without_fallback(
     assert captured.err == "cyexm: error: injected local Dask constructor failure\n"
 
 
+def test_slurm_constructor_failure_maps_to_exit_three_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cyexm.execution import slurm as slurm_execution
+    from cyexm.execution.sequential import SequentialExecutor
+
+    api = _FakeWorkflowApi()
+    api.execution = SimpleNamespace(
+        executor="slurm",
+        paths=SimpleNamespace(
+            dataset_root=Path("/dataset"),
+            output_root=Path("/output"),
+            worker_local_directory=Path("/project/cyexm-scratch"),
+        ),
+        native_threads=api.execution.native_threads,
+        local_dask=None,
+        slurm=SimpleNamespace(
+            queue="512GB",
+            workers=2,
+            cores_per_worker=72,
+            processes_per_worker=1,
+            memory="500GB",
+            walltime="72:00:00",
+            interface="ib0",
+            scheduler_interface="ib0",
+            startup_timeout="15m",
+            task_retries=0,
+            job_name="cyexm-registration",
+            job_extra_directives=(),
+        ),
+    )
+    api.plan.execution = api.execution
+    sequential_calls: list[object] = []
+
+    class FailingSlurmExecutor:
+        def __init__(self, profile: object) -> None:
+            del profile
+            raise ExecutorStartupError("injected SLURM constructor failure")
+
+    def run_through_production_factory(
+        plan: object,
+        *,
+        force_rounds: frozenset[int],
+        force_all: bool,
+    ) -> _StructuredResult:
+        del force_rounds, force_all
+        workflow_api._default_executor_factory(plan.execution)  # type: ignore[attr-defined]
+        raise AssertionError("SLURM executor construction unexpectedly returned")
+
+    api.run_workflow = run_through_production_factory  # type: ignore[method-assign]
+    monkeypatch.setattr(cli_commands, "_load_workflow_api", lambda: api)
+    monkeypatch.setattr(slurm_execution, "SlurmExecutor", FailingSlurmExecutor)
+    monkeypatch.setattr(
+        SequentialExecutor,
+        "execute",
+        lambda _self, tasks: sequential_calls.append(tasks) or (),
+    )
+
+    exit_code = main(
+        [
+            "workflow",
+            "run",
+            "dataset.yaml",
+            "--execution",
+            "slurm.yaml",
+        ]
+    )
+
+    assert exit_code == 3
+    assert sequential_calls == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "cyexm: error: injected SLURM constructor failure\n"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_exit"),
+    [
+        (ExecutorStartupError("SLURM worker wait failed"), 3),
+        (WorkerPreflightError("SLURM worker preflight failed"), 3),
+        (WorkflowExecutionError((2,), "/run.json"), 4),
+        (KeyboardInterrupt("SLURM cancellation"), 130),
+    ],
+    ids=("worker-wait", "worker-preflight", "round-failure", "interruption"),
+)
+def test_slurm_lifecycle_failures_map_to_stable_cli_exit_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: BaseException,
+    expected_exit: int,
+) -> None:
+    api = _FakeWorkflowApi()
+
+    def fail(
+        plan: object,
+        *,
+        force_rounds: frozenset[int],
+        force_all: bool,
+    ) -> _StructuredResult:
+        del plan, force_rounds, force_all
+        raise error
+
+    api.run_workflow = fail  # type: ignore[method-assign]
+    monkeypatch.setattr(cli_commands, "_load_workflow_api", lambda: api)
+
+    exit_code = main(
+        [
+            "workflow",
+            "run",
+            "dataset.yaml",
+            "--execution",
+            "slurm.yaml",
+        ]
+    )
+
+    assert exit_code == expected_exit
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("\n") == 1
+
+
 def test_run_restores_the_prior_sigterm_handler_after_success(
     fake_api: _FakeWorkflowApi,
 ) -> None:

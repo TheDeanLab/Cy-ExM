@@ -426,6 +426,40 @@ def _slurm_execution(plan: WorkflowPlan, tmp_path: Path) -> ExecutionProfile:
     )
 
 
+def _slurm_evidence(*, outcome: str = "succeeded") -> dict[str, object]:
+    return {
+        "executor": "slurm",
+        "requested": {
+            "workers": 2,
+            "configured_workers": 2,
+            "startup_timeout": "15m",
+            "task_retries": 0,
+        },
+        "rendered": {
+            "rendered_job_script_template": (
+                "#!/usr/bin/env bash\n#SBATCH --partition=512GB\n"
+            )
+        },
+        "observed": {"scheduler_address": "tcp://scheduler:8786"},
+        "startup": {
+            "phase": "complete",
+            "outcome": outcome,
+            "scale_attempted": True,
+            "scale_succeeded": True,
+        },
+        "attempt_counts": [{"dataset_id": "dataset-1", "round": 2, "attempts": 1}],
+        "timestamps": {
+            "started_at": "2026-07-20T10:00:00Z",
+            "ended_at": "2026-07-20T10:00:01Z",
+        },
+        "cleanup": {
+            "client": {"attempted": True, "succeeded": True},
+            "cluster": {"attempted": True, "succeeded": True},
+            "order": ["client", "cluster"],
+        },
+    }
+
+
 def _invalid_execution(
     plan: WorkflowPlan,
     tmp_path: Path,
@@ -678,9 +712,13 @@ class _FakeExecutor:
     def __init__(
         self,
         callback: Callable[[tuple[RoundTask, ...]], tuple[RoundResult, ...]],
+        *,
+        execution_evidence: object | None = None,
     ) -> None:
         self.callback = callback
         self.calls: list[tuple[RoundTask, ...]] = []
+        if execution_evidence is not None:
+            self.execution_evidence = execution_evidence
 
     def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
         self.calls.append(tasks)
@@ -1108,16 +1146,36 @@ def test_local_dask_constructor_failure_never_falls_back_to_sequential(
     assert not layout.workflow_runs.exists()
 
 
-def test_run_workflow_rejects_slurm_without_falling_back_to_sequential(
+def test_run_workflow_lazily_selects_slurm_without_falling_back_to_sequential(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from cyexm.execution import slurm as slurm_execution
+
     sequential_plan = _plan(tmp_path, rounds=(2,))
     plan = replace(
         sequential_plan,
         execution=_slurm_execution(sequential_plan, tmp_path),
     )
+    evidence = _slurm_evidence()
+    slurm_calls: list[tuple[str, tuple[int, ...]]] = []
     sequential_calls: list[tuple[int, ...]] = []
+
+    class FakeSlurmExecutor:
+        def __init__(self, profile: ExecutionProfile) -> None:
+            self.profile = profile
+
+        @property
+        def execution_evidence(self) -> object:
+            return evidence
+
+        def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+            slurm_calls.append(
+                (self.profile.executor, tuple(task.round for task in tasks))
+            )
+            return tuple(_result(task) for task in tasks)
+
+    monkeypatch.setattr(slurm_execution, "SlurmExecutor", FakeSlurmExecutor)
     monkeypatch.setattr(
         SequentialExecutor,
         "execute",
@@ -1127,13 +1185,181 @@ def test_run_workflow_rejects_slurm_without_falling_back_to_sequential(
         ),
     )
 
-    with pytest.raises(
-        ExecutorStartupError,
-        match=r"^SLURM execution is not available in this installed milestone$",
-    ):
-        run_workflow(plan)
+    result = run_workflow(plan)
 
+    assert slurm_calls == [("slurm", (2,))]
     assert sequential_calls == []
+    assert json.loads(result.execution_evidence_json) == evidence
+
+
+def test_slurm_execution_evidence_is_operational_detached_and_canonical(
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    evidence = _slurm_evidence()
+    fake = _FakeExecutor(
+        lambda tasks: tuple(_result(task) for task in tasks),
+        execution_evidence=evidence,
+    )
+
+    result = run_workflow(plan, _executor_factory=_factory(fake))
+
+    expected = canonical_json(evidence)
+    assert result.execution_evidence_json == expected
+    run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] == evidence
+    assert run_record["scientific_fingerprint"] == plan.scientific_fingerprint
+    assert "rendered_job_script_template" not in plan.scientific_json
+    assert "scheduler_address" not in plan.scientific_json
+
+    rendered = evidence["rendered"]
+    assert isinstance(rendered, dict)
+    rendered["rendered_job_script_template"] = "mutated"
+    assert result.execution_evidence_json == expected
+    assert (
+        json.loads(Path(result.run_record).read_text(encoding="utf-8"))["execution"]
+        != evidence
+    )
+
+
+def test_slurm_failed_round_persists_post_preflight_execution_evidence(
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    evidence = _slurm_evidence()
+    fake = _FakeExecutor(
+        lambda tasks: tuple(_result(task, failed=True) for task in tasks),
+        execution_evidence=evidence,
+    )
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    run_record = json.loads(Path(captured.value.run_record).read_text(encoding="utf-8"))
+    assert run_record["status"] == "failed"
+    assert run_record["execution"] == evidence
+    assert run_record["execution"]["startup"]["outcome"] == "succeeded"
+
+
+def test_slurm_interruption_persists_cancelled_execution_evidence(
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    evidence = _slurm_evidence()
+    observed = evidence["observed"]
+    assert isinstance(observed, dict)
+    observed["cancellation"] = {
+        "attempted": True,
+        "unfinished_futures": 1,
+        "force": True,
+        "succeeded": True,
+    }
+
+    def interrupt(_tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        raise KeyboardInterrupt("injected SLURM interruption")
+
+    fake = _FakeExecutor(interrupt, execution_evidence=evidence)
+
+    with pytest.raises(KeyboardInterrupt, match="SLURM interruption"):
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root,
+            plan.dataset_id,
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    run_record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert run_record["status"] == "cancelled"
+    assert run_record["execution"] == evidence
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        ["not-an-object"],
+        {_StringAlias("executor"): "slurm"},
+        {"elapsed": float("nan")},
+        {"tuple": (1, 2)},
+        {"opaque": object()},
+    ],
+    ids=("root-list", "string-alias-key", "nonfinite", "tuple", "opaque"),
+)
+def test_slurm_unsupported_injected_evidence_is_ignored_safely(
+    unsupported: object,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    fake = _FakeExecutor(
+        lambda tasks: tuple(_result(task) for task in tasks),
+        execution_evidence=unsupported,
+    )
+
+    result = run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert result.execution_evidence_json == "{}"
+    run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] == {}
+
+
+def test_local_dask_does_not_claim_injected_slurm_evidence(tmp_path: Path) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_local_execution(sequential_plan, tmp_path),
+    )
+    fake = _FakeExecutor(
+        lambda tasks: tuple(_result(task) for task in tasks),
+        execution_evidence=_slurm_evidence(),
+    )
+
+    result = run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert result.execution_evidence_json == "{}"
+    run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] == {}
+
+
+def test_all_reused_slurm_workflow_does_not_construct_an_executor_or_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    for artifact in _artifacts(plan.tasks[0]):
+        _commit_artifact(artifact, plan)
+
+    def unexpected_factory(_profile: ExecutionProfile) -> WorkflowExecutor:
+        raise AssertionError("all-reused SLURM workflow constructed an executor")
+
+    monkeypatch.setattr(workflow_api, "_default_executor_factory", unexpected_factory)
+
+    result = run_workflow(plan)
+
+    assert tuple(round_result.status for round_result in result.rounds) == ("reused",)
+    assert result.execution_evidence_json == "{}"
+    run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
+    assert run_record["execution"] == {}
 
 
 def test_run_workflow_skips_a_complete_round_without_opening_execution(

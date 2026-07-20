@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import Protocol, cast
 from uuid import uuid4
 
 from cyexm.config._validation import finite_positive_float
@@ -42,6 +44,7 @@ from cyexm.workflow.models import (
     RoundTask,
     WorkflowPlan,
     WorkflowResult,
+    _canonical_execution_evidence,
     canonical_json,
     sha256_fingerprint,
 )
@@ -55,6 +58,13 @@ from cyexm.workflow.status import (
 )
 
 type ExecutorFactory = Callable[[ExecutionProfile], WorkflowExecutor]
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class _ExecutionEvidenceOwner(Protocol):
+    @property
+    def execution_evidence(self) -> object: ...
 
 
 def _utc_now() -> str:
@@ -71,9 +81,9 @@ def _default_executor_factory(profile: ExecutionProfile) -> WorkflowExecutor:
 
         return LocalDaskExecutor(profile)
     if profile.executor == "slurm":
-        raise ExecutorStartupError(
-            "SLURM execution is not available in this installed milestone"
-        )
+        from cyexm.execution.slurm import SlurmExecutor
+
+        return SlurmExecutor(profile)
     raise ExecutorStartupError(
         f"{profile.executor} execution is not available in this installed milestone"
     )
@@ -635,6 +645,24 @@ def _write_run_record(
     _write_text_atomically(path, canonical_json(payload) + "\n")
 
 
+def _executor_execution_evidence_json(
+    profile: ExecutionProfile,
+    executor: object | None,
+) -> str:
+    if profile.executor != "slurm" or executor is None:
+        return "{}"
+    try:
+        evidence = cast(_ExecutionEvidenceOwner, executor).execution_evidence
+        return _canonical_execution_evidence(evidence)
+    except Exception as error:
+        _LOGGER.warning(
+            "Ignoring unsupported SLURM execution evidence: %s: %s",
+            type(error).__name__,
+            error,
+        )
+        return "{}"
+
+
 def run_workflow(
     plan: WorkflowPlan,
     *,
@@ -660,6 +688,8 @@ def run_workflow(
     )
     preserved_results: tuple[RoundResult, ...] = ()
     submitted: tuple[RoundTask, ...] = ()
+    executor: WorkflowExecutor | None = None
+    execution_evidence_json = "{}"
     try:
         _ensure_scientific_snapshot(plan, layout)
         status = _inspect_workflow_status(
@@ -704,7 +734,12 @@ def run_workflow(
         if submitted:
             factory = _executor_factory or _default_executor_factory
             executor = factory(plan.execution)
-            executed = _ordered_results(submitted, executor.execute(submitted))
+            raw_results = executor.execute(submitted)
+            execution_evidence_json = _executor_execution_evidence_json(
+                plan.execution,
+                executor,
+            )
+            executed = _ordered_results(submitted, raw_results)
         else:
             executed = ()
         rounds = tuple(sorted((*reused, *executed), key=lambda result: result.round))
@@ -725,6 +760,7 @@ def run_workflow(
             ended_at=_utc_now(),
             rounds=rounds,
             run_record=str(run_record),
+            execution_evidence_json=execution_evidence_json,
         )
         _write_run_record(
             run_record,
@@ -735,6 +771,10 @@ def run_workflow(
             force_rounds=force_rounds,
         )
     except KeyboardInterrupt as interruption:
+        execution_evidence_json = _executor_execution_evidence_json(
+            plan.execution,
+            executor,
+        )
         original_interruption = interruption
         if isinstance(interruption, _SequentialExecutionInterrupted):
             partial_results = _validated_partial_results(
@@ -756,6 +796,7 @@ def run_workflow(
             ended_at=_utc_now(),
             rounds=preserved_results,
             run_record=str(run_record),
+            execution_evidence_json=execution_evidence_json,
         )
         _write_run_record(
             run_record,

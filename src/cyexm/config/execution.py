@@ -82,6 +82,38 @@ _MANAGED_SLURM_LONG_OPTIONS = frozenset(
 _MANAGED_SLURM_SHORT_OPTIONS = frozenset(
     option for option in _MANAGED_SLURM_OPTIONS if not option.startswith("--")
 )
+_SLURM_SHORT_OPTIONS_WITH_ARGUMENTS = frozenset(
+    {
+        "-a",
+        "-A",
+        "-b",
+        "-B",
+        "-c",
+        "-C",
+        "-d",
+        "-D",
+        "-e",
+        "-F",
+        "-G",
+        "-i",
+        "-J",
+        "-L",
+        "-M",
+        "-m",
+        "-n",
+        "-N",
+        "-o",
+        "-p",
+        "-q",
+        "-S",
+        "-t",
+        "-w",
+        "-x",
+    }
+)
+_SLURM_SHORT_OPTIONS_WITHOUT_ARGUMENTS = frozenset(
+    {"-H", "-h", "-k", "-O", "-Q", "-s", "-v", "-V", "-W"}
+)
 
 
 def _choice(value: object, accepted: frozenset[str], yaml_path: str) -> str:
@@ -255,14 +287,35 @@ def _managed_slurm_option(directive: str, yaml_path: str) -> str | None:
         if token == "--":
             break
         if token.startswith("--"):
-            option = token.partition("=")[0]
-            if option in _MANAGED_SLURM_LONG_OPTIONS:
-                return option
+            managed_option = _managed_slurm_long_option(token)
+            if managed_option is not None:
+                return managed_option
         elif token.startswith("-"):
-            for name in token[1:]:
-                option = f"-{name}"
-                if option in _MANAGED_SLURM_SHORT_OPTIONS:
-                    return option
+            managed_option = _managed_slurm_short_option(token)
+            if managed_option is not None:
+                return managed_option
+    return None
+
+
+def _managed_slurm_long_option(token: str) -> str | None:
+    option = token.partition("=")[0]
+    if option in _MANAGED_SLURM_LONG_OPTIONS:
+        return option
+    matches = tuple(
+        managed for managed in _MANAGED_SLURM_LONG_OPTIONS if managed.startswith(option)
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _managed_slurm_short_option(token: str) -> str | None:
+    for name in token[1:]:
+        option = f"-{name}"
+        if option in _MANAGED_SLURM_SHORT_OPTIONS:
+            return option
+        if option in _SLURM_SHORT_OPTIONS_WITH_ARGUMENTS:
+            return None
+        if option not in _SLURM_SHORT_OPTIONS_WITHOUT_ARGUMENTS:
+            return None
     return None
 
 

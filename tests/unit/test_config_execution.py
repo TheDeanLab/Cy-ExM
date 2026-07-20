@@ -582,6 +582,22 @@ def test_slurm_extra_directives_reject_managed_option_later_in_directive(
         _load_profile(tmp_path, data)
 
 
+def test_slurm_extra_directives_reject_managed_long_option_abbreviation(
+    tmp_path: Path,
+) -> None:
+    data = _valid_data("slurm")
+    _mapping_at(data, "slurm")["job_extra_directives"] = ["--part=debug"]
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=(
+            r"slurm\.job_extra_directives\[0\] conflicts with managed SLURM option "
+            r"--partition"
+        ),
+    ):
+        _load_profile(tmp_path, data)
+
+
 @pytest.mark.parametrize("directive", ["-vn1", "-n1", "-pdebug"])
 def test_slurm_extra_directives_reject_grouped_or_attached_short_options(
     tmp_path: Path, directive: str
@@ -604,6 +620,19 @@ def test_slurm_extra_directives_accept_managed_prefix_neighbor(tmp_path: Path) -
 
     assert profile.slurm is not None
     assert profile.slurm.job_extra_directives == ("--mem-bind=local",)
+
+
+@pytest.mark.parametrize("directive", ["-Aproject", "-Cgpu"])
+def test_slurm_extra_directives_accept_attached_arguments_to_allowed_options(
+    tmp_path: Path, directive: str
+) -> None:
+    data = _valid_data("slurm")
+    _mapping_at(data, "slurm")["job_extra_directives"] = [directive]
+
+    profile = _load_profile(tmp_path, data)
+
+    assert profile.slurm is not None
+    assert profile.slurm.job_extra_directives == (directive,)
 
 
 @pytest.mark.parametrize("directive", ["", "bad\nvalue", "bad\x00value", 1])

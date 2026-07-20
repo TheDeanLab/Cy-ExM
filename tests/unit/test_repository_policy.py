@@ -221,6 +221,33 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
         assert required in runtime
 
 
+def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> None:
+    tests = _normalized_repository_file("tests/AGENTS.md")
+    for required in (
+        "narrow concrete-image exception",
+        "real registration belongs in integration",
+        "real slurm submission",
+        "hpc",
+    ):
+        assert required in tests
+
+    unit = _normalized_repository_file("tests/unit/AGENTS.md")
+    for required in (
+        "future manifest and planning policy",
+        "plain python data",
+        "must not import scheduler",
+    ):
+        assert required in unit
+
+    integration = _normalized_repository_file("tests/integration/AGENTS.md")
+    for required in (
+        "approved scheduler dependency",
+        "bounded local-scheduler",
+        "actual slurm submission remains `hpc`",
+    ):
+        assert required in integration
+
+
 def test_every_maintained_directory_has_local_agent_guidance() -> None:
     actual = {
         str(path.relative_to(REPOSITORY_ROOT))

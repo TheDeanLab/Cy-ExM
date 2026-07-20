@@ -28,3 +28,7 @@
 - Temporary transforms and images belong under pytest `tmp_path` or an explicit
   caller-provided comparison directory. Do not access or alter the separate spheroid
   registration run or its outputs.
+- After an approved scheduler dependency is declared, bounded local-scheduler
+  checks may use the `integration` marker with deterministic synthetic tasks. Actual
+  SLURM submission remains `hpc` and requires an explicit cluster allocation, cleanup
+  assertions, and machine-readable job evidence.

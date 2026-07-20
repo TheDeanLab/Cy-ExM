@@ -4,16 +4,26 @@ import os
 import socket
 import time
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
 
 from cyexm.execution.base import RoundTaskRunner
-
-if TYPE_CHECKING:
-    from cyexm.workflow.models import RoundResult, RoundTask
+from cyexm.workflow.models import RoundResult, RoundTask
 
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+class _SequentialExecutionInterrupted(KeyboardInterrupt):
+    """Carry durable results completed before the original interruption."""
+
+    def __init__(
+        self,
+        original: KeyboardInterrupt,
+        completed_results: tuple[RoundResult, ...],
+    ) -> None:
+        super().__init__(*original.args)
+        self.original = original
+        self.completed_results = completed_results
 
 
 class SequentialExecutor:
@@ -29,8 +39,10 @@ class SequentialExecutor:
             started = time.monotonic()
             try:
                 result = self._runner(task)
+            except KeyboardInterrupt as error:
+                raise _SequentialExecutionInterrupted(error, tuple(results)) from error
             except Exception as error:
-                from cyexm.workflow.models import RoundFailure, RoundResult
+                from cyexm.workflow.models import RoundFailure
 
                 results.append(
                     RoundResult(

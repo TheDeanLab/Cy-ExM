@@ -4,6 +4,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -12,7 +13,7 @@ from cyexm.config.models import (
     RegistrationSpec,
     RegistrationStageSpec,
 )
-from cyexm.execution import RoundTaskRunner, SequentialExecutor
+from cyexm.execution import RoundTaskRunner, SequentialExecutor, WorkflowExecutor
 from cyexm.workflow.models import ChannelTask, RoundResult, RoundTask
 
 pytestmark = pytest.mark.unit
@@ -35,6 +36,15 @@ def test_execution_namespace_imports_in_a_fresh_process() -> None:
 
 def test_round_task_runner_alias_resolves_at_runtime() -> None:
     assert "Callable" in str(RoundTaskRunner.__value__)
+
+
+def test_executor_annotations_resolve_at_runtime() -> None:
+    protocol_hints = get_type_hints(WorkflowExecutor.execute)
+    sequential_hints = get_type_hints(SequentialExecutor.execute)
+
+    assert protocol_hints["tasks"] == tuple[RoundTask, ...]
+    assert protocol_hints["return"] == tuple[RoundResult, ...]
+    assert sequential_hints == protocol_hints
 
 
 def _task(tmp_path: Path, round_number: int) -> RoundTask:
@@ -138,6 +148,23 @@ def test_sequential_executor_propagates_keyboard_interrupt(tmp_path: Path) -> No
         )
 
     assert calls == [2]
+
+
+def test_sequential_executor_attaches_results_completed_before_interrupt(
+    tmp_path: Path,
+) -> None:
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+
+    def runner(task: RoundTask) -> RoundResult:
+        if task.round == 3:
+            raise KeyboardInterrupt("injected")
+        return _successful_result(task)
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        SequentialExecutor(runner=runner).execute(tasks)
+
+    assert tuple(result.round for result in captured.value.completed_results) == (2,)  # type: ignore[attr-defined]
+    assert captured.value.original.args == ("injected",)  # type: ignore[attr-defined]
 
 
 def test_sequential_executor_does_not_mutate_tasks(tmp_path: Path) -> None:

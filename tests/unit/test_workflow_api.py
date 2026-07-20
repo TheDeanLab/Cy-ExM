@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+import cyexm.workflow.api as workflow_api
 from cyexm.config.models import (
     ChannelSpec,
     DatasetManifest,
@@ -18,14 +19,16 @@ from cyexm.config.models import (
     RegistrationStageSpec,
     RoundSpec,
 )
-from cyexm.errors import WorkflowExecutionError, WorkflowPlanError
+from cyexm.errors import RoundExecutionError, WorkflowExecutionError, WorkflowPlanError
 from cyexm.execution.base import WorkflowExecutor
+from cyexm.execution.sequential import SequentialExecutor
 from cyexm.registration.artifacts import (
     ArtifactStore,
     CompletionRecord,
     FileIdentity,
     StageRequest,
 )
+from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.spatial import ImageGeometry
 from cyexm.workflow import run_workflow
 from cyexm.workflow.layout import WorkflowLayout
@@ -89,6 +92,10 @@ def _artifacts(task: RoundTask) -> tuple[Path, ...]:
 def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
     output_root = tmp_path / "output"
     tasks = tuple(_task(output_root, round_number) for round_number in rounds)
+    sources = (tasks[0].fixed_image, *(task.moving_image for task in tasks))
+    for source in sources:
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(f"source:{source.name}".encode())
     manifest = DatasetManifest(
         schema_version=1,
         dataset_id="dataset-1",
@@ -120,26 +127,62 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         slurm=None,
         source_path=tmp_path / "execution.yaml",
     )
+    layout = WorkflowLayout.for_dataset(output_root, "dataset-1")
+
+    def source_mapping(path: Path) -> dict[str, object]:
+        stat = path.stat()
+        return {
+            "path": str(path.resolve()),
+            "shape_zyx": [1, 1, 1],
+            "dtype": "uint16",
+            "axes": "ZYX",
+            "geometry": None,
+            "st_size": stat.st_size,
+            "st_mtime_ns": stat.st_mtime_ns,
+        }
+
     scientific_json = canonical_json(
         {
             "schema_version": 1,
             "dataset_id": "dataset-1",
+            "voxel_spacing_xyz_um": [1.0, 1.0, 1.0],
+            "reference": {
+                "round": 1,
+                "channel": str(tasks[0].fixed_image.resolve()),
+            },
+            "registration": {
+                "crop": False,
+                "linear": {"type": "TRSAA", "accuracy": "high"},
+                "nonlinear": {"type": "SyNOnly", "accuracy": "high"},
+            },
+            "sources": [source_mapping(path) for path in sorted(sources)],
             "rounds": [
                 {
                     "round": task.round,
+                    "strategy": task.strategy,
+                    "registration_channel": str(task.moving_image.resolve()),
+                    "registration_manifest_channel": f"moving-{task.round}.tif",
+                    "chunk_size_zyx": None,
+                    "overlap_fraction": None,
                     "channels": [
                         {
+                            "file": str(channel.source.resolve()),
+                            "manifest_file": channel.source.name,
                             "output": channel.output.relative_to(
-                                WorkflowLayout.for_dataset(
-                                    output_root, "dataset-1"
-                                ).root
-                            ).as_posix()
+                                layout.root
+                            ).as_posix(),
+                            "interpolation": channel.interpolation,
                         }
                         for channel in task.channels
                     ],
                 }
                 for task in tasks
             ],
+            "policies": {
+                "axis_convention": "external-zyx-ants-xyz-v1",
+                "output_format": "ome-compatible-tiff-uint16-v1",
+                "postprocessing": "clip-uint16-no-normalization-v1",
+            },
         }
     )
     return WorkflowPlan(
@@ -197,7 +240,7 @@ def _factory(
     return lambda _profile: executor
 
 
-def _commit_artifact(path: Path) -> None:
+def _commit_artifact(path: Path, plan: WorkflowPlan) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"artifact")
     geometry = ImageGeometry(
@@ -206,18 +249,118 @@ def _commit_artifact(path: Path) -> None:
         spacing=(1.0, 1.0, 1.0),
         direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
     )
+    task = next(task for task in plan.tasks if path in _artifacts(task))
+    affine, warp, registered, *_ = _artifacts(task)
+    inputs = (
+        FileIdentity.from_path(task.fixed_image),
+        FileIdentity.from_path(task.moving_image),
+    )
+    common = {
+        "axis_convention_version": "external-zyx-ants-xyz-v1",
+        "crop": False,
+        "imaging_round": task.round,
+        "pixel_size_xyz": [1.0, 1.0, 1.0],
+    }
+    threads = {name: 1 for name in NATIVE_THREAD_ENV_VARS}
+    if path == affine:
+        request = StageRequest.for_identities(
+            stage="affine",
+            inputs=inputs,
+            geometry=geometry,
+            method="TRSAA",
+            accuracy="high",
+            native_threads=threads,
+            upstream=None,
+            parameters={
+                **common,
+                "image_interpolation": "linear",
+                "mask_interpolation": "nearestNeighbor",
+                "moving_geometry": geometry.to_dict(),
+                "registration_parameters": {
+                    "aff_metric": "mattes",
+                    "aff_random_sampling_rate": 0.5,
+                    "aff_sampling": 32,
+                    "mask_all_stages": True,
+                    "verbose": True,
+                    "reg_iterations": [1000, 500, 250, 100],
+                },
+            },
+        )
+    elif path == warp:
+        request = StageRequest.for_identities(
+            stage="nonlinear",
+            inputs=inputs,
+            geometry=geometry,
+            method="SyNOnly",
+            accuracy="high",
+            native_threads=threads,
+            upstream=FileIdentity.from_path(affine),
+            parameters={
+                **common,
+                "image_interpolation": "linear",
+                "mask_interpolation": "nearestNeighbor",
+                "moving_geometry": geometry.to_dict(),
+                "registration_mode": "whole-image",
+                "registration_parameters": {
+                    "aff_random_sampling_rate": 1.0,
+                    "flow_sigma": 3.0,
+                    "initial_transform": "Identity",
+                    "mask_all_stages": True,
+                    "reg_iterations": [100, 70, 50],
+                    "singleprecision": False,
+                    "syn_metric": "mattes",
+                    "syn_sampling": 32,
+                    "total_sigma": 0.5,
+                    "verbose": True,
+                },
+                "scalar_postprocessing_policy": "whole-global-histogram-match-v1",
+            },
+        )
+    elif path == registered:
+        request = StageRequest.for_identities(
+            stage="registered-image",
+            inputs=inputs,
+            geometry=geometry,
+            method="SyNOnly",
+            accuracy="high",
+            native_threads=threads,
+            upstream=FileIdentity.from_path(warp),
+            parameters={
+                **common,
+                "format": "uint16-tiff",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "scalar_postprocessing_policy": "whole-global-histogram-match-v1",
+            },
+        )
+    else:
+        channel = next(channel for channel in task.channels if channel.output == path)
+        request = StageRequest.for_identities(
+            stage="channel-transform-v1",
+            inputs=(
+                FileIdentity.from_path(task.fixed_image),
+                FileIdentity.from_path(channel.source),
+                FileIdentity.from_path(affine),
+                FileIdentity.from_path(warp),
+            ),
+            geometry=geometry,
+            method="warp-affine",
+            accuracy="not-applicable",
+            native_threads=threads,
+            upstream=FileIdentity.from_path(warp),
+            parameters={
+                "pixel_size_xyz_um": [1.0, 1.0, 1.0],
+                "interpolation": channel.interpolation,
+                "transform_order": ["warp", "affine"],
+                "whichtoinvert": [False, False],
+                "axis_convention": "external-zyx-ants-xyz-v1",
+                "output_format": "ome-compatible-tiff-uint16-v1",
+                "postprocessing": "clip-uint16-no-normalization-v1",
+            },
+        )
     record = CompletionRecord(
         schema_version=1,
-        request=StageRequest.for_identities(
-            stage="test",
-            inputs=(),
-            geometry=geometry,
-            method="test",
-            accuracy="test",
-            native_threads={},
-            upstream=None,
-            parameters={},
-        ),
+        request=request,
         artifact=FileIdentity.from_path(path),
     )
     ArtifactStore().record_path(path).write_text(record.to_json(), encoding="utf-8")
@@ -332,6 +475,104 @@ def test_run_workflow_rejects_unsafe_dataset_id_before_reading_or_writing(
     assert fake.calls == []
 
 
+def test_run_workflow_rejects_workflow_runs_symlink_escape_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    layout = WorkflowLayout.for_dataset(
+        plan.execution.paths.output_root, plan.dataset_id
+    )
+    layout.root.mkdir(parents=True)
+    outside = tmp_path / "outside-runs"
+    outside.mkdir()
+    layout.workflow_runs.symlink_to(outside, target_is_directory=True)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="outside workflow output"):
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert not layout.plan_path.exists()
+    assert tuple(outside.iterdir()) == ()
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_run_record_symlink_escape_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    layout = WorkflowLayout.for_dataset(
+        plan.execution.paths.output_root, plan.dataset_id
+    )
+    layout.workflow_runs.mkdir(parents=True)
+    outside = tmp_path / "outside-run.json"
+    outside.write_text("do not replace", encoding="utf-8")
+    layout.run_record("fixed-run-id").symlink_to(outside)
+    monkeypatch.setattr(workflow_api, "uuid4", lambda: "fixed-run-id")
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="outside workflow output"):
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert not layout.plan_path.exists()
+    assert outside.read_text(encoding="utf-8") == "do not replace"
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_malformed_scientific_schema_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    scientific = json.loads(plan.scientific_json)
+    del scientific["policies"]
+    scientific_json = canonical_json(scientific)
+    malformed = replace(
+        plan,
+        scientific_json=scientific_json,
+        scientific_fingerprint=sha256_fingerprint(scientific_json),
+    )
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match=r"scientific plan.*keys"):
+        run_workflow(malformed, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_task_output_mismatch_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    forged_task = replace(
+        plan.tasks[0],
+        registration_directory=tmp_path / "outside" / "registration",
+    )
+    forged = replace(plan, tasks=(forged_task, *plan.tasks[1:]))
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="registration_directory"):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert not (tmp_path / "outside").exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_expected_artifact_mismatch_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    forged = replace(plan, expected_artifacts=plan.expected_artifacts[:-1])
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="expected_artifacts"):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
 def test_run_workflow_rejects_incompatible_snapshot_without_changing_it(
     tmp_path: Path,
 ) -> None:
@@ -357,7 +598,7 @@ def test_run_workflow_excludes_complete_rounds_and_reports_them_reused(
 ) -> None:
     plan = _plan(tmp_path)
     for artifact in _artifacts(plan.tasks[0]):
-        _commit_artifact(artifact)
+        _commit_artifact(artifact, plan)
     fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
 
     result = run_workflow(plan, _executor_factory=_factory(fake))
@@ -373,7 +614,7 @@ def test_run_workflow_excludes_complete_rounds_and_reports_them_reused(
 def test_run_workflow_force_submits_an_otherwise_complete_round(tmp_path: Path) -> None:
     plan = _plan(tmp_path, rounds=(2,))
     for artifact in _artifacts(plan.tasks[0]):
-        _commit_artifact(artifact)
+        _commit_artifact(artifact, plan)
     fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
 
     result = run_workflow(
@@ -407,6 +648,50 @@ def test_run_workflow_writes_failed_summary_then_raises_sorted_rounds(
     assert not tuple(record.parent.glob(".*.tmp*"))
 
 
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda result, _task: replace(result, dataset_id="other"), "dataset_id"),
+        (
+            lambda result, task: replace(
+                result,
+                artifact_paths=(
+                    *result.artifact_paths,
+                    str(task.log_path.parent / "rogue.tif"),
+                ),
+            ),
+            "artifact_paths",
+        ),
+        (
+            lambda result, _task: replace(result, status="failed", failure=None),
+            "failure",
+        ),
+    ],
+)
+def test_run_workflow_rejects_inconsistent_executor_results_before_persistence(
+    mutate: Callable[[RoundResult, RoundTask], RoundResult],
+    message: str,
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def execute(tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        return (mutate(_result(tasks[0]), tasks[0]), _result(tasks[1]))
+
+    with pytest.raises(RoundExecutionError, match=message):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(_FakeExecutor(execute)),
+        )
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root, plan.dataset_id
+        ).workflow_runs.glob("*.json")
+    )
+    assert records == ()
+
+
 def test_run_workflow_writes_cancelled_summary_and_reraises(
     tmp_path: Path,
 ) -> None:
@@ -430,3 +715,94 @@ def test_run_workflow_writes_cancelled_summary_and_reraises(
     payload = json.loads(records[0].read_text(encoding="utf-8"))
     assert payload["status"] == "cancelled"
     assert payload["rounds"] == []
+
+
+def test_run_workflow_cancelled_summary_preserves_completed_sequential_rounds(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def runner(task: RoundTask) -> RoundResult:
+        if task.round == 3:
+            raise KeyboardInterrupt("injected")
+        return _result(task)
+
+    with pytest.raises(KeyboardInterrupt, match="injected"):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(SequentialExecutor(runner=runner)),
+        )
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root, plan.dataset_id
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    payload = json.loads(records[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "cancelled"
+    assert [item["round"] for item in payload["rounds"]] == [2]
+
+
+def test_run_workflow_records_cancellation_during_snapshot_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def cancel_snapshot(_plan: WorkflowPlan, _layout: WorkflowLayout) -> None:
+        raise KeyboardInterrupt("snapshot interruption")
+
+    monkeypatch.setattr(workflow_api, "_ensure_scientific_snapshot", cancel_snapshot)
+
+    with pytest.raises(KeyboardInterrupt, match="snapshot interruption"):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(_FakeExecutor(lambda tasks: ())),
+        )
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root, plan.dataset_id
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    payload = json.loads(records[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "cancelled"
+    assert payload["rounds"] == []
+
+
+def test_run_workflow_recovers_a_cancelled_final_record_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    original_write = workflow_api._write_run_record
+    calls = 0
+
+    def interrupt_once(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt("record interruption")
+        original_write(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(workflow_api, "_write_run_record", interrupt_once)
+
+    with pytest.raises(KeyboardInterrupt, match="record interruption"):
+        run_workflow(
+            plan,
+            _executor_factory=_factory(
+                _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+            ),
+        )
+
+    records = tuple(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root, plan.dataset_id
+        ).workflow_runs.glob("*.json")
+    )
+    assert len(records) == 1
+    payload = json.loads(records[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "cancelled"
+    assert [item["round"] for item in payload["rounds"]] == [2, 3]

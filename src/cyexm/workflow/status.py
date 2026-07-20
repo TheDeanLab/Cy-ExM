@@ -6,9 +6,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from cyexm.errors import WorkflowPlanError
-from cyexm.registration.artifacts import CompletionRecord, FileIdentity
+from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
+from cyexm.runtime import NATIVE_THREAD_ENV_VARS
+from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     RoundStatus,
@@ -18,6 +21,139 @@ from cyexm.workflow.models import (
 )
 
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_SCIENTIFIC_KEYS = frozenset(
+    {
+        "schema_version",
+        "dataset_id",
+        "voxel_spacing_xyz_um",
+        "reference",
+        "registration",
+        "sources",
+        "rounds",
+        "policies",
+    }
+)
+_REFERENCE_KEYS = frozenset({"round", "channel"})
+_REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
+_STAGE_KEYS = frozenset({"type", "accuracy"})
+_SOURCE_KEYS = frozenset(
+    {
+        "path",
+        "shape_zyx",
+        "dtype",
+        "axes",
+        "geometry",
+        "st_size",
+        "st_mtime_ns",
+    }
+)
+_ROUND_KEYS = frozenset(
+    {
+        "round",
+        "strategy",
+        "registration_channel",
+        "registration_manifest_channel",
+        "chunk_size_zyx",
+        "overlap_fraction",
+        "channels",
+    }
+)
+_CHANNEL_KEYS = frozenset({"file", "manifest_file", "output", "interpolation"})
+_POLICY_KEYS = frozenset({"axis_convention", "output_format", "postprocessing"})
+_LINEAR_TYPES = frozenset({"Translation", "Rigid", "Similarity", "Affine", "TRSAA"})
+_NONLINEAR_TYPES = frozenset({"Elastic", "SyNOnly", "SyN"})
+_ACCURACIES = frozenset({"high", "medium", "low", "dry run"})
+_LINEAR_ITERATIONS = {
+    "high": [1000, 500, 250, 100],
+    "medium": [500, 250, 100, 50],
+    "low": [100, 50, 25, 10],
+}
+_NONLINEAR_ITERATIONS = {
+    "high": [100, 70, 50],
+    "medium": [50, 35, 25],
+    "low": [5, 5, 5],
+    "dry run": [1, 1, 1],
+}
+_WHOLE_SCALAR_POLICY = "whole-global-histogram-match-v1"
+_CHUNK_SCALAR_POLICY = "serial-chunk-local-histogram-match-core-stitch-v1"
+_OUTPUT_FORMAT_POLICY = "ome-compatible-tiff-uint16-v1"
+_CHANNEL_POSTPROCESSING_POLICY = "clip-uint16-no-normalization-v1"
+
+type ArtifactRole = Literal["affine", "warp", "registered", "channel"]
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceContract:
+    path: Path
+    identity: FileIdentity
+    shape_zyx: tuple[int, int, int]
+    dtype: str
+    axes: str
+    geometry: ImageGeometry
+
+
+@dataclass(frozen=True, slots=True)
+class _ChannelContract:
+    source: _SourceContract
+    manifest_file: PurePosixPath
+    output: Path
+    interpolation: Literal["linear", "nearestNeighbor"]
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactExpectation:
+    path: Path
+    role: ArtifactRole
+    channel: _ChannelContract | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RoundContract:
+    round: int
+    strategy: Literal["whole_image", "serial_chunked"]
+    registration_source: _SourceContract
+    registration_manifest_channel: PurePosixPath
+    chunk_size_zyx: tuple[int, int, int] | None
+    overlap_fraction: float | None
+    channels: tuple[_ChannelContract, ...]
+    artifacts: tuple[_ArtifactExpectation, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _RegistrationContract:
+    crop: bool
+    linear_type: str
+    linear_accuracy: str
+    nonlinear_type: str
+    nonlinear_accuracy: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ScientificSnapshot:
+    fingerprint: str
+    dataset_id: str
+    voxel_spacing_xyz: tuple[float, float, float]
+    reference_round: int
+    fixed_source: _SourceContract
+    registration: _RegistrationContract
+    sources: tuple[_SourceContract, ...]
+    rounds: tuple[_RoundContract, ...]
+
+    @property
+    def expected_by_round(
+        self,
+    ) -> tuple[tuple[int, tuple[_ArtifactExpectation, ...]], ...]:
+        return tuple(
+            (round_contract.round, round_contract.artifacts)
+            for round_contract in self.rounds
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactEvidence:
+    state: Literal["incomplete", "invalid", "recorded"]
+    identity: FileIdentity | None = None
+    record: CompletionRecord | None = None
 
 
 def _validate_dataset_id(dataset_id: object) -> str:
@@ -44,10 +180,15 @@ def _safe_workflow_layout(output_root: str | Path, dataset_id: str) -> WorkflowL
     return layout
 
 
-@dataclass(frozen=True, slots=True)
-class _ScientificSnapshot:
-    fingerprint: str
-    expected_by_round: tuple[tuple[int, tuple[Path, ...]], ...]
+def _safe_descendant(path: Path, *, root: Path, location: str) -> Path:
+    resolved_root = root.resolve(strict=False)
+    resolved = path.resolve(strict=False)
+    if not resolved.is_relative_to(resolved_root):
+        raise WorkflowPlanError(
+            f"{location} resolves outside workflow output {resolved_root}; "
+            f"got {resolved}"
+        )
+    return path
 
 
 def _reject_json_constant(value: str) -> object:
@@ -70,106 +211,476 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _decode_json(text: str, location: str) -> object:
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_strict_json_object,
+            parse_float=_finite_json_float,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as error:
+        raise WorkflowPlanError(
+            f"{location} is not strict finite JSON: {error}"
+        ) from error
+
+
 def _mapping(value: object, location: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
         raise WorkflowPlanError(f"{location} must be a JSON object")
     return value
 
 
-def _built_in_round(value: object, location: str) -> int:
-    if type(value) is not int or value < 0:
+def _exact_mapping(
+    value: object,
+    keys: frozenset[str],
+    location: str,
+) -> Mapping[str, object]:
+    mapping = _mapping(value, location)
+    if frozenset(mapping) != keys:
         raise WorkflowPlanError(
-            f"{location} must be a built-in non-negative integer; got {value!r}"
+            f"{location} keys must be exactly {sorted(keys)!r}; got {sorted(mapping)!r}"
+        )
+    return mapping
+
+
+def _list(value: object, location: str) -> list[object]:
+    if not isinstance(value, list):
+        raise WorkflowPlanError(f"{location} must be a JSON array; got {value!r}")
+    return value
+
+
+def _string(value: object, location: str) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or "\n" in value:
+        raise WorkflowPlanError(
+            f"{location} must be a nonempty single-line string; got {value!r}"
         )
     return value
 
 
-def _channel_output(
-    value: object,
-    *,
-    layout: WorkflowLayout,
-    location: str,
-) -> Path:
-    if not isinstance(value, str) or not value or "\x00" in value:
+def _integer(value: object, location: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise WorkflowPlanError(
+            f"{location} must be a built-in integer >= {minimum}; got {value!r}"
+        )
+    return value
+
+
+def _finite_number(value: object, location: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise WorkflowPlanError(f"{location} must be a finite number; got {value!r}")
+    try:
+        result = float(value)
+    except OverflowError as error:
+        raise WorkflowPlanError(
+            f"{location} must be a finite number; got {value!r}"
+        ) from error
+    if not math.isfinite(result) or (positive and result <= 0.0):
+        qualifier = "positive finite" if positive else "finite"
+        raise WorkflowPlanError(
+            f"{location} must be a {qualifier} number; got {value!r}"
+        )
+    return result
+
+
+def _triple_float(value: object, location: str) -> tuple[float, float, float]:
+    values = _list(value, location)
+    if len(values) != 3:
+        raise WorkflowPlanError(f"{location} must contain exactly three values")
+    return (
+        _finite_number(values[0], f"{location}[0]", positive=True),
+        _finite_number(values[1], f"{location}[1]", positive=True),
+        _finite_number(values[2], f"{location}[2]", positive=True),
+    )
+
+
+def _triple_int(value: object, location: str) -> tuple[int, int, int]:
+    values = _list(value, location)
+    if len(values) != 3:
+        raise WorkflowPlanError(f"{location} must contain exactly three values")
+    return (
+        _integer(values[0], f"{location}[0]", minimum=1),
+        _integer(values[1], f"{location}[1]", minimum=1),
+        _integer(values[2], f"{location}[2]", minimum=1),
+    )
+
+
+def _relative_path(value: object, location: str) -> PurePosixPath:
+    text = _string(value, location)
+    raw_parts = text.split("/")
+    path = PurePosixPath(text)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in raw_parts):
         raise WorkflowPlanError(
             f"{location} must be a safe relative POSIX path; got {value!r}"
         )
-    raw_parts = value.split("/")
-    path = PurePosixPath(value)
-    if (
-        path.is_absolute()
-        or any(part in {"", ".", ".."} for part in raw_parts)
-        or path == PurePosixPath(".")
+    return path
+
+
+def _absolute_path(value: object, location: str) -> Path:
+    text = _string(value, location)
+    path = Path(text)
+    if not path.is_absolute() or str(path.resolve(strict=False)) != text:
+        raise WorkflowPlanError(
+            f"{location} must be a canonical absolute path; got {value!r}"
+        )
+    return path
+
+
+def _choice(value: object, choices: frozenset[str], location: str) -> str:
+    text = _string(value, location)
+    if text not in choices:
+        raise WorkflowPlanError(
+            f"{location} must be one of {sorted(choices)!r}; got {value!r}"
+        )
+    return text
+
+
+def _default_geometry(
+    shape: tuple[int, int, int],
+    spacing: tuple[float, float, float],
+) -> ImageGeometry:
+    return ImageGeometry(
+        shape=shape,
+        origin=(0.0, 0.0, 0.0),
+        spacing=spacing,
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+
+
+def _parse_source(
+    value: object,
+    *,
+    spacing: tuple[float, float, float],
+    index: int,
+) -> _SourceContract:
+    location = f"scientific plan sources[{index}]"
+    mapping = _exact_mapping(value, _SOURCE_KEYS, location)
+    path = _absolute_path(mapping["path"], f"{location}.path")
+    shape = _triple_int(mapping["shape_zyx"], f"{location}.shape_zyx")
+    dtype = _string(mapping["dtype"], f"{location}.dtype")
+    axes = _choice(mapping["axes"], frozenset({"ZYX", "QYX", "YX"}), f"{location}.axes")
+    if axes == "YX" and shape[0] != 1:
+        raise WorkflowPlanError(
+            f"{location}.shape_zyx must have singleton Z for YX axes"
+        )
+    raw_geometry = mapping["geometry"]
+    if raw_geometry is None:
+        geometry = _default_geometry(shape, spacing)
+    else:
+        try:
+            geometry = ImageGeometry.from_dict(
+                _mapping(raw_geometry, f"{location}.geometry")
+            )
+        except (TypeError, ValueError) as error:
+            raise WorkflowPlanError(
+                f"{location}.geometry is invalid: {error}"
+            ) from error
+        if geometry.shape != shape or geometry.spacing != spacing:
+            raise WorkflowPlanError(
+                f"{location}.geometry must match shape and voxel spacing"
+            )
+    identity = FileIdentity(
+        path=str(path),
+        st_size=_integer(mapping["st_size"], f"{location}.st_size"),
+        st_mtime_ns=_integer(mapping["st_mtime_ns"], f"{location}.st_mtime_ns"),
+    )
+    return _SourceContract(path, identity, shape, dtype, axes, geometry)
+
+
+def _parse_registration(value: object) -> _RegistrationContract:
+    mapping = _exact_mapping(value, _REGISTRATION_KEYS, "scientific plan registration")
+    crop = mapping["crop"]
+    if type(crop) is not bool:
+        raise WorkflowPlanError(
+            f"scientific plan registration.crop must be boolean; got {crop!r}"
+        )
+    linear = _exact_mapping(
+        mapping["linear"], _STAGE_KEYS, "scientific plan registration.linear"
+    )
+    nonlinear = _exact_mapping(
+        mapping["nonlinear"], _STAGE_KEYS, "scientific plan registration.nonlinear"
+    )
+    return _RegistrationContract(
+        crop=crop,
+        linear_type=_choice(
+            linear["type"], _LINEAR_TYPES, "scientific plan registration.linear.type"
+        ),
+        linear_accuracy=_choice(
+            linear["accuracy"],
+            _ACCURACIES,
+            "scientific plan registration.linear.accuracy",
+        ),
+        nonlinear_type=_choice(
+            nonlinear["type"],
+            _NONLINEAR_TYPES,
+            "scientific plan registration.nonlinear.type",
+        ),
+        nonlinear_accuracy=_choice(
+            nonlinear["accuracy"],
+            _ACCURACIES,
+            "scientific plan registration.nonlinear.accuracy",
+        ),
+    )
+
+
+def _parse_channel(
+    value: object,
+    *,
+    layout: WorkflowLayout,
+    round_number: int,
+    sources: Mapping[Path, _SourceContract],
+    index: int,
+) -> _ChannelContract:
+    location = f"scientific plan rounds[{round_number}].channels[{index}]"
+    mapping = _exact_mapping(value, _CHANNEL_KEYS, location)
+    source_path = _absolute_path(mapping["file"], f"{location}.file")
+    try:
+        source = sources[source_path]
+    except KeyError as error:
+        raise WorkflowPlanError(
+            f"{location}.file must reference a declared source; got {source_path}"
+        ) from error
+    manifest_file = _relative_path(
+        mapping["manifest_file"], f"{location}.manifest_file"
+    )
+    relative_output = _relative_path(mapping["output"], f"{location}.output")
+    output = layout.root.joinpath(*relative_output.parts)
+    expected_output = layout.round(round_number).channel(manifest_file)
+    if output != expected_output:
+        raise WorkflowPlanError(
+            f"{location}.output must be "
+            f"{expected_output.relative_to(layout.root).as_posix()!r}; "
+            f"got {relative_output.as_posix()!r}"
+        )
+    _safe_descendant(output, root=layout.root, location=f"{location}.output")
+    interpolation = _choice(
+        mapping["interpolation"],
+        frozenset({"linear", "nearestNeighbor"}),
+        f"{location}.interpolation",
+    )
+    return _ChannelContract(
+        source=source,
+        manifest_file=manifest_file,
+        output=output,
+        interpolation=interpolation,  # type: ignore[arg-type]
+    )
+
+
+def _parse_round(
+    value: object,
+    *,
+    layout: WorkflowLayout,
+    sources: Mapping[Path, _SourceContract],
+    index: int,
+) -> _RoundContract:
+    location = f"scientific plan rounds[{index}]"
+    mapping = _exact_mapping(value, _ROUND_KEYS, location)
+    round_number = _integer(mapping["round"], f"{location}.round")
+    strategy = _choice(
+        mapping["strategy"],
+        frozenset({"whole_image", "serial_chunked"}),
+        f"{location}.strategy",
+    )
+    registration_path = _absolute_path(
+        mapping["registration_channel"], f"{location}.registration_channel"
+    )
+    try:
+        registration_source = sources[registration_path]
+    except KeyError as error:
+        raise WorkflowPlanError(
+            f"{location}.registration_channel must reference a declared source; "
+            f"got {registration_path}"
+        ) from error
+    registration_manifest = _relative_path(
+        mapping["registration_manifest_channel"],
+        f"{location}.registration_manifest_channel",
+    )
+    channels = tuple(
+        _parse_channel(
+            channel,
+            layout=layout,
+            round_number=round_number,
+            sources=sources,
+            index=channel_index,
+        )
+        for channel_index, channel in enumerate(
+            _list(mapping["channels"], f"{location}.channels")
+        )
+    )
+    if not channels:
+        raise WorkflowPlanError(f"{location}.channels must not be empty")
+    matches = tuple(
+        channel
+        for channel in channels
+        if channel.manifest_file == registration_manifest
+    )
+    if len(matches) != 1 or matches[0].source != registration_source:
+        raise WorkflowPlanError(
+            f"{location}.registration_manifest_channel must identify the "
+            "registration source"
+        )
+    if strategy == "whole_image":
+        if (
+            mapping["chunk_size_zyx"] is not None
+            or mapping["overlap_fraction"] is not None
+        ):
+            raise WorkflowPlanError(f"{location} whole_image chunk values must be null")
+        chunk_size = None
+        overlap = None
+    else:
+        chunk_size = _triple_int(
+            mapping["chunk_size_zyx"], f"{location}.chunk_size_zyx"
+        )
+        overlap = _finite_number(
+            mapping["overlap_fraction"], f"{location}.overlap_fraction"
+        )
+        if not 0.0 <= overlap < 1.0:
+            raise WorkflowPlanError(
+                f"{location}.overlap_fraction must satisfy 0 <= value < 1"
+            )
+    round_layout = layout.round(round_number)
+    artifacts = (
+        _ArtifactExpectation(
+            _safe_descendant(
+                round_layout.registration / f"linear_transform_{round_number}.mat",
+                root=layout.root,
+                location=f"{location} affine",
+            ),
+            "affine",
+        ),
+        _ArtifactExpectation(
+            _safe_descendant(
+                round_layout.registration / f"nonlinear_warp_{round_number}.nii.gz",
+                root=layout.root,
+                location=f"{location} warp",
+            ),
+            "warp",
+        ),
+        _ArtifactExpectation(
+            _safe_descendant(
+                round_layout.registration / f"nonlinear_registered_{round_number}.tif",
+                root=layout.root,
+                location=f"{location} registered image",
+            ),
+            "registered",
+        ),
+        *(
+            _ArtifactExpectation(channel.output, "channel", channel)
+            for channel in channels
+        ),
+    )
+    return _RoundContract(
+        round=round_number,
+        strategy=strategy,  # type: ignore[arg-type]
+        registration_source=registration_source,
+        registration_manifest_channel=registration_manifest,
+        chunk_size_zyx=chunk_size,
+        overlap_fraction=overlap,
+        channels=channels,
+        artifacts=artifacts,
+    )
+
+
+def _parse_scientific_snapshot(
+    payload: object,
+    *,
+    layout: WorkflowLayout,
+    dataset_id: str,
+) -> _ScientificSnapshot:
+    scientific = _exact_mapping(payload, _SCIENTIFIC_KEYS, "scientific plan")
+    schema_version = scientific["schema_version"]
+    if type(schema_version) is not int or schema_version != 1:
+        raise WorkflowPlanError(
+            "scientific plan schema_version must be the built-in integer 1; "
+            f"got {schema_version!r}"
+        )
+    if scientific["dataset_id"] != dataset_id:
+        raise WorkflowPlanError(
+            f"scientific plan dataset_id must be {dataset_id!r}; "
+            f"got {scientific['dataset_id']!r}"
+        )
+    spacing = _triple_float(
+        scientific["voxel_spacing_xyz_um"], "scientific plan voxel_spacing_xyz_um"
+    )
+    registration = _parse_registration(scientific["registration"])
+    sources = tuple(
+        _parse_source(source, spacing=spacing, index=index)
+        for index, source in enumerate(
+            _list(scientific["sources"], "scientific plan sources")
+        )
+    )
+    if not sources:
+        raise WorkflowPlanError("scientific plan sources must not be empty")
+    if tuple(source.path for source in sources) != tuple(
+        sorted((source.path for source in sources), key=str)
     ):
         raise WorkflowPlanError(
-            f"{location} must be a safe relative POSIX path; got {value!r}"
+            "scientific plan sources must be in canonical path order"
         )
-    destination = layout.root.joinpath(*path.parts)
-    return _safe_artifact_path(destination, layout=layout, location=location)
+    sources_by_path = {source.path: source for source in sources}
+    if len(sources_by_path) != len(sources):
+        raise WorkflowPlanError("scientific plan source paths must be unique")
+    reference = _exact_mapping(
+        scientific["reference"], _REFERENCE_KEYS, "scientific plan reference"
+    )
+    reference_round = _integer(reference["round"], "scientific plan reference.round")
+    fixed_path = _absolute_path(
+        reference["channel"], "scientific plan reference.channel"
+    )
+    try:
+        fixed_source = sources_by_path[fixed_path]
+    except KeyError as error:
+        raise WorkflowPlanError(
+            "scientific plan reference.channel must reference a declared source"
+        ) from error
+    rounds = tuple(
+        _parse_round(round_value, layout=layout, sources=sources_by_path, index=index)
+        for index, round_value in enumerate(
+            _list(scientific["rounds"], "scientific plan rounds")
+        )
+    )
+    round_numbers = tuple(round_contract.round for round_contract in rounds)
+    if not rounds or round_numbers != tuple(sorted(set(round_numbers))):
+        raise WorkflowPlanError(
+            "scientific plan rounds must be nonempty, unique, and sorted; "
+            f"got {round_numbers!r}"
+        )
+    policies = _exact_mapping(
+        scientific["policies"], _POLICY_KEYS, "scientific plan policies"
+    )
+    expected_policies = {
+        "axis_convention": AXIS_CONVENTION_VERSION,
+        "output_format": _OUTPUT_FORMAT_POLICY,
+        "postprocessing": _CHANNEL_POSTPROCESSING_POLICY,
+    }
+    if canonical_json(policies) != canonical_json(expected_policies):
+        raise WorkflowPlanError(
+            f"scientific plan policies must be exactly {expected_policies!r}; "
+            f"got {dict(policies)!r}"
+        )
+    encoded = canonical_json(scientific)
+    return _ScientificSnapshot(
+        fingerprint=sha256_fingerprint(encoded),
+        dataset_id=dataset_id,
+        voxel_spacing_xyz=spacing,
+        reference_round=reference_round,
+        fixed_source=fixed_source,
+        registration=registration,
+        sources=sources,
+        rounds=rounds,
+    )
 
 
-def _safe_artifact_path(
-    destination: Path,
+def _snapshot_from_text(
+    text: str,
     *,
     layout: WorkflowLayout,
-    location: str,
-) -> Path:
-    root = layout.root.resolve(strict=False)
-    resolved = destination.resolve(strict=False)
-    if not resolved.is_relative_to(root):
-        raise WorkflowPlanError(
-            f"{location} resolves outside workflow output {root}; got {resolved}"
-        )
-    return destination
-
-
-def _round_artifacts(
-    value: object,
-    *,
-    layout: WorkflowLayout,
-    index: int,
-) -> tuple[int, tuple[Path, ...]]:
-    round_mapping = _mapping(value, f"scientific plan rounds[{index}]")
-    round_number = _built_in_round(
-        round_mapping.get("round"), f"scientific plan rounds[{index}].round"
-    )
-    channels = round_mapping.get("channels")
-    if not isinstance(channels, list):
-        raise WorkflowPlanError(
-            f"scientific plan rounds[{index}].channels must be a JSON array"
-        )
-    channel_outputs = tuple(
-        _channel_output(
-            _mapping(
-                channel,
-                f"scientific plan rounds[{index}].channels[{channel_index}]",
-            ).get("output"),
-            layout=layout,
-            location=(
-                f"scientific plan rounds[{index}].channels[{channel_index}].output"
-            ),
-        )
-        for channel_index, channel in enumerate(channels)
-    )
-    round_layout = layout.round(round_number)
-    registration_artifacts = tuple(
-        _safe_artifact_path(
-            path,
-            layout=layout,
-            location=f"scientific plan round {round_number} registration artifact",
-        )
-        for path in (
-            round_layout.registration / f"linear_transform_{round_number}.mat",
-            round_layout.registration / f"nonlinear_warp_{round_number}.nii.gz",
-            round_layout.registration / f"nonlinear_registered_{round_number}.tif",
-        )
-    )
-    return (
-        round_number,
-        (
-            *registration_artifacts,
-            *channel_outputs,
-        ),
+    dataset_id: str,
+) -> _ScientificSnapshot:
+    return _parse_scientific_snapshot(
+        _decode_json(text, "scientific plan"),
+        layout=layout,
+        dataset_id=dataset_id,
     )
 
 
@@ -177,96 +688,373 @@ def _read_scientific_snapshot(
     plan_path: Path,
     dataset_id: str,
 ) -> _ScientificSnapshot | None:
+    layout = WorkflowLayout(plan_path.parent)
+    _safe_descendant(plan_path, root=layout.root, location="scientific-plan.json")
     if not plan_path.exists() and not plan_path.is_symlink():
         return None
     try:
-        payload = json.loads(
-            plan_path.read_text(encoding="utf-8"),
-            object_pairs_hook=_strict_json_object,
-            parse_float=_finite_json_float,
-            parse_constant=_reject_json_constant,
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        text = plan_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
         raise WorkflowPlanError(
-            f"Scientific plan is not strict JSON at {plan_path}: {error}"
+            f"Scientific plan is unreadable at {plan_path}: {error}"
         ) from error
-    scientific = _mapping(payload, "scientific plan")
-    schema_version = scientific.get("schema_version")
-    if type(schema_version) is not int or schema_version != 1:
-        raise WorkflowPlanError(
-            "scientific plan schema_version must be the built-in integer 1; "
-            f"got {schema_version!r}"
-        )
-    if scientific.get("dataset_id") != dataset_id:
-        raise WorkflowPlanError(
-            f"scientific plan dataset_id must be {dataset_id!r}; "
-            f"got {scientific.get('dataset_id')!r}"
-        )
-    raw_rounds = scientific.get("rounds")
-    if not isinstance(raw_rounds, list):
-        raise WorkflowPlanError("scientific plan rounds must be a JSON array")
-    layout = WorkflowLayout(plan_path.parent)
-    expected_by_round = tuple(
-        sorted(
-            (
-                _round_artifacts(round_value, layout=layout, index=index)
-                for index, round_value in enumerate(raw_rounds)
-            ),
-            key=lambda item: item[0],
-        )
-    )
-    round_numbers = tuple(round_number for round_number, _ in expected_by_round)
-    if len(set(round_numbers)) != len(round_numbers):
-        raise WorkflowPlanError(
-            f"scientific plan round numbers must be unique; got {round_numbers!r}"
-        )
-    encoded = canonical_json(scientific)
-    return _ScientificSnapshot(
-        fingerprint=sha256_fingerprint(encoded),
-        expected_by_round=expected_by_round,
-    )
+    return _snapshot_from_text(text, layout=layout, dataset_id=dataset_id)
 
 
-def _artifact_state(artifact: Path) -> str:
-    record_path = artifact.with_name(f"{artifact.name}.complete.json")
+def _current_source_identities(
+    snapshot: _ScientificSnapshot,
+) -> dict[Path, FileIdentity] | None:
+    identities: dict[Path, FileIdentity] = {}
+    for source in snapshot.sources:
+        try:
+            identity = FileIdentity.from_path(source.path)
+        except (OSError, RuntimeError):
+            return None
+        if identity != source.identity:
+            return None
+        identities[source.path] = identity
+    return identities
+
+
+def _read_artifact_evidence(
+    expectation: _ArtifactExpectation,
+    *,
+    layout: WorkflowLayout,
+) -> _ArtifactEvidence:
+    artifact = _safe_descendant(
+        expectation.path,
+        root=layout.root,
+        location=f"{expectation.role} artifact",
+    )
+    record_path = _safe_descendant(
+        artifact.with_name(f"{artifact.name}.complete.json"),
+        root=layout.root,
+        location=f"{expectation.role} completion record",
+    )
     artifact_present = artifact.exists() or artifact.is_symlink()
     record_present = record_path.exists() or record_path.is_symlink()
-    if not artifact_present and record_present:
-        return "invalid"
-    if not artifact_present or not record_present:
-        return "incomplete"
-    if not artifact.is_file() or not record_path.is_file():
-        return "invalid"
+    if not artifact_present and not record_present:
+        return _ArtifactEvidence("incomplete")
+    if artifact_present and not record_present:
+        return _ArtifactEvidence("incomplete")
+    if not artifact_present or not artifact.is_file() or not record_path.is_file():
+        return _ArtifactEvidence("invalid")
     try:
+        record_text = record_path.read_text(encoding="utf-8")
+        _decode_json(record_text, f"completion record {record_path}")
         record = CompletionRecord.read(record_path)
         identity = FileIdentity.from_path(artifact)
     except Exception:
-        return "invalid"
-    return "complete" if record.artifact == identity else "invalid"
+        return _ArtifactEvidence("invalid")
+    if record.to_json() != record_text or record.artifact != identity:
+        return _ArtifactEvidence("invalid")
+    return _ArtifactEvidence("recorded", identity, record)
 
 
-def _round_status(round_number: int, artifacts: tuple[Path, ...]) -> RoundStatus:
+def _valid_native_threads(value: Mapping[str, int]) -> bool:
+    if frozenset(value) != frozenset(NATIVE_THREAD_ENV_VARS):
+        return False
+    if any(type(item) is not int or item < 1 for item in value.values()):
+        return False
+    blas_values = tuple(value[name] for name in NATIVE_THREAD_ENV_VARS[1:])
+    return len(set(blas_values)) == 1
+
+
+def _linear_parameters(registration: _RegistrationContract) -> dict[str, object]:
+    parameters: dict[str, object] = {
+        "aff_metric": "mattes",
+        "aff_random_sampling_rate": 0.5,
+        "aff_sampling": 32,
+        "mask_all_stages": True,
+        "verbose": True,
+    }
+    if (
+        registration.linear_type == "TRSAA"
+        and registration.linear_accuracy != "dry run"
+    ):
+        parameters["reg_iterations"] = _LINEAR_ITERATIONS[registration.linear_accuracy]
+    if registration.linear_accuracy == "dry run":
+        parameters.update(
+            effective_registration_type="Rigid",
+            aff_iterations=[1],
+            aff_smoothing_sigmas=[0],
+            aff_shrink_factors=[8],
+            aff_random_sampling_rate=0.1,
+        )
+    return parameters
+
+
+def _nonlinear_parameters(registration: _RegistrationContract) -> dict[str, object]:
+    return {
+        "aff_random_sampling_rate": 1.0,
+        "flow_sigma": 3.0,
+        "initial_transform": "Identity",
+        "mask_all_stages": True,
+        "reg_iterations": _NONLINEAR_ITERATIONS[registration.nonlinear_accuracy],
+        "singleprecision": False,
+        "syn_metric": "mattes",
+        "syn_sampling": 32,
+        "total_sigma": 0.5,
+        "verbose": True,
+    }
+
+
+def _valid_geometry(
+    actual: ImageGeometry,
+    expected: ImageGeometry,
+    *,
+    crop: bool,
+) -> bool:
+    if not crop:
+        return actual == expected
+    return (
+        actual.spacing == expected.spacing
+        and actual.direction == expected.direction
+        and all(
+            actual_size <= source_size
+            for actual_size, source_size in zip(
+                actual.shape, expected.shape, strict=True
+            )
+        )
+    )
+
+
+def _common_parameters(
+    snapshot: _ScientificSnapshot,
+    round_contract: _RoundContract,
+) -> dict[str, object]:
+    return {
+        "axis_convention_version": AXIS_CONVENTION_VERSION,
+        "crop": snapshot.registration.crop,
+        "imaging_round": round_contract.round,
+        "pixel_size_xyz": list(snapshot.voxel_spacing_xyz),
+    }
+
+
+def _request_basics_valid(
+    request: StageRequest,
+    *,
+    inputs: tuple[FileIdentity, ...],
+    expected_geometry: ImageGeometry,
+    crop: bool,
+) -> bool:
+    return (
+        request.inputs == inputs
+        and _valid_native_threads(request.native_threads)
+        and _valid_geometry(request.geometry, expected_geometry, crop=crop)
+    )
+
+
+def _whole_request_valid(
+    expectation: _ArtifactExpectation,
+    evidence: _ArtifactEvidence,
+    *,
+    snapshot: _ScientificSnapshot,
+    round_contract: _RoundContract,
+    source_identities: Mapping[Path, FileIdentity],
+    artifact_identities: Mapping[ArtifactRole, FileIdentity],
+) -> bool:
+    if evidence.record is None:
+        return False
+    if snapshot.registration.crop:
+        # A cropped output grid is runtime-derived from image intensities and crop
+        # bounds. The Phase 2A scientific snapshot does not carry the complete crop
+        # artifact chain, so accepting only a plausible geometry would authorize
+        # reuse without enough provenance.
+        return False
+    request = evidence.record.request
+    fixed_identity = source_identities[snapshot.fixed_source.path]
+    moving_identity = source_identities[round_contract.registration_source.path]
+    registration_inputs = (fixed_identity, moving_identity)
+    common = _common_parameters(snapshot, round_contract)
+    scalar_policy = (
+        _WHOLE_SCALAR_POLICY
+        if round_contract.strategy == "whole_image"
+        else _CHUNK_SCALAR_POLICY
+    )
+    if expectation.role == "affine":
+        if not _request_basics_valid(
+            request,
+            inputs=registration_inputs,
+            expected_geometry=snapshot.fixed_source.geometry,
+            crop=snapshot.registration.crop,
+        ):
+            return False
+        expected_parameters = {
+            **common,
+            "image_interpolation": "linear",
+            "mask_interpolation": "nearestNeighbor",
+            "moving_geometry": round_contract.registration_source.geometry.to_dict(),
+            "registration_parameters": _linear_parameters(snapshot.registration),
+        }
+        return (
+            request.stage == "affine"
+            and request.method == snapshot.registration.linear_type
+            and request.accuracy == snapshot.registration.linear_accuracy
+            and request.upstream is None
+            and canonical_json(request.parameters)
+            == canonical_json(expected_parameters)
+        )
+    affine_identity = artifact_identities.get("affine")
+    if affine_identity is None:
+        return False
+    if expectation.role == "warp":
+        if not _request_basics_valid(
+            request,
+            inputs=registration_inputs,
+            expected_geometry=snapshot.fixed_source.geometry,
+            crop=snapshot.registration.crop,
+        ):
+            return False
+        if round_contract.strategy != "whole_image":
+            # Serial-chunk provenance includes local-warp and manifest records. Until
+            # that full chain is represented by the Phase 2B worker, never authorize
+            # coarse workflow reuse from only the assembled warp record.
+            return False
+        expected_parameters = {
+            **common,
+            "image_interpolation": "linear",
+            "mask_interpolation": "nearestNeighbor",
+            "moving_geometry": request.geometry.to_dict(),
+            "registration_mode": "whole-image",
+            "registration_parameters": _nonlinear_parameters(snapshot.registration),
+            "scalar_postprocessing_policy": scalar_policy,
+        }
+        return (
+            request.stage == "nonlinear"
+            and request.method == snapshot.registration.nonlinear_type
+            and request.accuracy == snapshot.registration.nonlinear_accuracy
+            and request.upstream == affine_identity
+            and canonical_json(request.parameters)
+            == canonical_json(expected_parameters)
+        )
+    warp_identity = artifact_identities.get("warp")
+    if warp_identity is None:
+        return False
+    if expectation.role == "registered":
+        if not _request_basics_valid(
+            request,
+            inputs=registration_inputs,
+            expected_geometry=snapshot.fixed_source.geometry,
+            crop=snapshot.registration.crop,
+        ):
+            return False
+        expected_keys = frozenset(
+            {
+                *common,
+                "format",
+                "minimum",
+                "maximum",
+                "scalar_postprocessing_policy",
+            }
+        )
+        if frozenset(request.parameters) != expected_keys:
+            return False
+        minimum = request.parameters.get("minimum")
+        maximum = request.parameters.get("maximum")
+        try:
+            minimum_value = _finite_number(minimum, "registered request minimum")
+            maximum_value = _finite_number(maximum, "registered request maximum")
+        except WorkflowPlanError:
+            return False
+        expected_static = {
+            **common,
+            "format": "uint16-tiff",
+            "scalar_postprocessing_policy": scalar_policy,
+        }
+        actual_static = {
+            key: value
+            for key, value in request.parameters.items()
+            if key not in {"minimum", "maximum"}
+        }
+        return (
+            minimum_value <= maximum_value
+            and request.stage == "registered-image"
+            and request.method == snapshot.registration.nonlinear_type
+            and request.accuracy == snapshot.registration.nonlinear_accuracy
+            and request.upstream == warp_identity
+            and canonical_json(actual_static) == canonical_json(expected_static)
+        )
+    channel = expectation.channel
+    if channel is None:
+        return False
+    channel_inputs = (
+        fixed_identity,
+        source_identities[channel.source.path],
+        affine_identity,
+        warp_identity,
+    )
+    if not _request_basics_valid(
+        request,
+        inputs=channel_inputs,
+        expected_geometry=snapshot.fixed_source.geometry,
+        crop=False,
+    ):
+        return False
+    expected_parameters = {
+        "pixel_size_xyz_um": list(snapshot.voxel_spacing_xyz),
+        "interpolation": channel.interpolation,
+        "transform_order": ["warp", "affine"],
+        "whichtoinvert": [False, False],
+        "axis_convention": AXIS_CONVENTION_VERSION,
+        "output_format": _OUTPUT_FORMAT_POLICY,
+        "postprocessing": _CHANNEL_POSTPROCESSING_POLICY,
+    }
+    return (
+        request.stage == "channel-transform-v1"
+        and request.method == "warp-affine"
+        and request.accuracy == "not-applicable"
+        and request.upstream == warp_identity
+        and canonical_json(request.parameters) == canonical_json(expected_parameters)
+    )
+
+
+def _round_status(
+    snapshot: _ScientificSnapshot,
+    round_contract: _RoundContract,
+    *,
+    layout: WorkflowLayout,
+) -> RoundStatus:
+    evidences = tuple(
+        _read_artifact_evidence(expectation, layout=layout)
+        for expectation in round_contract.artifacts
+    )
+    source_identities = _current_source_identities(snapshot)
+    artifact_identities: dict[ArtifactRole, FileIdentity] = {}
     complete: list[str] = []
     incomplete: list[str] = []
     invalid: list[str] = []
-    for artifact in artifacts:
-        state = _artifact_state(artifact)
-        destination = {
-            "complete": complete,
-            "incomplete": incomplete,
-            "invalid": invalid,
-        }[state]
-        destination.append(str(artifact))
+    for expectation, evidence in zip(round_contract.artifacts, evidences, strict=True):
+        path = str(expectation.path)
+        if evidence.state == "incomplete":
+            incomplete.append(path)
+        elif (
+            evidence.state == "recorded"
+            and source_identities is not None
+            and _whole_request_valid(
+                expectation,
+                evidence,
+                snapshot=snapshot,
+                round_contract=round_contract,
+                source_identities=source_identities,
+                artifact_identities=artifact_identities,
+            )
+        ):
+            complete.append(path)
+            if expectation.role != "channel" and evidence.identity is not None:
+                artifact_identities[expectation.role] = evidence.identity
+        else:
+            invalid.append(path)
     if invalid:
         status = "invalid"
-    elif len(complete) == len(artifacts):
+    elif len(complete) == len(round_contract.artifacts):
         status = "complete"
     elif complete:
         status = "partial"
     else:
         status = "pending"
     return RoundStatus(
-        round=round_number,
+        round=round_contract.round,
         status=status,
         complete_artifacts=tuple(complete),
         incomplete_artifacts=tuple(incomplete),
@@ -278,19 +1066,17 @@ def inspect_workflow_status(
     output_root: str | Path,
     dataset_id: str,
 ) -> WorkflowStatus:
-    """Inspect authoritative completion records without changing workflow state."""
+    """Inspect authoritative completion provenance without changing workflow state."""
     layout = _safe_workflow_layout(output_root, dataset_id)
+    _safe_descendant(
+        layout.plan_path, root=layout.root, location="scientific-plan.json"
+    )
     snapshot = _read_scientific_snapshot(layout.plan_path, dataset_id)
     if snapshot is None:
-        return WorkflowStatus(
-            dataset_id=dataset_id,
-            scientific_fingerprint=None,
-            rounds=(),
-            complete=False,
-        )
+        return WorkflowStatus(dataset_id, None, (), False)
     rounds = tuple(
-        _round_status(round_number, artifacts)
-        for round_number, artifacts in snapshot.expected_by_round
+        _round_status(snapshot, round_contract, layout=layout)
+        for round_contract in snapshot.rounds
     )
     return WorkflowStatus(
         dataset_id=dataset_id,

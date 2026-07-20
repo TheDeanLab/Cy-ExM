@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
-if TYPE_CHECKING:
-    from cyexm.workflow.models import RoundResult, RoundTask
+from cyexm.workflow.models import RoundResult, RoundTask
 
-type RoundTaskRunner = Callable[["RoundTask"], "RoundResult"]
+type RoundTaskRunner = Callable[[RoundTask], RoundResult]
 
 
 class WorkflowExecutor(Protocol):

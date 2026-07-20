@@ -307,6 +307,29 @@ def test_plan_rejects_roots_that_contain_one_another_after_strict_resolution(
         build_workflow_plan(manifest, execution)
 
 
+def test_plan_rejects_an_existing_output_root_that_is_not_a_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    execution.paths.output_root.write_text("do not replace", encoding="utf-8")
+    before = execution.paths.output_root.read_bytes()
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    with pytest.raises(
+        WorkflowPlanError,
+        match=r"paths\.output_root must resolve to a directory",
+    ):
+        build_workflow_plan(manifest, execution)
+
+    assert execution.paths.output_root.read_bytes() == before
+
+
 def test_plan_rejects_existing_output_symlinks_that_escape_the_output_root(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -327,6 +350,62 @@ def test_plan_rejects_existing_output_symlinks_that_escape_the_output_root(
         build_workflow_plan(manifest, execution)
 
     assert str(outside) in str(captured.value)
+
+
+@pytest.mark.parametrize("strategy", ["whole_image", "serial_chunked"])
+@pytest.mark.parametrize(
+    ("registration_filename", "role_fragment"),
+    [
+        ("linear_transform_2.mat", "registration affine"),
+        ("nonlinear_warp_2.nii.gz", "registration warp"),
+        ("nonlinear_registered_2.tif", "registration diagnostic"),
+    ],
+)
+def test_plan_rejects_channel_aliases_to_registration_final_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    strategy: str,
+    registration_filename: str,
+    role_fragment: str,
+) -> None:
+    channel_file = PurePosixPath(f"nested/{registration_filename}")
+    manifest = DatasetManifest(
+        schema_version=1,
+        dataset_id="dataset-1",
+        voxel_spacing_um=(1.0, 1.0, 1.0),
+        reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+        registration=_registration(),
+        rounds=(
+            RoundSpec(
+                round=2,
+                strategy=strategy,  # type: ignore[arg-type]
+                registration_channel=channel_file,
+                channels=(ChannelSpec(channel_file, "linear"),),
+                chunk_size_zyx=(2, 4, 4) if strategy == "serial_chunked" else None,
+                overlap_fraction=0.25 if strategy == "serial_chunked" else None,
+            ),
+        ),
+    )
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    round_root = (
+        execution.paths.output_root / manifest.dataset_id / "rounds" / "round-002"
+    )
+    registration = round_root / "registration"
+    registration.mkdir(parents=True)
+    (round_root / "channels").symlink_to(registration, target_is_directory=True)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    with pytest.raises(WorkflowPlanError, match="final artifact collision") as captured:
+        build_workflow_plan(manifest, execution)
+
+    message = str(captured.value)
+    assert role_fragment in message
+    assert "channels[0]" in message
+    assert str(registration / registration_filename) in message
 
 
 def test_plan_aggregates_header_failures_and_shape_incompatibility(
@@ -421,9 +500,74 @@ def test_scientific_fingerprint_contains_complete_policy_but_not_execution_choic
         for artifact in (
             task.registration_directory / f"linear_transform_{task.round}.mat",
             task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
+            task.registration_directory / f"nonlinear_registered_{task.round}.tif",
             *(channel.output for channel in task.channels),
         )
     )
+
+
+def test_manifest_alias_and_relative_channel_output_are_scientific_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    fixed = dataset_root / "fixed.tif"
+    shared = dataset_root / "shared.tif"
+    fixed.touch()
+    shared.touch()
+    (dataset_root / "alias-a.tif").symlink_to(shared)
+    (dataset_root / "alias-b.tif").symlink_to(shared)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    def manifest(alias: str) -> DatasetManifest:
+        relative = PurePosixPath(alias)
+        return DatasetManifest(
+            schema_version=1,
+            dataset_id="dataset-1",
+            voxel_spacing_um=(1.0, 1.0, 1.0),
+            reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+            registration=_registration(),
+            rounds=(
+                RoundSpec(
+                    2,
+                    "whole_image",
+                    relative,
+                    (ChannelSpec(relative, "linear"),),
+                ),
+            ),
+        )
+
+    plan_a = build_workflow_plan(
+        manifest("alias-a.tif"),
+        _execution(
+            tmp_path,
+            dataset_root=dataset_root,
+            output_root=tmp_path / "output-a",
+        ),
+    )
+    plan_b = build_workflow_plan(
+        manifest("alias-b.tif"),
+        _execution(
+            tmp_path,
+            dataset_root=dataset_root,
+            output_root=tmp_path / "output-b",
+        ),
+    )
+
+    channel_a = json.loads(plan_a.scientific_json)["rounds"][0]["channels"][0]
+    channel_b = json.loads(plan_b.scientific_json)["rounds"][0]["channels"][0]
+    assert channel_a["file"] == channel_b["file"] == str(shared)
+    assert channel_a["manifest_file"] == "alias-a.tif"
+    assert channel_b["manifest_file"] == "alias-b.tif"
+    assert channel_a["output"] == "rounds/round-002/channels/alias-a.tif"
+    assert channel_b["output"] == "rounds/round-002/channels/alias-b.tif"
+    assert plan_a.tasks[0].channels[0].output.name == "alias-a.tif"
+    assert plan_b.tasks[0].channels[0].output.name == "alias-b.tif"
+    assert plan_a.scientific_fingerprint != plan_b.scientific_fingerprint
 
 
 def test_existing_exact_plan_is_accepted_without_mutation(
@@ -511,6 +655,135 @@ def test_existing_plan_requires_the_exact_snapshot_schema(
     assert "select a new output root" in str(captured.value)
 
 
+def test_existing_plan_rejects_overflowing_json_floats_as_workflow_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+    plan = build_workflow_plan(manifest, execution)
+    plan_path = WorkflowLayout.for_dataset(
+        execution.paths.output_root, manifest.dataset_id
+    ).plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(
+        plan.scientific_json.replace("0.324", "1e400", 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowPlanError, match="finite JSON number"):
+        build_workflow_plan(manifest, execution)
+
+
+def test_existing_plan_signed_zero_mismatch_has_a_dotted_value_difference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    base = _round(3)
+    manifest = DatasetManifest(
+        schema_version=1,
+        dataset_id="dataset-1",
+        voxel_spacing_um=(0.324, 0.324, 0.9),
+        reference=ReferenceSpec(1, PurePosixPath("round_1_488.tif")),
+        registration=_registration(),
+        rounds=(
+            RoundSpec(
+                round=base.round,
+                strategy=base.strategy,
+                registration_channel=base.registration_channel,
+                channels=base.channels,
+                chunk_size_zyx=base.chunk_size_zyx,
+                overlap_fraction=0.0,
+            ),
+        ),
+    )
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+    plan = build_workflow_plan(manifest, execution)
+    existing = json.loads(plan.scientific_json)
+    existing["rounds"][0]["overlap_fraction"] = -0.0
+    plan_path = WorkflowLayout.for_dataset(
+        execution.paths.output_root, manifest.dataset_id
+    ).plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(json.dumps(existing), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError) as captured:
+        build_workflow_plan(manifest, execution)
+
+    message = str(captured.value)
+    assert "rounds[0].overlap_fraction" in message
+    assert "existing=-0.0" in message
+    assert "planned=0.0" in message
+
+
+def test_existing_plan_list_cardinality_is_a_dotted_scientific_difference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+    plan = build_workflow_plan(manifest, execution)
+    existing = json.loads(plan.scientific_json)
+    existing["rounds"][0]["channels"].pop()
+    plan_path = WorkflowLayout.for_dataset(
+        execution.paths.output_root, manifest.dataset_id
+    ).plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(json.dumps(existing), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError) as captured:
+        build_workflow_plan(manifest, execution)
+
+    message = str(captured.value)
+    assert "fingerprint mismatch" in message
+    assert "rounds[0].channels[1]" in message
+    assert "planned=" in message
+
+
+def test_existing_plan_validates_schema_of_added_list_elements(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+    plan = build_workflow_plan(manifest, execution)
+    existing = json.loads(plan.scientific_json)
+    existing["rounds"][0]["channels"].append({"file": "incomplete"})
+    plan_path = WorkflowLayout.for_dataset(
+        execution.paths.output_root, manifest.dataset_id
+    ).plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(json.dumps(existing), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match="exact schema") as captured:
+        build_workflow_plan(manifest, execution)
+
+    message = str(captured.value)
+    assert "rounds[0].channels[2].interpolation" in message
+    assert "rounds[0].channels[2].manifest_file" in message
+    assert "rounds[0].channels[2].output" in message
+
+
 def test_planner_public_signature_has_no_force_escape_hatch() -> None:
     assert tuple(inspect.signature(build_workflow_plan).parameters) == (
         "manifest",
@@ -542,6 +815,72 @@ def test_private_header_inspection_reads_strict_scalar_tiff_metadata(
     assert header.geometry is None
     assert header.st_size == path.stat().st_size
     assert header.st_mtime_ns == path.stat().st_mtime_ns
+
+
+@pytest.mark.parametrize(
+    ("axes", "shape", "expected_axes"),
+    [
+        ("QYX", (2, 3, 4), "QYX"),
+        ("ZYX", (1, 3, 4), "YX"),
+    ],
+)
+def test_private_header_inspection_preserves_phase_one_scalar_layouts(
+    tmp_path: Path,
+    axes: str,
+    shape: tuple[int, int, int],
+    expected_axes: str,
+) -> None:
+    import numpy as np
+    import tifffile
+
+    path = tmp_path / f"{axes.lower()}-{shape[0]}.tif"
+    tifffile.imwrite(
+        path,
+        np.zeros(shape, dtype=np.uint16),
+        metadata={"axes": axes},
+        photometric="minisblack",
+    )
+
+    header = _inspect_tiff_header(path)
+
+    assert header.shape_zyx == shape
+    assert header.axes == expected_axes
+
+
+def test_private_header_inspection_rejects_a_file_changed_between_metadata_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import numpy as np
+    import tifffile
+
+    from cyexm.io import tiff as tiff_module
+
+    path = tmp_path / "changing.tif"
+    tifffile.imwrite(
+        path,
+        np.zeros((2, 3, 5), dtype=np.uint16),
+        metadata={"axes": "ZYX"},
+        photometric="minisblack",
+    )
+
+    def mutate_during_strict_validation(
+        source: str | Path,
+        _shape: tuple[int, ...],
+    ) -> None:
+        with Path(source).open("ab") as stream:
+            stream.write(b"changed")
+
+    monkeypatch.setattr(
+        tiff_module,
+        "read_tiff_geometry",
+        mutate_during_strict_validation,
+    )
+
+    with pytest.raises(
+        WorkflowPlanError, match="changed during TIFF header inspection"
+    ):
+        _inspect_tiff_header(path)
 
 
 @pytest.mark.parametrize("layout", ["two_dimensional", "rgb"])

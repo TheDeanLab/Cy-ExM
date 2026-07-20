@@ -34,6 +34,12 @@ class _InputReference:
     relative_path: PurePosixPath
 
 
+@dataclass(frozen=True, slots=True)
+class _FinalArtifact:
+    path: Path
+    role: str
+
+
 def _input_references(manifest: DatasetManifest) -> tuple[_InputReference, ...]:
     references = [
         _InputReference(
@@ -63,6 +69,10 @@ def _resolve_root(path: Path, role: str, *, strict: bool) -> Path:
     if strict and not resolved.is_dir():
         raise WorkflowPlanError(
             f"{role} must resolve to an existing directory; got {resolved}"
+        )
+    if not strict and resolved.exists() and not resolved.is_dir():
+        raise WorkflowPlanError(
+            f"{role} must resolve to a directory when it exists; got {resolved}"
         )
     return resolved
 
@@ -159,6 +169,13 @@ def _inspect_tiff_header(path: Path) -> ImageHeader:
     try:
         import tifffile
 
+        stat_before = path.stat()
+        identity_before = (
+            stat_before.st_dev,
+            stat_before.st_ino,
+            stat_before.st_size,
+            stat_before.st_mtime_ns,
+        )
         with tifffile.TiffFile(path) as handle:
             series = handle.series[0]
             shape = _shape_from_series(series, handle.shaped_metadata)
@@ -167,12 +184,23 @@ def _inspect_tiff_header(path: Path) -> ImageHeader:
         from cyexm.io.tiff import read_tiff_geometry
 
         geometry = read_tiff_geometry(path, shape)
-        stat = path.stat()
+        stat_after = path.stat()
+        identity_after = (
+            stat_after.st_dev,
+            stat_after.st_ino,
+            stat_after.st_size,
+            stat_after.st_mtime_ns,
+        )
     except (IndexError, InputValidationError, OSError, TypeError, ValueError) as error:
         raise WorkflowPlanError(
             f"TIFF must have a readable scalar three-dimensional layout: {path}; "
             f"{error}"
         ) from error
+    if identity_before != identity_after:
+        raise WorkflowPlanError(
+            f"File changed during TIFF header inspection: {path}; "
+            f"before={identity_before!r}, after={identity_after!r}"
+        )
     if len(shape) != 3 or axes not in {"ZYX", "QYX", "YX"}:
         raise WorkflowPlanError(
             f"TIFF must have a readable scalar three-dimensional layout: {path}; "
@@ -184,8 +212,8 @@ def _inspect_tiff_header(path: Path) -> ImageHeader:
         dtype=dtype,
         axes=axes,
         geometry=geometry,
-        st_size=stat.st_size,
-        st_mtime_ns=stat.st_mtime_ns,
+        st_size=stat_after.st_size,
+        st_mtime_ns=stat_after.st_mtime_ns,
     )
 
 
@@ -278,44 +306,83 @@ def _inspect_headers(
     return headers
 
 
-def _validate_output_paths(
+def _final_artifacts(
     manifest: DatasetManifest,
+    tasks: tuple[RoundTask, ...],
+) -> tuple[_FinalArtifact, ...]:
+    artifacts: list[_FinalArtifact] = []
+    round_indexes = {
+        round_spec.round: round_index
+        for round_index, round_spec in enumerate(manifest.rounds)
+    }
+    for task in tasks:
+        round_label = f"rounds[{round_indexes[task.round]}]"
+        artifacts.extend(
+            (
+                _FinalArtifact(
+                    task.registration_directory / f"linear_transform_{task.round}.mat",
+                    f"{round_label} registration affine",
+                ),
+                _FinalArtifact(
+                    task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
+                    f"{round_label} registration warp",
+                ),
+                _FinalArtifact(
+                    task.registration_directory
+                    / f"nonlinear_registered_{task.round}.tif",
+                    f"{round_label} registration diagnostic",
+                ),
+            )
+        )
+        artifacts.extend(
+            _FinalArtifact(
+                channel.output,
+                f"{round_label}.channels[{channel_index}].file output",
+            )
+            for channel_index, channel in enumerate(task.channels)
+        )
+    return tuple(artifacts)
+
+
+def _validate_output_paths(
     layout: WorkflowLayout,
     output_root: Path,
-    resolved_inputs: Mapping[PurePosixPath, Path],
+    source_paths: frozenset[Path],
+    tasks: tuple[RoundTask, ...],
+    artifacts: tuple[_FinalArtifact, ...],
 ) -> None:
-    source_paths = frozenset(resolved_inputs.values())
     errors: list[str] = []
-    outputs: dict[Path, list[str]] = {}
+    artifacts_by_resolved_path: dict[Path, list[_FinalArtifact]] = {}
     planned_locations = [
         ("dataset output directory", layout.root),
         ("scientific plan", layout.plan_path),
     ]
-    for round_index, round_spec in enumerate(manifest.rounds):
-        round_layout = layout.round(round_spec.round)
+    for task in tasks:
         planned_locations.extend(
             (
                 (
-                    f"rounds[{round_index}] registration directory",
-                    round_layout.registration,
+                    f"round {task.round} registration directory",
+                    task.registration_directory,
                 ),
-                (f"rounds[{round_index}] log", round_layout.log),
+                (f"round {task.round} log", task.log_path),
             )
         )
-        for channel_index, channel in enumerate(round_spec.channels):
-            yaml_path = f"rounds[{round_index}].channels[{channel_index}].file"
-            destination = round_layout.channel(channel.file).resolve(strict=False)
-            planned_locations.append((f"{yaml_path} output", destination))
-            outputs.setdefault(destination, []).append(yaml_path)
-            if destination in source_paths:
-                errors.append(
-                    f"{yaml_path}: channel output collides with source input "
-                    f"{destination}"
-                )
-    for destination, yaml_paths in outputs.items():
-        if len(yaml_paths) > 1:
+    for artifact in artifacts:
+        resolved = artifact.path.resolve(strict=False)
+        artifacts_by_resolved_path.setdefault(resolved, []).append(artifact)
+        planned_locations.append((artifact.role, artifact.path))
+        if resolved in source_paths:
+            errors.append(f"{artifact.role} collides with source input {resolved}")
+    for destination, aliases in artifacts_by_resolved_path.items():
+        if len(aliases) > 1:
+            roles = ", ".join(artifact.role for artifact in aliases)
+            channel_detail = (
+                " (channel output collision)"
+                if all("channels[" in artifact.role for artifact in aliases)
+                else ""
+            )
             errors.append(
-                f"channel output collision for {destination}: {', '.join(yaml_paths)}"
+                f"final artifact collision{channel_detail} for {destination}: {roles}"
             )
     for role, location in planned_locations:
         resolved = location.resolve(strict=False)
@@ -393,7 +460,10 @@ def _scientific_mapping(
     manifest: DatasetManifest,
     resolved_inputs: Mapping[PurePosixPath, Path],
     headers: Mapping[Path, ImageHeader],
+    layout: WorkflowLayout,
+    tasks: tuple[RoundTask, ...],
 ) -> dict[str, object]:
+    tasks_by_round = {task.round: task for task in tasks}
     return {
         "schema_version": manifest.schema_version,
         "dataset_id": manifest.dataset_id,
@@ -423,6 +493,9 @@ def _scientific_mapping(
                 "registration_channel": str(
                     resolved_inputs[round_spec.registration_channel]
                 ),
+                "registration_manifest_channel": (
+                    round_spec.registration_channel.as_posix()
+                ),
                 "chunk_size_zyx": (
                     None
                     if round_spec.chunk_size_zyx is None
@@ -432,9 +505,17 @@ def _scientific_mapping(
                 "channels": [
                     {
                         "file": str(resolved_inputs[channel.file]),
+                        "manifest_file": channel.file.as_posix(),
+                        "output": channel_task.output.relative_to(
+                            layout.root
+                        ).as_posix(),
                         "interpolation": channel.interpolation,
                     }
-                    for channel in round_spec.channels
+                    for channel, channel_task in zip(
+                        round_spec.channels,
+                        tasks_by_round[round_spec.round].channels,
+                        strict=True,
+                    )
                 ],
             }
             for round_spec in sorted(manifest.rounds, key=lambda item: item.round)
@@ -449,6 +530,13 @@ def _scientific_mapping(
 
 def _reject_json_constant(value: str) -> object:
     raise ValueError(f"non-finite JSON constant {value!r} is not allowed")
+
+
+def _finite_json_float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"finite JSON number required; got {value!r}")
+    return result
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -486,13 +574,13 @@ def _schema_differences(
         if not isinstance(actual, list):
             return [f"{location}: expected array, got {type(actual).__name__}"]
         differences = []
-        if len(actual) != len(expected):
-            differences.append(
-                f"{location}: expected {len(expected)} items, got {len(actual)}"
-            )
-        for index, (actual_item, expected_item) in enumerate(
-            zip(actual, expected, strict=False)
-        ):
+        for index, actual_item in enumerate(actual):
+            if index < len(expected):
+                expected_item = expected[index]
+            elif expected:
+                expected_item = expected[-1]
+            else:
+                continue
             differences.extend(
                 _schema_differences(
                     actual_item,
@@ -551,7 +639,7 @@ def _value_differences(
                     _value_differences(actual[index], expected[index], child)
                 )
         return differences
-    if actual != expected:
+    if canonical_json(actual) != canonical_json(expected):
         return [f"{location}: existing={actual!r}, planned={expected!r}"]
     return []
 
@@ -568,6 +656,7 @@ def _validate_existing_plan(
         existing = json.loads(
             text,
             object_pairs_hook=_strict_json_object,
+            parse_float=_finite_json_float,
             parse_constant=_reject_json_constant,
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
@@ -593,18 +682,6 @@ def _validate_existing_plan(
         )
 
 
-def _expected_artifacts(tasks: tuple[RoundTask, ...]) -> tuple[Path, ...]:
-    return tuple(
-        artifact
-        for task in tasks
-        for artifact in (
-            task.registration_directory / f"linear_transform_{task.round}.mat",
-            task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
-            *(channel.output for channel in task.channels),
-        )
-    )
-
-
 def build_workflow_plan(
     manifest: DatasetManifest,
     execution: ExecutionProfile,
@@ -627,14 +704,27 @@ def build_workflow_plan(
         manifest.voxel_spacing_um,
     )
     layout = WorkflowLayout.for_dataset(output_root, manifest.dataset_id)
-    _validate_output_paths(manifest, layout, output_root, resolved_inputs)
     tasks = _round_tasks(
         manifest,
         normalized_execution,
         layout,
         resolved_inputs,
     )
-    scientific_mapping = _scientific_mapping(manifest, resolved_inputs, headers)
+    artifacts = _final_artifacts(manifest, tasks)
+    _validate_output_paths(
+        layout,
+        output_root,
+        frozenset(resolved_inputs.values()),
+        tasks,
+        artifacts,
+    )
+    scientific_mapping = _scientific_mapping(
+        manifest,
+        resolved_inputs,
+        headers,
+        layout,
+        tasks,
+    )
     scientific_json = canonical_json(scientific_mapping)
     scientific_fingerprint = sha256_fingerprint(scientific_json)
     _validate_existing_plan(
@@ -649,7 +739,7 @@ def build_workflow_plan(
         execution=normalized_execution,
         fixed_image=resolved_inputs[manifest.reference.channel],
         tasks=tasks,
-        expected_artifacts=_expected_artifacts(tasks),
+        expected_artifacts=tuple(artifact.path for artifact in artifacts),
         scientific_json=scientific_json,
         scientific_fingerprint=scientific_fingerprint,
     )

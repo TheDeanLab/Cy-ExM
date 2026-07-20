@@ -15,6 +15,7 @@
   the operation that creates or connects to a scheduler. Keep scheduler imports out
   of module scope and preserve no import-time cluster, client, worker, filesystem,
   or network activity.
-- Phase 2A scientific manifest models, planning policy, sequential execution, and CLI
-  imports must remain usable without importing ANTs or scheduler libraries.
-  Machine-specific execution adapters depend on those models, never the reverse.
+- Phase 2 scientific manifest models, planning policy, sequential execution, real
+  round-task modules, and CLI imports must remain usable without importing ANTs or
+  scheduler libraries. Machine-specific execution adapters depend on those models,
+  never the reverse.

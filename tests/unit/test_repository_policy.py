@@ -90,7 +90,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "cleaned up on success, failure, and cancellation",
     ),
     "src/cyexm/workflow/AGENTS.md": (
-        "phase 2a",
+        "phase 2b binds sequential execution to the real round worker",
         "immutable plans, tasks, and results",
         "deterministic path and header validation",
         "output layout, status, fingerprinting, and public orchestration",
@@ -100,6 +100,11 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "scientific fingerprints exclude executor, resource, and logging settings",
         "force never bypasses a scientific-plan fingerprint mismatch",
         "no module-scope scientific or scheduler imports",
+        "only real registration execution boundary in workflow",
+        "configures the task's native threads before its lazy "
+        "registration/scientific imports",
+        "must not create a dask client, submit child tasks, schedule other rounds, "
+        "or start multiprocessing",
     ),
 }
 
@@ -213,16 +218,18 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
         assert forbidden not in workflow
 
 
-def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_a() -> None:
+def test_root_guidance_tracks_stable_phase_one_and_current_phase_two_b() -> None:
     root = _normalized_repository_file("AGENTS.md")
     for required in (
         "phase 1 is the current stable runtime",
-        "phase 2a is the current workflow surface",
+        "phase 2b is the current workflow surface",
         "approved phase 2 runtime design and implementation plans",
         "scientific dataset manifests",
         "execution profiles",
         "deterministic planning",
         "sequential execution",
+        "real scheduler-neutral round runner",
+        "restart-safe transformed-channel artifacts",
         "dask and slurm executors remain later milestones",
         "serial chunk workflow remains",
         "nested chunk multiprocessing",
@@ -262,10 +269,11 @@ def test_documentation_and_examples_track_the_current_phase_two_boundary() -> No
     documentation = _normalized_repository_file("docs/AGENTS.md")
     for required in (
         "merged phase 1 behavior",
-        "phase 2a runtime available on this branch",
+        "phase 2b runtime available on this branch",
         "strict yaml validation",
         "deterministic planning",
-        "sequential execution",
+        "real sequential round execution",
+        "restart-safe transformed channels",
         "later phase 2 milestones",
     ):
         assert required in documentation
@@ -295,8 +303,11 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
 
     package = _normalized_repository_file("src/cyexm/AGENTS.md")
     for required in (
-        "configuration, workflow, execution, and cli namespaces implement phase 2a",
+        "configuration, workflow, execution, and cli namespaces implement the "
+        "phase 2 workflow surface",
         "must not become package-root exports",
+        "phase 2b channel primitive usable without dask, distributed, "
+        "dask-jobqueue, or yaml workflow dependencies",
     ):
         assert required in package
     assert "scheduler concerns do not belong in `cyexm.registration`" in package
@@ -306,6 +317,11 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
         "backend artifact writer methods",
         "`artifacts.py`, `whole_image.py`, and `chunked.py`",
         "must not own workflow scheduling",
+        "`channels.py` owns only one source channel's restart-safe transform "
+        "artifact lifecycle",
+        "configures native threads before requesting the lazy scientific backend",
+        "must not schedule rounds, create clients or child tasks, or import "
+        "workflow/executor code",
     ):
         assert required in registration
 
@@ -333,10 +349,11 @@ def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> 
 
     unit = _normalized_repository_file("tests/unit/AGENTS.md")
     for required in (
-        "phase 2a manifest, execution-profile, planning, sequential-executor, "
-        "and cli policy",
+        "phase 2 manifest, execution-profile, planning, sequential-executor, "
+        "workflow, and cli policy",
         "plain python data",
-        "must not import scheduler",
+        "channel and round-task modules defer scheduler and scientific runtimes",
+        "real registration remains in integration tests",
     ):
         assert required in unit
 

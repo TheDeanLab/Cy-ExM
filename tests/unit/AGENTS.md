@@ -10,7 +10,8 @@
   cleanup of temporary or stale state.
 - Keep import-contract checks in fresh subprocesses and explicitly assert that ANTs,
   NumPy, and SciPy remain absent when testing lightweight namespaces.
-- Phase 2A manifest, execution-profile, planning, sequential-executor, and CLI policy
-  tests use plain Python data and temporary files; they must not import scheduler or
-  scientific runtimes. Scheduler adapter behavior starts at an approved integration
-  boundary.
+- Phase 2 manifest, execution-profile, planning, sequential-executor, workflow, and
+  CLI policy tests use plain Python data, narrow fakes, and temporary files. Import
+  contracts must prove channel and round-task modules defer scheduler and scientific
+  runtimes; real registration remains in integration tests. Scheduler adapter
+  behavior starts at an approved integration boundary.

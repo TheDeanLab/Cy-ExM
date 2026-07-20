@@ -135,6 +135,28 @@ for name in (
     assert completed.returncode == 0, completed.stderr
 
 
+def test_round_task_module_defers_scientific_imports_until_execution() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.registration.channels
+import cyexm.workflow.round_task
+
+assert before == dict(os.environ)
+for root in ("ants", "numpy", "scipy", "tifffile", "dask", "distributed"):
+    assert not any(name == root or name.startswith(root + ".") for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_registration_namespace_resolves_stable_exports_lazily() -> None:
     code = """
 import sys

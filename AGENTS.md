@@ -12,11 +12,11 @@
 - Phase 1 is the current stable runtime: whole-image and serial chunked registration,
   restart-safe artifacts, strict geometry/TIFF boundaries, and configurable native
   threads. Preserve that API and its acceptance evidence as Phase 2 is implemented.
-- Phase 2A is the current workflow surface: strict scientific dataset manifests and
-  execution profiles, deterministic planning and status inspection, sequential
-  execution through an injected task runner, and the `cyexm workflow` CLI. It does
-  not yet provide the real round runner, transformed-channel artifacts, or a
-  distributed executor. Dask and SLURM executors remain later milestones.
+- Phase 2B is the current workflow surface: Phase 2A's strict scientific dataset
+  manifests and execution profiles, deterministic planning and status inspection,
+  sequential execution, and `cyexm workflow` CLI now drive the real scheduler-neutral
+  round runner and restart-safe transformed-channel artifacts. Dask and SLURM
+  executors remain later milestones.
 - All Phase 2 additions follow the approved Phase 2 runtime design and implementation
   plans. Keep optional workflow, distributed, and HPC dependencies out of the base
   installation, and do not advertise a later milestone before its acceptance gate.

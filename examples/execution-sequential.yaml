@@ -1,0 +1,13 @@
+schema_version: 1
+executor: sequential
+
+# Edit these caller-owned paths. Relative paths resolve from this profile's directory.
+paths:
+  dataset_root: ../data
+  output_root: ../results
+  worker_local_directory: null
+
+# Conservative defaults; increase only after dataset-specific validation.
+native_threads:
+  itk: 1
+  blas: 1

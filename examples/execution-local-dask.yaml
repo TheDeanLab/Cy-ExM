@@ -1,0 +1,22 @@
+schema_version: 1
+executor: local_dask
+
+# Edit these caller-owned paths. Relative paths resolve from this profile's directory.
+paths:
+  dataset_root: ../data
+  output_root: ../results
+  worker_local_directory: ../scratch
+
+# Conservative native-library defaults apply independently inside each worker.
+native_threads:
+  itk: 1
+  blas: 1
+
+# Edit these resources to fit the workstation and dataset.
+local_dask:
+  workers: 3
+  threads_per_worker: 1
+  processes: true
+  memory_limit: 24GB
+  startup_timeout: "30s"
+  task_retries: 0

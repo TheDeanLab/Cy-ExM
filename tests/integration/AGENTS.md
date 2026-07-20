@@ -10,8 +10,8 @@
   `pytestmark = pytest.mark.integration`. Never skip portable checks by hostname or
   by probing lab storage.
 - Limit ordinary registration fixtures to at most `16 x 32 x 32` voxels and use the
-  `dry run` accuracy preset. Larger data, representative lab inputs, and scheduler
-  access belong behind the explicit `hpc` marker.
+  `dry run` accuracy preset. Larger data, representative lab inputs, and access to an
+  external scheduler or cluster service require the explicit `hpc` marker.
 - Assert geometry, component order, masks, axes, dtype, artifact records, and pure
   chunk geometry exactly. Numerical registration comparisons use only the documented
   `rtol=1e-4`, `atol=1e-5` migration tolerance; explain any different tolerance next
@@ -28,3 +28,8 @@
 - Temporary transforms and images belong under pytest `tmp_path` or an explicit
   caller-provided comparison directory. Do not access or alter the separate spheroid
   registration run or its outputs.
+- After an approved scheduler dependency is declared, deterministic bounded
+  in-process or local-scheduler checks may run as portable integration tests. This
+  bounded local-scheduler coverage must use synthetic tasks. Actual SLURM submission
+  remains `hpc` and requires an explicit cluster allocation, cleanup assertions, and
+  machine-readable job evidence.

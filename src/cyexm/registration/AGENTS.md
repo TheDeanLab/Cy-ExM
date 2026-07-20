@@ -16,9 +16,10 @@
   they are characterization utilities over arrays already supplied by callers.
 - Preserve image origin, spacing, direction, vector components, and the public
   ZYX crop-bound convention when adapting ANTs images.
-- Artifact writer methods must write exactly to the supplied path so callers
-  can provide atomic temporary destinations. Do not add artifact lifecycle,
-  whole-image orchestration, chunking, scheduling, or CLI behavior here.
+- Backend artifact writer methods must write exactly to the supplied path so callers
+  can provide atomic temporary destinations. `backend.py` must not own workflow
+  scheduling or artifact lifecycle; completion records and orchestration remain in
+  `artifacts.py`, `whole_image.py`, and `chunked.py`.
 - `RegistrationBackend.nonlinear` and every `_estimate_nonlinear` override transfer
   ownership of one unique disposable warp candidate to their immediate caller. The
   caller must persist or consume it and then use the shared best-effort cleanup helper;

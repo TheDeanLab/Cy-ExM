@@ -10,3 +10,6 @@
   cleanup of temporary or stale state.
 - Keep import-contract checks in fresh subprocesses and explicitly assert that ANTs,
   NumPy, and SciPy remain absent when testing lightweight namespaces.
+- Future manifest and planning policy tests use plain Python data and temporary files;
+  they must not import scheduler or scientific runtimes. Scheduler adapter behavior
+  starts at an approved integration boundary.

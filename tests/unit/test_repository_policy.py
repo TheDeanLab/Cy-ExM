@@ -17,10 +17,36 @@ THREAD_ENVIRONMENT = (
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 )
+AGENT_GUIDANCE_PATHS = frozenset(
+    {
+        "AGENTS.md",
+        ".github/AGENTS.md",
+        ".github/workflows/AGENTS.md",
+        "docs/AGENTS.md",
+        "docs/superpowers/AGENTS.md",
+        "docs/superpowers/plans/AGENTS.md",
+        "docs/superpowers/specs/AGENTS.md",
+        "examples/AGENTS.md",
+        "examples/notebooks/AGENTS.md",
+        "examples/scripts/AGENTS.md",
+        "src/AGENTS.md",
+        "src/cyexm/AGENTS.md",
+        "src/cyexm/io/AGENTS.md",
+        "src/cyexm/registration/AGENTS.md",
+        "src/cyexm/runtime/AGENTS.md",
+        "tests/AGENTS.md",
+        "tests/integration/AGENTS.md",
+        "tests/unit/AGENTS.md",
+    }
+)
 
 
 def _read_repository_file(path: str) -> str:
     return (REPOSITORY_ROOT / path).read_text(encoding="utf-8")
+
+
+def _normalized_repository_file(path: str) -> str:
+    return " ".join(_read_repository_file(path).split()).lower()
 
 
 def _load_yaml(path: str, *, github_actions: bool = False) -> object:
@@ -122,6 +148,175 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
     workflow = _read_repository_file(".github/workflows/ci.yml").lower()
     for forbidden in ("clearex", "dask", "slurm", "/archive", "/project"):
         assert forbidden not in workflow
+
+
+def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
+    root = _normalized_repository_file("AGENTS.md")
+    for required in (
+        "phase 1 is the current stable runtime",
+        "dedicated phase 2 runtime design and implementation plan",
+        "scientific dataset manifests",
+        "execution profiles",
+        "serial chunk workflow remains",
+        "nested chunk multiprocessing",
+        "uv lock --check",
+        "uv sync --locked --group dev --extra examples",
+    ):
+        assert required in root
+
+    root_lines = set(_read_repository_file("AGENTS.md").splitlines())
+    assert "uv lock" not in root_lines
+    assert "uv sync --group dev --extra examples" not in root_lines
+
+
+def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
+    documentation = _normalized_repository_file("docs/AGENTS.md")
+    for required in (
+        "merged phase 1 behavior",
+        "proposed phase 2",
+        "not installable behavior",
+        "dedicated runtime design",
+    ):
+        assert required in documentation
+
+    examples = _normalized_repository_file("examples/AGENTS.md")
+    for required in (
+        "phase 1 examples are the current runnable surface",
+        "runtime api is implemented and accepted",
+        "examples never lead production behavior",
+        "scientific manifest",
+        "execution profile",
+    ):
+        assert required in examples
+
+
+def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> None:
+    source = _normalized_repository_file("src/AGENTS.md")
+    for required in (
+        "future execution boundary",
+        "scheduler imports",
+        "module scope",
+        "no import-time cluster",
+    ):
+        assert required in source
+
+    package = _normalized_repository_file("src/cyexm/AGENTS.md")
+    assert "workflow or configuration namespace" in package
+    assert "scheduler concerns do not belong in `cyexm.registration`" in package
+
+    registration = _normalized_repository_file("src/cyexm/registration/AGENTS.md")
+    for required in (
+        "backend artifact writer methods",
+        "`artifacts.py`, `whole_image.py`, and `chunked.py`",
+        "must not own workflow scheduling",
+    ):
+        assert required in registration
+
+    runtime = _normalized_repository_file("src/cyexm/runtime/AGENTS.md")
+    for required in (
+        "worker process",
+        "before importing ants, numpy, or scipy",
+        "must not initialize or own a scheduler",
+    ):
+        assert required in runtime
+
+
+def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> None:
+    tests = _normalized_repository_file("tests/AGENTS.md")
+    for required in (
+        "narrow concrete-image exception",
+        "real registration belongs in integration",
+        "real slurm submission",
+        "external scheduler or cluster services",
+        "bounded in-process or local-scheduler checks",
+        "portable integration",
+        "hpc",
+    ):
+        assert required in tests
+
+    unit = _normalized_repository_file("tests/unit/AGENTS.md")
+    for required in (
+        "future manifest and planning policy",
+        "plain python data",
+        "must not import scheduler",
+    ):
+        assert required in unit
+
+    integration = _normalized_repository_file("tests/integration/AGENTS.md")
+    for required in (
+        "approved scheduler dependency",
+        "bounded local-scheduler",
+        "access to an external scheduler or cluster service",
+        "bounded in-process or local-scheduler checks",
+        "portable integration",
+        "actual slurm submission remains `hpc`",
+    ):
+        assert required in integration
+    assert (
+        "larger data, representative lab inputs, and scheduler access belong"
+        not in integration
+    )
+
+
+def test_completed_guidance_plan_records_execution_state() -> None:
+    plan_path = "docs/superpowers/plans/2026-07-19-phase-2-ready-agents-guidance.md"
+    plan = _read_repository_file(plan_path)
+    normalized_plan = " ".join(plan.split()).lower()
+
+    assert "execution status: implementation complete" in normalized_plan
+    assert "integration pending" in normalized_plan
+    assert "- [ ]" not in plan
+    assert plan.count("- [x]") == 39
+
+
+def test_every_maintained_directory_has_local_agent_guidance() -> None:
+    actual = {
+        str(path.relative_to(REPOSITORY_ROOT))
+        for path in REPOSITORY_ROOT.rglob("AGENTS.md")
+        if not {".git", ".worktrees", ".venv"}
+        & set(path.relative_to(REPOSITORY_ROOT).parts)
+    }
+    assert actual == AGENT_GUIDANCE_PATHS
+
+    required_by_path = {
+        ".github/AGENTS.md": (
+            "least-privilege",
+            "version-pinned",
+            "public github-hosted runners",
+            "lab paths",
+        ),
+        ".github/workflows/AGENTS.md": (
+            "uv sync --locked --group dev --extra examples",
+            "python 3.12",
+            "all six native-thread",
+            "unit and not hpc",
+            "integration and not hpc",
+            "slurm",
+        ),
+        "docs/superpowers/AGENTS.md": (
+            "dated",
+            "design",
+            "implementation plan",
+            "generated review packages",
+        ),
+        "docs/superpowers/plans/AGENTS.md": (
+            "exact files",
+            "tdd",
+            "evidence",
+            "historical plans",
+        ),
+        "docs/superpowers/specs/AGENTS.md": (
+            "current behavior",
+            "alternatives",
+            "failure handling",
+            "acceptance criteria",
+            "erratum",
+        ),
+    }
+    for path, required_fragments in required_by_path.items():
+        guidance = _normalized_repository_file(path)
+        for fragment in required_fragments:
+            assert fragment in guidance, (path, fragment)
 
 
 def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> None:

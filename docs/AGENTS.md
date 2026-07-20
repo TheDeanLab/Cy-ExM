@@ -1,8 +1,13 @@
 # Documentation guidance
 
-- Describe current behavior separately from proposed work. Label the YAML manifest,
-  round-level scheduler, and cluster execution as Phase 2; never present them as
-  installable Phase 1 features.
+- Describe merged Phase 1 behavior—the repository's current behavior—separately from
+  proposed Phase 2 work. YAML
+  manifests, round-level schedulers, and cluster execution are not installable
+  behavior until their dedicated runtime design, implementation, and acceptance gates
+  are complete.
+- Design and plan documents may describe proposed Phase 2 decisions when they label
+  status and assumptions explicitly. User guides and API examples describe only the
+  runtime available on the referenced branch.
 - Keep API examples synchronized with signatures in `src/cyexm`. Use public XYZ
   spacing, explicit native-thread configuration, and exact artifact filenames.
 - Artifact and restart claims must follow the implementation: a data file alone is

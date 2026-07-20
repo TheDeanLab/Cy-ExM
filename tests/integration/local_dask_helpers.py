@@ -59,7 +59,7 @@ def _worker_observation(task: RoundTask, attempt: int) -> dict[str, object]:
         "hostname": socket.gethostname(),
         "pid": os.getpid(),
         "round": task.round,
-        "start_ns": time.time_ns(),
+        "start_monotonic_ns": time.monotonic_ns(),
         "started_at": _utc_timestamp(),
         "worker_address": str(worker.address),
     }
@@ -81,10 +81,10 @@ def _finish_observation(
     outcome: str,
 ) -> dict[str, object]:
     ended_at = _utc_timestamp()
-    end_ns = time.time_ns()
+    end_monotonic_ns = time.monotonic_ns()
     finished = {
         **observation,
-        "end_ns": end_ns,
+        "end_monotonic_ns": end_monotonic_ns,
         "ended_at": ended_at,
         "outcome": outcome,
     }
@@ -98,7 +98,7 @@ def _finish_observation(
 
 def _completed_result(task: RoundTask, observation: dict[str, object]) -> RoundResult:
     duration_seconds = (
-        int(observation["end_ns"]) - int(observation["start_ns"])
+        int(observation["end_monotonic_ns"]) - int(observation["start_monotonic_ns"])
     ) / 1_000_000_000.0
     return RoundResult(
         dataset_id=task.dataset_id,

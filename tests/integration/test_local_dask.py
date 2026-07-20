@@ -152,9 +152,9 @@ def _execute_and_assert_cleanup(
 
 
 def _overlap(first: dict[str, object], second: dict[str, object]) -> bool:
-    return int(first["start_ns"]) < int(second["end_ns"]) and int(
-        second["start_ns"]
-    ) < int(first["end_ns"])
+    return int(first["start_monotonic_ns"]) < int(second["end_monotonic_ns"]) and int(
+        second["start_monotonic_ns"]
+    ) < int(first["end_monotonic_ns"])
 
 
 def test_local_cluster_enforces_one_round_slot_and_preserves_result_order(
@@ -172,7 +172,10 @@ def test_local_cluster_enforces_one_round_slot_and_preserves_result_order(
     assert tuple(result.round for result in results) == (2, 3, 4, 5)
     assert tuple(
         int(observation["round"])
-        for observation in sorted(observations, key=lambda item: int(item["end_ns"]))
+        for observation in sorted(
+            observations,
+            key=lambda item: int(item["end_monotonic_ns"]),
+        )
     ) != (2, 3, 4, 5)
     assert len({str(item["worker_address"]) for item in observations}) == 2
     assert len({int(item["pid"]) for item in observations}) == 2

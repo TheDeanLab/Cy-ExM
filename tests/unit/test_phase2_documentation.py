@@ -24,10 +24,10 @@ def _normalized_readme() -> str:
 def test_readme_documents_every_workflow_command_option_and_example() -> None:
     readme = _readme()
     for command in (
-        "cyexm workflow validate",
-        "cyexm workflow plan",
-        "cyexm workflow run",
-        "cyexm workflow status",
+        "uv run cyexm workflow validate",
+        "uv run cyexm workflow plan",
+        "uv run cyexm workflow run",
+        "uv run cyexm workflow status",
         "--force-round",
         "--force-all",
         "--json",
@@ -38,6 +38,27 @@ def test_readme_documents_every_workflow_command_option_and_example() -> None:
     for path in EXAMPLE_PATHS:
         assert f"]({path})" in readme
 
+    assert not any(line.startswith("cyexm ") for line in readme.splitlines())
+
+
+def test_readme_workflow_command_blocks_use_the_uv_managed_environment() -> None:
+    readme = _readme()
+    for command_block in (
+        "uv run cyexm workflow validate examples/spheroid-dataset.yaml \\\n"
+        "  --execution examples/execution-sequential.yaml",
+        "uv run cyexm workflow plan examples/spheroid-dataset.yaml \\\n"
+        "  --execution examples/execution-local-dask.yaml",
+        "uv run cyexm workflow run examples/spheroid-dataset.yaml \\\n"
+        "  --execution examples/execution-local-dask.yaml",
+        "uv run cyexm workflow status results spheroid-registration-example",
+        "uv run cyexm --version",
+    ):
+        assert command_block in readme
+
+    normalized = _normalized_readme()
+    assert "`uv sync` does not activate `.venv`" in normalized
+    assert "all workflow commands below use `uv run`" in normalized
+
 
 def test_readme_documents_installation_and_scheduler_neutral_architecture() -> None:
     readme = _normalized_readme()
@@ -46,6 +67,8 @@ def test_readme_documents_installation_and_scheduler_neutral_architecture() -> N
         "uv sync --locked --extra workflow",
         "uv sync --locked --extra distributed",
         "uv sync --locked --extra hpc",
+        "uv sync --no-dev --extra examples",
+        "uv sync --group dev --extra examples",
     ):
         assert command in readme
     for required in (
@@ -141,6 +164,22 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
     ):
         assert f"`{field}`" in readme
 
+    for exact_row in (
+        "| `local_dask` / `workers` | positive built-in integer | Maximum local "
+        "worker processes. |",
+        "| `local_dask` / `startup_timeout` | non-empty single-line string | "
+        "Bounds only Dask `Client` connection and `wait_for_workers`. |",
+        "| `local_dask` / `task_retries` | nonnegative built-in integer | "
+        "Executor-managed retry count after the first attempt. |",
+        "| `slurm` / `workers` | positive built-in integer | Maximum number of "
+        "worker jobs. |",
+        "| `slurm` / `startup_timeout` | non-empty single-line string | Bounds "
+        "only Dask `Client` connection and `wait_for_workers`. |",
+        "| `slurm` / `task_retries` | nonnegative built-in integer | "
+        "Executor-managed retry count after the first attempt. |",
+    ):
+        assert exact_row in readme
+
     normalized = _normalized_readme()
     for rule in (
         "`sequential`, `local_dask`, or `slurm`",
@@ -148,17 +187,25 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "dataset and output roots must be disjoint",
         "worker-backed executors require",
         "must not be `/archive`",
-        "positive built-in integers",
         "inherited environment",
         "one-thread default",
         "`processes` must be `true`",
         "`processes_per_worker` must be exactly `1`",
-        "nonnegative built-in integer",
-        "non-empty single-line string",
         "conflict with managed slurm options",
         "exactly one executor-specific section",
     ):
         assert rule in normalized
+
+
+def test_readme_documents_the_exact_startup_timeout_scope() -> None:
+    normalized = _normalized_readme()
+    for required in (
+        "`startup_timeout` is not an end-to-end startup deadline",
+        "does not bound `localcluster` or `slurmcluster` construction",
+        "does not bound `scheduler_info()` calls",
+        "does not bound the `client.run()` worker-preflight rpc",
+    ):
+        assert required in normalized
 
 
 def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
@@ -194,7 +241,21 @@ def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
         assert required in normalized
 
 
+def test_readme_documents_success_only_json_output() -> None:
+    normalized = _normalized_readme()
+    for required in (
+        "`--json` is success-only",
+        "failures return before result emission",
+        "stdout is empty",
+        "plain-text diagnostics go to stderr",
+        "no json error object",
+        "`--version` prints version text rather than a json result",
+    ):
+        assert required in normalized
+
+
 def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> None:
+    readme = _readme()
     normalized = _normalized_readme()
     for required in (
         "sequential executor is the numerical and restart reference",
@@ -214,8 +275,25 @@ def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> No
     ):
         assert required in normalized
 
-    for code in ("`0`", "`2`", "`3`", "`4`", "`130`"):
-        assert code in normalized
+    for exact_row in (
+        "| `0` | Every round completed or was validly reused. |",
+        "| `2` | Argument, YAML, configuration, input, plan, output, or "
+        "fingerprint validation failed. |",
+        "| `3` | Executor startup, worker connection, or preflight failure; also "
+        "invalid SLURM operational evidence, including validation after round "
+        "execution. Valid committed artifacts remain restartable. |",
+        "| `4` | At least one round failed after execution began. |",
+        "| `130` | Operator interruption or termination through the CLI run handler. |",
+    ):
+        assert exact_row in readme
+
+    for required in (
+        "post-execution slurm evidence validation",
+        "preserves the round results in the operational run record",
+        "the cli exits `3`",
+        "a later ordinary run can reuse those valid artifacts",
+    ):
+        assert required in normalized
 
 
 def test_readme_states_hpc_acceptance_scope_and_remaining_non_goals() -> None:

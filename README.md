@@ -40,6 +40,9 @@ For a lean non-development environment, add `--no-dev`. The optional dependency
 versions, including Dask/distributed 2025.1.0 and dask-jobqueue 0.9.0, are locked;
 change them only with fresh compatibility evidence.
 
+`uv sync` does not activate `.venv`, so all workflow commands below use `uv run` to
+execute in the managed project environment.
+
 The established Phase 1 notebook/example convenience commands remain available:
 
 ```bash
@@ -283,7 +286,7 @@ The `executor` controls which one matching resource section is present:
 | `local_dask` / `threads_per_worker` | positive built-in integer | Dask threads in each worker; independent of native library counts. |
 | `local_dask` / `processes` | built-in boolean `true` | Process isolation is mandatory; `processes` must be `true`. |
 | `local_dask` / `memory_limit` | non-empty single-line string | Dask memory limit passed to `LocalCluster`. |
-| `local_dask` / `startup_timeout` | non-empty single-line string | Client and worker-start timeout. |
+| `local_dask` / `startup_timeout` | non-empty single-line string | Bounds only Dask `Client` connection and `wait_for_workers`. |
 | `local_dask` / `task_retries` | nonnegative built-in integer | Executor-managed retry count after the first attempt. |
 | `slurm` / `queue` | non-empty single-line string | SLURM queue/partition. |
 | `slurm` / `workers` | positive built-in integer | Maximum number of worker jobs. |
@@ -293,7 +296,7 @@ The `executor` controls which one matching resource section is present:
 | `slurm` / `walltime` | non-empty single-line string | Job walltime. |
 | `slurm` / `interface` | non-empty single-line string | Worker network interface. |
 | `slurm` / `scheduler_interface` | non-empty single-line string | Coordinator/scheduler network interface. |
-| `slurm` / `startup_timeout` | non-empty single-line string | Cluster construction, connection, and preflight timeout. |
+| `slurm` / `startup_timeout` | non-empty single-line string | Bounds only Dask `Client` connection and `wait_for_workers`. |
 | `slurm` / `task_retries` | nonnegative built-in integer | Executor-managed retry count after the first attempt. |
 | `slurm` / `job_name` | non-empty single-line string | Owned worker-job name. |
 | `slurm` / `job_extra_directives` | list of non-empty single-line strings | Site additions that do not conflict with managed SLURM options. |
@@ -319,6 +322,13 @@ managed SLURM options for partition (`--partition`, `-p`), memory (`--mem`,
 stdout/stderr (`--output`, `-o`, `--error`, `-e`), including unambiguous long-option
 abbreviations and grouped or attached short forms.
 
+`startup_timeout` is not an end-to-end startup deadline. It does not bound
+`LocalCluster` or `SLURMCluster` construction, does not bound `scheduler_info()`
+calls, and does not bound the `Client.run()` worker-preflight RPC. Those operations
+currently have no Cy-ExM wall-clock timeout, so a stalled constructor or preflight RPC
+can outlive the configured value. Treat this as an operational limitation when
+choosing where to run the coordinator.
+
 #### Native-thread resolution
 
 An explicit `native_threads` section overrides the inherited environment. If it is
@@ -343,28 +353,28 @@ profile so its roots point to caller-owned inputs and outputs.
 
 ```bash
 # Decode both files, resolve inputs, inspect headers, and construct a plan.
-cyexm workflow validate examples/spheroid-dataset.yaml \
+uv run cyexm workflow validate examples/spheroid-dataset.yaml \
   --execution examples/execution-sequential.yaml
 
 # Print the canonical scientific plan and resource request without mutation.
-cyexm workflow plan examples/spheroid-dataset.yaml \
+uv run cyexm workflow plan examples/spheroid-dataset.yaml \
   --execution examples/execution-local-dask.yaml
 
 # Execute pending work; an ordinary run resumes valid artifacts by default.
-cyexm workflow run examples/spheroid-dataset.yaml \
+uv run cyexm workflow run examples/spheroid-dataset.yaml \
   --execution examples/execution-local-dask.yaml
 
 # Recompute selected rounds. --force-round is repeatable.
-cyexm workflow run examples/spheroid-dataset.yaml \
+uv run cyexm workflow run examples/spheroid-dataset.yaml \
   --execution examples/execution-local-dask.yaml \
   --force-round 2 --force-round 4
 
 # Recompute every round in the compatible plan.
-cyexm workflow run examples/spheroid-dataset.yaml \
+uv run cyexm workflow run examples/spheroid-dataset.yaml \
   --execution examples/execution-local-dask.yaml --force-all
 
 # Inspect artifacts using only an output root and dataset ID.
-cyexm workflow status results spheroid-registration-example
+uv run cyexm workflow status results spheroid-registration-example
 ```
 
 `--force-round` and `--force-all` are mutually exclusive. An unknown forced round is
@@ -375,14 +385,18 @@ and resolved resource request but never opens the selected executor.
 Common options are accepted at the top-level, `workflow`, or action boundary:
 
 ```bash
-cyexm workflow status results spheroid-registration-example --json
-cyexm workflow plan examples/spheroid-dataset.yaml \
+uv run cyexm workflow status results spheroid-registration-example --json
+uv run cyexm workflow plan examples/spheroid-dataset.yaml \
   --execution examples/execution-sequential.yaml --log-level DEBUG --json
-cyexm --version
+uv run cyexm --version
 ```
 
-Human and structured results go to stdout. `--json` emits one JSON object;
-diagnostics and the selected `--log-level` stream go to stderr. Option abbreviation
+Human and structured success results go to stdout. `--json` is success-only:
+successful workflow actions that reach result emission emit one JSON object.
+Failures return before result emission, so stdout is empty, plain-text diagnostics
+go to stderr, and there is no JSON error object. `--version` prints version text
+rather than a JSON result. Argparse failures can include usage text, and
+`--log-level DEBUG` can add a traceback to the stderr diagnostic. Option abbreviation
 is disabled.
 
 ### Planning, outputs, status, and restart
@@ -530,6 +544,12 @@ cancel other submitted rounds; all submitted work settles, successful artifacts 
 committed, a failed operational summary is written, and the workflow reports the
 failed round numbers.
 
+Post-execution SLURM evidence validation is a separate exit-3 path. After submitted
+rounds return, Cy-ExM validates the executor's operational evidence before reporting
+success. If that validation fails, it preserves the round results in the operational
+run record, the CLI exits `3`, and a later ordinary run can reuse those valid
+artifacts through normal completion-record validation.
+
 Automatic retries default to zero. A positive `task_retries` value is an
 executor-managed resubmission; Dask's opaque future retry count remains zero, and
 each attempt re-enters ordinary Phase 1 artifact validation. Use a small bounded
@@ -546,7 +566,7 @@ artifact validation.
 | --- | --- |
 | `0` | Every round completed or was validly reused. |
 | `2` | Argument, YAML, configuration, input, plan, output, or fingerprint validation failed. |
-| `3` | Executor startup, worker connection, preflight, or SLURM evidence validation failed before round execution. |
+| `3` | Executor startup, worker connection, or preflight failure; also invalid SLURM operational evidence, including validation after round execution. Valid committed artifacts remain restartable. |
 | `4` | At least one round failed after execution began. |
 | `130` | Operator interruption or termination through the CLI run handler. |
 

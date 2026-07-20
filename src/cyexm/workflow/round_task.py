@@ -96,9 +96,9 @@ def _completion_snapshot(path: Path) -> _ArtifactSnapshot | None:
 
 def _inspect_image_geometry(path: Path, spacing: PixelSize) -> ImageGeometry:
     """Inspect authoritative TIFF geometry without loading voxel data."""
-    from cyexm.workflow.planning import _inspect_tiff_header
+    from cyexm.workflow.planning import _inspect_tiff_header_in_process
 
-    header = _inspect_tiff_header(path)
+    header = _inspect_tiff_header_in_process(path)
     if header.geometry is not None:
         return header.geometry
     return ImageGeometry(

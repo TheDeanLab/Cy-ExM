@@ -352,9 +352,11 @@ A sequential run applies the resolved native-thread environment in the coordinat
 before workflow status inspection or registration begins; the round boundary then
 reapplies the same values idempotently. Dask and SLURM coordinators do not apply task
 native-thread settings. Their separate worker processes receive and apply the values
-before scientific imports. If a caller has already imported ANTs, NumPy, or SciPy,
-`run_workflow` still rejects a conflicting late change before writing workflow
-outputs; only an exactly idempotent reapplication is safe.
+before scientific imports. Inside an already configured round worker, source and
+completion-evidence TIFF headers are inspected in-process; workers do not launch
+nested header-probe child processes. If a caller has already imported ANTs, NumPy,
+or SciPy, `run_workflow` still rejects a conflicting late change before writing
+workflow outputs; only an exactly idempotent reapplication is safe.
 
 ### Validate, plan, run, and inspect
 

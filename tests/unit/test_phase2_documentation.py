@@ -216,6 +216,8 @@ def test_readme_documents_planning_and_execution_thread_boundaries() -> None:
         "sequential run applies the resolved native-thread environment",
         "before workflow status inspection or registration begins",
         "dask and slurm coordinators do not apply task native-thread settings",
+        "source and completion-evidence tiff headers are inspected in-process",
+        "workers do not launch nested header-probe child processes",
     ):
         assert required in normalized
 

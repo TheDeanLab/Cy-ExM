@@ -798,6 +798,59 @@ def test_round_task_configures_threads_before_loading_runtime(
     assert order == ["threads", "runtime"]
 
 
+def test_round_task_inspects_tiff_headers_in_process_after_thread_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow import planning
+    from cyexm.workflow import round_task as module
+
+    task = _task(tmp_path, channel_names=())
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    original_inspector = module._inspect_image_geometry
+    _install_runtime(monkeypatch, task, calls, constructors)
+    events: list[str] = []
+    geometries = {
+        task.fixed_image: _FULL_FIXED_GEOMETRY,
+        task.moving_image: _FULL_MOVING_GEOMETRY,
+        _registration_paths(task).fixed_reference: _effective_geometries(task)[0],
+    }
+
+    def configure(config: NativeThreadConfig) -> ResolvedNativeThreads:
+        assert config == NativeThreadConfig(itk_threads=2, blas_threads=3)
+        events.append("threads")
+        return _resolved(task)
+
+    def inspect_in_process(path: Path) -> SimpleNamespace:
+        assert events and events[0] == "threads"
+        events.append(f"header:{path.name}")
+        return SimpleNamespace(
+            geometry=geometries[path],
+            shape_zyx=geometries[path].shape,
+        )
+
+    def reject_subprocess(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("round worker launched a TIFF header probe process")
+
+    monkeypatch.setattr(module, "configure_native_threads", configure)
+    monkeypatch.setattr(module, "_inspect_image_geometry", original_inspector)
+    monkeypatch.setattr(
+        planning,
+        "_inspect_tiff_header_in_process",
+        inspect_in_process,
+    )
+    monkeypatch.setattr(planning.subprocess, "run", reject_subprocess)
+
+    result = run_round_task(task)
+
+    assert result.status == "completed"
+    assert events[0] == "threads"
+    assert events[1:3] == ["header:fixed.tif", "header:registration.tif"]
+    assert "header:fixed_reference.tif" in events
+
+
 def test_round_task_creates_output_directories_and_log_only_when_invoked(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

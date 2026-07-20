@@ -46,12 +46,12 @@ from cyexm.workflow.models import (
     sha256_fingerprint,
 )
 from cyexm.workflow.status import (
+    _inspect_workflow_status,
     _read_scientific_snapshot,
     _safe_descendant,
     _safe_workflow_layout,
     _ScientificSnapshot,
     _snapshot_from_text,
-    inspect_workflow_status,
 )
 
 type ExecutorFactory = Callable[[ExecutionProfile], WorkflowExecutor]
@@ -61,15 +61,11 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _unavailable_round_runner(task: RoundTask) -> RoundResult:
-    raise RoundExecutionError(
-        f"Round {task.round} scientific execution is not available until Phase 2B"
-    )
-
-
 def _default_executor_factory(profile: ExecutionProfile) -> WorkflowExecutor:
     if profile.executor == "sequential":
-        return SequentialExecutor(runner=_unavailable_round_runner)
+        from cyexm.workflow.round_task import run_round_task
+
+        return SequentialExecutor(runner=run_round_task)
     raise ExecutorStartupError(
         f"{profile.executor} execution is not available in this installed milestone"
     )
@@ -992,9 +988,10 @@ def run_workflow(
     submitted: tuple[RoundTask, ...] = ()
     try:
         _ensure_scientific_snapshot(plan, layout)
-        status = inspect_workflow_status(
+        status = _inspect_workflow_status(
             plan.execution.paths.output_root,
             plan.dataset_id,
+            _tasks=plan.tasks,
         )
         if status.scientific_fingerprint != plan.scientific_fingerprint:
             raise WorkflowPlanError(

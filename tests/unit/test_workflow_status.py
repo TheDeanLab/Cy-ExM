@@ -5,10 +5,30 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
+import cyexm.workflow.status as workflow_status
 from cyexm.errors import WorkflowPlanError
+from cyexm.registration._request_policy import (
+    CHUNK_SCALAR_POLICY,
+    WHOLE_SCALAR_POLICY,
+    affine_parameters,
+    canonical_compact_json,
+    channel_transform_parameters,
+    chunk_grid,
+    chunk_manifest_parameters,
+    chunk_manifest_payload,
+    common_parameters,
+    crop_geometry,
+    crop_parameters,
+    fixed_reference_parameters,
+    local_chunk_parameters,
+    nonlinear_stage_parameters,
+    registered_image_parameters,
+)
 from cyexm.registration.artifacts import (
     ArtifactStore,
     CompletionRecord,
@@ -255,6 +275,48 @@ def _commit_artifact(
     *,
     stage_override: str | None = None,
 ) -> None:
+    if path.name.startswith("linear_transform_"):
+        round_number = int(
+            next(part for part in path.parts if part.startswith("round-"))[6:]
+        )
+        registration = (
+            WorkflowLayout.for_dataset(output_root, "dataset-1")
+            .round(round_number)
+            .registration
+        )
+        fixed_reference = registration / "fixed_reference.tif"
+        dataset_root = output_root.parent / "dataset"
+        inputs = (
+            FileIdentity.from_path(dataset_root / "fixed.tif"),
+            FileIdentity.from_path(dataset_root / f"round_{round_number}_488.tif"),
+        )
+        fixed_reference.parent.mkdir(parents=True, exist_ok=True)
+        fixed_reference.write_bytes(b"fixed-reference")
+        fixed_request = StageRequest.for_identities(
+            stage="fixed-reference",
+            inputs=inputs,
+            geometry=_geometry(),
+            method="uint16-tiff",
+            accuracy="exact",
+            native_threads=_native_threads(),
+            upstream=None,
+            parameters={
+                **common_parameters(
+                    crop=False,
+                    imaging_round=round_number,
+                    pixel_size_xyz=(1.0, 1.0, 1.0),
+                ),
+                **fixed_reference_parameters(0.0, 1.0),
+            },
+        )
+        fixed_record = CompletionRecord(
+            schema_version=1,
+            request=fixed_request,
+            artifact=FileIdentity.from_path(fixed_reference),
+        )
+        ArtifactStore().record_path(fixed_reference).write_text(
+            fixed_record.to_json(), encoding="utf-8"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"artifact")
     request = _request_for_artifact(path, output_root)
@@ -266,6 +328,351 @@ def _commit_artifact(
         artifact=FileIdentity.from_path(path),
     )
     ArtifactStore().record_path(path).write_text(record.to_json(), encoding="utf-8")
+
+
+def _write_request_artifact(
+    path: Path,
+    request: StageRequest,
+    *,
+    contents: bytes = b"artifact",
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(contents)
+    record = CompletionRecord(
+        schema_version=1,
+        request=request,
+        artifact=FileIdentity.from_path(path),
+    )
+    ArtifactStore().record_path(path).write_text(record.to_json(), encoding="utf-8")
+
+
+def _commit_serial_round(output_root: Path) -> tuple[Path, ...]:
+    round_number = 2
+    dataset_root = output_root.parent / "dataset"
+    fixed = dataset_root / "fixed.tif"
+    moving = dataset_root / "round_2_488.tif"
+    inputs = (FileIdentity.from_path(fixed), FileIdentity.from_path(moving))
+    threads = _native_threads()
+    geometry = _geometry()
+    common = common_parameters(
+        crop=False,
+        imaging_round=round_number,
+        pixel_size_xyz=(1.0, 1.0, 1.0),
+    )
+    round_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(
+        round_number
+    )
+    artifacts = _expected_artifacts(output_root, round_number)
+    affine, warp, registered, channel = artifacts
+    fixed_reference = round_layout.registration / "fixed_reference.tif"
+    _write_request_artifact(
+        fixed_reference,
+        StageRequest.for_identities(
+            stage="fixed-reference",
+            inputs=inputs,
+            geometry=geometry,
+            method="uint16-tiff",
+            accuracy="exact",
+            native_threads=threads,
+            upstream=None,
+            parameters={**common, **fixed_reference_parameters(0.0, 1.0)},
+        ),
+    )
+    _write_request_artifact(
+        affine,
+        StageRequest.for_identities(
+            stage="affine",
+            inputs=inputs,
+            geometry=geometry,
+            method="TRSAA",
+            accuracy="high",
+            native_threads=threads,
+            upstream=None,
+            parameters={
+                **common,
+                **affine_parameters(
+                    moving_geometry=geometry,
+                    linear_type="TRSAA",
+                    accuracy="high",
+                ),
+            },
+        ),
+    )
+    affine_identity = FileIdentity.from_path(affine)
+    chunk_size = (4, 8, 8)
+    overlap = 0.0
+    chunks = chunk_grid(geometry.shape, chunk_size, overlap)
+    local_warps: list[FileIdentity] = []
+    chunk_directory = round_layout.registration / "round_2_chunks"
+    for chunk in chunks:
+        local_warp = chunk_directory / f"chunk_{chunk['chunk_id']:04d}_warp.nii.gz"
+        local_geometry = crop_geometry(
+            geometry,
+            (
+                chunk["z_start_ext"],
+                chunk["z_end_ext"],
+                chunk["y_start_ext"],
+                chunk["y_end_ext"],
+                chunk["x_start_ext"],
+                chunk["x_end_ext"],
+            ),
+        )
+        _write_request_artifact(
+            local_warp,
+            StageRequest.for_identities(
+                stage=f"nonlinear-chunk:{chunk['chunk_id']}",
+                inputs=inputs,
+                geometry=local_geometry,
+                method="SyNOnly",
+                accuracy="high",
+                native_threads=threads,
+                upstream=affine_identity,
+                parameters=local_chunk_parameters(
+                    chunk=chunk,
+                    chunks=chunks,
+                    chunk_size_zyx=chunk_size,
+                    fixed_mask_geometry=local_geometry,
+                    image_shape_zyx=geometry.shape,
+                    moving_geometry=local_geometry,
+                    moving_mask_geometry=local_geometry,
+                    overlap_fraction=overlap,
+                    nonlinear_accuracy="high",
+                    scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+                ),
+            ),
+        )
+        local_warps.append(FileIdentity.from_path(local_warp))
+    local_dicts = [identity.to_dict() for identity in local_warps]
+    manifest = chunk_directory / "manifest.json"
+    manifest_payload = chunk_manifest_payload(
+        round_number=round_number,
+        image_shape_zyx=geometry.shape,
+        chunk_size_zyx=chunk_size,
+        overlap_fraction=overlap,
+        chunks=chunks,
+        local_warps=local_dicts,
+    )
+    _write_request_artifact(
+        manifest,
+        StageRequest.for_identities(
+            stage="nonlinear-chunk-manifest",
+            inputs=inputs,
+            geometry=geometry,
+            method="serial-chunk-grid",
+            accuracy="exact",
+            native_threads=threads,
+            upstream=affine_identity,
+            parameters=chunk_manifest_parameters(
+                chunk_size_zyx=chunk_size,
+                image_shape_zyx=geometry.shape,
+                local_warps=local_dicts,
+                nonlinear_accuracy="high",
+                nonlinear_type="SyNOnly",
+                overlap_fraction=overlap,
+            ),
+        ),
+        contents=canonical_compact_json(manifest_payload).encode(),
+    )
+    nonlinear_evidence = {
+        "chunk_grid": [dict(chunk) for chunk in chunks],
+        "chunk_manifest": FileIdentity.from_path(manifest).to_dict(),
+        "chunk_size_zyx": list(chunk_size),
+        "local_warps": local_dicts,
+        "overlap_fraction": overlap,
+    }
+    _write_request_artifact(
+        warp,
+        StageRequest.for_identities(
+            stage="nonlinear",
+            inputs=inputs,
+            geometry=geometry,
+            method="SyNOnly",
+            accuracy="high",
+            native_threads=threads,
+            upstream=affine_identity,
+            parameters={
+                **common,
+                **nonlinear_stage_parameters(
+                    moving_geometry=geometry,
+                    registration_mode="serial-chunked",
+                    nonlinear_accuracy="high",
+                    scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+                    evidence=nonlinear_evidence,
+                ),
+            },
+        ),
+    )
+    warp_identity = FileIdentity.from_path(warp)
+    _write_request_artifact(
+        registered,
+        StageRequest.for_identities(
+            stage="registered-image",
+            inputs=inputs,
+            geometry=geometry,
+            method="SyNOnly",
+            accuracy="high",
+            native_threads=threads,
+            upstream=warp_identity,
+            parameters={
+                **common,
+                **registered_image_parameters(
+                    minimum=0.0,
+                    maximum=1.0,
+                    scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+                ),
+            },
+        ),
+    )
+    _write_request_artifact(
+        channel,
+        StageRequest.for_identities(
+            stage="channel-transform-v1",
+            inputs=(inputs[0], inputs[1], affine_identity, warp_identity),
+            geometry=geometry,
+            method="warp-affine",
+            accuracy="not-applicable",
+            native_threads=threads,
+            upstream=warp_identity,
+            parameters=channel_transform_parameters(
+                pixel_size_xyz=(1.0, 1.0, 1.0),
+                interpolation="linear",
+            ),
+        ),
+    )
+    return artifacts
+
+
+def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
+    round_number = 2
+    dataset_root = output_root.parent / "dataset"
+    fixed = dataset_root / "fixed.tif"
+    moving = dataset_root / "round_2_488.tif"
+    inputs = (FileIdentity.from_path(fixed), FileIdentity.from_path(moving))
+    threads = _native_threads()
+    geometry = _geometry()
+    bounds = (0, 4, 0, 8, 0, 8)
+    common = common_parameters(
+        crop=True,
+        imaging_round=round_number,
+        pixel_size_xyz=(1.0, 1.0, 1.0),
+    )
+    round_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(
+        round_number
+    )
+    artifacts = _expected_artifacts(output_root, round_number)
+    affine, warp, registered, channel = artifacts
+    for role, crop_path in (
+        ("fixed", round_layout.registration / "fixed_crop_indices_2.json"),
+        ("moving", round_layout.registration / "moving_crop_indices_2.json"),
+    ):
+        _write_request_artifact(
+            crop_path,
+            StageRequest.for_identities(
+                stage=f"crop:{role}",
+                inputs=inputs,
+                geometry=geometry,
+                method="robust-bounding-box",
+                accuracy="legacy-robust",
+                native_threads=threads,
+                upstream=None,
+                parameters={**common, **crop_parameters(role)},  # type: ignore[arg-type]
+            ),
+            contents=canonical_compact_json(list(bounds)).encode(),
+        )
+    fixed_reference = round_layout.registration / "fixed_reference.tif"
+    _write_request_artifact(
+        fixed_reference,
+        StageRequest.for_identities(
+            stage="fixed-reference",
+            inputs=inputs,
+            geometry=geometry,
+            method="uint16-tiff",
+            accuracy="exact",
+            native_threads=threads,
+            upstream=None,
+            parameters={**common, **fixed_reference_parameters(0.0, 1.0)},
+        ),
+    )
+    _write_request_artifact(
+        affine,
+        StageRequest.for_identities(
+            stage="affine",
+            inputs=inputs,
+            geometry=geometry,
+            method="TRSAA",
+            accuracy="high",
+            native_threads=threads,
+            upstream=None,
+            parameters={
+                **common,
+                **affine_parameters(
+                    moving_geometry=geometry,
+                    linear_type="TRSAA",
+                    accuracy="high",
+                ),
+            },
+        ),
+    )
+    affine_identity = FileIdentity.from_path(affine)
+    _write_request_artifact(
+        warp,
+        StageRequest.for_identities(
+            stage="nonlinear",
+            inputs=inputs,
+            geometry=geometry,
+            method="SyNOnly",
+            accuracy="high",
+            native_threads=threads,
+            upstream=affine_identity,
+            parameters={
+                **common,
+                **nonlinear_stage_parameters(
+                    moving_geometry=geometry,
+                    registration_mode="whole-image",
+                    nonlinear_accuracy="high",
+                    scalar_postprocessing_policy=WHOLE_SCALAR_POLICY,
+                ),
+            },
+        ),
+    )
+    warp_identity = FileIdentity.from_path(warp)
+    _write_request_artifact(
+        registered,
+        StageRequest.for_identities(
+            stage="registered-image",
+            inputs=inputs,
+            geometry=geometry,
+            method="SyNOnly",
+            accuracy="high",
+            native_threads=threads,
+            upstream=warp_identity,
+            parameters={
+                **common,
+                **registered_image_parameters(
+                    minimum=0.0,
+                    maximum=1.0,
+                    scalar_postprocessing_policy=WHOLE_SCALAR_POLICY,
+                ),
+            },
+        ),
+    )
+    _write_request_artifact(
+        channel,
+        StageRequest.for_identities(
+            stage="channel-transform-v1",
+            inputs=(inputs[0], inputs[1], affine_identity, warp_identity),
+            geometry=geometry,
+            method="warp-affine",
+            accuracy="not-applicable",
+            native_threads=threads,
+            upstream=warp_identity,
+            parameters=channel_transform_parameters(
+                pixel_size_xyz=(1.0, 1.0, 1.0),
+                interpolation="linear",
+            ),
+        ),
+    )
+    return artifacts
 
 
 def test_status_missing_plan_is_pending_without_creating_files(tmp_path: Path) -> None:
@@ -405,9 +812,8 @@ def test_status_rejects_source_shape_incompatible_with_reference(
     output_root = tmp_path / "output"
     scientific = _scientific_mapping(output_root)
     moving_path = str((output_root.parent / "dataset" / "round_2_488.tif").resolve())
-    moving = next(  # type: ignore[union-attr]
-        source for source in scientific["sources"] if source["path"] == moving_path
-    )
+    sources = cast(list[dict[str, object]], scientific["sources"])
+    moving = next(source for source in sources if source["path"] == moving_path)
     moving["shape_zyx"] = [5, 8, 8]
     plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
     plan_path.parent.mkdir(parents=True)
@@ -522,6 +928,103 @@ def test_status_requires_every_artifact_completion_record(tmp_path: Path) -> Non
     assert status.complete
 
 
+def test_status_uses_the_shared_authoritative_completion_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    artifacts = _expected_artifacts(output_root, 2)
+    for artifact in artifacts:
+        _commit_artifact(artifact, output_root)
+    calls: list[int] = []
+
+    def completion_evidence(
+        task: Any,
+        paths: Any,
+        geometries: Any,
+        **_: object,
+    ) -> SimpleNamespace:
+        calls.append(task.round)
+        assert paths.affine == artifacts[0]
+        assert geometries.fixed == _geometry()
+        return SimpleNamespace(artifacts=artifacts[:-1], affine=None, warp=None)
+
+    monkeypatch.setattr(
+        workflow_status,
+        "completion_evidence",
+        completion_evidence,
+        raising=False,
+    )
+
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert calls == [2]
+    assert round_status.status == "invalid"
+    assert round_status.complete_artifacts == tuple(map(str, artifacts[:-1]))
+    assert round_status.invalid_artifacts == (str(artifacts[-1]),)
+
+
+def test_status_accepts_only_a_complete_serial_chunk_provenance_chain(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    scientific_round = scientific["rounds"][0]  # type: ignore[index]
+    scientific_round["strategy"] = "serial_chunked"
+    scientific_round["chunk_size_zyx"] = [4, 8, 8]
+    scientific_round["overlap_fraction"] = 0.0
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+    artifacts = _commit_serial_round(output_root)
+
+    complete = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert complete.status == "complete"
+    assert complete.complete_artifacts == tuple(map(str, artifacts))
+
+    local_warp = (
+        WorkflowLayout.for_dataset(output_root, "dataset-1").round(2).registration
+        / "round_2_chunks"
+        / "chunk_0000_warp.nii.gz"
+    )
+    ArtifactStore().record_path(local_warp).unlink()
+
+    stale = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert stale.status == "invalid"
+    assert stale.complete_artifacts == (str(artifacts[0]),)
+    assert stale.invalid_artifacts == tuple(map(str, artifacts[1:]))
+
+
+def test_status_requires_the_complete_crop_provenance_chain(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    scientific["registration"]["crop"] = True  # type: ignore[index]
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+    artifacts = _commit_cropped_round(output_root)
+
+    complete = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert complete.status == "complete"
+    assert complete.complete_artifacts == tuple(map(str, artifacts))
+
+    fixed_crop = (
+        WorkflowLayout.for_dataset(output_root, "dataset-1").round(2).registration
+        / "fixed_crop_indices_2.json"
+    )
+    fixed_crop.write_text("[0,4,0,8,0,7]\n", encoding="utf-8")
+
+    stale = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert stale.status == "invalid"
+    assert stale.complete_artifacts == ()
+    assert stale.invalid_artifacts == tuple(map(str, artifacts))
+
+
 def test_status_marks_a_corrupt_completion_record_invalid(tmp_path: Path) -> None:
     output_root = tmp_path / "output"
     _write_plan(output_root)
@@ -583,6 +1086,34 @@ def test_status_ignores_missing_or_corrupt_operational_run_summaries(
 
     assert status.complete
     assert status.rounds[0].status == "complete"
+
+
+def test_status_does_not_treat_metrics_or_run_summaries_as_completion(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    affine, warp, registered, channel = _expected_artifacts(output_root, 2)
+    for artifact in (affine, warp, channel):
+        _commit_artifact(artifact, output_root)
+    layout = WorkflowLayout.for_dataset(output_root, "dataset-1")
+    registration = layout.round(2).registration
+    for metric_name in (
+        "image_metrics_pre-registration.txt",
+        "image_metrics_linearly-registered.txt",
+        "image_metrics_nonlinear-registered.txt",
+    ):
+        (registration / metric_name).write_text("metric", encoding="utf-8")
+    layout.workflow_runs.mkdir()
+    (layout.workflow_runs / "claimed-complete.json").write_text(
+        '{"status":"completed"}', encoding="utf-8"
+    )
+
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert round_status.status == "partial"
+    assert round_status.complete_artifacts == tuple(map(str, (affine, warp, channel)))
+    assert round_status.incomplete_artifacts == (str(registered),)
 
 
 def test_status_marks_identity_mismatch_invalid(tmp_path: Path) -> None:

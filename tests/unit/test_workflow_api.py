@@ -26,6 +26,10 @@ from cyexm.config.models import (
 from cyexm.errors import RoundExecutionError, WorkflowExecutionError, WorkflowPlanError
 from cyexm.execution.base import WorkflowExecutor
 from cyexm.execution.sequential import SequentialExecutor
+from cyexm.registration._request_policy import (
+    common_parameters,
+    fixed_reference_parameters,
+)
 from cyexm.registration.artifacts import (
     ArtifactStore,
     CompletionRecord,
@@ -703,6 +707,34 @@ def _commit_artifact(path: Path, plan: WorkflowPlan) -> None:
     }
     threads = {name: 1 for name in NATIVE_THREAD_ENV_VARS}
     if path == affine:
+        fixed_reference = task.registration_directory / "fixed_reference.tif"
+        fixed_reference.parent.mkdir(parents=True, exist_ok=True)
+        fixed_reference.write_bytes(b"fixed-reference")
+        fixed_request = StageRequest.for_identities(
+            stage="fixed-reference",
+            inputs=inputs,
+            geometry=geometry,
+            method="uint16-tiff",
+            accuracy="exact",
+            native_threads=threads,
+            upstream=None,
+            parameters={
+                **common_parameters(
+                    crop=False,
+                    imaging_round=task.round,
+                    pixel_size_xyz=task.voxel_spacing_xyz,
+                ),
+                **fixed_reference_parameters(0.0, 1.0),
+            },
+        )
+        fixed_record = CompletionRecord(
+            schema_version=1,
+            request=fixed_request,
+            artifact=FileIdentity.from_path(fixed_reference),
+        )
+        ArtifactStore().record_path(fixed_reference).write_text(
+            fixed_record.to_json(), encoding="utf-8"
+        )
         request = StageRequest.for_identities(
             stage="affine",
             inputs=inputs,
@@ -832,6 +864,95 @@ def test_run_workflow_writes_scientific_snapshot_before_execution(
         == "completed"
     )
     assert not tuple(layout.root.rglob(".*.tmp*"))
+
+
+def test_run_workflow_lazily_uses_the_production_round_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow import round_task as round_task_module
+
+    plan = _plan(tmp_path, rounds=(2,))
+    calls: list[int] = []
+
+    def run_round(task: RoundTask) -> RoundResult:
+        calls.append(task.round)
+        return _result(task)
+
+    monkeypatch.setattr(round_task_module, "run_round_task", run_round)
+
+    result = run_workflow(plan)
+
+    assert calls == [2]
+    assert tuple(item.status for item in result.rounds) == ("completed",)
+
+
+def test_run_workflow_skips_a_complete_round_without_opening_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow import round_task as round_task_module
+
+    plan = _plan(tmp_path, rounds=(2,))
+    for artifact in _artifacts(plan.tasks[0]):
+        _commit_artifact(artifact, plan)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        round_task_module,
+        "run_round_task",
+        lambda task: calls.append(task.round) or _result(task),
+    )
+
+    result = run_workflow(plan)
+
+    assert calls == []
+    assert tuple(item.status for item in result.rounds) == ("reused",)
+
+
+def test_run_workflow_executes_when_a_channel_record_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow import round_task as round_task_module
+
+    plan = _plan(tmp_path, rounds=(2,))
+    for artifact in _artifacts(plan.tasks[0])[:-1]:
+        _commit_artifact(artifact, plan)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        round_task_module,
+        "run_round_task",
+        lambda task: calls.append(task.round) or _result(task),
+    )
+
+    result = run_workflow(plan)
+
+    assert calls == [2]
+    assert tuple(item.status for item in result.rounds) == ("completed",)
+
+
+def test_run_workflow_executes_when_registration_evidence_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow import round_task as round_task_module
+
+    plan = _plan(tmp_path, rounds=(2,))
+    artifacts = _artifacts(plan.tasks[0])
+    for artifact in artifacts:
+        _commit_artifact(artifact, plan)
+    artifacts[0].write_bytes(b"stale-affine")
+    calls: list[int] = []
+    monkeypatch.setattr(
+        round_task_module,
+        "run_round_task",
+        lambda task: calls.append(task.round) or _result(task),
+    )
+
+    result = run_workflow(plan)
+
+    assert calls == [2]
+    assert tuple(item.status for item in result.rounds) == ("completed",)
 
 
 def test_run_workflow_forces_only_selected_rounds(tmp_path: Path) -> None:
@@ -1220,6 +1341,35 @@ def test_run_workflow_force_submits_an_otherwise_complete_round(tmp_path: Path) 
 
     assert tuple(task.round for task in fake.calls[0]) == (2,)
     assert fake.calls[0][0].force
+    assert result.rounds[0].status == "completed"
+
+
+def test_run_workflow_does_not_reuse_artifacts_from_other_native_threads(
+    tmp_path: Path,
+) -> None:
+    original = _plan(tmp_path, rounds=(2,))
+    for artifact in _artifacts(original.tasks[0]):
+        _commit_artifact(artifact, original)
+    requested_threads = NativeThreadSpec(itk=2, blas=3)
+    task = replace(original.tasks[0], native_threads=requested_threads)
+    execution = replace(original.execution, native_threads=requested_threads)
+    plan = replace(original, tasks=(task,), execution=execution)
+    fake = _FakeExecutor(
+        lambda tasks: tuple(
+            replace(
+                _result(item),
+                native_threads=(
+                    ("itk", requested_threads.itk),
+                    ("blas", requested_threads.blas),
+                ),
+            )
+            for item in tasks
+        )
+    )
+
+    result = run_workflow(plan, _executor_factory=_factory(fake))
+
+    assert tuple(item.round for item in fake.calls[0]) == (2,)
     assert result.rounds[0].status == "completed"
 
 

@@ -8,24 +8,31 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from cyexm.config.models import (
+    NativeThreadSpec,
+    RegistrationSpec,
+    RegistrationStageSpec,
+)
 from cyexm.errors import WorkflowPlanError
 from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
-    CHUNK_SCALAR_POLICY,
     OUTPUT_FORMAT_POLICY,
-    WHOLE_SCALAR_POLICY,
-    affine_parameters,
-    channel_transform_parameters,
-    common_parameters,
-    nonlinear_stage_parameters,
-    registered_image_parameters,
 )
-from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
+from cyexm.registration.artifacts import CompletionRecord, FileIdentity
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
+from cyexm.workflow._round_provenance import (
+    ArtifactSnapshot,
+    RegistrationArtifactPaths,
+    SourceGeometries,
+    completion_evidence,
+    completion_snapshot,
+)
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
+    ChannelTask,
     RoundStatus,
+    RoundTask,
     WorkflowStatus,
     canonical_json,
     sha256_fingerprint,
@@ -747,21 +754,6 @@ def _read_scientific_snapshot(
     return _snapshot_from_text(text, layout=layout, dataset_id=dataset_id)
 
 
-def _current_source_identities(
-    snapshot: _ScientificSnapshot,
-) -> dict[Path, FileIdentity] | None:
-    identities: dict[Path, FileIdentity] = {}
-    for source in snapshot.sources:
-        try:
-            identity = FileIdentity.from_path(source.path)
-        except (OSError, RuntimeError):
-            return None
-        if identity != source.identity:
-            return None
-        identities[source.path] = identity
-    return identities
-
-
 def _read_artifact_evidence(
     expectation: _ArtifactExpectation,
     *,
@@ -806,216 +798,78 @@ def _valid_native_threads(value: Mapping[str, int]) -> bool:
     return len(set(blas_values)) == 1
 
 
-def _valid_geometry(
-    actual: ImageGeometry,
-    expected: ImageGeometry,
-    *,
-    crop: bool,
-) -> bool:
-    if not crop:
-        return actual == expected
-    return (
-        actual.spacing == expected.spacing
-        and actual.direction == expected.direction
-        and all(
-            actual_size <= source_size
-            for actual_size, source_size in zip(
-                actual.shape, expected.shape, strict=True
+def _native_threads_from_evidence(
+    evidences: tuple[_ArtifactEvidence, ...],
+) -> NativeThreadSpec:
+    for evidence in evidences:
+        if evidence.record is None:
+            continue
+        values = evidence.record.request.native_threads
+        if _valid_native_threads(values):
+            return NativeThreadSpec(
+                itk=values[NATIVE_THREAD_ENV_VARS[0]],
+                blas=values[NATIVE_THREAD_ENV_VARS[1]],
             )
-        )
-    )
+    return NativeThreadSpec(itk=1, blas=1)
 
 
-def _common_parameters(
+def _task_from_snapshot(
     snapshot: _ScientificSnapshot,
     round_contract: _RoundContract,
-) -> dict[str, object]:
-    return common_parameters(
-        crop=snapshot.registration.crop,
-        imaging_round=round_contract.round,
-        pixel_size_xyz=snapshot.voxel_spacing_xyz,
-    )
-
-
-def _request_basics_valid(
-    request: StageRequest,
-    *,
-    inputs: tuple[FileIdentity, ...],
-    expected_geometry: ImageGeometry,
-    crop: bool,
-) -> bool:
-    return (
-        request.inputs == inputs
-        and _valid_native_threads(request.native_threads)
-        and _valid_geometry(request.geometry, expected_geometry, crop=crop)
-    )
-
-
-def _whole_request_valid(
-    expectation: _ArtifactExpectation,
-    evidence: _ArtifactEvidence,
-    *,
-    snapshot: _ScientificSnapshot,
-    round_contract: _RoundContract,
-    source_identities: Mapping[Path, FileIdentity],
-    artifact_identities: Mapping[ArtifactRole, FileIdentity],
-) -> bool:
-    if evidence.record is None:
-        return False
-    if snapshot.registration.crop:
-        # A cropped output grid is runtime-derived from image intensities and crop
-        # bounds. The Phase 2A scientific snapshot does not carry the complete crop
-        # artifact chain, so accepting only a plausible geometry would authorize
-        # reuse without enough provenance.
-        return False
-    request = evidence.record.request
-    fixed_identity = source_identities[snapshot.fixed_source.path]
-    moving_identity = source_identities[round_contract.registration_source.path]
-    registration_inputs = (fixed_identity, moving_identity)
-    common = _common_parameters(snapshot, round_contract)
-    scalar_policy = (
-        WHOLE_SCALAR_POLICY
-        if round_contract.strategy == "whole_image"
-        else CHUNK_SCALAR_POLICY
-    )
-    if expectation.role == "affine":
-        if not _request_basics_valid(
-            request,
-            inputs=registration_inputs,
-            expected_geometry=snapshot.fixed_source.geometry,
+    layout: WorkflowLayout,
+    native_threads: NativeThreadSpec,
+) -> RoundTask:
+    round_layout = layout.round(round_contract.round)
+    return RoundTask(
+        dataset_id=snapshot.dataset_id,
+        round=round_contract.round,
+        strategy=round_contract.strategy,
+        fixed_image=snapshot.fixed_source.path,
+        moving_image=round_contract.registration_source.path,
+        registration_directory=round_layout.registration,
+        log_path=round_layout.log,
+        voxel_spacing_xyz=snapshot.voxel_spacing_xyz,
+        registration=RegistrationSpec(
             crop=snapshot.registration.crop,
-        ):
-            return False
-        expected_parameters = {
-            **common,
-            **affine_parameters(
-                moving_geometry=round_contract.registration_source.geometry,
-                linear_type=snapshot.registration.linear_type,
+            linear=RegistrationStageSpec(
+                type=snapshot.registration.linear_type,
                 accuracy=snapshot.registration.linear_accuracy,
             ),
-        }
-        return (
-            request.stage == "affine"
-            and request.method == snapshot.registration.linear_type
-            and request.accuracy == snapshot.registration.linear_accuracy
-            and request.upstream is None
-            and canonical_json(request.parameters)
-            == canonical_json(expected_parameters)
-        )
-    affine_identity = artifact_identities.get("affine")
-    if affine_identity is None:
-        return False
-    if expectation.role == "warp":
-        if not _request_basics_valid(
-            request,
-            inputs=registration_inputs,
-            expected_geometry=snapshot.fixed_source.geometry,
-            crop=snapshot.registration.crop,
-        ):
-            return False
-        if round_contract.strategy != "whole_image":
-            # Serial-chunk provenance includes local-warp and manifest records. Until
-            # that full chain is represented by the Phase 2B worker, never authorize
-            # coarse workflow reuse from only the assembled warp record.
-            return False
-        expected_parameters = {
-            **common,
-            **nonlinear_stage_parameters(
-                moving_geometry=request.geometry,
-                registration_mode="whole-image",
-                nonlinear_accuracy=snapshot.registration.nonlinear_accuracy,
-                scalar_postprocessing_policy=scalar_policy,
+            nonlinear=RegistrationStageSpec(
+                type=snapshot.registration.nonlinear_type,
+                accuracy=snapshot.registration.nonlinear_accuracy,
             ),
-        }
-        return (
-            request.stage == "nonlinear"
-            and request.method == snapshot.registration.nonlinear_type
-            and request.accuracy == snapshot.registration.nonlinear_accuracy
-            and request.upstream == affine_identity
-            and canonical_json(request.parameters)
-            == canonical_json(expected_parameters)
-        )
-    warp_identity = artifact_identities.get("warp")
-    if warp_identity is None:
-        return False
-    if expectation.role == "registered":
-        if not _request_basics_valid(
-            request,
-            inputs=registration_inputs,
-            expected_geometry=snapshot.fixed_source.geometry,
-            crop=snapshot.registration.crop,
-        ):
-            return False
-        expected_keys = frozenset(
-            {
-                *common,
-                "format",
-                "minimum",
-                "maximum",
-                "scalar_postprocessing_policy",
-            }
-        )
-        if frozenset(request.parameters) != expected_keys:
-            return False
-        minimum = request.parameters.get("minimum")
-        maximum = request.parameters.get("maximum")
-        try:
-            minimum_value = _finite_number(minimum, "registered request minimum")
-            maximum_value = _finite_number(maximum, "registered request maximum")
-        except WorkflowPlanError:
-            return False
-        expected_static = {
-            **common,
-            **{
-                key: value
-                for key, value in registered_image_parameters(
-                    minimum=minimum_value,
-                    maximum=maximum_value,
-                    scalar_postprocessing_policy=scalar_policy,
-                ).items()
-                if key not in {"minimum", "maximum"}
-            },
-        }
-        actual_static = {
-            key: value
-            for key, value in request.parameters.items()
-            if key not in {"minimum", "maximum"}
-        }
-        return (
-            minimum_value <= maximum_value
-            and request.stage == "registered-image"
-            and request.method == snapshot.registration.nonlinear_type
-            and request.accuracy == snapshot.registration.nonlinear_accuracy
-            and request.upstream == warp_identity
-            and canonical_json(actual_static) == canonical_json(expected_static)
-        )
-    channel = expectation.channel
-    if channel is None:
-        return False
-    channel_inputs = (
-        fixed_identity,
-        source_identities[channel.source.path],
-        affine_identity,
-        warp_identity,
+        ),
+        native_threads=native_threads,
+        channels=tuple(
+            ChannelTask(
+                source=channel.source.path,
+                output=channel.output,
+                interpolation=channel.interpolation,
+            )
+            for channel in round_contract.channels
+        ),
+        chunk_size_zyx=round_contract.chunk_size_zyx,
+        overlap_fraction=round_contract.overlap_fraction,
     )
-    if not _request_basics_valid(
-        request,
-        inputs=channel_inputs,
-        expected_geometry=snapshot.fixed_source.geometry,
-        crop=False,
-    ):
-        return False
-    expected_parameters = channel_transform_parameters(
-        pixel_size_xyz=snapshot.voxel_spacing_xyz,
-        interpolation=channel.interpolation,
+
+
+def _safe_completion_snapshot(
+    path: Path,
+    *,
+    layout: WorkflowLayout,
+) -> ArtifactSnapshot | None:
+    artifact = _safe_descendant(
+        path,
+        root=layout.root,
+        location="authoritative round artifact",
     )
-    return (
-        request.stage == "channel-transform-v1"
-        and request.method == "warp-affine"
-        and request.accuracy == "not-applicable"
-        and request.upstream == warp_identity
-        and canonical_json(request.parameters) == canonical_json(expected_parameters)
+    _safe_descendant(
+        artifact.with_name(f"{artifact.name}.complete.json"),
+        root=layout.root,
+        location="authoritative round completion record",
     )
+    return completion_snapshot(artifact)
 
 
 def _round_status(
@@ -1023,13 +877,47 @@ def _round_status(
     round_contract: _RoundContract,
     *,
     layout: WorkflowLayout,
+    task: RoundTask | None = None,
 ) -> RoundStatus:
     evidences = tuple(
         _read_artifact_evidence(expectation, layout=layout)
         for expectation in round_contract.artifacts
     )
-    source_identities = _current_source_identities(snapshot)
-    artifact_identities: dict[ArtifactRole, FileIdentity] = {}
+    if task is None:
+        task = _task_from_snapshot(
+            snapshot,
+            round_contract,
+            layout,
+            _native_threads_from_evidence(evidences),
+        )
+    paths = RegistrationArtifactPaths.for_round(
+        task.registration_directory,
+        task.round,
+    )
+
+    def snapshot_reader(path: Path) -> ArtifactSnapshot | None:
+        return _safe_completion_snapshot(path, layout=layout)
+
+    def geometry_reader(
+        path: Path,
+        _spacing: tuple[float, float, float],
+    ) -> ImageGeometry:
+        evidence = snapshot_reader(path)
+        if evidence is None:
+            raise ValueError(f"Missing fixed-reference completion evidence: {path}")
+        return evidence[0].request.geometry
+
+    authoritative = completion_evidence(
+        task,
+        paths,
+        SourceGeometries(
+            fixed=snapshot.fixed_source.geometry,
+            moving=round_contract.registration_source.geometry,
+        ),
+        snapshot_reader=snapshot_reader,
+        geometry_reader=geometry_reader,
+    )
+    accepted = frozenset(authoritative.artifacts)
     complete: list[str] = []
     incomplete: list[str] = []
     invalid: list[str] = []
@@ -1037,21 +925,8 @@ def _round_status(
         path = str(expectation.path)
         if evidence.state == "incomplete":
             incomplete.append(path)
-        elif (
-            evidence.state == "recorded"
-            and source_identities is not None
-            and _whole_request_valid(
-                expectation,
-                evidence,
-                snapshot=snapshot,
-                round_contract=round_contract,
-                source_identities=source_identities,
-                artifact_identities=artifact_identities,
-            )
-        ):
+        elif evidence.state == "recorded" and expectation.path in accepted:
             complete.append(path)
-            if expectation.role != "channel" and evidence.identity is not None:
-                artifact_identities[expectation.role] = evidence.identity
         else:
             invalid.append(path)
     if invalid:
@@ -1071,9 +946,11 @@ def _round_status(
     )
 
 
-def inspect_workflow_status(
+def _inspect_workflow_status(
     output_root: str | Path,
     dataset_id: str,
+    *,
+    _tasks: tuple[RoundTask, ...] | None = None,
 ) -> WorkflowStatus:
     """Inspect authoritative completion provenance without changing workflow state."""
     layout = _safe_workflow_layout(output_root, dataset_id)
@@ -1083,8 +960,25 @@ def inspect_workflow_status(
     snapshot = _read_scientific_snapshot(layout.plan_path, dataset_id)
     if snapshot is None:
         return WorkflowStatus(dataset_id, None, (), False)
+    tasks_by_round: dict[int, RoundTask] = {}
+    if _tasks is not None:
+        tasks_by_round = {task.round: task for task in _tasks}
+        expected_rounds = tuple(item.round for item in snapshot.rounds)
+        if len(tasks_by_round) != len(_tasks) or set(tasks_by_round) != set(
+            expected_rounds
+        ):
+            actual_rounds = tuple(task.round for task in _tasks)
+            raise WorkflowPlanError(
+                "Status task rounds must match the persisted scientific plan; "
+                f"expected={expected_rounds!r}, got={actual_rounds!r}"
+            )
     rounds = tuple(
-        _round_status(snapshot, round_contract, layout=layout)
+        _round_status(
+            snapshot,
+            round_contract,
+            layout=layout,
+            task=tasks_by_round.get(round_contract.round),
+        )
         for round_contract in snapshot.rounds
     )
     return WorkflowStatus(
@@ -1093,6 +987,14 @@ def inspect_workflow_status(
         rounds=rounds,
         complete=bool(rounds) and all(item.status == "complete" for item in rounds),
     )
+
+
+def inspect_workflow_status(
+    output_root: str | Path,
+    dataset_id: str,
+) -> WorkflowStatus:
+    """Inspect authoritative completion provenance without changing workflow state."""
+    return _inspect_workflow_status(output_root, dataset_id)
 
 
 __all__ = ["inspect_workflow_status"]

@@ -1025,17 +1025,25 @@ def _round_status(
     ) -> ImageGeometry:
         return _read_uint16_tiff_geometry_without_runtime(path)
 
-    authoritative = completion_evidence(
-        task,
-        paths,
-        SourceGeometries(
-            fixed=snapshot.fixed_source.geometry,
-            moving=round_contract.registration_source.geometry,
-        ),
-        snapshot_reader=snapshot_reader,
-        geometry_reader=geometry_reader,
-    )
-    accepted = frozenset(authoritative.artifacts)
+    try:
+        prepared_fixed_geometry = geometry_reader(
+            snapshot.fixed_output,
+            snapshot.voxel_spacing_xyz,
+        )
+    except Exception:
+        accepted: frozenset[Path] = frozenset()
+    else:
+        authoritative = completion_evidence(
+            task,
+            paths,
+            SourceGeometries(
+                fixed=prepared_fixed_geometry,
+                moving=round_contract.registration_source.geometry,
+            ),
+            snapshot_reader=snapshot_reader,
+            geometry_reader=geometry_reader,
+        )
+        accepted = frozenset(authoritative.artifacts)
     complete: list[str] = []
     incomplete: list[str] = []
     invalid: list[str] = []

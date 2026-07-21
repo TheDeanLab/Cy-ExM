@@ -10,6 +10,9 @@
   shared `channels` directory.
 - Workflow must not mutate a plan or create a scheduler.
 - Phase 1 completion records remain the only restart authority.
+- Status must reconstruct moving-round provenance from the prepared reference TIFF's
+  persisted geometry, not the native reference source grid. An unreadable prepared
+  reference cannot authorize any moving-round completion chain.
 - Scientific fingerprints exclude executor, resource, and logging settings.
 - Validate each source TIFF shape independently as positive scalar ZYX evidence.
   Native reference, registration-channel, and dependent-channel shapes may differ

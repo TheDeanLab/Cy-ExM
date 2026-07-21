@@ -341,7 +341,9 @@ def _write_request_artifact(
     contents: bytes = b"artifact",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.name == "fixed_reference.tif" and contents == b"artifact":
+    if (
+        path.name == "fixed_reference.tif" or request.stage == "reference-channel"
+    ) and contents == b"artifact":
         write_cyexm_uint16_tiff(path, request.geometry)
     else:
         path.write_bytes(contents)
@@ -557,14 +559,23 @@ def _commit_serial_round(output_root: Path) -> tuple[Path, ...]:
     return artifacts
 
 
-def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
+def _commit_cropped_round(
+    output_root: Path,
+    *,
+    fixed_source_geometry: ImageGeometry | None = None,
+    moving_source_geometry: ImageGeometry | None = None,
+    reference_bounds: tuple[int, int, int, int, int, int] = (0, 4, 0, 8, 0, 8),
+    moving_bounds: tuple[int, int, int, int, int, int] = (0, 4, 0, 8, 0, 8),
+) -> tuple[Path, ...]:
     round_number = 2
     dataset_root = output_root.parent / "dataset"
     source_fixed = dataset_root / "fixed.tif"
     moving = dataset_root / "round_2_488.tif"
     threads = _native_threads()
-    geometry = _geometry()
-    bounds = (0, 4, 0, 8, 0, 8)
+    fixed_native = fixed_source_geometry or _geometry()
+    moving_native = moving_source_geometry or _geometry()
+    fixed_geometry = crop_geometry(fixed_native, reference_bounds)
+    moving_geometry = crop_geometry(moving_native, moving_bounds)
     reference_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(1)
     reference_crop = reference_layout.reference_crop
     _write_request_artifact(
@@ -572,14 +583,14 @@ def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
         StageRequest.for_identities(
             stage="reference-crop",
             inputs=(FileIdentity.from_path(source_fixed),),
-            geometry=geometry,
+            geometry=fixed_native,
             method="robust-bounding-box",
             accuracy="legacy-robust",
             native_threads=threads,
             upstream=None,
             parameters=reference_crop_parameters(),
         ),
-        contents=canonical_compact_json(list(bounds)).encode(),
+        contents=canonical_compact_json(list(reference_bounds)).encode(),
     )
     fixed = reference_layout.channel(Path("fixed.tif"))
     _write_request_artifact(
@@ -587,7 +598,7 @@ def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
         StageRequest.for_identities(
             stage="reference-channel",
             inputs=(FileIdentity.from_path(source_fixed),),
-            geometry=geometry,
+            geometry=fixed_geometry,
             method="uint16-tiff",
             accuracy="exact",
             native_threads=threads,
@@ -612,21 +623,21 @@ def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
         StageRequest.for_identities(
             stage="crop:moving",
             inputs=inputs,
-            geometry=geometry,
+            geometry=moving_native,
             method="robust-bounding-box",
             accuracy="legacy-robust",
             native_threads=threads,
             upstream=None,
             parameters={**common, **crop_parameters("moving")},
         ),
-        contents=canonical_compact_json(list(bounds)).encode(),
+        contents=canonical_compact_json(list(moving_bounds)).encode(),
     )
     _write_request_artifact(
         affine,
         StageRequest.for_identities(
             stage="affine",
             inputs=inputs,
-            geometry=geometry,
+            geometry=fixed_geometry,
             method="TRSAA",
             accuracy="high",
             native_threads=threads,
@@ -634,7 +645,7 @@ def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
             parameters={
                 **common,
                 **affine_parameters(
-                    moving_geometry=geometry,
+                    moving_geometry=moving_geometry,
                     linear_type="TRSAA",
                     accuracy="high",
                 ),
@@ -647,7 +658,7 @@ def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
         StageRequest.for_identities(
             stage="nonlinear",
             inputs=inputs,
-            geometry=geometry,
+            geometry=fixed_geometry,
             method="SyNOnly",
             accuracy="high",
             native_threads=threads,
@@ -655,7 +666,7 @@ def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
             parameters={
                 **common,
                 **nonlinear_stage_parameters(
-                    moving_geometry=geometry,
+                    moving_geometry=fixed_geometry,
                     registration_mode="whole-image",
                     nonlinear_accuracy="high",
                     scalar_postprocessing_policy=WHOLE_SCALAR_POLICY,
@@ -669,7 +680,7 @@ def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
         StageRequest.for_identities(
             stage="registered-image",
             inputs=inputs,
-            geometry=geometry,
+            geometry=fixed_geometry,
             method="SyNOnly",
             accuracy="high",
             native_threads=threads,
@@ -689,7 +700,7 @@ def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
         StageRequest.for_identities(
             stage="channel-transform-v1",
             inputs=(inputs[0], inputs[1], affine_identity, warp_identity),
-            geometry=geometry,
+            geometry=fixed_geometry,
             method="warp-affine",
             accuracy="not-applicable",
             native_threads=threads,
@@ -1190,6 +1201,42 @@ def test_status_requires_the_complete_crop_provenance_chain(tmp_path: Path) -> N
     assert stale.status == "invalid"
     assert stale.complete_artifacts == ()
     assert stale.invalid_artifacts == tuple(map(str, artifacts))
+
+
+def test_status_uses_prepared_cropped_reference_geometry_for_moving_rounds(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    scientific["registration"]["crop"] = True  # type: ignore[index]
+    scientific["reference"]["crop_output"] = (  # type: ignore[index]
+        "rounds/round-001/registration/reference_crop_indices.json"
+    )
+    fixed_native = replace(_geometry(), shape=(5, 9, 10))
+    moving_native = replace(_geometry(), shape=(4, 8, 9))
+    sources = cast(list[dict[str, object]], scientific["sources"])
+    fixed_path = str((output_root.parent / "dataset" / "fixed.tif").resolve())
+    for source in sources:
+        source["shape_zyx"] = list(
+            fixed_native.shape if source["path"] == fixed_path else moving_native.shape
+        )
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+    artifacts = _commit_cropped_round(
+        output_root,
+        fixed_source_geometry=fixed_native,
+        moving_source_geometry=moving_native,
+        reference_bounds=(1, 5, 1, 9, 2, 10),
+        moving_bounds=(0, 3, 1, 8, 1, 9),
+    )
+
+    status = inspect_workflow_status(output_root, "dataset-1")
+
+    assert status.rounds[0].status == "complete"
+    assert status.rounds[1].status == "complete"
+    assert status.rounds[1].complete_artifacts == tuple(map(str, artifacts))
+    assert status.complete
 
 
 def test_status_marks_a_corrupt_completion_record_invalid(tmp_path: Path) -> None:

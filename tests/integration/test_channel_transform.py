@@ -23,6 +23,75 @@ def _temporary_siblings(root: Path) -> tuple[Path, ...]:
     )
 
 
+def test_transform_channel_resamples_unequal_native_shape_to_fixed_geometry(
+    tmp_path: Path,
+    native_threads: NativeThreadConfig,
+) -> None:
+    import ants
+    import numpy as np
+    import tifffile
+
+    fixed_shape = (4, 6, 8)
+    moving_shape = (3, 5, 7)
+    fixed_geometry = ImageGeometry(
+        shape=fixed_shape,
+        origin=(0.5, -1.0, 2.0),
+        spacing=_PIXEL_SIZE,
+        direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    fixed_path = tmp_path / "fixed.tif"
+    moving_path = tmp_path / "moving-channel.tif"
+    tifffile.imwrite(
+        fixed_path,
+        np.ones(fixed_shape, dtype=np.float32),
+        metadata={
+            "axes": "ZYX",
+            "cyexm": {
+                "schema_version": 1,
+                "axis_convention_version": AXIS_CONVENTION_VERSION,
+                "geometry": fixed_geometry.to_dict(),
+            },
+        },
+        photometric="minisblack",
+    )
+    tifffile.imwrite(
+        moving_path,
+        np.arange(np.prod(moving_shape), dtype=np.float32).reshape(moving_shape),
+        metadata={"axes": "ZYX"},
+        photometric="minisblack",
+    )
+
+    backend = AntsRegistrationBackend(native_threads)
+    fixed = backend.load_image(fixed_path, _PIXEL_SIZE)
+    affine_path = tmp_path / "identity-affine.mat"
+    warp_path = tmp_path / "zero-warp.nii.gz"
+    backend.write_affine(
+        ants.create_ants_transform(transform_type="AffineTransform", dimension=3),
+        affine_path,
+    )
+    backend.write_identity_warp(fixed, warp_path)
+
+    output_path = tmp_path / "registered-unequal-channel.tif"
+    transform_channel(
+        fixed_image_path=fixed_path,
+        moving_image_path=moving_path,
+        affine_path=affine_path,
+        warp_path=warp_path,
+        output_path=output_path,
+        pixel_size=_PIXEL_SIZE,
+        interpolation="linear",
+        native_threads=native_threads,
+    )
+
+    written = tifffile.imread(output_path)
+    assert written.shape == fixed_shape
+    assert read_tiff_geometry(output_path, written.shape) == fixed_geometry
+    assert (
+        backend.geometry(backend.load_image(output_path, _PIXEL_SIZE))
+        == fixed_geometry
+    )
+
+
 def test_transform_channel_applies_identity_chain_clips_and_reuses_exactly(
     tmp_path: Path,
     native_threads: NativeThreadConfig,

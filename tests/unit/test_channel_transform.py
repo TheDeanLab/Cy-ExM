@@ -510,25 +510,46 @@ def test_transform_channel_completion_record_failure_removes_uncommitted_data(
     assert list(tmp_path.glob(".*.tmp*")) == []
 
 
-def test_transform_channel_rejects_moving_shape_mismatch_before_transform(
+def test_transform_channel_resamples_unequal_moving_shape_with_fixed_reference(
     tmp_path: Path,
 ) -> None:
     sources = source_files(tmp_path)
-    backend = FakeBackend(
-        moving_image=fake_image(data=np.zeros((7, 8, 8), dtype=np.float32))
+    fixed_image = fake_image(data=np.ones((8, 8, 8), dtype=np.float32))
+    moving_image = fake_image(data=np.ones((7, 9, 6), dtype=np.float32))
+
+    class FixedReferenceBackend(FakeBackend):
+        transform_arguments: list[tuple[object, object]]
+
+        def __init__(self) -> None:
+            super().__init__(fixed_image=fixed_image, moving_image=moving_image)
+            self.transform_arguments = []
+
+        def apply_transform_chain(self, **kwargs: object) -> object:
+            self.transform_arguments.append((kwargs["fixed"], kwargs["moving"]))
+            super().apply_transform_chain(**kwargs)  # type: ignore[arg-type]
+            fixed = kwargs["fixed"]
+            assert hasattr(fixed, "clone")
+            return fixed.clone()  # type: ignore[union-attr]
+
+    backend = FixedReferenceBackend()
+
+    output = run_transform(
+        tmp_path,
+        backend=backend,
+        fixed=sources[0],
+        moving=sources[1],
+        affine=sources[2],
+        warp=sources[3],
     )
 
-    with pytest.raises(RegistrationStageError, match="moving shape"):
-        run_transform(
-            tmp_path,
-            backend=backend,
-            fixed=sources[0],
-            moving=sources[1],
-            affine=sources[2],
-            warp=sources[3],
-        )
-
-    assert backend.transform_lists == []
+    assert output.is_file()
+    assert len(backend.transform_arguments) == 1
+    fixed_argument, moving_argument = backend.transform_arguments[0]
+    assert backend.geometry(fixed_argument).shape == (8, 8, 8)
+    assert backend.geometry(moving_argument).shape == (7, 9, 6)
+    assert backend.geometry(backend.clipped_tiff_images[0]) == backend.geometry(
+        fixed_argument
+    )
 
 
 def test_transform_channel_rejects_result_that_loses_fixed_geometry(

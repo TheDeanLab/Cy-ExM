@@ -235,11 +235,6 @@ def transform_channel(
         moving = backend.load_image(moving_path, spacing)
         _verify_input_identities(input_paths, input_identities)
         fixed_geometry = backend.geometry(fixed)
-        moving_geometry = backend.geometry(moving)
-        if fixed_geometry.shape != moving_geometry.shape:
-            raise RegistrationStageError(
-                "channel-transform moving shape does not match the fixed image"
-            )
         request = StageRequest.for_files(
             stage="channel-transform-v1",
             inputs=input_paths,

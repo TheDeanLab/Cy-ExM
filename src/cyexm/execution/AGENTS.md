@@ -18,6 +18,9 @@
   Revalidate directly constructed SLURM profiles before scheduler module loading,
   and validate the production-rendered header and worker command before the first
   scale call. Reject unexpected or duplicate resource and worker options.
+  Serialize the configured runner directly before scheduler module loading and carry
+  its bytes in a production-owned callable. Reconstruct it inside ordinary task
+  execution so nested non-production runners do not become worker imports.
   Require that all connected workers pass preflight before any registration task is
   submitted. Construction, worker probes, and job-script templates are portable
   evidence only, not proof that a scheduler accepted or ran a job.

@@ -550,6 +550,13 @@ command. The coordinator runs in the process that invokes the CLI; a batch-launc
 coordinator is not implemented. Confirm site policy and the stability of the chosen
 login or interactive coordinator location before a long run.
 
+Before SLURM submission, Cy-ExM directly serializes the configured round runner and
+carries those bytes in a production-owned callable. This prevents Distributed's
+outer task serialization from reducing an acceptance-only runner to a test-module
+import. Workers never need `tests` on `PYTHONPATH`; the embedded runner is rebuilt
+inside ordinary task execution, where a reconstruction error becomes a normal task
+failure instead of a worker-side task-deserialization failure.
+
 Each SLURM workflow-run record carries versioned operational evidence: requested
 workers/retries/timeouts, the rendered job-script template, connected worker and
 preflight observations, task attempt counts, startup phase/outcome, timestamps,

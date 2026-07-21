@@ -199,6 +199,9 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "`500gb` becomes `466g`",
         "500,363,689,984 bytes",
         "never passes a `gb` suffix to `#sbatch --mem`",
+        "production-owned callable",
+        "workers never need `tests` on `pythonpath`",
+        "inside ordinary task execution",
     ):
         assert rule in normalized
 

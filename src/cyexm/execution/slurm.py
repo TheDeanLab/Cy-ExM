@@ -100,6 +100,25 @@ _STARTUP_PHASES = (
 _CLEANUP_RESOURCES = ("client", "cluster", "configuration")
 
 
+@dataclass(frozen=True, slots=True)
+class _SerializedRoundTaskRunner:
+    payload: bytes
+
+    def __call__(self, task: RoundTask) -> RoundResult:
+        import cloudpickle
+
+        runner = cast(RoundTaskRunner, cloudpickle.loads(self.payload))
+        return runner(task)
+
+
+def _serialize_round_task_runner(
+    runner: RoundTaskRunner,
+) -> _SerializedRoundTaskRunner:
+    import cloudpickle
+
+    return _SerializedRoundTaskRunner(cloudpickle.dumps(runner))
+
+
 def _evidence_object(
     value: object,
     location: str,
@@ -1207,6 +1226,7 @@ class SlurmExecutor:
         spec = self._spec()
         memory = normalize_slurm_memory(spec.memory)
         validate_distributed_tasks(tasks, executor_name="SlurmExecutor")
+        submission_runner = _serialize_round_task_runner(self._runner)
         worker_count = min(len(tasks), spec.workers)
         rendered, observed, startup, cleanup, evidence = self._begin_evidence(
             worker_count=worker_count,
@@ -1357,7 +1377,7 @@ class SlurmExecutor:
             assert execution_client is not None
             results, _attempts = collect_distributed_results(
                 tasks,
-                runner=self._runner,
+                runner=submission_runner,
                 client=execution_client,
                 as_completed=modules.as_completed,
                 task_retries=spec.task_retries,

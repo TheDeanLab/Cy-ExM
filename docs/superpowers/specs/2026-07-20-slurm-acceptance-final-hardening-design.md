@@ -116,3 +116,37 @@ request. Passing bare `466G` to Dask was rejected because Dask treats `G` as dec
 and would under-allocate the worker. Depending only on dask-jobqueue's implicit
 header conversion was rejected because Cy-ExM needs explicit, durable normalized
 facts for fail-closed validation and acceptance evidence.
+
+## Runner-serialization erratum after real attempt 1
+
+The first approved environment attempt proved the original portable serialization
+test modeled the wrong boundary. Direct `cloudpickle.dumps(run_environment_smoke)`
+honored the temporary by-value registry, but Distributed serializes the submitted
+`dask._task_spec.Task` through `distributed.protocol.pickle`. That protocol first
+uses standard-library pickle. Because the submitted runner was a
+`functools.partial`, the outer module was `functools`, not the registered
+`hpc.environment` module; the short standard pickle therefore retained an
+`hpc.environment.run_environment_smoke` import reference. A worker with only the
+installed `cyexm` source correctly failed task deserialization with
+`ModuleNotFoundError: No module named 'hpc'`.
+
+Before loading scheduler modules or scaling, `SlurmExecutor` now directly serializes
+the configured runner with cloudpickle and places the resulting bytes in a frozen,
+production-owned callable. Distributed can serialize that outer callable by
+reference to `cyexm.execution.slurm`, which every worker must already import. The
+callable reconstructs the embedded runner inside ordinary task execution and invokes
+it with the immutable `RoundTask`. For acceptance, the existing temporary by-value
+registration remains active during the explicit runner serialization and restores
+its exact prior state on every exit path. Workers never add `tests` to `PYTHONPATH`.
+
+Reconstruction inside the callable is also the failure boundary: a corrupt or
+unavailable embedded runner becomes a normal task exception that Distributed returns
+through the future, rather than a failure to deserialize the outer Dask task. No
+finite task timeout is added because valid registration rounds may run for many
+hours; `startup_timeout` continues to bound only client connection and worker wait.
+
+The portable regression uses the actual installed `dask._task_spec.Task` and
+`distributed.protocol.pickle.dumps` path captured from the executor's fake client.
+A clean child with only `src` on `PYTHONPATH` must deserialize the submission, invoke
+the embedded runner far enough to reach the expected no-worker boundary, and prove
+that neither `hpc` nor `hpc.environment` was imported.

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
-import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -901,36 +899,6 @@ def test_path_fact_records_device_and_mount_identity(tmp_path: Path) -> None:
         mount["root"],
         mount["mount_point"],
     )
-
-
-def test_smoke_runner_serializes_without_worker_importing_test_package() -> None:
-    import cloudpickle
-
-    with smoke_module_by_value():
-        encoded = base64.b64encode(cloudpickle.dumps(run_environment_smoke)).decode(
-            "ascii"
-        )
-    source_root = Path(__file__).resolve().parents[2] / "src"
-    environment = dict(os.environ)
-    environment["PYTHONPATH"] = str(source_root)
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import base64, cloudpickle, sys; "
-            "runner = cloudpickle.loads(base64.b64decode(sys.argv[1])); "
-            "assert runner.__name__ == 'run_environment_smoke'",
-            encoded,
-        ],
-        cwd="/tmp",
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
 
 
 def test_smoke_module_by_value_restores_absent_state_across_nested_contexts() -> None:

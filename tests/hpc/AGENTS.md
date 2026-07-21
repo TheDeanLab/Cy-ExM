@@ -30,6 +30,10 @@
   submit no registration in the environment smoke test, require one process and one
   `round_slot` per job, and preserve exact job IDs, hostnames, partition facts,
   worker probes, and rendered job-script evidence.
+- Register only the acceptance helper module for exact, temporary cloudpickle-by-
+  value serialization and restore its prior registry state in every exit path. The
+  production executor must carry those bytes in its importable runner wrapper;
+  never add `tests` to worker `PYTHONPATH` or submit a direct test-module callable.
 - Own every job created by the harness. Close the Dask client before its cluster on
   success or failure, and query only the current user plus exact name after cleanup;
   never pass recorded job IDs to squeue. Sort and deduplicate the recorded IDs,

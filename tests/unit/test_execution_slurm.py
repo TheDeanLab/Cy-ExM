@@ -173,6 +173,7 @@ def _probe(address: str, *, ok: bool = True) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class _SubmitCall:
+    runner: Callable[[RoundTask], RoundResult]
     task: RoundTask
     key: str
     pure: bool
@@ -301,7 +302,6 @@ class _FakeClient:
         retries: int,
         resources: dict[str, int],
     ) -> _FakeFuture:
-        del runner
         self._modules.events.append(f"submit:{task.round}")
         submit_error = self._modules.submit_errors.get(
             task.round,
@@ -310,7 +310,7 @@ class _FakeClient:
         if submit_error is not None:
             raise submit_error
         self._modules.submit_calls.append(
-            _SubmitCall(task, key, pure, retries, resources)
+            _SubmitCall(runner, task, key, pure, retries, resources)
         )
         configured = self._modules.outcomes.setdefault(task.round, [])
         outcome = configured.pop(0) if configured else _result(task)
@@ -1625,6 +1625,70 @@ def test_slurm_executor_submits_zero_retry_one_slot_unique_keys_and_returns_orde
         ("cyexm-dataset-1-round-003", False, 0, {"round_slot": 1}),
     ]
     assert tuple(result.round for result in results) == (2, 3)
+
+
+def test_slurm_executor_submission_deserializes_without_worker_importing_hpc(
+    tmp_path: Path,
+) -> None:
+    import os
+    import subprocess
+    from functools import partial
+
+    from dask._task_spec import Task as DaskTask
+    from distributed.protocol import pickle as distributed_pickle
+    from hpc.environment import run_environment_smoke, smoke_module_by_value
+
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    runner = partial(
+        run_environment_smoke,
+        evidence_dir=str(tmp_path / "evidence"),
+        dataset_root=str(tmp_path / "dataset"),
+        output_root=str(tmp_path / "output"),
+        worker_local_directory=str(tmp_path / "scratch"),
+        interface="ib0",
+    )
+    executor = SlurmExecutor(
+        _profile(tmp_path),
+        _runner=runner,
+        _modules=lambda: modules,
+        _version=lambda name: "test-version" if name in _PACKAGES else "unexpected",
+    )
+
+    with smoke_module_by_value():
+        executor.execute((_task(tmp_path, 2),))
+        call = modules.submit_calls[0]
+        payload = distributed_pickle.dumps(DaskTask(call.key, call.runner, call.task))
+    payload_path = tmp_path / "submission.pickle"
+    payload_path.write_bytes(payload)
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(source_root)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, sys\n"
+            "from distributed.protocol import pickle as distributed_pickle\n"
+            "submission = distributed_pickle.loads(\n"
+            "    pathlib.Path(sys.argv[1]).read_bytes()\n"
+            ")\n"
+            "assert callable(submission.func)\n"
+            "try: submission.func(*submission.args, **submission.kwargs)\n"
+            "except ValueError as error: assert 'No worker found' in str(error)\n"
+            "else: raise AssertionError('embedded runner unexpectedly succeeded')\n"
+            "assert 'hpc' not in sys.modules and 'hpc.environment' not in sys.modules",
+            str(payload_path),
+        ],
+        cwd="/tmp",
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_slurm_executor_resubmits_with_bounded_unique_attempts(

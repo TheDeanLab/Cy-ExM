@@ -33,11 +33,11 @@
 - Consumes: `ImageHeader.shape_zyx: tuple[int, int, int]`, `_header_contract_error(...)`, and the existing canonical scientific-plan source records.
 - Produces: `_inspect_headers(...) -> dict[Path, ImageHeader]` with per-source validity only, and `_scientific_snapshot(...) -> _ScientificSnapshot` that accepts independently valid recorded shapes.
 
-- [ ] **Step 1: Replace the planner shape-rejection regression with an unequal-shape acceptance and provenance regression**
+- [x] **Step 1: Replace the planner shape-rejection regression with an unequal-shape acceptance and provenance regression**
 
   In `tests/unit/test_workflow_planning.py`, replace `test_plan_aggregates_header_failures_and_shape_incompatibility` with a test whose mocked headers assign distinct shapes to the fixed source, registration source, and dependent source, including differences along every spatial axis. Build the plan and assert the source mappings retain those exact `shape_zyx` values. Keep a separate malformed-axes test proving `ZCYX` still fails as a non-scalar header.
 
-- [ ] **Step 2: Run the focused planner tests and verify the compatibility test fails**
+- [x] **Step 2: Run the focused planner tests and verify the compatibility test fails**
 
   Run:
 
@@ -47,15 +47,15 @@
 
   Expected: the new unequal-shape test fails with `WorkflowPlanError` containing `must match reference`; malformed header tests continue to pass.
 
-- [ ] **Step 3: Remove only the cross-source comparison in planning**
+- [x] **Step 3: Remove only the cross-source comparison in planning**
 
   Delete the `reference_path` / `reference_header` comparison loop from `_inspect_headers`. Retain `_header_contract_error`, aggregation of unreadable or malformed TIFF errors, embedded geometry-shape consistency, and manifest-spacing compatibility unchanged.
 
-- [ ] **Step 4: Replace the persisted-plan rejection with acceptance and malformed-shape coverage**
+- [x] **Step 4: Replace the persisted-plan rejection with acceptance and malformed-shape coverage**
 
   In `tests/unit/test_workflow_status.py`, replace `test_status_rejects_source_shape_incompatible_with_reference` with `test_status_accepts_independently_valid_source_shapes`. Assign distinct positive three-element shapes to the fixed and moving source records, write the canonical plan, call `inspect_workflow_status`, and assert the round remains `pending`. Add a parametrized malformed-shape test covering a zero dimension, a boolean dimension, and a non-three-element shape, each still raising `WorkflowPlanError` mentioning `shape_zyx`.
 
-- [ ] **Step 5: Run the focused status tests and verify the acceptance test fails**
+- [x] **Step 5: Run the focused status tests and verify the acceptance test fails**
 
   Run:
 
@@ -65,15 +65,15 @@
 
   Expected: unequal valid shapes fail with the current reference-shape error; malformed shapes fail under the existing per-source parser.
 
-- [ ] **Step 6: Remove only persisted cross-source equality validation**
+- [x] **Step 6: Remove only persisted cross-source equality validation**
 
   Delete `incompatible_shapes` and its error branch from `src/cyexm/workflow/status.py`. Do not change `_parse_source`, source use/uniqueness validation, canonical serialization, or fingerprint computation.
 
-- [ ] **Step 7: Document the planning contract**
+- [x] **Step 7: Document the planning contract**
 
   Add guidance to `src/cyexm/workflow/AGENTS.md` stating that every source shape is independently positive scalar ZYX evidence, native source shapes may differ along every axis, and fixed-grid equality is an output/stage-boundary invariant rather than a planner input invariant.
 
-- [ ] **Step 8: Run and commit the workflow slice**
+- [x] **Step 8: Run and commit the workflow slice**
 
   Run:
 
@@ -103,11 +103,11 @@
 - Consumes: `transform_channel(...) -> Path`, `RegistrationBackend.apply_transform_chain(fixed=..., moving=..., affine_path=..., warp_path=..., interpolation=...)`, and `geometry_compatible`.
 - Produces: channel transformation from any valid native moving shape to exact fixed `ImageGeometry`, with unchanged completion-record and atomic-commit behavior.
 
-- [ ] **Step 1: Convert the unit rejection test into a fixed-reference invocation test**
+- [x] **Step 1: Convert the unit rejection test into a fixed-reference invocation test**
 
   Replace `test_transform_channel_rejects_moving_shape_mismatch_before_transform` with a test using fixed `(8, 8, 8)` and moving `(7, 9, 6)`. Assert one transform-chain call occurs, the fixed image supplied to the backend is the fixed object, the moving image is the unequal source object, and the committed result geometry equals the fixed geometry. Retain `test_transform_channel_rejects_result_that_loses_fixed_geometry` unchanged.
 
-- [ ] **Step 2: Run the two geometry unit tests and verify the acceptance test fails**
+- [x] **Step 2: Run the two geometry unit tests and verify the acceptance test fails**
 
   Run:
 
@@ -117,19 +117,19 @@
 
   Expected: the unequal-shape invocation fails at the current pre-transform shape check; wrong result geometry still fails.
 
-- [ ] **Step 3: Remove the native shape equality check**
+- [x] **Step 3: Remove the native shape equality check**
 
   In `transform_channel`, continue loading and fingerprinting fixed and moving inputs, but remove `moving_geometry` and the `fixed_geometry.shape != moving_geometry.shape` rejection. Keep the fixed geometry in the `StageRequest`, pass `fixed=fixed` to the backend, and retain the exact output geometry guard before commit and during cache reuse.
 
-- [ ] **Step 4: Add a real-ANTs unequal-shape integration regression**
+- [x] **Step 4: Add a real-ANTs unequal-shape integration regression**
 
   Add a test in `tests/integration/test_channel_transform.py` with small deterministic fixed and moving arrays differing along Z, Y, and X. Write fixed TIFF metadata with a non-default origin and direction, create an identity affine and a zero warp on the fixed grid, call `transform_channel`, and assert the output array shape and loaded `ImageGeometry` exactly equal the fixed reference. Limit numerical comparison to the physically overlapping identity-transformed region using the documented `rtol=1e-4`, `atol=1e-5`; do not make a registration-quality claim.
 
-- [ ] **Step 5: Document dependent-channel behavior**
+- [x] **Step 5: Document dependent-channel behavior**
 
   Update `src/cyexm/registration/AGENTS.md` to state that dependent channels may differ from both the reference and registration channel, transform application starts from the native channel grid with fixed as the reference, and promotion requires exact fixed geometry.
 
-- [ ] **Step 6: Run and commit the channel slice**
+- [x] **Step 6: Run and commit the channel slice**
 
   Run:
 
@@ -160,11 +160,11 @@
 - Consumes: `ImageRegistration._load_or_estimate_affine(...) -> tuple[object, object, object]`, `backend.geometry(...) -> ImageGeometry`, and the existing `ChunkedImageRegistration._estimate_nonlinear` fixed-grid guard.
 - Produces: an affine-stage contract that returns scalar and mask on exact fixed geometry or raises `RegistrationStageError` before metrics, nonlinear estimation, or chunk creation.
 
-- [ ] **Step 1: Add unit failures for estimated and cached wrong-grid affine results**
+- [x] **Step 1: Add unit failures for estimated and cached wrong-grid affine results**
 
   In `tests/unit/test_whole_image.py`, add focused fake-backend tests for both branches of `_load_or_estimate_affine`: one backend returns an estimated `moving_linear` with a shape or origin differing from fixed; another reconstructs a cached affine onto the wrong grid. Assert `RegistrationStageError` mentions affine result geometry and that no nonlinear warp or registered artifact is committed.
 
-- [ ] **Step 2: Run the new unit tests and verify they fail**
+- [x] **Step 2: Run the new unit tests and verify they fail**
 
   Run:
 
@@ -174,19 +174,19 @@
 
   Expected: both tests currently proceed beyond the affine boundary instead of raising the specific geometry error.
 
-- [ ] **Step 3: Add one shared affine-result validator**
+- [x] **Step 3: Add one shared affine-result validator**
 
   Add a private `ImageRegistration` helper that compares `backend.geometry(moving_linear)` and `backend.geometry(moving_linear_mask)` to `backend.geometry(fixed)` with `geometry_compatible`. Call it before returning from both the cached and newly estimated affine branches. Raise `RegistrationStageError` identifying whether the scalar or mask violates fixed-reference geometry. Do not weaken the existing chunked check.
 
-- [ ] **Step 4: Add the real-ANTs serial-chunked regression**
+- [x] **Step 4: Add the real-ANTs serial-chunked regression**
 
   In `tests/integration/test_chunked.py`, create deterministic native fixed and moving TIFFs no larger than `16 x 32 x 32`, with dimensions different along all three axes. Run `ChunkedImageRegistration` using `dry run`, a bounded chunk grid, and one native thread. Instrument only the nonlinear stage boundary so the test records the fixed and post-affine moving geometries while leaving real ANTs affine application, artifact persistence, reconstruction, and final transform application intact. Assert every nonlinear call receives equal fixed-reference geometry, the final registered TIFF has exact fixed geometry, and the full warp geometry equals fixed.
 
-- [ ] **Step 5: Document the integration invariant**
+- [x] **Step 5: Document the integration invariant**
 
   Update `tests/integration/AGENTS.md` to require an unequal-native-shape regression whenever affine, nonlinear, chunking, or channel-grid behavior changes, and to assert exact fixed geometry after the first resampling boundary.
 
-- [ ] **Step 6: Run and commit the affine/chunk slice**
+- [x] **Step 6: Run and commit the affine/chunk slice**
 
   Run:
 
@@ -217,11 +217,11 @@
 - Consumes: the planner, status, registration, and channel contracts completed in Tasks 1-3.
 - Produces: repository-wide scientific guidance and no-submit dataset validation evidence for rounds 2, 3, and 4.
 
-- [ ] **Step 1: Update root and test guidance**
+- [x] **Step 1: Update root and test guidance**
 
   Add to root `AGENTS.md` that native source shapes may differ independently, the affine stage is the first fixed-grid boundary, and all later scalar/mask/warp/channel products must use exact fixed-reference geometry. Add to `tests/AGENTS.md` that grid-contract changes require fixed and moving shapes differing along all three axes plus exact geometry assertions.
 
-- [ ] **Step 2: Run focused and broad portable verification**
+- [x] **Step 2: Run focused and broad portable verification**
 
   Export project-backed uv paths, then run:
 
@@ -237,7 +237,7 @@
 
   Expected: all portable tests, lint, format, and type checks pass. If the repository’s configured suite excludes a known external HPC acceptance artifact, report that separately rather than altering the active jobs or logs.
 
-- [ ] **Step 3: Validate and plan the approved spheroid configuration without scheduler access**
+- [x] **Step 3: Validate and plan the approved spheroid configuration without scheduler access**
 
   Run:
 
@@ -248,7 +248,7 @@
 
   Expected: both commands exit zero, report rounds 2, 3, and 4, preserve each source’s actual shape, and submit no scheduler jobs.
 
-- [ ] **Step 4: Confirm repository scope and commit guidance**
+- [x] **Step 4: Confirm repository scope and commit guidance**
 
   Run:
 
@@ -276,11 +276,11 @@
 - Consumes: all prior task deliverables.
 - Produces: reviewed implementation that satisfies every acceptance criterion without modifying active scheduler state.
 
-- [ ] **Step 1: Review the implementation against every design acceptance criterion**
+- [x] **Step 1: Review the implementation against every design acceptance criterion**
 
   Confirm arbitrary positive ZYX source shapes, fixed-reference affine resampling, dependent-channel independence, exact persisted output geometry, deterministic per-source evidence, focused real-ANTs coverage, portable gates, spheroid no-submit planning, and updated guidance.
 
-- [ ] **Step 2: Inspect the final diff and commit history**
+- [x] **Step 2: Inspect the final diff and commit history**
 
   Run:
 
@@ -292,6 +292,6 @@
 
   Expected: coherent focused commits, no whitespace errors, and only the two known untracked active SLURM logs outside version control.
 
-- [ ] **Step 3: Record exact verification outcomes in the handoff**
+- [x] **Step 3: Record exact verification outcomes in the handoff**
 
   Report test counts and commands, spheroid round/shape evidence, any environmental skips or failures, current branch/commit, and explicit confirmation that no scheduler job was submitted or altered.

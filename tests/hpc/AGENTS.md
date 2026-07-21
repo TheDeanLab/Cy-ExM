@@ -14,6 +14,9 @@
   `--cyexm-evidence-dir PATH`. Atomically write `acceptance-context.json` before any
   scheduler inspection, including UTC time, git commit, exact package versions,
   resolved paths, and the complete argument vector.
+- Before pytest starts, export all six coordinator native-thread variables to the
+  exact profile values. Fail before scheduler access when any value is missing or
+  mismatched so later sequential parity never attempts a post-import thread change.
 - Keep datasets, generated registration outputs, submitted scripts, scheduler
   snapshots, and other large evidence on `/archive`. Keep the environment, caches,
   and worker scratch on `/project`; each smoke worker must prove scratch

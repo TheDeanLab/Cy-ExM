@@ -21,6 +21,7 @@ from hpc.environment import (
     partition_is_exclusive,
     prepare_acceptance_context,
     require_cli_paths,
+    require_coordinator_native_threads,
     require_explicit_hpc_selection,
     run_environment_smoke,
     shared_path_identity,
@@ -40,6 +41,26 @@ from cyexm.config.models import (
 from cyexm.workflow.models import ChannelTask, RoundResult, RoundTask
 
 pytestmark = pytest.mark.unit
+
+
+def test_coordinator_threads_must_match_profile_before_scheduler_access(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    profile = SimpleNamespace(native_threads=NativeThreadSpec(itk=1, blas=1))
+    environment = {
+        "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+    }
+
+    require_coordinator_native_threads(profile, environ=environment)  # type: ignore[arg-type]
+    environment["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = "8"
+    with pytest.raises(HpcAcceptanceError, match="coordinator native threads"):
+        require_coordinator_native_threads(profile, environ=environment)  # type: ignore[arg-type]
 
 
 def _write_approved_inputs(archive_root: Path, project_root: Path) -> tuple[Path, Path]:

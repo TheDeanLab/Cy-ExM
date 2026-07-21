@@ -99,6 +99,11 @@ tasks, add a red/green regression requiring one completed `reference-preparation
 result plus the two completed moving strategies. Compute overlap and unique
 job/hostname evidence only from the moving rounds.
 
+- [x] **Step 6: Fail before submission on coordinator thread mismatch**
+
+Require all six coordinator native-thread variables to match the execution profile
+before scheduler access so sequential parity cannot attempt a post-import change.
+
 ---
 
 ### Task 3: Verify, integrate, and rerun exact-main acceptance

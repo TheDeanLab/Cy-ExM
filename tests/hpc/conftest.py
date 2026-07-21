@@ -7,6 +7,7 @@ import pytest
 from hpc.environment import (
     HpcAcceptanceContext,
     prepare_acceptance_context,
+    require_coordinator_native_threads,
     require_explicit_hpc_selection,
 )
 
@@ -54,13 +55,15 @@ def _required_hpc_context(
 ) -> HpcAcceptanceContext:
     try:
         require_explicit_hpc_selection(request.config.invocation_params.args)
-        return prepare_acceptance_context(
+        context = prepare_acceptance_context(
             request.config.getoption("--cyexm-dataset"),
             request.config.getoption("--cyexm-execution"),
             request.config.getoption("--cyexm-evidence-dir"),
             repository_root=REPOSITORY_ROOT,
             protected_roots=(CLEAREX_ROOT, *LIVE_SPHEROID_ROOTS),
         )
+        require_coordinator_native_threads(context.profile)
+        return context
     except Exception as error:
         raise pytest.UsageError(
             "Cy-ExM HPC acceptance prerequisites failed before scheduler access: "

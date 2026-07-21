@@ -30,6 +30,7 @@ from cyexm.config import (
 )
 from cyexm.execution.slurm import validate_slurm_job_script
 from cyexm.io.atomic import atomic_write
+from cyexm.runtime.threads import BLAS_THREAD_ENV_VARS, ITK_THREAD_ENV_VAR
 from cyexm.workflow.models import ChannelTask, RoundResult, RoundTask
 
 ACCEPTANCE_PACKAGES = (
@@ -105,6 +106,28 @@ def require_explicit_hpc_selection(arguments: Sequence[str]) -> None:
         raise HpcAcceptanceError(
             "explicit HPC acceptance requires the actual pytest invocation to "
             "contain exactly '-m hpc'"
+        )
+
+
+def require_coordinator_native_threads(
+    profile: ExecutionProfile,
+    *,
+    environ: Mapping[str, str] = os.environ,
+) -> None:
+    """Require native settings before pytest can load scientific runtimes."""
+    expected = {
+        ITK_THREAD_ENV_VAR: str(profile.native_threads.itk),
+        **{name: str(profile.native_threads.blas) for name in BLAS_THREAD_ENV_VARS},
+    }
+    mismatches = [
+        f"{name}={environ.get(name)!r}, expected {value!r}"
+        for name, value in expected.items()
+        if environ.get(name) != value
+    ]
+    if mismatches:
+        raise HpcAcceptanceError(
+            "coordinator native threads must be exported before HPC pytest starts: "
+            + "; ".join(mismatches)
         )
 
 
@@ -1381,6 +1404,7 @@ __all__ = [
     "partition_is_exclusive",
     "prepare_acceptance_context",
     "require_cli_paths",
+    "require_coordinator_native_threads",
     "require_explicit_hpc_selection",
     "run_environment_smoke",
     "shared_path_identity",

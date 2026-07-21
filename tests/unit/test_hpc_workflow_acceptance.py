@@ -641,7 +641,12 @@ def test_injected_failure_accepts_exact_failure_tied_to_durable_commit_marker(
 
 @pytest.mark.parametrize(
     ("walltime", "seconds"),
-    [("72:00:00", 72 * 60 * 60), ("3-00:00:00", 3 * 24 * 60 * 60)],
+    [
+        ("72:00:00", 72 * 60 * 60),
+        ("3-00:00:00", 3 * 24 * 60 * 60),
+        ("90", 90 * 60),
+        ("90:00", 90 * 60),
+    ],
 )
 def test_coordination_timeout_uses_the_approved_slurm_walltime(
     tmp_path: Path,

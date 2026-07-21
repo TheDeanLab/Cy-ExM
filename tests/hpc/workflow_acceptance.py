@@ -90,6 +90,7 @@ def _slurm_walltime_seconds(value: object) -> int:
         raise HpcWorkflowAcceptanceError(
             f"approved SLURM walltime must be a nonempty string; got {value!r}"
         )
+    minute_only = False
     if "-" in value:
         if value.count("-") != 1:
             raise HpcWorkflowAcceptanceError(
@@ -106,6 +107,7 @@ def _slurm_walltime_seconds(value: object) -> int:
     else:
         days_text = "0"
         parts = value.split(":")
+        minute_only = len(parts) in {1, 2}
         if len(parts) == 1:
             hours_text, minutes_text, seconds_text = "0", parts[0], "0"
         elif len(parts) == 2:
@@ -122,11 +124,18 @@ def _slurm_walltime_seconds(value: object) -> int:
             f"approved SLURM walltime is malformed: {value!r}"
         )
     days, hours, minutes, seconds = (int(field, 10) for field in fields)
-    if minutes > 59 or seconds > 59 or (days > 0 and hours > 23):
+    if minute_only:
+        if seconds > 59:
+            raise HpcWorkflowAcceptanceError(
+                f"approved SLURM walltime is malformed: {value!r}"
+            )
+        total = minutes * 60 + seconds
+    elif minutes > 59 or seconds > 59 or (days > 0 and hours > 23):
         raise HpcWorkflowAcceptanceError(
             f"approved SLURM walltime is malformed: {value!r}"
         )
-    total = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+    else:
+        total = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
     if total < 1:
         raise HpcWorkflowAcceptanceError(
             f"approved SLURM walltime must be positive: {value!r}"

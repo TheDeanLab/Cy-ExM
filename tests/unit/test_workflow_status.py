@@ -161,7 +161,7 @@ def _geometry() -> ImageGeometry:
     )
 
 
-def _commit_reference(output_root: Path) -> Path:
+def _commit_reference(output_root: Path, *, thread_count: int = 1) -> Path:
     dataset_root = output_root.parent / "dataset"
     source = dataset_root / "fixed.tif"
     output = (
@@ -175,7 +175,7 @@ def _commit_reference(output_root: Path) -> Path:
         geometry=_geometry(),
         method="uint16-tiff",
         accuracy="exact",
-        native_threads=_native_threads(),
+        native_threads=_native_threads(thread_count),
         upstream=None,
         parameters=reference_channel_parameters(index=0, cropped=False),
     )
@@ -188,8 +188,8 @@ def _commit_reference(output_root: Path) -> Path:
     return output
 
 
-def _native_threads() -> dict[str, int]:
-    return {name: 1 for name in NATIVE_THREAD_ENV_VARS}
+def _native_threads(thread_count: int = 1) -> dict[str, int]:
+    return {name: thread_count for name in NATIVE_THREAD_ENV_VARS}
 
 
 def _request_for_artifact(path: Path, output_root: Path) -> StageRequest:
@@ -993,6 +993,23 @@ def test_status_requires_every_artifact_completion_record(tmp_path: Path) -> Non
     assert status.rounds[1].incomplete_artifacts == ()
     assert status.rounds[1].invalid_artifacts == ()
     assert status.complete
+
+
+def test_status_infers_reference_native_threads_from_completion_evidence(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    scientific_json = canonical_json(_scientific_mapping(output_root))
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(scientific_json + "\n", encoding="utf-8")
+    reference = _commit_reference(output_root, thread_count=8)
+
+    reference_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+
+    assert reference_status.status == "complete"
+    assert reference_status.complete_artifacts == (str(reference),)
+    assert reference_status.invalid_artifacts == ()
 
 
 def test_status_rejects_reference_channel_with_wrong_scientific_request(

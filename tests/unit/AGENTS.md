@@ -25,6 +25,8 @@
 - Cropped status regressions must use a nontrivial prepared-reference crop and fixed
   and moving native shapes that differ along Z, Y, and X so the native source grid
   cannot accidentally satisfy prepared-grid provenance.
+- Status tests must cover non-default native thread evidence on the reference round;
+  the scientific plan intentionally excludes execution-profile thread settings.
 - Executor tests must make the reference barrier observable: reference submission
   precedes moving submissions, failure prevents descendant submission, and one owned
   client/cluster lifecycle spans both stages.

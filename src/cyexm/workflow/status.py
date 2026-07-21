@@ -1079,6 +1079,21 @@ def _reference_status(
     task: ReferenceTask | None = None,
 ) -> RoundStatus:
     if task is None:
+        expected_paths = (
+            *(
+                ()
+                if snapshot.reference_crop_output is None
+                else (snapshot.reference_crop_output,)
+            ),
+            *(channel.output for channel in snapshot.reference_channels),
+        )
+        evidences = tuple(
+            _read_artifact_evidence(
+                _ArtifactExpectation(path=path, role="channel"),
+                layout=layout,
+            )
+            for path in expected_paths
+        )
         task = ReferenceTask(
             dataset_id=snapshot.dataset_id,
             round=snapshot.reference_round,
@@ -1089,7 +1104,7 @@ def _reference_status(
             log_path=layout.round(snapshot.reference_round).log,
             voxel_spacing_xyz=snapshot.voxel_spacing_xyz,
             crop=snapshot.registration.crop,
-            native_threads=NativeThreadSpec(itk=1, blas=1),
+            native_threads=_native_threads_from_evidence(evidences),
             channels=tuple(
                 ReferenceChannelTask(channel.source.path, channel.output)
                 for channel in snapshot.reference_channels

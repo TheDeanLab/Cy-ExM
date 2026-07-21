@@ -78,6 +78,31 @@ before changing the environment. Configure threads before ANTs, NumPy, or SciPy
 initializes; a focused error is raised instead of pretending a late change took
 effect.
 
+### Observed threading benchmark
+
+A controlled cropped-spheroid SLURM benchmark compared otherwise identical
+high-accuracy Rigid and SyNOnly workflows on two dedicated 512-GB nodes. The dataset,
+scientific fingerprint, registration schedules, and output checks were identical;
+only the ITK and BLAS-family thread counts changed.
+
+| ITK / BLAS threads | Total runtime | Speedup versus 1/1 |
+| --- | ---: | ---: |
+| 1 / 1 | 310.5 s | 1.00x |
+| 8 / 8 | 88.3 s | 3.52x |
+| 30 / 30 | 69.5 s | 4.47x |
+
+The correlation results were scientifically consistent but not bit-for-bit
+identical. Pre-registration metrics were exact across runs; the largest
+nonlinear-correlation change was 0.003416 (0.411%), final transformed-channel
+correlations changed by at most 0.000835, and multithreaded final images retained
+voxel-level Pearson correlations of 0.9979 to 0.9991 against the 1/1 outputs.
+
+These measurements characterize one small cropped dataset, not universal scaling or
+stability. One thread remains the conservative default. The 8/8 setting captured
+most of the measured acceleration and is the validated moderate choice for the next
+larger trial. Although 30/30 was fastest here, it should require full-volume stability
+evidence before becoming a routine setting.
+
 ## Whole-image registration
 
 Public pixel size is expressed in micrometers in `(x, y, z)` order. NumPy and TIFF

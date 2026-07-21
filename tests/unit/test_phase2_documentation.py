@@ -238,6 +238,21 @@ def test_readme_documents_planning_and_execution_thread_boundaries() -> None:
         assert required in normalized
 
 
+def test_readme_documents_observed_native_thread_scaling() -> None:
+    normalized = _normalized_readme()
+    for required in (
+        "observed threading benchmark",
+        "| 1 / 1 | 310.5 s | 1.00x |",
+        "| 8 / 8 | 88.3 s | 3.52x |",
+        "| 30 / 30 | 69.5 s | 4.47x |",
+        "scientifically consistent but not bit-for-bit identical",
+        "largest nonlinear-correlation change was 0.003416",
+        "one thread remains the conservative default",
+        "full-volume stability evidence",
+    ):
+        assert required in normalized
+
+
 def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
     readme = _readme()
     for output in (

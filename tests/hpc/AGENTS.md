@@ -48,6 +48,11 @@
   semantic and scheduler-normalized memory, derive the exact expected worker bytes
   from the rendered worker limit, and require worker probes, requested/allocated
   TRES, partition capacity, and node capacity to cover the corresponding facts.
+  Validate version-compatible SLURM job and node fields: require job CPU/node `TRES`,
+  validate exact `MinMemoryNode` and any optional job `ReqTRES`/`AllocTRES`, and
+  validate reported node `RealMemory`, `CfgTRES`, `AllocTRES`, or `AllocMem`. Never
+  index an optional controller-version field before checking its presence, and fail
+  if neither job-request nor node-allocation memory can be proved.
 - Make no acceptance claim without a real allocation and complete machine-readable
   evidence. Never commit caller data, external evidence, generated arrays, job logs,
   credentials, or site-specific approved paths.

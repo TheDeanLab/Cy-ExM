@@ -264,6 +264,226 @@ def parse_slurm_tres_memory_bytes(value: str) -> int:
     return amount * multiplier
 
 
+def _resource_text(
+    record: Mapping[str, str],
+    field: str,
+    location: str,
+) -> str:
+    value = record.get(field)
+    if type(value) is not str or not value:
+        raise HpcAcceptanceError(f"{location}.{field} must be a nonempty string")
+    return value
+
+
+def _resource_integer(
+    record: Mapping[str, str],
+    field: str,
+    location: str,
+) -> int:
+    value = _resource_text(record, field, location)
+    try:
+        parsed = int(value, 10)
+    except ValueError as error:
+        raise HpcAcceptanceError(
+            f"{location}.{field} must be a positive integer; got {value!r}"
+        ) from error
+    if parsed < 1:
+        raise HpcAcceptanceError(
+            f"{location}.{field} must be a positive integer; got {value!r}"
+        )
+    return parsed
+
+
+def _tres_facts(value: str, location: str) -> dict[str, str]:
+    if type(value) is not str or not value:
+        raise HpcAcceptanceError(f"{location} must be a nonempty built-in string")
+    facts: dict[str, str] = {}
+    for item in value.split(","):
+        if "=" not in item:
+            raise HpcAcceptanceError(f"{location} contains an invalid fact: {item!r}")
+        key, fact = item.split("=", 1)
+        if not key or not fact or key in facts:
+            raise HpcAcceptanceError(f"{location} contains an invalid fact: {item!r}")
+        facts[key] = fact
+    return facts
+
+
+def _tres_count(facts: Mapping[str, str], field: str, location: str) -> int:
+    value = facts.get(field)
+    try:
+        parsed = int(value, 10) if type(value) is str else 0
+    except ValueError as error:
+        raise HpcAcceptanceError(
+            f"{location} {field} must be a positive integer; got {value!r}"
+        ) from error
+    if parsed < 1:
+        raise HpcAcceptanceError(
+            f"{location} {field} must be a positive integer; got {value!r}"
+        )
+    return parsed
+
+
+def _validate_tres_resources(
+    value: str,
+    *,
+    location: str,
+    expected_cores: int,
+    expected_nodes: int | None,
+    expected_memory_bytes: int | None,
+) -> None:
+    facts = _tres_facts(value, location)
+    cores = _tres_count(facts, "cpu", location)
+    if cores != expected_cores:
+        raise HpcAcceptanceError(
+            f"{location} cpu must equal {expected_cores}; got {cores}"
+        )
+    if expected_nodes is not None:
+        nodes = _tres_count(facts, "node", location)
+        if nodes != expected_nodes:
+            raise HpcAcceptanceError(
+                f"{location} node must equal {expected_nodes}; got {nodes}"
+            )
+    if expected_memory_bytes is not None:
+        memory_bytes = parse_slurm_tres_memory_bytes(value)
+        if memory_bytes < expected_memory_bytes:
+            raise HpcAcceptanceError(
+                f"{location} memory must cover {expected_memory_bytes} bytes; "
+                f"got {memory_bytes}"
+            )
+
+
+def validate_slurm_job_node_resources(
+    job: Mapping[str, str],
+    node: Mapping[str, str],
+    *,
+    expected_job_id: str,
+    expected_node_name: str,
+    expected_partition: str,
+    expected_cores: int,
+    expected_memory: str,
+    expected_memory_bytes: int,
+) -> None:
+    """Validate version-compatible SLURM job request and node allocation facts."""
+    expected_memory_decoded = parse_slurm_tres_memory_bytes(f"mem={expected_memory}")
+    if expected_memory_decoded != expected_memory_bytes:
+        raise HpcAcceptanceError(
+            "expected SLURM memory spelling and byte count disagree: "
+            f"{expected_memory!r} != {expected_memory_bytes}"
+        )
+
+    exact_job_facts = {
+        "JobId": expected_job_id,
+        "Partition": expected_partition,
+        "NodeList": expected_node_name,
+    }
+    for field, expected in exact_job_facts.items():
+        observed = _resource_text(job, field, "job")
+        if observed != expected:
+            raise HpcAcceptanceError(
+                f"job.{field} must equal {expected!r}; got {observed!r}"
+            )
+    if _resource_text(job, "JobState", "job").upper() != "RUNNING":
+        raise HpcAcceptanceError("job.JobState must be RUNNING during worker smoke")
+    for field, expected in (
+        ("NumNodes", 1),
+        ("NumCPUs", expected_cores),
+        ("NumTasks", 1),
+    ):
+        observed = _resource_integer(job, field, "job")
+        if observed != expected:
+            raise HpcAcceptanceError(
+                f"job.{field} must equal {expected}; got {observed}"
+            )
+    _validate_tres_resources(
+        _resource_text(job, "TRES", "job"),
+        location="job.TRES",
+        expected_cores=expected_cores,
+        expected_nodes=1,
+        expected_memory_bytes=None,
+    )
+
+    job_memory_proven = False
+    if "MinMemoryNode" in job:
+        minimum = _resource_text(job, "MinMemoryNode", "job")
+        if minimum != expected_memory:
+            raise HpcAcceptanceError(
+                f"job.MinMemoryNode must equal {expected_memory!r}; got {minimum!r}"
+            )
+        if parse_slurm_tres_memory_bytes(f"mem={minimum}") != expected_memory_bytes:
+            raise HpcAcceptanceError(
+                "job.MinMemoryNode does not equal the normalized byte request"
+            )
+        job_memory_proven = True
+    for field in ("ReqTRES", "AllocTRES"):
+        if field not in job:
+            continue
+        _validate_tres_resources(
+            _resource_text(job, field, "job"),
+            location=f"job.{field}",
+            expected_cores=expected_cores,
+            expected_nodes=1,
+            expected_memory_bytes=expected_memory_bytes,
+        )
+        job_memory_proven = True
+
+    observed_node_name = _resource_text(node, "NodeName", "node")
+    if observed_node_name != expected_node_name:
+        raise HpcAcceptanceError(
+            f"node.NodeName must equal {expected_node_name!r}; "
+            f"got {observed_node_name!r}"
+        )
+    node_state = _resource_text(node, "State", "node").upper()
+    if "ALLOCATED" not in node_state or "MIXED" in node_state:
+        raise HpcAcceptanceError(
+            f"node.State must be fully ALLOCATED and not MIXED; got {node_state!r}"
+        )
+    for field in ("CPUTot", "CPUAlloc"):
+        observed = _resource_integer(node, field, "node")
+        if observed != expected_cores:
+            raise HpcAcceptanceError(
+                f"node.{field} must equal {expected_cores}; got {observed}"
+            )
+
+    real_memory_bytes = _resource_integer(node, "RealMemory", "node") * 1024**2
+    if real_memory_bytes < expected_memory_bytes:
+        raise HpcAcceptanceError(
+            f"node.RealMemory must cover {expected_memory_bytes} bytes; "
+            f"got {real_memory_bytes}"
+        )
+    if "CfgTRES" in node:
+        _validate_tres_resources(
+            _resource_text(node, "CfgTRES", "node"),
+            location="node.CfgTRES",
+            expected_cores=expected_cores,
+            expected_nodes=None,
+            expected_memory_bytes=expected_memory_bytes,
+        )
+
+    node_allocation_proven = False
+    if "AllocTRES" in node:
+        _validate_tres_resources(
+            _resource_text(node, "AllocTRES", "node"),
+            location="node.AllocTRES",
+            expected_cores=expected_cores,
+            expected_nodes=None,
+            expected_memory_bytes=expected_memory_bytes,
+        )
+        node_allocation_proven = True
+    if "AllocMem" in node:
+        allocated_bytes = _resource_integer(node, "AllocMem", "node") * 1024**2
+        if allocated_bytes < expected_memory_bytes:
+            raise HpcAcceptanceError(
+                f"node.AllocMem must cover {expected_memory_bytes} bytes; "
+                f"got {allocated_bytes}"
+            )
+        node_allocation_proven = True
+    if not job_memory_proven and not node_allocation_proven:
+        raise HpcAcceptanceError(
+            "SLURM evidence contains neither an authoritative memory request "
+            "nor a node memory allocation fact"
+        )
+
+
 def _run_read_only(
     arguments: list[str],
     *,
@@ -1155,6 +1375,7 @@ __all__ = [
     "smoke_module_by_value",
     "validate_rendered_job_script",
     "validate_scheduler_interface",
+    "validate_slurm_job_node_resources",
     "wait_for_queue_empty",
     "write_evidence_json",
     "write_evidence_text",

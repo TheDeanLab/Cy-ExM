@@ -21,13 +21,13 @@ from hpc.environment import (
     collect_partition_snapshot,
     collect_path_fact,
     collect_queue_snapshot,
-    parse_slurm_tres_memory_bytes,
     partition_is_exclusive,
     run_environment_smoke,
     shared_path_identity,
     smoke_module_by_value,
     validate_rendered_job_script,
     validate_scheduler_interface,
+    validate_slurm_job_node_resources,
     wait_for_queue_empty,
     write_evidence_json,
     write_evidence_text,
@@ -86,24 +86,17 @@ def _assert_worker_records(
         assert record["worker_memory_limit_bytes"] == expected_worker_memory_bytes
 
         job = cast(dict[str, str], record["job"])
-        assert job["JobId"] == job_id
-        assert job["JobState"].upper() == "RUNNING"
-        assert job["Partition"] == spec.queue
-        assert int(job["NumNodes"]) == 1
-        assert int(job["NumCPUs"]) == spec.cores_per_worker
-        assert int(job["NumTasks"]) == 1
-        assert node_name in job["NodeList"]
-        assert "node=1" in job["AllocTRES"]
-        assert parse_slurm_tres_memory_bytes(job["ReqTRES"]) >= memory.scheduler_bytes
-        assert parse_slurm_tres_memory_bytes(job["AllocTRES"]) >= memory.scheduler_bytes
-
         node = cast(dict[str, str], record["node"])
-        assert node["NodeName"] == node_name
-        assert "ALLOCATED" in node["State"].upper()
-        assert "MIXED" not in node["State"].upper()
-        assert int(node["CPUAlloc"]) == int(node["CPUTot"])
-        assert int(node["RealMemory"]) * 1024**2 >= memory.scheduler_bytes
-        assert int(node["AllocMem"]) * 1024**2 >= memory.scheduler_bytes
+        validate_slurm_job_node_resources(
+            job,
+            node,
+            expected_job_id=job_id,
+            expected_node_name=node_name,
+            expected_partition=spec.queue,
+            expected_cores=spec.cores_per_worker,
+            expected_memory=memory.scheduler,
+            expected_memory_bytes=memory.scheduler_bytes,
+        )
 
         interface = cast(dict[str, object], record["interface"])
         assert interface == {

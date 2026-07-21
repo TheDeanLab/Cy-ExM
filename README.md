@@ -557,6 +557,15 @@ import. Workers never need `tests` on `PYTHONPATH`; the embedded runner is rebui
 inside ordinary task execution, where a reconstruction error becomes a normal task
 failure instead of a worker-side task-deserialization failure.
 
+Real acceptance validates version-compatible SLURM resource records rather than
+assuming every controller exposes the same keys. Job `TRES` must prove the requested
+CPU and one node. When present, `MinMemoryNode` must equal the exact normalized
+scheduler request; job `ReqTRES` and `AllocTRES` are optional but must prove adequate
+CPU, node, and memory resources when reported. Node `RealMemory` must cover the
+request, and reported `CfgTRES` and `AllocTRES` must cover its CPU and memory facts.
+The harness fails closed if neither an authoritative job memory request nor a node
+memory-allocation fact is available.
+
 Each SLURM workflow-run record carries versioned operational evidence: requested
 workers/retries/timeouts, the rendered job-script template, connected worker and
 preflight observations, task attempt counts, startup phase/outcome, timestamps,

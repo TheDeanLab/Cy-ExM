@@ -150,3 +150,28 @@ The portable regression uses the actual installed `dask._task_spec.Task` and
 A clean child with only `src` on `PYTHONPATH` must deserialize the submission, invoke
 the embedded runner far enough to reach the expected no-worker boundary, and prove
 that neither `hpc` nor `hpc.environment` was imported.
+
+## Slurm-22.05 evidence erratum after real attempt 2
+
+The second approved environment attempt completed both smoke tasks with exact worker
+memory and clean job teardown. Its only harness failure was a `KeyError` from
+requiring job `AllocTRES`. The site's Slurm 22.05 job record instead reports
+`TRES=cpu=72,node=1,billing=72` and `MinMemoryNode=466G`; it does not report job
+`ReqTRES` or `AllocTRES`. The allocated node record reports
+`RealMemory=512000`, `CfgTRES=cpu=72,mem=500G,billing=72`, and
+`AllocTRES=cpu=72,mem=500G,billing=72`.
+
+Acceptance now validates job and node records through one version-compatible helper.
+The job identity, RUNNING state, partition, exact one-node/one-task/72-CPU facts,
+single node name, and `TRES` CPU/node counts remain mandatory. `MinMemoryNode`, when
+reported, must exactly equal the normalized scheduler spelling and byte count. Job
+`ReqTRES` and `AllocTRES` are optional; every one reported must prove the requested
+CPU, node, and sufficient normalized memory.
+
+The node identity, fully ALLOCATED/non-MIXED state, full CPU count/allocation, and
+sufficient `RealMemory` remain mandatory. Reported node `CfgTRES`, `AllocTRES`, and
+`AllocMem` are validated; node allocation evidence may replace an absent job memory
+field, but configured capacity without either a job request or an allocated-memory
+fact is insufficient. The minimized portable fixture preserves the exact Slurm 22.05
+field presence and absence so later tests cannot silently restore the newer-schema
+assumption.

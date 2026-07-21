@@ -202,6 +202,9 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "production-owned callable",
         "workers never need `tests` on `pythonpath`",
         "inside ordinary task execution",
+        "`minmemorynode`",
+        "`cfgtres` and `alloctres`",
+        "job `reqtres` and `alloctres` are optional",
     ):
         assert rule in normalized
 

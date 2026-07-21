@@ -27,6 +27,7 @@ from hpc.environment import (
     smoke_module_by_value,
     validate_rendered_job_script,
     validate_scheduler_interface,
+    validate_slurm_job_node_resources,
     wait_for_queue_empty,
     write_evidence_json,
 )
@@ -359,6 +360,161 @@ def test_parse_slurm_tres_memory_uses_slurm_binary_units() -> None:
     assert parse_slurm_tres_memory_bytes("cpu=72,mem=500G,node=1") == 500 * 1024**3
 
 
+_SLURM_22_JOB = {
+    "JobId": "10765424",
+    "JobState": "RUNNING",
+    "Partition": "512GB",
+    "NumNodes": "1",
+    "NumCPUs": "72",
+    "NumTasks": "1",
+    "NodeList": "NucleusB050",
+    "TRES": "cpu=72,node=1,billing=72",
+    "MinMemoryNode": "466G",
+}
+_SLURM_22_NODE = {
+    "NodeName": "NucleusB050",
+    "State": "ALLOCATED",
+    "CPUTot": "72",
+    "CPUAlloc": "72",
+    "RealMemory": "512000",
+    "CfgTRES": "cpu=72,mem=500G,billing=72",
+    "AllocTRES": "cpu=72,mem=500G,billing=72",
+}
+
+
+def _validate_slurm_22_resources(
+    job: dict[str, str] | None = None,
+    node: dict[str, str] | None = None,
+) -> None:
+    validate_slurm_job_node_resources(
+        _SLURM_22_JOB if job is None else job,
+        _SLURM_22_NODE if node is None else node,
+        expected_job_id="10765424",
+        expected_node_name="NucleusB050",
+        expected_partition="512GB",
+        expected_cores=72,
+        expected_memory="466G",
+        expected_memory_bytes=500_363_689_984,
+    )
+
+
+def test_slurm_22_job_and_node_resources_accept_actual_minimized_shape() -> None:
+    assert "ReqTRES" not in _SLURM_22_JOB
+    assert "AllocTRES" not in _SLURM_22_JOB
+
+    _validate_slurm_22_resources()
+
+
+def test_job_req_and_alloc_tres_are_optional_but_validated_when_present() -> None:
+    compatible = dict(_SLURM_22_JOB)
+    compatible.pop("MinMemoryNode")
+    compatible["ReqTRES"] = "cpu=72,mem=466G,node=1"
+    compatible["AllocTRES"] = "cpu=72,mem=500G,node=1"
+
+    _validate_slurm_22_resources(job=compatible)
+
+    compatible["ReqTRES"] = "cpu=72,mem=465G,node=1"
+    with pytest.raises(HpcAcceptanceError, match=r"ReqTRES.*memory"):
+        _validate_slurm_22_resources(job=compatible)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("MinMemoryNode", "465G", "MinMemoryNode"),
+        ("TRES", "cpu=71,node=1,billing=71", "TRES.*cpu"),
+        ("TRES", "cpu=72,billing=72", "TRES.*node"),
+    ),
+)
+def test_job_resource_facts_fail_closed(
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    job = dict(_SLURM_22_JOB)
+    job[field] = value
+
+    with pytest.raises(HpcAcceptanceError, match=message):
+        _validate_slurm_22_resources(job=job)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("JobId", "unexpected", "JobId"),
+        ("JobState", "PENDING", "JobState"),
+        ("Partition", "unexpected", "Partition"),
+        ("NumNodes", "2", "NumNodes"),
+        ("NumCPUs", "71", "NumCPUs"),
+        ("NumTasks", "2", "NumTasks"),
+        ("NodeList", "NucleusB058", "NodeList"),
+    ),
+)
+def test_job_identity_and_shape_facts_fail_closed(
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    job = dict(_SLURM_22_JOB)
+    job[field] = value
+
+    with pytest.raises(HpcAcceptanceError, match=message):
+        _validate_slurm_22_resources(job=job)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("RealMemory", "477180", "RealMemory"),
+        ("CfgTRES", "cpu=72,mem=465G,billing=72", "CfgTRES.*memory"),
+        ("AllocTRES", "cpu=71,mem=500G,billing=71", "AllocTRES.*cpu"),
+        ("AllocTRES", "cpu=72,mem=465G,billing=72", "AllocTRES.*memory"),
+        ("AllocMem", "477180", "AllocMem"),
+    ),
+)
+def test_node_resource_facts_fail_closed(
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    node = dict(_SLURM_22_NODE)
+    node[field] = value
+
+    with pytest.raises(HpcAcceptanceError, match=message):
+        _validate_slurm_22_resources(node=node)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("NodeName", "NucleusB058", "NodeName"),
+        ("State", "MIXED", "State"),
+        ("CPUTot", "71", "CPUTot"),
+        ("CPUAlloc", "71", "CPUAlloc"),
+    ),
+)
+def test_node_identity_and_cpu_facts_fail_closed(
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    node = dict(_SLURM_22_NODE)
+    node[field] = value
+
+    with pytest.raises(HpcAcceptanceError, match=message):
+        _validate_slurm_22_resources(node=node)
+
+
+def test_memory_proof_requires_job_request_or_node_allocation_fact() -> None:
+    job = dict(_SLURM_22_JOB)
+    job.pop("MinMemoryNode")
+    node = dict(_SLURM_22_NODE)
+    node.pop("AllocTRES")
+
+    with pytest.raises(HpcAcceptanceError, match="authoritative memory"):
+        _validate_slurm_22_resources(job=job, node=node)
+
+
 class _Completed:
     def __init__(self, stdout: str) -> None:
         self.stdout = stdout
@@ -673,13 +829,13 @@ def test_environment_smoke_records_real_worker_facts_without_registration(
         if "job" in arguments:
             return _Completed(
                 "JobId=913 JobState=RUNNING NumNodes=1 NumCPUs=72 "
-                "NumTasks=1 NodeList=slurm-node-a "
-                "ReqTRES=cpu=72,mem=466G,node=1 "
-                "AllocTRES=cpu=72,mem=466G,node=1\n"
+                "NumTasks=1 NodeList=slurm-node-a Partition=512GB "
+                "TRES=cpu=72,node=1,billing=72 MinMemoryNode=466G\n"
             )
         return _Completed(
             "NodeName=slurm-node-a State=ALLOCATED CPUTot=72 CPUAlloc=72 "
-            "RealMemory=515000 AllocMem=512000\n"
+            "RealMemory=512000 CfgTRES=cpu=72,mem=500G,billing=72 "
+            "AllocTRES=cpu=72,mem=500G,billing=72\n"
         )
 
     result = run_environment_smoke(
@@ -710,6 +866,16 @@ def test_environment_smoke_records_real_worker_facts_without_registration(
     assert record["job"]["JobId"] == "913"
     assert record["slurm_node_name"] == "slurm-node-a"
     assert record["node"]["State"] == "ALLOCATED"
+    validate_slurm_job_node_resources(
+        record["job"],
+        record["node"],
+        expected_job_id="913",
+        expected_node_name="slurm-node-a",
+        expected_partition="512GB",
+        expected_cores=72,
+        expected_memory="466G",
+        expected_memory_bytes=500_363_689_984,
+    )
     assert record["scratch_probe"] == {"created": True, "deleted": True}
     assert tuple(evidence.rglob("linear_transform_2.mat")) == ()
     assert tuple(evidence.rglob("nonlinear_warp_2.nii.gz")) == ()

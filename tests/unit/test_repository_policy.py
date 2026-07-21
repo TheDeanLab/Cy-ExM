@@ -576,6 +576,7 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "rendered job script",
             "semantic and scheduler-normalized memory",
             "never add `tests` to worker `pythonpath`",
+            "version-compatible slurm job and node fields",
             "cleanup",
             "no acceptance claim without a real allocation",
         ),

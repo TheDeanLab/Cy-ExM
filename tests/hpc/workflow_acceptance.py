@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -83,6 +83,64 @@ def task5_output_roots(profile: ExecutionProfile) -> Task5OutputRoots:
         failure=base / "failure-resume",
         cancellation=base / "cancellation-resume",
     )
+
+
+def _slurm_walltime_seconds(value: object) -> int:
+    if type(value) is not str or not value:
+        raise HpcWorkflowAcceptanceError(
+            f"approved SLURM walltime must be a nonempty string; got {value!r}"
+        )
+    if "-" in value:
+        if value.count("-") != 1:
+            raise HpcWorkflowAcceptanceError(
+                f"approved SLURM walltime is malformed: {value!r}"
+            )
+        days_text, clock = value.split("-", 1)
+        parts = clock.split(":")
+        if len(parts) not in {1, 2, 3}:
+            raise HpcWorkflowAcceptanceError(
+                f"approved SLURM walltime is malformed: {value!r}"
+            )
+        parts.extend(["0"] * (3 - len(parts)))
+        hours_text, minutes_text, seconds_text = parts
+    else:
+        days_text = "0"
+        parts = value.split(":")
+        if len(parts) == 1:
+            hours_text, minutes_text, seconds_text = "0", parts[0], "0"
+        elif len(parts) == 2:
+            hours_text, minutes_text, seconds_text = "0", parts[0], parts[1]
+        elif len(parts) == 3:
+            hours_text, minutes_text, seconds_text = parts
+        else:
+            raise HpcWorkflowAcceptanceError(
+                f"approved SLURM walltime is malformed: {value!r}"
+            )
+    fields = (days_text, hours_text, minutes_text, seconds_text)
+    if any(not field.isdigit() for field in fields):
+        raise HpcWorkflowAcceptanceError(
+            f"approved SLURM walltime is malformed: {value!r}"
+        )
+    days, hours, minutes, seconds = (int(field, 10) for field in fields)
+    if minutes > 59 or seconds > 59 or (days > 0 and hours > 23):
+        raise HpcWorkflowAcceptanceError(
+            f"approved SLURM walltime is malformed: {value!r}"
+        )
+    total = ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+    if total < 1:
+        raise HpcWorkflowAcceptanceError(
+            f"approved SLURM walltime must be positive: {value!r}"
+        )
+    return total
+
+
+def coordination_timeout_seconds(profile: ExecutionProfile) -> float:
+    """Bound worker coordination by the exact approved SLURM job walltime."""
+    if profile.executor != "slurm" or profile.slurm is None:
+        raise HpcWorkflowAcceptanceError(
+            "coordination timeout requires an approved SLURM profile"
+        )
+    return float(_slurm_walltime_seconds(profile.slurm.walltime))
 
 
 def prepare_task5_output_roots(roots: Task5OutputRoots) -> dict[str, object]:
@@ -538,6 +596,10 @@ def _error_payload(error: BaseException) -> dict[str, str]:
     return {"exception_type": type(error).__name__, "message": str(error)}
 
 
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
 def _write_marker(path: Path, value: Mapping[str, object]) -> None:
     import json
 
@@ -562,7 +624,7 @@ def _wait_for_committed_marker(
     timeout_seconds: float,
     _monotonic: Callable[[], float],
     _sleep: Callable[[float], None],
-) -> None:
+) -> dict[str, object]:
     import json
 
     if timeout_seconds <= 0.0:
@@ -576,12 +638,35 @@ def _wait_for_committed_marker(
                 raise HpcWorkflowAcceptanceError(
                     f"committed marker is malformed: {path}: {error}"
                 ) from error
-            if payload != {"round": expected_round, "status": "completed"}:
+            expected_keys = {
+                "schema_version",
+                "round",
+                "status",
+                "result_ended_at",
+                "marker_written_at",
+            }
+            if not isinstance(payload, dict) or set(payload) != expected_keys:
+                raise HpcWorkflowAcceptanceError(
+                    f"committed marker has invalid schema: {payload!r}"
+                )
+            if (
+                payload["schema_version"] != 1
+                or payload["round"] != expected_round
+                or payload["status"] != "completed"
+                or type(payload["result_ended_at"]) is not str
+                or type(payload["marker_written_at"]) is not str
+            ):
                 raise HpcWorkflowAcceptanceError(
                     "committed marker does not prove round "
                     f"{expected_round}: {payload!r}"
                 )
-            return
+            if _timestamp(payload["result_ended_at"]) > _timestamp(
+                payload["marker_written_at"]
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    "committed marker timestamp precedes the completed round"
+                )
+            return cast(dict[str, object], payload)
         now = _monotonic()
         if now >= deadline:
             raise HpcWorkflowAcceptanceError(
@@ -596,13 +681,94 @@ def _production_round_task(task: RoundTask) -> RoundResult:
     return run_round_task(task)
 
 
-def _commit_round_marker(path: Path, result: RoundResult, expected_round: int) -> None:
+def _commit_round_marker(
+    path: Path,
+    result: RoundResult,
+    expected_round: int,
+    *,
+    utc_now: Callable[[], str],
+) -> None:
     if result.round != expected_round or result.status != "completed":
         raise HpcWorkflowAcceptanceError(
             f"round {expected_round} did not commit before coordination: "
             f"round={result.round}, status={result.status!r}"
         )
-    _write_marker(path, {"round": expected_round, "status": "completed"})
+    marker_written_at = utc_now()
+    if _timestamp(result.ended_at) > _timestamp(marker_written_at):
+        raise HpcWorkflowAcceptanceError(
+            "commit marker timestamp precedes the completed round"
+        )
+    _write_marker(
+        path,
+        {
+            "schema_version": 1,
+            "round": expected_round,
+            "status": "completed",
+            "result_ended_at": result.ended_at,
+            "marker_written_at": marker_written_at,
+        },
+    )
+
+
+def validate_injected_failure_record(
+    record: Mapping[str, object],
+    *,
+    successful_round: int,
+    failing_round: int,
+    committed_marker: Path,
+) -> dict[str, object]:
+    """Require the exact post-commit injected failure, not a coordination timeout."""
+    rounds = record.get("rounds")
+    if record.get("status") != "failed" or not isinstance(rounds, list):
+        raise HpcWorkflowAcceptanceError(
+            "injected failure run must have failed workflow status and round results"
+        )
+    by_round = {item.get("round"): item for item in rounds if isinstance(item, Mapping)}
+    successful = by_round.get(successful_round)
+    failed = by_round.get(failing_round)
+    if not isinstance(successful, Mapping) or not isinstance(failed, Mapping):
+        raise HpcWorkflowAcceptanceError(
+            "injected failure run is missing the selected round results"
+        )
+    if successful.get("status") != "completed" or successful.get("failure") is not None:
+        raise HpcWorkflowAcceptanceError(
+            "peer round did not complete before the injected failure"
+        )
+    if failed.get("status") != "failed":
+        raise HpcWorkflowAcceptanceError("selected injected round did not fail")
+
+    marker = _wait_for_committed_marker(
+        committed_marker,
+        expected_round=successful_round,
+        timeout_seconds=1.0,
+        _monotonic=time.monotonic,
+        _sleep=time.sleep,
+    )
+    if successful.get("ended_at") != marker["result_ended_at"]:
+        raise HpcWorkflowAcceptanceError(
+            "committed marker does not identify the completed peer result"
+        )
+    expected_failure = {
+        "stage": "round",
+        "exception_type": "RuntimeError",
+        "message": (
+            f"injected Task 5 failure for round {failing_round} after committed "
+            f"round {successful_round} at {marker['marker_written_at']}"
+        ),
+    }
+    if failed.get("failure") != expected_failure:
+        raise HpcWorkflowAcceptanceError(
+            "failed round does not identify the intended injected RuntimeError "
+            f"after peer commit: {failed.get('failure')!r}"
+        )
+    return {
+        "schema_version": 1,
+        "successful_round": successful_round,
+        "failing_round": failing_round,
+        "committed_marker": marker,
+        "failure": expected_failure,
+        "ordering_proven": True,
+    }
 
 
 def run_failure_task(
@@ -611,25 +777,34 @@ def run_failure_task(
     successful_round: int,
     failing_round: int,
     committed_marker: Path,
-    timeout_seconds: float = 900.0,
+    timeout_seconds: float,
     _run_round_task: Callable[[RoundTask], RoundResult] = _production_round_task,
     _monotonic: Callable[[], float] = time.monotonic,
     _sleep: Callable[[float], None] = time.sleep,
+    _utc_now: Callable[[], str] = _utc_now,
 ) -> RoundResult:
     """Commit one real round before deterministically failing its independent peer."""
     if task.round == successful_round:
         result = _run_round_task(task)
-        _commit_round_marker(committed_marker, result, successful_round)
+        _commit_round_marker(
+            committed_marker,
+            result,
+            successful_round,
+            utc_now=_utc_now,
+        )
         return result
     if task.round == failing_round:
-        _wait_for_committed_marker(
+        marker = _wait_for_committed_marker(
             committed_marker,
             expected_round=successful_round,
             timeout_seconds=timeout_seconds,
             _monotonic=_monotonic,
             _sleep=_sleep,
         )
-        raise RuntimeError(f"injected Task 5 failure for round {failing_round}")
+        raise RuntimeError(
+            f"injected Task 5 failure for round {failing_round} after committed "
+            f"round {successful_round} at {marker['marker_written_at']}"
+        )
     raise HpcWorkflowAcceptanceError(
         f"unexpected Task 5 failure task round {task.round}"
     )
@@ -642,15 +817,21 @@ def run_cancellation_task(
     blocked_round: int,
     committed_marker: Path,
     ready_marker: Path,
-    timeout_seconds: float = 900.0,
+    timeout_seconds: float,
     _run_round_task: Callable[[RoundTask], RoundResult] = _production_round_task,
     _monotonic: Callable[[], float] = time.monotonic,
     _sleep: Callable[[float], None] = time.sleep,
+    _utc_now: Callable[[], str] = _utc_now,
 ) -> RoundResult:
     """Commit one real round while its peer stays cancellably unfinished."""
     if task.round == successful_round:
         result = _run_round_task(task)
-        _commit_round_marker(committed_marker, result, successful_round)
+        _commit_round_marker(
+            committed_marker,
+            result,
+            successful_round,
+            utc_now=_utc_now,
+        )
         return result
     if task.round != blocked_round:
         raise HpcWorkflowAcceptanceError(
@@ -691,7 +872,7 @@ def execute_cancellation_acceptance(
     ready_marker: Path,
     successful_round: int,
     blocked_round: int,
-    timeout_seconds: float = 900.0,
+    timeout_seconds: float,
     _execute_owned: Callable[..., Any] | None = None,
     _send_signal: Callable[[int, int], None] = os.kill,
     _monotonic: Callable[[], float] = time.monotonic,
@@ -708,6 +889,7 @@ def execute_cancellation_acceptance(
         "committed_round": successful_round,
         "signal": "SIGINT",
         "status": "waiting",
+        "timeout_seconds": timeout_seconds,
     }
 
     def trigger_when_ready() -> None:
@@ -892,6 +1074,7 @@ __all__ = [
     "Task5OutputRoots",
     "bounded_acceptance_manifest",
     "bounded_slurm_profile",
+    "coordination_timeout_seconds",
     "execute_cancellation_acceptance",
     "execute_owned_slurm_workflow",
     "parallel_placement_evidence",
@@ -901,6 +1084,7 @@ __all__ = [
     "scientific_parity_evidence",
     "sequential_reference_profile",
     "task5_output_roots",
+    "validate_injected_failure_record",
     "validate_task5_output_ownership",
     "workflow_module_by_value",
 ]

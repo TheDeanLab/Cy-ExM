@@ -27,6 +27,7 @@ from hpc.workflow_acceptance import (
     Task5OutputRoots,
     bounded_acceptance_manifest,
     bounded_slurm_profile,
+    coordination_timeout_seconds,
     execute_cancellation_acceptance,
     execute_owned_slurm_workflow,
     parallel_placement_evidence,
@@ -36,6 +37,7 @@ from hpc.workflow_acceptance import (
     scientific_parity_evidence,
     sequential_reference_profile,
     task5_output_roots,
+    validate_injected_failure_record,
     validate_task5_output_ownership,
 )
 
@@ -148,6 +150,7 @@ def _run_task5_acceptance(
     assert (
         parallel_plan.scientific_fingerprint == sequential_plan.scientific_fingerprint
     )
+    coordination_timeout = coordination_timeout_seconds(context.profile)
     user = getpass.getuser()
 
     parallel = cast(
@@ -180,6 +183,7 @@ def _run_task5_acceptance(
         successful_round=failure_success.round,
         failing_round=failure_target.round,
         committed_marker=failure_marker,
+        timeout_seconds=coordination_timeout,
     )
     try:
         execute_owned_slurm_workflow(
@@ -195,12 +199,12 @@ def _run_task5_acceptance(
         raise HpcWorkflowAcceptanceError(
             "injected independent round failure unexpectedly succeeded"
         )
-    statuses = {item["round"]: item["status"] for item in failure_record["rounds"]}
-    assert failure_record["status"] == "failed"
-    assert statuses == {
-        failure_success.round: "completed",
-        failure_target.round: "failed",
-    }
+    injected_failure = validate_injected_failure_record(
+        failure_record,
+        successful_round=failure_success.round,
+        failing_round=failure_target.round,
+        committed_marker=failure_marker,
+    )
     failure_identities = _artifact_identities(failure_plan, failure_success.round)
     failure_resume = cast(
         WorkflowResult,
@@ -224,6 +228,8 @@ def _run_task5_acceptance(
         context.evidence_dir / "failure-resume.json",
         {
             "failed_run": failure_record,
+            "injected_failure": injected_failure,
+            "coordination_timeout_seconds": coordination_timeout,
             "resume": failure_resume.to_dict(),
             "preserved_artifacts": _identity_evidence(failure_identities),
         },
@@ -242,6 +248,7 @@ def _run_task5_acceptance(
         blocked_round=cancellation_target.round,
         committed_marker=cancellation_committed,
         ready_marker=cancellation_ready,
+        timeout_seconds=coordination_timeout,
     )
     exit_code = execute_cancellation_acceptance(
         cancellation_plan,
@@ -252,6 +259,7 @@ def _run_task5_acceptance(
         ready_marker=cancellation_ready,
         successful_round=cancellation_success.round,
         blocked_round=cancellation_target.round,
+        timeout_seconds=coordination_timeout,
     )
     assert exit_code == 130
     cancellation_records = _run_records(cancellation_plan)
@@ -303,6 +311,7 @@ def _run_task5_acceptance(
         context.evidence_dir / "cancellation-resume.json",
         {
             "exit_code": exit_code,
+            "coordination_timeout_seconds": coordination_timeout,
             "cancelled_run": cancelled_record,
             "resume": cancellation_resume.to_dict(),
             "preserved_artifacts": _identity_evidence(cancellation_identities),
@@ -316,6 +325,7 @@ def _run_task5_acceptance(
         "selected_rounds": [task.round for task in parallel_plan.tasks],
         "placement": placement,
         "scientific_parity": parity,
+        "coordination_timeout_seconds": coordination_timeout,
         "failure_resume": {
             "reused_round": failure_success.round,
             "recomputed_round": failure_target.round,

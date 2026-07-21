@@ -16,6 +16,7 @@ from hpc.workflow_acceptance import (
     HpcWorkflowAcceptanceError,
     bounded_acceptance_manifest,
     bounded_slurm_profile,
+    coordination_timeout_seconds,
     execute_cancellation_acceptance,
     execute_owned_slurm_workflow,
     parallel_placement_evidence,
@@ -24,6 +25,7 @@ from hpc.workflow_acceptance import (
     run_failure_task,
     sequential_reference_profile,
     task5_output_roots,
+    validate_injected_failure_record,
     validate_task5_output_ownership,
     workflow_module_by_value,
 )
@@ -263,7 +265,10 @@ def test_failure_runner_waits_for_committed_peer_before_failing(tmp_path: Path) 
     successful = SimpleNamespace(round=4)
     failing = SimpleNamespace(round=7)
     completed = SimpleNamespace(
-        status="completed", round=4, to_dict=lambda: {"round": 4}
+        status="completed",
+        round=4,
+        ended_at="2026-07-21T10:00:00Z",
+        to_dict=lambda: {"round": 4},
     )
 
     result = run_failure_task(
@@ -271,20 +276,32 @@ def test_failure_runner_waits_for_committed_peer_before_failing(tmp_path: Path) 
         successful_round=4,
         failing_round=7,
         committed_marker=marker,
+        timeout_seconds=1_800.0,
         _run_round_task=lambda _task: completed,  # type: ignore[arg-type]
+        _utc_now=lambda: "2026-07-21T10:00:01Z",
     )
 
     assert result is completed
     assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "marker_written_at": "2026-07-21T10:00:01Z",
+        "result_ended_at": "2026-07-21T10:00:00Z",
         "round": 4,
+        "schema_version": 1,
         "status": "completed",
     }
-    with pytest.raises(RuntimeError, match="injected Task 5 failure for round 7"):
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "injected Task 5 failure for round 7 after committed round 4 "
+            "at 2026-07-21T10:00:01Z"
+        ),
+    ):
         run_failure_task(
             failing,  # type: ignore[arg-type]
             successful_round=4,
             failing_round=7,
             committed_marker=marker,
+            timeout_seconds=1_800.0,
         )
     assert not tuple(tmp_path.glob(".*.tmp"))
 
@@ -294,7 +311,19 @@ def test_cancellation_runner_announces_blocked_future_after_peer_commit(
 ) -> None:
     committed = tmp_path / "peer-committed.json"
     ready = tmp_path / "cancellation-ready.json"
-    committed.write_text('{"round":4,"status":"completed"}\n', encoding="utf-8")
+    committed.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "round": 4,
+                "status": "completed",
+                "result_ended_at": "2026-07-21T10:00:00Z",
+                "marker_written_at": "2026-07-21T10:00:01Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     task = SimpleNamespace(round=7)
 
     def interrupt_sleep(_seconds: float) -> None:
@@ -307,6 +336,7 @@ def test_cancellation_runner_announces_blocked_future_after_peer_commit(
             blocked_round=7,
             committed_marker=committed,
             ready_marker=ready,
+            timeout_seconds=1_800.0,
             _sleep=interrupt_sleep,
         )
 
@@ -370,6 +400,7 @@ def test_cancellation_harness_maps_coordinator_interrupt_to_130_and_restores_sig
         "exit_code": 130,
         "signal": "SIGINT",
         "status": "interrupted",
+        "timeout_seconds": 2.0,
     }
 
 
@@ -508,3 +539,117 @@ def test_task5_runner_serializes_by_value_without_worker_hpc_import(
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_injected_failure_rejects_timeout_with_same_final_status_shape(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "committed-before-failure.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "round": 4,
+                "status": "completed",
+                "result_ended_at": "2026-07-21T10:00:00Z",
+                "marker_written_at": "2026-07-21T10:00:01Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    same_shape_timeout = {
+        "status": "failed",
+        "rounds": [
+            {
+                "round": 4,
+                "status": "completed",
+                "ended_at": "2026-07-21T10:00:00Z",
+                "failure": None,
+            },
+            {
+                "round": 7,
+                "status": "failed",
+                "ended_at": "2026-07-21T10:15:00Z",
+                "failure": {
+                    "stage": "round",
+                    "exception_type": "HpcWorkflowAcceptanceError",
+                    "message": "timed out waiting for committed round 4",
+                },
+            },
+        ],
+    }
+
+    with pytest.raises(
+        HpcWorkflowAcceptanceError,
+        match="intended injected RuntimeError",
+    ):
+        validate_injected_failure_record(
+            same_shape_timeout,
+            successful_round=4,
+            failing_round=7,
+            committed_marker=marker,
+        )
+
+
+def test_injected_failure_accepts_exact_failure_tied_to_durable_commit_marker(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "committed-before-failure.json"
+    marker_payload = {
+        "schema_version": 1,
+        "round": 4,
+        "status": "completed",
+        "result_ended_at": "2026-07-21T10:00:00Z",
+        "marker_written_at": "2026-07-21T10:00:01Z",
+    }
+    marker.write_text(json.dumps(marker_payload) + "\n", encoding="utf-8")
+    record = {
+        "status": "failed",
+        "rounds": [
+            {
+                "round": 4,
+                "status": "completed",
+                "ended_at": "2026-07-21T10:00:00Z",
+                "failure": None,
+            },
+            {
+                "round": 7,
+                "status": "failed",
+                "failure": {
+                    "stage": "round",
+                    "exception_type": "RuntimeError",
+                    "message": (
+                        "injected Task 5 failure for round 7 after committed round 4 "
+                        "at 2026-07-21T10:00:01Z"
+                    ),
+                },
+            },
+        ],
+    }
+
+    evidence = validate_injected_failure_record(
+        record,
+        successful_round=4,
+        failing_round=7,
+        committed_marker=marker,
+    )
+
+    assert evidence["ordering_proven"] is True
+    assert evidence["committed_marker"] == marker_payload
+
+
+@pytest.mark.parametrize(
+    ("walltime", "seconds"),
+    [("72:00:00", 72 * 60 * 60), ("3-00:00:00", 3 * 24 * 60 * 60)],
+)
+def test_coordination_timeout_uses_the_approved_slurm_walltime(
+    tmp_path: Path,
+    walltime: str,
+    seconds: int,
+) -> None:
+    profile = _profile(tmp_path)
+    assert profile.slurm is not None
+    profile = replace(profile, slurm=replace(profile.slurm, walltime=walltime))
+
+    assert coordination_timeout_seconds(profile) == float(seconds)

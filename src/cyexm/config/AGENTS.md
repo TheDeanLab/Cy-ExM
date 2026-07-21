@@ -5,6 +5,9 @@
 - Reject unknown and duplicate keys, non-scalar YAML keys, aliases, custom tags,
   additional documents, and unsafe paths.
 - Scientific and execution roots are disjoint, neither containing the other.
+- Parse `slurm.memory` centrally as positive whole decimal memory with exact `KB`,
+  `MB`, `GB`, or `TB` suffixes. Reject invalid, fractional, zero, unsupported, or
+  signed-64-bit-overflowing semantic and ceiling-normalized quantities.
 - Treat every long, short, attached, abbreviated, or equals-form node, task,
   resource, or worker option in `slurm.job_extra_directives` as managed and reject
   it. Preserve safe site policy such as account, QoS, constraint, mail,

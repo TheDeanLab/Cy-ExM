@@ -12,6 +12,9 @@
   consumes one.
 - SLURM scales to `min(pending rounds, configured workers)` with one worker process
   and one advertised `round_slot` per job; every submitted round requests that slot.
+  Round semantic profile memory upward to whole binary GiB, pass the `G` spelling to
+  SLURM and the matching `GiB` spelling to Dask, and record both semantic and
+  scheduler-normalized facts. Never copy a decimal `GB` suffix into `#SBATCH`.
   Revalidate directly constructed SLURM profiles before scheduler module loading,
   and validate the production-rendered header and worker command before the first
   scale call. Reject unexpected or duplicate resource and worker options.

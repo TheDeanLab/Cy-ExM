@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from cyexm.config import normalize_slurm_memory
 from cyexm.execution.slurm import SlurmExecutor
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow.models import RoundResult
@@ -35,20 +36,6 @@ from hpc.environment import (
 pytestmark = pytest.mark.hpc
 
 
-def _memory_bytes(value: str) -> int:
-    units = {
-        "KB": 1_000,
-        "MB": 1_000_000,
-        "GB": 1_000_000_000,
-        "TB": 1_000_000_000_000,
-    }
-    normalized = value.strip().upper()
-    for unit, multiplier in units.items():
-        if normalized.endswith(unit):
-            return int(normalized.removesuffix(unit)) * multiplier
-    raise AssertionError(f"unsupported acceptance memory value: {value!r}")
-
-
 def _assert_partition(
     context: HpcAcceptanceContext,
     snapshot: dict[str, object],
@@ -62,14 +49,14 @@ def _assert_partition(
         "The selected partition is not exclusive. Add an approved --exclusive "
         "directive to the strict profile, rerun portable profile tests, and retry."
     )
-    requested_mib = _memory_bytes(spec.memory) // (1024 * 1024)
+    memory = normalize_slurm_memory(spec.memory)
     rows = cast(list[dict[str, object]], snapshot["rows"])
     assert rows
     for row in rows:
         assert cast(str, row["partition"]).removesuffix("*") == spec.queue
         assert cast(str, row["availability"]).lower() == "up"
         assert cast(int, row["cpus"]) >= spec.cores_per_worker
-        assert cast(int, row["memory_mb"]) >= requested_mib
+        assert cast(int, row["memory_mb"]) * 1024**2 >= memory.scheduler_bytes
 
 
 def _assert_worker_records(
@@ -77,10 +64,11 @@ def _assert_worker_records(
     results: tuple[RoundResult, ...],
     records: list[dict[str, object]],
     coordinator_paths: dict[str, dict[str, object]],
+    expected_worker_memory_bytes: int,
 ) -> None:
     spec = context.profile.slurm
     assert spec is not None
-    expected_memory = _memory_bytes(spec.memory)
+    memory = normalize_slurm_memory(spec.memory)
     expected_ids = {result.slurm_job_id for result in results}
     expected_hosts = {result.hostname for result in results}
     assert None not in expected_ids
@@ -95,7 +83,7 @@ def _assert_worker_records(
         assert job_id in expected_ids
         assert hostname in expected_hosts
         assert record["round_slot"] == 1
-        assert record["worker_memory_limit_bytes"] == expected_memory
+        assert record["worker_memory_limit_bytes"] == expected_worker_memory_bytes
 
         job = cast(dict[str, str], record["job"])
         assert job["JobId"] == job_id
@@ -106,16 +94,16 @@ def _assert_worker_records(
         assert int(job["NumTasks"]) == 1
         assert node_name in job["NodeList"]
         assert "node=1" in job["AllocTRES"]
-        assert parse_slurm_tres_memory_bytes(job["ReqTRES"]) >= expected_memory
-        assert parse_slurm_tres_memory_bytes(job["AllocTRES"]) >= expected_memory
+        assert parse_slurm_tres_memory_bytes(job["ReqTRES"]) >= memory.scheduler_bytes
+        assert parse_slurm_tres_memory_bytes(job["AllocTRES"]) >= memory.scheduler_bytes
 
         node = cast(dict[str, str], record["node"])
         assert node["NodeName"] == node_name
         assert "ALLOCATED" in node["State"].upper()
         assert "MIXED" not in node["State"].upper()
         assert int(node["CPUAlloc"]) == int(node["CPUTot"])
-        assert int(node["RealMemory"]) >= expected_memory // (1024 * 1024)
-        assert int(node["AllocMem"]) >= expected_memory // (1024 * 1024)
+        assert int(node["RealMemory"]) * 1024**2 >= memory.scheduler_bytes
+        assert int(node["AllocMem"]) * 1024**2 >= memory.scheduler_bytes
 
         interface = cast(dict[str, object], record["interface"])
         assert interface == {
@@ -160,15 +148,23 @@ def _assert_executor_evidence(
     evidence: dict[str, object],
     worker_count: int,
     scheduler_interface: dict[str, object],
-) -> None:
+) -> int:
     spec = context.profile.slurm
     assert spec is not None
     requested = cast(dict[str, object], evidence["requested"])
     assert requested["workers"] == worker_count
     assert requested["configured_workers"] == spec.workers
+    memory = normalize_slurm_memory(spec.memory)
+    assert requested["memory"] == {
+        "profile": memory.profile,
+        "semantic_bytes": memory.semantic_bytes,
+        "scheduler": memory.scheduler,
+        "scheduler_bytes": memory.scheduler_bytes,
+        "dask": memory.dask,
+    }
     rendered = cast(dict[str, str], evidence["rendered"])
     script = rendered["rendered_job_script_template"]
-    validate_rendered_job_script(script, context.profile)
+    worker_memory_bytes = validate_rendered_job_script(script, context.profile)
     assert "round_slot=1" in script
     for index, name in enumerate(NATIVE_THREAD_ENV_VARS):
         count = (
@@ -207,7 +203,7 @@ def _assert_executor_evidence(
         assert probe["scratch_usable"] is True
         assert probe["native_threads"] == expected_threads
         assert probe["package_versions"] == [list(item) for item in expected_versions]
-        assert probe["memory_limit_bytes"] == _memory_bytes(spec.memory)
+        assert probe["memory_limit_bytes"] == worker_memory_bytes
     assert len({cast(str, probe["slurm_job_id"]) for probe in probes}) == worker_count
     assert len({cast(str, probe["hostname"]) for probe in probes}) == worker_count
 
@@ -221,6 +217,7 @@ def _assert_executor_evidence(
     assert cleanup["order"] == ["client", "cluster", "configuration"]
     for resource in ("client", "cluster", "configuration"):
         assert cleanup[resource] == {"attempted": True, "succeeded": True}
+    return worker_memory_bytes
 
 
 def test_real_slurm_environment_acceptance(
@@ -307,6 +304,12 @@ def test_real_slurm_environment_acceptance(
         raise execution_error
 
     evidence = dict(executor.execution_evidence)
+    expected_worker_memory_bytes = _assert_executor_evidence(
+        context,
+        evidence,
+        worker_count,
+        scheduler_interface,
+    )
     records = [json.loads(task.log_path.read_text(encoding="utf-8")) for task in tasks]
     script = cast(dict[str, str], evidence["rendered"])["rendered_job_script_template"]
     script_hash = hashlib.sha256(script.encode("utf-8")).hexdigest()
@@ -321,6 +324,8 @@ def test_real_slurm_environment_acceptance(
             "submitted_job_script_sha256": script_hash,
             "results": [result.to_dict() for result in results],
             "worker_records": records,
+            "memory": cast(dict[str, object], evidence["requested"])["memory"],
+            "rendered_worker_memory_bytes": expected_worker_memory_bytes,
             "coordinator_scheduler_interface": scheduler_interface,
             "coordinator_paths": coordinator_paths,
             "cleanup_queue": after,
@@ -333,8 +338,13 @@ def test_real_slurm_environment_acceptance(
     assert cleanup_query["job_ids"] == sorted(
         cast(str, result.slurm_job_id) for result in results
     )
-    _assert_executor_evidence(context, evidence, worker_count, scheduler_interface)
-    _assert_worker_records(context, results, records, coordinator_paths)
+    _assert_worker_records(
+        context,
+        results,
+        records,
+        coordinator_paths,
+        expected_worker_memory_bytes,
+    )
     for task in tasks:
         assert not task.registration_directory.exists(), (
             "environment smoke unexpectedly created registration output"

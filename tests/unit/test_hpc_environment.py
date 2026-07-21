@@ -667,7 +667,7 @@ def test_environment_smoke_records_real_worker_facts_without_registration(
     worker = SimpleNamespace(
         address="tcp://10.0.0.2:43100",
         state=SimpleNamespace(total_resources={"round_slot": 1}),
-        memory_manager=SimpleNamespace(memory_limit=500_000_000_000),
+        memory_manager=SimpleNamespace(memory_limit=500_363_689_984),
         get_current_task=lambda: "cyexm-zenodo-smoke-round-002",
     )
 
@@ -676,8 +676,8 @@ def test_environment_smoke_records_real_worker_facts_without_registration(
             return _Completed(
                 "JobId=913 JobState=RUNNING NumNodes=1 NumCPUs=72 "
                 "NumTasks=1 NodeList=slurm-node-a "
-                "ReqTRES=cpu=72,mem=500G,node=1 "
-                "AllocTRES=cpu=72,mem=500G,node=1\n"
+                "ReqTRES=cpu=72,mem=466G,node=1 "
+                "AllocTRES=cpu=72,mem=466G,node=1\n"
             )
         return _Completed(
             "NodeName=slurm-node-a State=ALLOCATED CPUTot=72 CPUAlloc=72 "
@@ -708,7 +708,7 @@ def test_environment_smoke_records_real_worker_facts_without_registration(
     assert result.slurm_job_id == "913"
     record = json.loads(task.log_path.read_text(encoding="utf-8"))
     assert record["round_slot"] == 1
-    assert record["worker_memory_limit_bytes"] == 500_000_000_000
+    assert record["worker_memory_limit_bytes"] == 500_363_689_984
     assert record["job"]["JobId"] == "913"
     assert record["slurm_node_name"] == "slurm-node-a"
     assert record["node"]["State"] == "ALLOCATED"
@@ -790,17 +790,17 @@ def test_rendered_job_script_proves_exact_single_process_node_contract(
 #SBATCH -p 512GB
 #SBATCH -n 1
 #SBATCH --cpus-per-task=72
-#SBATCH --mem=500GB
+#SBATCH --mem=466G
 #SBATCH -t 01:00:00
 #SBATCH --exclusive
 export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1
 python -m distributed.cli.dask_worker tcp://10.0.0.1:8786 --name dummy \\
- --nthreads 72 --memory-limit 500GB --nanny --death-timeout 60 \\
+ --nthreads 72 --memory-limit 466.00GiB --nanny --death-timeout 60 \\
  --local-directory {project_root / "cyexm-smoke"} --resources round_slot=1 \\
  --interface ib0
 """
 
-    validate_rendered_job_script(script, context.profile)
+    assert validate_rendered_job_script(script, context.profile) == 500_363_689_984
 
     with pytest.raises(HpcAcceptanceError, match="rendered job script"):
         validate_rendered_job_script(
@@ -819,9 +819,10 @@ python -m distributed.cli.dask_worker tcp://10.0.0.1:8786 --name dummy \\
         "#SBATCH -p 512GB\n",
         "#SBATCH -n 1\n",
         "#SBATCH --cpus-per-task=72\n",
-        "#SBATCH --mem=500GB\n",
+        "#SBATCH --mem=466G\n",
         "#SBATCH --exclusive\n",
         "--nthreads 72",
+        "--memory-limit 466.00GiB",
         "--resources round_slot=1",
         "--interface ib0",
     ),
@@ -854,11 +855,11 @@ def test_rendered_job_script_fails_closed_when_managed_fact_is_missing(
 #SBATCH -p 512GB
 #SBATCH -n 1
 #SBATCH --cpus-per-task=72
-#SBATCH --mem=500GB
+#SBATCH --mem=466G
 #SBATCH -t 01:00:00
 #SBATCH --exclusive
 python -m distributed.cli.dask_worker tcp://10.0.0.1:8786 \
- --nthreads 72 --memory-limit 500GB --nanny \
+ --nthreads 72 --memory-limit 466.00GiB --nanny \
  --local-directory /project/scratch --resources round_slot=1 --interface ib0
 """
 

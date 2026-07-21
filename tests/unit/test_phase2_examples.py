@@ -11,9 +11,11 @@ from cyexm.config import (
     NativeThreadSpec,
     RegistrationSpec,
     RegistrationStageSpec,
+    SlurmMemoryQuantity,
     SlurmSpec,
     load_dataset_manifest,
     load_execution_profile,
+    normalize_slurm_memory,
 )
 
 pytestmark = pytest.mark.unit
@@ -191,6 +193,13 @@ def test_slurm_example_records_editable_512gb_resources() -> None:
         task_retries=0,
         job_name="cyexm-registration",
         job_extra_directives=(),
+    )
+    assert normalize_slurm_memory(profile.slurm.memory) == SlurmMemoryQuantity(
+        profile="500GB",
+        semantic_bytes=500_000_000_000,
+        scheduler="466G",
+        scheduler_bytes=500_363_689_984,
+        dask="466GiB",
     )
 
     text = (REPOSITORY_ROOT / EXAMPLE_PATHS[3]).read_text("utf-8")

@@ -12,6 +12,7 @@ from types import ModuleType
 from typing import Any, cast
 
 import pytest
+from dask.utils import format_bytes, parse_bytes
 
 from cyexm.config.models import (
     ExecutionPaths,
@@ -164,7 +165,7 @@ def _probe(address: str, *, ok: bool = True) -> dict[str, object]:
         dataset_visible=ok,
         output_writable=ok,
         scratch_usable=ok,
-        memory_limit_bytes=500_000_000_000 if ok else 0,
+        memory_limit_bytes=500_363_689_984 if ok else 0,
         network_host=address.removeprefix("tcp://").split(":", 1)[0],
         errors=errors,
     ).to_dict()
@@ -358,6 +359,7 @@ class _FakeSlurmModules:
         self.job_script_text = "#!/bin/bash\n#SBATCH --partition=512GB\n"
         self.rendered_header_injections: tuple[str, ...] = ()
         self.rendered_worker_injections: tuple[str, ...] = ()
+        self.rendered_worker_memory: str | None = None
         self.disappear_after_probe = False
         self.cluster_error: BaseException | None = None
         self.job_script_error: BaseException | None = None
@@ -412,6 +414,11 @@ class _FakeSlurmModules:
         worker_extra_args = " ".join(
             cast(list[str], kwargs.get("worker_extra_args", []))
         )
+        worker_memory = format_bytes(parse_bytes(cast(str, kwargs["memory"]))).replace(
+            " ", ""
+        )
+        if self.rendered_worker_memory is not None:
+            worker_memory = self.rendered_worker_memory
         rendered_headers = "\n".join(self.rendered_header_injections)
         rendered_worker = " ".join(self.rendered_worker_injections)
         self.job_script_text = (
@@ -426,7 +433,7 @@ class _FakeSlurmModules:
             f"{rendered_headers}\n"
             f"{prologue}\n{python} -m {worker_command} tcp://scheduler:8786 "
             f"--name fake --nthreads {kwargs['cores']} "
-            f"--memory-limit {kwargs['memory']} --nanny "
+            f"--memory-limit {worker_memory} --nanny "
             f"--death-timeout {kwargs['death_timeout']} "
             f"--local-directory {kwargs['local_directory']} "
             f"--resources {worker_extra_args.removeprefix('--resources ')} "
@@ -512,10 +519,10 @@ def test_slurm_executor_builds_one_process_jobs_with_round_resource(
         "queue": "512GB",
         "cores": 72,
         "processes": 1,
-        "memory": "500GB",
+        "memory": "466GiB",
         "walltime": "72:00:00",
         "job_cpu": 72,
-        "job_mem": "500GB",
+        "job_mem": "466G",
         "interface": "ib0",
         "scheduler_options": {"interface": "ib0"},
         "local_directory": str(tmp_path / "scratch"),
@@ -536,6 +543,15 @@ def test_slurm_executor_builds_one_process_jobs_with_round_resource(
     assert modules.scale_calls == [{"jobs": 3}]
     assert modules.wait_for_workers_calls == [(3, 900.0)]
     assert modules.client_timeout == "15m"
+    assert "#SBATCH --mem=466G" in modules.job_script_text
+    assert "--memory-limit 466.00GiB" in modules.job_script_text
+    assert (
+        slurm_module.validate_slurm_job_script(
+            modules.job_script_text,
+            _profile(tmp_path),
+        )
+        == 500_363_689_984
+    )
 
 
 def test_slurm_executor_exports_resolved_threads_before_worker_launch(
@@ -628,7 +644,7 @@ def test_slurm_executor_supplies_isolated_jobqueue_launch_configuration(
     for managed in (
         "#SBATCH -p 512GB",
         "#SBATCH --cpus-per-task=72",
-        "#SBATCH --mem=500GB",
+        "#SBATCH --mem=466G",
         "#SBATCH -t 72:00:00",
     ):
         assert managed in rendered
@@ -708,6 +724,23 @@ def test_slurm_executor_rejects_rendered_resource_collision_before_scale(
     assert modules.events == ["cluster.close"]
 
 
+@pytest.mark.parametrize("worker_memory", ("465.99GiB", "466.01GiB", "500GB"))
+def test_slurm_executor_rejects_inexact_rendered_worker_memory_before_scale(
+    tmp_path: Path,
+    worker_memory: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    modules.rendered_worker_memory = worker_memory
+
+    with pytest.raises(ExecutorStartupError, match="worker memory limit"):
+        _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+
+    assert modules.scale_calls == []
+    assert modules.submit_calls == []
+    assert modules.events == ["cluster.close"]
+
+
 def test_slurm_executor_bounds_jobs_by_configured_workers(tmp_path: Path) -> None:
     modules = _FakeSlurmModules()
     tasks = tuple(_task(tmp_path, number) for number in (2, 3, 4))
@@ -762,6 +795,13 @@ def test_slurm_executor_captures_exact_script_versions_scheduler_and_probes(
         "configured_workers": 4,
         "startup_timeout": "15m",
         "task_retries": 0,
+        "memory": {
+            "profile": "500GB",
+            "semantic_bytes": 500_000_000_000,
+            "scheduler": "466G",
+            "scheduler_bytes": 500_363_689_984,
+            "dask": "466GiB",
+        },
     }
     rendered = cast(dict[str, object], evidence["rendered"])
     assert rendered["rendered_job_script_template"] == modules.job_script_text
@@ -852,6 +892,16 @@ def _invalid_execution_evidence(
         requested["workers"] = 5
     elif case == "requested_retry_mismatch":
         requested["task_retries"] = 1
+    elif case == "requested_memory_profile_mismatch":
+        cast(dict[str, object], requested["memory"])["profile"] = "499GB"
+    elif case == "requested_memory_semantic_mismatch":
+        cast(dict[str, object], requested["memory"])["semantic_bytes"] = 1
+    elif case == "requested_memory_scheduler_mismatch":
+        cast(dict[str, object], requested["memory"])["scheduler"] = "500G"
+    elif case == "requested_memory_bytes_mismatch":
+        cast(dict[str, object], requested["memory"])["scheduler_bytes"] = 1
+    elif case == "requested_memory_dask_mismatch":
+        cast(dict[str, object], requested["memory"])["dask"] = "500GiB"
     elif case == "rendered_stale":
         rendered["submitted_job_script"] = rendered.pop("rendered_job_script_template")
     elif case == "rendered_missing":
@@ -1086,6 +1136,11 @@ def test_slurm_evidence_schema_preserves_failed_probe_identity_diagnostics(
         "requested_bool",
         "requested_bound",
         "requested_retry_mismatch",
+        "requested_memory_profile_mismatch",
+        "requested_memory_semantic_mismatch",
+        "requested_memory_scheduler_mismatch",
+        "requested_memory_bytes_mismatch",
+        "requested_memory_dask_mismatch",
         "rendered_stale",
         "rendered_missing",
         "rendered_alias",

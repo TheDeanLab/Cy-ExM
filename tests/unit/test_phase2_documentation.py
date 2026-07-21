@@ -173,6 +173,9 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "Executor-managed retry count after the first attempt. |",
         "| `slurm` / `workers` | positive built-in integer | Maximum number of "
         "worker jobs. |",
+        "| `slurm` / `memory` | positive whole decimal `KB`, `MB`, `GB`, or `TB` "
+        "string | Semantic memory request; the executor rounds up to whole binary "
+        "GiB for SLURM and Dask. |",
         "| `slurm` / `startup_timeout` | non-empty single-line string | Bounds "
         "only Dask `Client` connection and `wait_for_workers`. |",
         "| `slurm` / `task_retries` | nonnegative built-in integer | "
@@ -193,6 +196,9 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "`processes_per_worker` must be exactly `1`",
         "conflict with managed slurm options",
         "exactly one executor-specific section",
+        "`500gb` becomes `466g`",
+        "500,363,689,984 bytes",
+        "never passes a `gb` suffix to `#sbatch --mem`",
     ):
         assert rule in normalized
 

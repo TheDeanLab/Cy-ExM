@@ -437,6 +437,13 @@ def _slurm_evidence(*, outcome: str = "succeeded") -> dict[str, object]:
             "configured_workers": 2,
             "startup_timeout": "15m",
             "task_retries": 0,
+            "memory": {
+                "profile": "500GB",
+                "semantic_bytes": 500_000_000_000,
+                "scheduler": "466G",
+                "scheduler_bytes": 500_363_689_984,
+                "dask": "466GiB",
+            },
         },
         "rendered": {
             "rendered_job_script_template": (
@@ -480,7 +487,7 @@ def _slurm_evidence(*, outcome: str = "succeeded") -> dict[str, object]:
                     "dataset_visible": True,
                     "output_writable": True,
                     "scratch_usable": True,
-                    "memory_limit_bytes": 500_000_000_000,
+                    "memory_limit_bytes": 500_363_689_984,
                     "network_host": "worker",
                     "errors": [],
                 }

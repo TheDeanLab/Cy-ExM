@@ -294,7 +294,7 @@ The `executor` controls which one matching resource section is present:
 | `slurm` / `workers` | positive built-in integer | Maximum number of worker jobs. |
 | `slurm` / `cores_per_worker` | positive built-in integer | Requested cores and job CPU count. |
 | `slurm` / `processes_per_worker` | built-in integer `1` | One Dask worker process per SLURM job; `processes_per_worker` must be exactly `1`. |
-| `slurm` / `memory` | non-empty single-line string | Job and Dask worker memory request. |
+| `slurm` / `memory` | positive whole decimal `KB`, `MB`, `GB`, or `TB` string | Semantic memory request; the executor rounds up to whole binary GiB for SLURM and Dask. |
 | `slurm` / `walltime` | non-empty single-line string | Job walltime. |
 | `slurm` / `interface` | non-empty single-line string | Worker network interface. |
 | `slurm` / `scheduler_interface` | non-empty single-line string | Coordinator/scheduler network interface. |
@@ -317,8 +317,17 @@ be `/archive` or a descendant of `/archive`; use active `/project` or approved
 node-local storage instead.
 
 All worker/core fields are positive built-in integers and retry fields are a
-nonnegative built-in integer; booleans are never accepted as counts. Every SLURM text
-value is a non-empty single-line string. `job_extra_directives` cannot conflict with
+nonnegative built-in integer; booleans are never accepted as counts. SLURM memory
+uses positive whole decimal memory with exact uppercase `KB`, `MB`, `GB`, or `TB`
+suffixes. These profile units are decimal semantic bytes. The executor rounds upward
+to whole binary GiB, passes the matching `GiB` quantity to Dask, and never passes a
+`GB` suffix to `#SBATCH --mem`. For example, `500GB` becomes `466G`, which is
+500,363,689,984 bytes, and Dask receives `466GiB`. Invalid, fractional, zero,
+unsupported, or overflowing values fail configuration. Operational evidence records
+both semantic and scheduler-normalized memory.
+
+Every other SLURM text value is a non-empty single-line string.
+`job_extra_directives` cannot conflict with
 managed SLURM options for partition (`--partition`, `-p`), memory (`--mem`,
 `--mem-per-cpu`), CPU/task counts (`--cpus-per-task`, `-c`, `--ntasks`, `-n`), or
 stdout/stderr (`--output`, `-o`, `--error`, `-e`), including unambiguous long-option
@@ -585,7 +594,8 @@ artifact validation.
 ### 512-GB SLURM example and acceptance boundary
 
 The checked-in profile currently proposes queue `512GB`, three workers, 72 cores per
-worker, one process per worker, `500GB` Dask/job memory, a 72-hour walltime, `ib0`
+worker, one process per worker, a semantic `500GB` memory profile (normalized to
+`466G` for SLURM and `466GiB` for Dask), a 72-hour walltime, `ib0`
 worker/scheduler interfaces, a 15-minute startup timeout, and zero retries. These
 512GB values are site-specific and editable. They are not unconditional facts about
 the current cluster; verify partition availability, exclusive-node policy, usable

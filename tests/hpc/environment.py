@@ -585,10 +585,10 @@ def partition_is_exclusive(
     return False
 
 
-def validate_rendered_job_script(script: str, profile: ExecutionProfile) -> None:
+def validate_rendered_job_script(script: str, profile: ExecutionProfile) -> int:
     """Expose the production pre-scale template check as acceptance policy."""
     try:
-        validate_slurm_job_script(script, profile)
+        return validate_slurm_job_script(script, profile)
     except (TypeError, ValueError) as error:
         raise HpcAcceptanceError(
             f"rendered job script validation failed: {error}"

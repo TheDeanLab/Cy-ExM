@@ -14,6 +14,7 @@ from importlib.metadata import version as package_version
 from typing import Any, cast
 
 from cyexm.config.execution import _validate_execution_profile
+from cyexm.config.memory import SlurmMemoryQuantity, normalize_slurm_memory
 from cyexm.config.models import ExecutionProfile, SlurmSpec
 from cyexm.errors import (
     ConfigurationValidationError,
@@ -65,7 +66,10 @@ _EVIDENCE_KEYS = frozenset(
     }
 )
 _REQUESTED_KEYS = frozenset(
-    {"workers", "configured_workers", "startup_timeout", "task_retries"}
+    {"workers", "configured_workers", "startup_timeout", "task_retries", "memory"}
+)
+_MEMORY_EVIDENCE_KEYS = frozenset(
+    {"profile", "semantic_bytes", "scheduler", "scheduler_bytes", "dask"}
 )
 _OBSERVED_KEYS = frozenset(
     {
@@ -172,6 +176,41 @@ def _evidence_timestamp(value: object, location: str) -> datetime:
     return parsed
 
 
+def _memory_evidence(quantity: SlurmMemoryQuantity) -> dict[str, object]:
+    return {
+        "profile": quantity.profile,
+        "semantic_bytes": quantity.semantic_bytes,
+        "scheduler": quantity.scheduler,
+        "scheduler_bytes": quantity.scheduler_bytes,
+        "dask": quantity.dask,
+    }
+
+
+def _validate_memory_evidence(value: object) -> None:
+    location = "execution_evidence.requested.memory"
+    memory = _evidence_object(value, location, exact_keys=_MEMORY_EVIDENCE_KEYS)
+    profile = _evidence_string(memory["profile"], f"{location}.profile")
+    _evidence_integer(memory["semantic_bytes"], f"{location}.semantic_bytes", minimum=1)
+    _evidence_string(memory["scheduler"], f"{location}.scheduler")
+    _evidence_integer(
+        memory["scheduler_bytes"],
+        f"{location}.scheduler_bytes",
+        minimum=1,
+    )
+    _evidence_string(memory["dask"], f"{location}.dask")
+    try:
+        expected = _memory_evidence(
+            normalize_slurm_memory(profile, f"{location}.profile")
+        )
+    except ConfigurationValidationError as error:
+        raise ValueError(str(error)) from error
+    if memory != expected:
+        raise ValueError(
+            f"{location} must exactly match normalized profile memory; "
+            f"expected {expected!r}, got {memory!r}"
+        )
+
+
 def _validate_requested(value: object) -> tuple[int, int | None, int | None]:
     requested = _evidence_object(value, "execution_evidence.requested")
     if frozenset(requested) == frozenset({"workers"}):
@@ -210,6 +249,7 @@ def _validate_requested(value: object) -> tuple[int, int | None, int | None]:
         "execution_evidence.requested.task_retries",
         minimum=0,
     )
+    _validate_memory_evidence(requested["memory"])
     return workers, configured, retries
 
 
@@ -820,8 +860,8 @@ def _worker_option_values(
     return values, observed_flags
 
 
-def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> None:
-    """Validate the fully rendered owned job template before any scale call."""
+def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> int:
+    """Validate the template and return its exact Dask worker memory bytes."""
     if type(script) is not str or not script.strip():
         raise _rendered_script_error("template must be a nonempty built-in string")
     spec = profile.slurm
@@ -832,6 +872,7 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> None:
         or scratch is None
     ):
         raise _rendered_script_error("validation requires a complete SLURM profile")
+    memory = normalize_slurm_memory(spec.memory)
     lines = [line.strip() for line in script.splitlines() if line.strip()]
     if not lines or lines[0] != _SHEBANG:
         raise _rendered_script_error(f"expected shebang {_SHEBANG!r}")
@@ -840,7 +881,7 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> None:
         f"#SBATCH -p {spec.queue}",
         "#SBATCH -n 1",
         f"#SBATCH --cpus-per-task={spec.cores_per_worker}",
-        f"#SBATCH --mem={spec.memory}",
+        f"#SBATCH --mem={memory.scheduler}",
         f"#SBATCH -t {spec.walltime}",
         *(f"#SBATCH {directive}" for directive in spec.job_extra_directives),
     ]
@@ -894,10 +935,29 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> None:
                 f"worker option {option!r} must occur once with {expected!r}; "
                 f"got {observed!r}"
             )
+    worker_memory = values["--memory-limit"][0]
+    try:
+        from dask.utils import parse_bytes
+
+        worker_memory_bytes = parse_bytes(worker_memory)
+    except (TypeError, ValueError) as error:
+        raise _rendered_script_error(
+            f"worker memory limit cannot be parsed: {worker_memory!r}"
+        ) from error
+    if (
+        type(worker_memory_bytes) is not int
+        or worker_memory_bytes != memory.scheduler_bytes
+    ):
+        raise _rendered_script_error(
+            "worker memory limit must equal the scheduler-normalized request "
+            f"{memory.scheduler_bytes} bytes; got {worker_memory!r} "
+            f"({worker_memory_bytes!r} bytes)"
+        )
     if flags != ["--nanny"]:
         raise _rendered_script_error(
             f"worker flags must be exactly ['--nanny']; got {flags!r}"
         )
+    return worker_memory_bytes
 
 
 def _scheduler_snapshot(
@@ -1039,6 +1099,7 @@ class SlurmExecutor:
         *,
         worker_count: int,
         spec: SlurmSpec | None,
+        memory: SlurmMemoryQuantity | None,
     ) -> tuple[
         dict[str, object],
         dict[str, object],
@@ -1047,12 +1108,13 @@ class SlurmExecutor:
         dict[str, object],
     ]:
         requested: dict[str, object] = {"workers": worker_count}
-        if spec is not None:
+        if spec is not None and memory is not None:
             requested.update(
                 {
                     "configured_workers": spec.workers,
                     "startup_timeout": spec.startup_timeout,
                     "task_retries": spec.task_retries,
+                    "memory": _memory_evidence(memory),
                 }
             )
         rendered: dict[str, object] = {}
@@ -1137,16 +1199,19 @@ class SlurmExecutor:
             _rendered, _observed, _startup, _cleanup, evidence = self._begin_evidence(
                 worker_count=0,
                 spec=None,
+                memory=None,
             )
             cast(dict[str, str], evidence["timestamps"])["ended_at"] = utc_now()
             return ()
 
         spec = self._spec()
+        memory = normalize_slurm_memory(spec.memory)
         validate_distributed_tasks(tasks, executor_name="SlurmExecutor")
         worker_count = min(len(tasks), spec.workers)
         rendered, observed, startup, cleanup, evidence = self._begin_evidence(
             worker_count=worker_count,
             spec=spec,
+            memory=memory,
         )
         attempts = [0 for _task in tasks]
         cluster: Any | None = None
@@ -1168,10 +1233,10 @@ class SlurmExecutor:
                     queue=spec.queue,
                     cores=spec.cores_per_worker,
                     processes=spec.processes_per_worker,
-                    memory=spec.memory,
+                    memory=memory.dask,
                     walltime=spec.walltime,
                     job_cpu=spec.cores_per_worker,
-                    job_mem=spec.memory,
+                    job_mem=memory.scheduler,
                     interface=spec.interface,
                     scheduler_options={"interface": spec.scheduler_interface},
                     local_directory=str(self.profile.paths.worker_local_directory),

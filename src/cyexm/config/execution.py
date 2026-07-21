@@ -12,6 +12,7 @@ from cyexm.config._validation import (
     require_exact_keys,
 )
 from cyexm.config._yaml import load_yaml_mapping
+from cyexm.config.memory import normalize_slurm_memory
 from cyexm.config.models import (
     ExecutionPaths,
     ExecutionProfile,
@@ -412,7 +413,7 @@ def _slurm(value: object) -> SlurmSpec:
             mapping["cores_per_worker"], "slurm.cores_per_worker", minimum=1
         ),
         processes_per_worker=processes_per_worker,
-        memory=nonempty_string(mapping["memory"], "slurm.memory"),
+        memory=normalize_slurm_memory(mapping["memory"]).profile,
         walltime=nonempty_string(mapping["walltime"], "slurm.walltime"),
         interface=nonempty_string(mapping["interface"], "slurm.interface"),
         scheduler_interface=nonempty_string(

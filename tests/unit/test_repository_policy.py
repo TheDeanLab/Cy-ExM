@@ -85,6 +85,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "must not mutate the filesystem or environment",
         "initialize a scheduler",
         "resource-shaping slurm aliases",
+        "positive whole decimal memory",
     ),
     "src/cyexm/execution/AGENTS.md": (
         "phase 2d implements sequential, bounded local-dask, and slurm execution",
@@ -108,6 +109,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "operational evidence",
         "never authorizes artifact reuse",
         "before the first scale call",
+        "whole binary gib",
         "real slurm submission and hpc acceptance remain unaccepted until phase 2e",
     ),
     "src/cyexm/workflow/AGENTS.md": (
@@ -571,6 +573,7 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "query error or timeout",
             "device and mount",
             "rendered job script",
+            "semantic and scheduler-normalized memory",
             "cleanup",
             "no acceptance claim without a real allocation",
         ),

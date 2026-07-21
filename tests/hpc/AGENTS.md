@@ -40,7 +40,10 @@
 - Fail closed unless the rendered job script exactly records the approved partition,
   exclusivity, single task/process, cores, memory, worker and scheduler interfaces,
   job name, and `round_slot`. Verify the allocated job partition, scheduler address,
-  and coordinator/worker shared filesystem device and mount identities.
+  and coordinator/worker shared filesystem device and mount identities. Record
+  semantic and scheduler-normalized memory, derive the exact expected worker bytes
+  from the rendered worker limit, and require worker probes, requested/allocated
+  TRES, partition capacity, and node capacity to cover the corresponding facts.
 - Make no acceptance claim without a real allocation and complete machine-readable
   evidence. Never commit caller data, external evidence, generated arrays, job logs,
   credentials, or site-specific approved paths.

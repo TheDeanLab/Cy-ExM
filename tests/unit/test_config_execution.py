@@ -537,7 +537,6 @@ def test_slurm_process_count_must_be_builtin_integer_one(
     "field",
     [
         "queue",
-        "memory",
         "walltime",
         "interface",
         "scheduler_interface",
@@ -555,6 +554,33 @@ def test_slurm_text_fields_require_nonempty_single_line_strings(
         ConfigurationValidationError,
         match=rf"slurm\.{field} must be a nonempty single-line string",
     ):
+        _load_profile(tmp_path, data)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        1,
+        "",
+        "0GB",
+        "1.5GB",
+        "500G",
+        "466GiB",
+        "500gb",
+        " 500GB",
+        "500GB ",
+        "9223372036854776KB",
+        "9223372036854775KB",
+    ],
+)
+def test_slurm_memory_requires_a_strict_nonoverflowing_decimal_quantity(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    data = _valid_data("slurm")
+    _mapping_at(data, "slurm")["memory"] = value
+
+    with pytest.raises(ConfigurationValidationError, match=r"slurm\.memory"):
         _load_profile(tmp_path, data)
 
 

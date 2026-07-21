@@ -46,7 +46,7 @@ dask-jobqueue fake boundary, strict JSON operational evidence.
   scheduler_bytes, dask)` and `normalize_slurm_memory(value, location)`.
 - Consumes: `ConfigurationValidationError` and the existing immutable `SlurmSpec`.
 
-- [ ] **Step 1: Write failing parser and current-profile tests**
+- [x] **Step 1: Write failing parser and current-profile tests**
 
 ```python
 def test_approved_decimal_memory_rounds_up_to_binary_gib() -> None:
@@ -64,22 +64,22 @@ whitespace, unsupported `G`/`GiB`, non-strings, semantic overflow, and ceiling
 overflow. Require strict YAML loading and direct-profile revalidation to use the same
 parser, and require the checked-in `500GB` example to produce the quantity above.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `uv run pytest -q tests/unit/test_config_memory.py tests/unit/test_config_execution.py tests/unit/test_phase2_examples.py`
 
 Expected: collection/import failures for the absent memory interface and profile
 validation failures showing unsupported quantities still pass.
 
-- [ ] **Step 3: Implement the minimal dependency-light normalizer**
+- [x] **Step 3: Implement the minimal dependency-light normalizer**
 
 Use an exact `([1-9][0-9]*)(KB|MB|GB|TB)` full match, decimal multipliers, integer
-ceiling to `K`, `M`, or `G` binary units, and explicit signed-64-bit checks before
+ceiling to whole `G` binary units, and explicit signed-64-bit checks before
 multiplication and after ceiling. Keep the profile spelling immutable; expose the
 pure helper from `cyexm.config`; call it from `_slurm` so direct revalidation shares
 the same contract.
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run the Step 2 command. Expected: all selected tests pass.
 
@@ -95,11 +95,11 @@ Run the Step 2 command. Expected: all selected tests pass.
 - Produces: cluster `memory="466GiB"`, `job_mem="466G"`; exact requested-memory
   evidence; `validate_slurm_job_script(...) -> int` returning rendered worker bytes.
 
-- [ ] **Step 1: Write failing construction, rendering, and evidence tests**
+- [x] **Step 1: Write failing construction, rendering, and evidence tests**
 
 Require the fake cluster kwargs to contain `memory="466GiB"` and `job_mem="466G"`,
-the rendered script to contain `#SBATCH --mem=466G` and Dask's
-`--memory-limit 466.00 GiB`, and the validator to return 500,363,689,984. Require
+the rendered script to contain `#SBATCH --mem=466G` and dask-jobqueue's
+`--memory-limit 466.00GiB`, and the validator to return 500,363,689,984. Require
 requested evidence to contain this exact object:
 
 ```python
@@ -115,14 +115,14 @@ requested evidence to contain this exact object:
 Add fail-closed evidence mismatches and rendered worker values below, above, or
 syntactically different from the normalized byte count.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `uv run pytest -q tests/unit/test_execution_slurm.py tests/unit/test_workflow_api.py`
 
 Expected: assertions show the current `500GB` construction/header and absent memory
 evidence, while the validator returns `None`.
 
-- [ ] **Step 3: Implement normalized construction and validation**
+- [x] **Step 3: Implement normalized construction and validation**
 
 Normalize once after strict profile validation. Add the exact memory object to
 nonzero requested evidence and validate it by recomputing the quantity. Pass its
@@ -130,7 +130,7 @@ nonzero requested evidence and validate it by recomputing the quantity. Pass its
 rendered `--memory-limit` value with Dask's lazy-loaded `parse_bytes`, require it to
 equal `scheduler_bytes`, and return that integer before scaling.
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run the Step 2 command. Expected: all selected tests pass with zero unsafe scale or
 submission calls.
@@ -155,22 +155,22 @@ submission calls.
 - Produces: exact worker-probe comparison and scheduler/node capacity comparisons
   against 500,363,689,984 normalized bytes.
 
-- [ ] **Step 1: Write failing acceptance and documentation tests**
+- [x] **Step 1: Write failing acceptance and documentation tests**
 
-Update realistic scripts to `--mem=466G` and `--memory-limit 466.00 GiB`. Require
+Update realistic scripts to `--mem=466G` and `--memory-limit 466.00GiB`. Require
 worker smoke records and probes to equal the rendered worker bytes, `ReqTRES` and
 `AllocTRES` to cover scheduler bytes, and partition/node MiB facts converted to bytes
 to cover the request. Require README and directory guidance to distinguish semantic
 decimal memory from ceiling binary scheduler/Dask memory.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `uv run pytest -q tests/unit/test_hpc_environment.py tests/unit/test_phase2_documentation.py tests/unit/test_repository_policy.py`
 
 Expected: acceptance expectations and documentation fragments fail against the old
 500GB header/semantic-only comparisons.
 
-- [ ] **Step 3: Implement acceptance and documentation contract**
+- [x] **Step 3: Implement acceptance and documentation contract**
 
 Return worker bytes from the acceptance validator wrapper; remove the duplicated
 acceptance `_memory_bytes`; derive quantities through production normalization and
@@ -178,7 +178,7 @@ template validation; use byte-safe ceiling comparisons for partition, TRES, and 
 facts. Update README, inherited `AGENTS.md` guidance, and the ignored implementation
 report with RED/GREEN and gate evidence.
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run all Task 1-3 focused modules. Expected: all pass without an HPC selector.
 
@@ -191,19 +191,19 @@ Run all Task 1-3 focused modules. Expected: all pass without an HPC selector.
 - Consumes: all three task deliverables.
 - Produces: one detailed implementation commit and a clean worktree.
 
-- [ ] **Step 1: Run every portable gate**
+- [x] **Step 1: Run every portable gate**
 
 Run lock check and locked sync,  `pytest -m "unit and not hpc" tests/unit -q`,
 `pytest -m "integration and not hpc" tests/integration -q`, Ruff check, Ruff format
 check, BasedPyright, all-files pre-commit, and `git diff --check` with the required uv
 and six thread environment variables.
 
-- [ ] **Step 2: Audit the exact staged diff**
+- [x] **Step 2: Audit the exact staged diff**
 
 Verify no external evidence, dataset content, scheduler output, credentials, lock
 changes, or unrelated user edits are staged.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git commit -m "fix: normalize SLURM memory requests"

@@ -88,8 +88,9 @@ The profile's SLURM memory value is a semantic decimal quantity: the approved
 `500GB` value means exactly 500,000,000,000 bytes. It must never be copied verbatim
 to `#SBATCH --mem`, because SLURM accepts integer `K`, `M`, `G`, or `T` suffixes and
 interprets them as binary units. Cy-ExM parses the strict profile value once and
-rounds it up to the smallest whole binary unit at the GiB scale for this profile.
-Thus `500GB` becomes the scheduler quantity `466G`, exactly 500,363,689,984 bytes.
+rounds every accepted semantic value up to a whole binary GiB so dask-jobqueue's
+worker formatter remains byte-exact. Thus `500GB` becomes the scheduler quantity
+`466G`, exactly 500,363,689,984 bytes.
 
 The centralized quantity carries three spellings of two facts: the profile spelling
 and its semantic byte count, the SLURM spelling and its ceiling-normalized byte

@@ -186,11 +186,13 @@ contains paths, native threads, executor selection, and machine resources. This
 separation lets the same manifest run sequentially, on a local workstation, or on an
 HPC system without changing its scientific identity.
 
-Planning validates inputs and creates one immutable `RoundTask` per moving round.
-The selected executor schedules those coarse tasks. Registration and channel
-transformation remain serial inside each round task, and Phase 1 completion records
-are the only restart authority. There is no nested chunk multiprocessing, no nested
-Dask graph, and no scheduler-dependent artifact cache.
+Planning validates inputs and creates one immutable `ReferenceTask` plus one immutable
+`RoundTask` per moving round. The reference task first materializes every declared
+reference channel on one shared reference grid. The selected executor then schedules
+the coarse moving-round tasks only after that prerequisite succeeds. Registration and
+channel transformation remain serial inside each moving-round task, and Phase 1
+completion records are the only restart authority. There is no nested chunk
+multiprocessing, no nested Dask graph, and no scheduler-dependent artifact cache.
 
 The public workflow API is available from `cyexm.workflow`:
 
@@ -243,7 +245,9 @@ The fields are:
 | `dataset_id` | string matching `[A-Za-z0-9][A-Za-z0-9._-]*` | Becomes the dataset output-directory name. |
 | `voxel_spacing_um` / `x`, `y`, `z` | three finite positive numbers | Physical voxel spacing in micrometers in XYZ order. |
 | `reference` / `round` | nonnegative built-in integer | Fixed-reference imaging round. |
-| `reference` / `channel` | safe relative POSIX path | Fixed-reference image, resolved below `paths.dataset_root`. |
+| `reference` / `registration_channel` | safe relative POSIX path | Fixed image used for every moving-round registration; it must occur exactly once in `reference.channels`. |
+| `reference` / `channels` | nonempty ordered list with unique `file` values and basenames | Every reference-round image copied to the shared reference output in declaration order. |
+| reference channel `file` | safe relative POSIX path | Source below `paths.dataset_root`; its basename becomes the reference channel output name. |
 | `registration` / `crop` | built-in boolean | Enables or disables Phase 1 fixed/moving foreground cropping. |
 | `registration` / `linear` / `type` | `Translation`, `Rigid`, `Similarity`, `Affine`, or `TRSAA` | Phase 1 linear method. |
 | `registration` / `linear` / `accuracy` | `high`, `medium`, `low`, or `dry run` | Phase 1 linear schedule. |
@@ -263,8 +267,18 @@ Scientific image paths must be safe relative POSIX paths. Absolute paths, empty 
 `.` components, `..`, NULs, newlines, and paths that resolve outside the execution
 profile's dataset root are rejected. Round numbers are built-in integers rather than
 booleans, channel files are unique within a round, and the registration channel must
-match a channel entry exactly. Planning requires all inputs to be scalar 3-D TIFFs
-with compatible shapes and manifest-compatible physical spacing.
+match a channel entry exactly. All declared reference channels must have identical
+native shape, origin, spacing, and direction because they were acquired together; if
+cropping is enabled, Cy-ExM estimates one crop from the reference registration channel
+and applies those scientifically identical bounds to every reference channel. Moving
+registration and dependent-channel images may differ from the reference along any
+spatial axis: ANTs resamples them onto the fixed reference grid before nonlinear
+chunking and before final channel export. Planning requires every input to be a scalar
+3-D TIFF with manifest-compatible physical spacing.
+
+Schema version 1 intentionally uses only `reference.registration_channel` and
+`reference.channels`. The retired singular `reference.channel` form is rejected;
+there is no dual parser or compatibility schema to maintain.
 
 The loader uses safe YAML decoding and rejects unknown keys, missing keys, duplicate
 mapping keys, YAML aliases, custom tags, non-scalar keys, specialized collection
@@ -431,9 +445,12 @@ fingerprint mismatch, and a scientifically incompatible plan requires a new outp
 root. `--force-round` and `--force-all` only request recomputation within a compatible
 plan.
 
-For round 2, the workflow uses `rounds/round-002/registration/`,
-`rounds/round-002/channels/`, and `rounds/round-002/logs/round-002.log`. The complete
-layout is:
+For reference round 1 and moving round 2, the workflow uses the following layout.
+Reference sources are copied, never moved or modified. The current export boundary is
+TIFF; the shared channel directory and task model keep output-format selection separate
+so a future schema can add formats without changing registration semantics.
+The moving-round directories are `rounds/round-002/registration/`,
+`rounds/round-002/channels/`, and `rounds/round-002/logs/round-002.log`.
 
 ```text
 <output-root>/<dataset-id>/
@@ -441,10 +458,19 @@ layout is:
   workflow-runs/
     <run-id>.json
   rounds/
+    round-001/
+      registration/
+        reference_crop_indices.json                 # only when crop: true
+        reference_crop_indices.json.complete.json   # only when crop: true
+      channels/
+        round_1_488_tubulin.tif
+        round_1_488_tubulin.tif.complete.json
+        <each-other-declared-reference-basename>
+        <each-other-declared-reference-basename>.complete.json
+      logs/
+        round-001.log
     round-002/
       registration/
-        fixed_reference.tif
-        fixed_reference.tif.complete.json
         image_metrics_pre-registration.txt
         image_metrics_pre-registration.txt.complete.json
         linear_transform_2.mat
@@ -457,8 +483,6 @@ layout is:
         image_metrics_nonlinear-registered.txt.complete.json
         nonlinear_registered_2.tif
         nonlinear_registered_2.tif.complete.json
-        fixed_crop_indices_2.json                 # only when crop: true
-        fixed_crop_indices_2.json.complete.json   # only when crop: true
         moving_crop_indices_2.json                # only when crop: true
         moving_crop_indices_2.json.complete.json  # only when crop: true
         round_2_chunks/                            # serial_chunked only
@@ -478,10 +502,18 @@ layout is:
 
 Every reusable artifact has its own matching `.complete.json`. A file alone, a
 completion record alone, an invalid identity, or incompatible request evidence is not
-reusable. A normal rerun scans those Phase 1 records, reports fully valid rounds as
-reused without opening an executor, and submits only incomplete work. This ordinary
-resume is the default. Valid earlier affine or chunk work remains reusable after a
-later stage fails.
+reusable. A normal rerun scans those Phase 1 records and submits only incomplete moving
+rounds. Reference preparation still crosses the selected executor barrier so its
+sources and shared-grid evidence are revalidated; its task reports `completed` with
+reused artifacts when nothing is rewritten. This ordinary resume is the default.
+Valid earlier affine or chunk work remains reusable after a later stage fails.
+
+Moving rounds read the prepared registration channel directly from
+`rounds/round-001/channels/`; they do not create a per-round `fixed_reference.tif`.
+The reference task is a hard executor barrier for sequential, local-Dask, and SLURM
+execution. A reference failure prevents moving-round submission. Forcing the reference
+round invalidates all moving descendants because their fixed-input provenance changed;
+forcing only a moving round leaves valid reference artifacts reusable.
 
 `workflow-runs/<run-id>.json` is an atomic operational summary containing the
 execution profile, force selection, round results, timestamps, and available SLURM
@@ -491,9 +523,10 @@ stderr and per-round shared logs; it does not currently create the reserved root
 `logs/<run-id>.log` path.
 
 The read-only status command validates the scientific plan and authoritative
-completion records without importing scientific or scheduler runtimes. Each known
-round is classified as `pending`, `partial`, `complete`, or `invalid`, and JSON output
-lists complete, incomplete, and invalid artifact paths.
+completion records without importing scientific or scheduler runtimes. It reports the
+reference preparation as its declared round alongside moving rounds. Each known round
+is classified as `pending`, `partial`, `complete`, or `invalid`, and JSON output lists
+complete, incomplete, and invalid artifact paths.
 
 #### Diagnostic image versus transformed channel
 
@@ -517,26 +550,29 @@ no silent fallback when a selected executor fails.
 
 #### Sequential
 
-The sequential executor is the numerical and restart reference. It runs pending
-rounds in canonical order in the CLI process, continues to later independent rounds
-after a structured round failure, and opens no Dask scheduler.
+The sequential executor is the numerical and restart reference. It prepares or reuses
+the reference round first, then runs pending moving rounds in canonical order in the
+CLI process. A reference failure stops the dependency chain; a moving-round failure
+does not prevent later independent moving rounds. It opens no Dask scheduler.
 
 #### Local Dask
 
-`local_dask` lazily creates an owned, process-based `LocalCluster`. It starts
-`min(pending rounds, configured workers)` workers, never starts a cluster for a fully
-reused workflow, and gives every worker one `round_slot`. Every coarse round task
-requires that resource, so only one round runs in a worker even if its Dask
-`threads_per_worker` is larger. The client and cluster are closed for success,
-failure, startup error, and interruption.
+`local_dask` lazily creates one owned, process-based `LocalCluster`. It starts
+`min(pending tasks, configured workers)` workers and gives every worker one
+`round_slot`. Even when all moving rounds are reusable, the cluster runs the reference
+revalidation barrier; it submits no moving work. The reference prerequisite and
+subsequent coarse moving-round tasks use that same cluster. Every task requires one
+slot, so only one runs in a worker even if its Dask `threads_per_worker` is larger. The
+client and cluster are closed for success, failure, startup error, and interruption.
 
 #### SLURM
 
-`slurm` lazily constructs an owned dask-jobqueue `SLURMCluster` and scales it to
-`min(pending rounds, configured workers)`. It requests one process per job and gives
-each worker one `round_slot`; each submitted round consumes that slot. This prevents
-more than one registration round in a worker job. A claim of one dedicated node per
-job additionally depends on the site's allocation/exclusivity policy and must be
+`slurm` lazily constructs one owned dask-jobqueue `SLURMCluster` and scales it to
+`min(pending tasks, configured workers)`. It requests one process per job and gives
+each worker one `round_slot`; reference preparation and every submitted moving round
+consume one slot. The reference barrier does not create a second cluster. This
+prevents more than one workflow task in a worker job. A claim of one dedicated node
+per job additionally depends on the site's allocation/exclusivity policy and must be
 confirmed during real HPC acceptance.
 
 Before any registration submission, every connected worker must pass preflight.
@@ -645,7 +681,9 @@ Dask scheduling, nested multiprocessing, parallel channel transformation, job ar
 cross-dataset scheduling, cloud or Kubernetes executors, or automatic resource
 optimization. It does not recreate ClearEx's GUI, pipeline, TRE, or general analysis
 framework, and it never silently changes executor: no silent fallback is permitted.
-Reference-round channels are not copied or transformed by this workflow.
+Reference-round channels are materialized as shared TIFF outputs, with one identical
+crop applied to all of them when requested. Export to other file formats remains a
+future extension.
 
 ## Development checks
 

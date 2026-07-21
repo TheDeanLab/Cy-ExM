@@ -11,7 +11,8 @@
   masks, interpolation modes, histogram matching, and single-precision policy.
 - Apply forward transforms in warp-then-affine list order with both inversion
   flags false. Scalars use linear interpolation; labels and masks use
-  `nearestNeighbor`, with transformed masks thresholded at 0.5.
+  `nearestNeighbor`, with transformed masks cast to float and thresholded at 0.5 so
+  ANTSpyX metric masks retain the required floating pixel type.
 - Keep affine decomposition helpers callable without runtime configuration;
   they are characterization utilities over arrays already supplied by callers.
 - Preserve image origin, spacing, direction, vector components, and the public
@@ -32,6 +33,9 @@
 - Linear registration accepts native fixed and moving grids, but affine resampling
   must produce the exact fixed-reference scalar and mask geometry before whole-image
   or serial-chunked nonlinear work. Keep chunk geometry strict on that fixed grid.
+- Pre-registration metrics resample unequal moving scalar and mask grids to the fixed
+  grid for diagnosis only; this must not replace or pre-resample the native moving
+  inputs supplied to affine estimation.
 - Standalone Phase 1 registration retains `prepared_fixed=False`, including its
   fixed crop and persisted `fixed_reference.tif`. Workflow rounds explicitly use
   `prepared_fixed=True`: never recrop or duplicate the prepared fixed TIFF, but keep

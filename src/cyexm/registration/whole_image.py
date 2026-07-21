@@ -584,6 +584,23 @@ class ImageRegistration:
             "nonlinear-registered": paths.nonlinear_metrics,
         }
         try:
+            source_moving_geometry = backend.geometry(moving)
+            resampled_to_fixed = not geometry_compatible(
+                backend.geometry(fixed), source_moving_geometry
+            )
+            if resampled_to_fixed:
+                moving = backend.resample_to_target(
+                    image=moving,
+                    target=fixed,
+                    interpolation="linear",
+                )
+                moving_mask = backend.threshold_mask(
+                    backend.resample_to_target(
+                        image=moving_mask,
+                        target=fixed_mask,
+                        interpolation="nearestNeighbor",
+                    )
+                )
             upstream = None
             if stage == "linearly-registered":
                 upstream = FileIdentity.from_path(paths.affine)
@@ -591,6 +608,8 @@ class ImageRegistration:
                 upstream = FileIdentity.from_path(paths.warp)
             parameters: dict[str, object] = {
                 "moving_geometry": backend.geometry(moving).to_dict(),
+                "source_moving_geometry": source_moving_geometry.to_dict(),
+                "resampled_to_fixed": resampled_to_fixed,
                 "sampling": "regular",
                 "sampling_pct": 1.0,
             }

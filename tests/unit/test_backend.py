@@ -156,8 +156,11 @@ def test_threshold_mask_uses_the_characterized_half_value_cutoff(
 
     result = AntsRegistrationBackend().threshold_mask(source)
 
+    threshold_source = calls.threshold.pop("image")
+    assert threshold_source is not source
+    assert threshold_source.data.dtype == np.float32
+    assert np.array_equal(threshold_source.data, source.data)
     assert calls.threshold == {
-        "image": source,
         "low_thresh": 0.5,
         "high_thresh": 1.0,
         "inval": 1,

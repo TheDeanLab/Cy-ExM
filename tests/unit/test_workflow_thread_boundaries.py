@@ -101,7 +101,7 @@ from cyexm.workflow.models import RoundResult
 
 
 class Executor:
-    def execute(self, tasks):
+    def execute(self, reference_task, tasks):
         config = NativeThreadConfig(itk_threads=2, blas_threads=3)
         configure_native_threads(config)
         import numpy
@@ -113,12 +113,25 @@ class Executor:
         actual = {name: os.environ.get(name) for name in NATIVE_THREAD_ENV_VARS}
         assert actual == expected
         results = []
-        for task in tasks:
+        for task in (reference_task, *tasks):
+            is_reference = task is reference_task
             artifacts = (
-                task.registration_directory / f"linear_transform_{task.round}.mat",
-                task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
-                task.registration_directory / f"nonlinear_registered_{task.round}.tif",
-                *(channel.output for channel in task.channels),
+                (
+                    *(
+                        ()
+                        if task.crop_bounds_path is None
+                        else (task.crop_bounds_path,)
+                    ),
+                    *(channel.output for channel in task.channels),
+                )
+                if is_reference
+                else (
+                    task.registration_directory / f"linear_transform_{task.round}.mat",
+                    task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
+                    task.registration_directory
+                    / f"nonlinear_registered_{task.round}.tif",
+                    *(channel.output for channel in task.channels),
+                )
             )
             results.append(
                 RoundResult(
@@ -132,7 +145,9 @@ class Executor:
                     pid=os.getpid(),
                     dask_task_key=None,
                     slurm_job_id=None,
-                    strategy=task.strategy,
+                    strategy=(
+                        "reference-preparation" if is_reference else task.strategy
+                    ),
                     native_threads=(("itk", 2), ("blas", 3)),
                     artifact_paths=tuple(str(path) for path in artifacts),
                     reused_artifacts=(),
@@ -176,6 +191,7 @@ def test_cli_sequential_run_applies_explicit_threads_after_planning(
 import os
 import sys
 
+import cyexm.workflow.reference_task as reference_task
 import cyexm.workflow.round_task as round_task
 from cyexm.cli import main
 from cyexm.runtime import (
@@ -199,11 +215,19 @@ def run(task):
         **{name: "3" for name in NATIVE_THREAD_ENV_VARS[1:]},
     }
     assert {name: os.environ.get(name) for name in NATIVE_THREAD_ENV_VARS} == expected
+    is_reference = not hasattr(task, "strategy")
     artifacts = (
-        task.registration_directory / f"linear_transform_{task.round}.mat",
-        task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
-        task.registration_directory / f"nonlinear_registered_{task.round}.tif",
-        *(channel.output for channel in task.channels),
+        (
+            *(() if task.crop_bounds_path is None else (task.crop_bounds_path,)),
+            *(channel.output for channel in task.channels),
+        )
+        if is_reference
+        else (
+            task.registration_directory / f"linear_transform_{task.round}.mat",
+            task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
+            task.registration_directory / f"nonlinear_registered_{task.round}.tif",
+            *(channel.output for channel in task.channels),
+        )
     )
     return RoundResult(
         dataset_id=task.dataset_id,
@@ -216,7 +240,7 @@ def run(task):
         pid=os.getpid(),
         dask_task_key=None,
         slurm_job_id=None,
-        strategy=task.strategy,
+        strategy="reference-preparation" if is_reference else task.strategy,
         native_threads=(("itk", 2), ("blas", 3)),
         artifact_paths=tuple(str(path) for path in artifacts),
         reused_artifacts=(),
@@ -225,6 +249,7 @@ def run(task):
     )
 
 
+reference_task.run_reference_task = run
 round_task.run_round_task = run
 raise SystemExit(
     main(

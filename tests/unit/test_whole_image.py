@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from fakes import FakeBackend, FakeImage
+from fakes import FakeBackend, FakeImage, fake_image
 
 import cyexm.registration.whole_image as whole_image
 from cyexm.errors import CacheValidationError, RegistrationStageError
@@ -1912,3 +1912,23 @@ def test_crop_completion_records_capture_inputs_and_effective_threads(
         )
         assert request.native_threads == resolved_native_threads.values
         assert "native_thread_sources" not in request.parameters
+
+
+def test_pre_registration_metrics_resample_unequal_moving_grid_to_fixed(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        fixed_image=fake_image(data=np.ones((6, 8, 10), dtype=np.float32)),
+        moving_image=fake_image(data=np.ones((7, 9, 11), dtype=np.float32)),
+    )
+
+    make_registration(tmp_path, backend=backend, prepared_fixed=True).register()
+
+    assert len(backend.resample_calls) == 2
+    assert tuple(call[2] for call in backend.resample_calls) == (
+        "linear",
+        "nearestNeighbor",
+    )
+    fixed, moving, fixed_mask, moving_mask = backend.metric_calls[0]
+    assert backend.geometry(moving) == backend.geometry(fixed)
+    assert backend.geometry(moving_mask) == backend.geometry(fixed_mask)

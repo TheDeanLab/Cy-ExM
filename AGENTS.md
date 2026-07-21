@@ -32,7 +32,10 @@
   authority, and the serial chunk workflow remains the numerical reference. Do not
   introduce nested chunk multiprocessing, a Dask chunk graph, or
   `ParallelChunkedImageRegistration` inside round-level tasks by default.
-- Schedule one coarse task per moving round and keep serial work inside that task.
+- Schedule one reference-preparation prerequisite followed by one coarse task per
+  moving round, and keep serial work inside each task. All executors use a hard
+  reference barrier in the same owned execution lifecycle; reference failure prevents
+  moving submission. Forcing the reference round propagates to every moving descendant.
   Worker-backed executors expose one `round_slot` per worker and every submitted round
   consumes one slot. SLURM uses one process per SLURM job and one node per round; do not
   weaken that resource contract without explicit scientific and operational acceptance.
@@ -58,6 +61,10 @@
   boundary: its scalar and mask outputs, every nonlinear input and output, the full
   warp, and every transformed dependent channel must match the fixed-reference
   geometry.
+- Every declared reference-round channel must share one exact native geometry. Copy
+  each source into the reference round's shared `channels` directory, never move it;
+  when cropping is enabled, estimate one crop from the registration channel and apply
+  the identical bounds to all declared reference channels.
 - Preserve masks based on values greater than zero, affine-before-nonlinear transform
   order, TRSAA linear registration, SyNOnly nonlinear registration, scalar linear
   interpolation, mask nearest-neighbor interpolation, and ANTs origin, spacing, and

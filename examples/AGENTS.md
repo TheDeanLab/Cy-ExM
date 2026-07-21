@@ -26,3 +26,6 @@
   `examples/execution-sequential.yaml`, `examples/execution-local-dask.yaml`, and
   `examples/execution-slurm-512gb.yaml`. Keep them strict-loader compatible and preserve
   their separation between reusable scientific settings and editable machine resources.
+- Scientific-manifest examples declare `reference.registration_channel` and every
+  intended `reference.channels[].file`; do not use the retired singular
+  `reference.channel` field. Reference declaration order is preserved in outputs.

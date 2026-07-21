@@ -16,6 +16,8 @@
   along every spatial axis; fixed-grid equality is a post-resampling output contract,
   not a planning input requirement.
 - Force never bypasses a scientific-plan fingerprint mismatch.
+- Forcing the reference task forces every moving descendant; forcing only a moving
+  task must preserve reusable reference evidence. Status includes the reference round.
 - Use no module-scope scientific or scheduler imports.
 - `round_task.py` is the only real registration execution boundary in workflow. It
   configures the task's native threads before its lazy registration/scientific

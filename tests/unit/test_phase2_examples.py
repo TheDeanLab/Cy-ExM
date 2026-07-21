@@ -41,7 +41,12 @@ def test_spheroid_manifest_records_approved_scientific_inputs() -> None:
     assert manifest.dataset_id == "spheroid-registration-example"
     assert manifest.voxel_spacing_um == (0.324, 0.324, 0.900)
     assert manifest.reference.round == 1
-    assert manifest.reference.channel == PurePosixPath("round_1_488_tubulin.tif")
+    assert manifest.reference.registration_channel == PurePosixPath(
+        "round_1_488_tubulin.tif"
+    )
+    assert tuple(channel.file for channel in manifest.reference.channels) == (
+        PurePosixPath("round_1_488_tubulin.tif"),
+    )
     assert manifest.registration == RegistrationSpec(
         crop=False,
         linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),

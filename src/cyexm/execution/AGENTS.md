@@ -7,15 +7,16 @@
   HPC acceptance remain unaccepted until Phase 2E.
 - Scheduler imports occur only inside the selected operation.
 - Local Dask uses process-isolated workers and bounds their count to
-  `min(pending rounds, configured workers)`. Schedule one coarse task per round. Each
-  worker advertises one `round_slot`, and every submitted round task requests and
-  consumes one.
+  `min(pending tasks, configured workers)`. Schedule one reference prerequisite and
+  one coarse task per moving round in the same owned cluster. Each worker advertises
+  one `round_slot`, and every submitted workflow task requests and consumes one.
 - Every executor runs the reference-preparation task as a hard prerequisite in the
   same owned worker pool. Moving-round futures may be submitted only after the
   reference result is successful; a failed reference result ends the execution
   without submitting descendants.
-- SLURM scales to `min(pending rounds, configured workers)` with one worker process
-  and one advertised `round_slot` per job; every submitted round requests that slot.
+- SLURM scales to `min(pending tasks, configured workers)` with one worker process
+  and one advertised `round_slot` per job; every submitted workflow task requests that
+  slot. The reference barrier must not construct or scale a second cluster.
   Round semantic profile memory upward to whole binary GiB, pass the `G` spelling to
   SLURM and the matching `GiB` spelling to Dask, and record both semantic and
   scheduler-normalized facts. Never copy a decimal `GB` suffix into `#SBATCH`.

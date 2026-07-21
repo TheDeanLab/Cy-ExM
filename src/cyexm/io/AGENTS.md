@@ -13,3 +13,6 @@
 - Reference-round preparation must use the existing atomic TIFF writer boundary:
   clip to uint16 without normalization, preserve the cropped or full source geometry,
   reopen for validation, and pair every output with completion metadata.
+- TIFF is the schema-version-1 export format, not a registration invariant. Keep
+  format-specific writing and validation behind I/O boundaries so future formats do
+  not require changing transform or executor semantics.

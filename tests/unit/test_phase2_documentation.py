@@ -74,8 +74,10 @@ def test_readme_documents_installation_and_scheduler_neutral_architecture() -> N
     for required in (
         "scientific dataset manifest",
         "execution profile",
+        "one immutable `referencetask`",
         "one immutable `roundtask` per moving round",
-        "serial inside each round task",
+        "hard executor barrier",
+        "serial inside each moving-round task",
         "phase 1 completion records are the only restart authority",
         "no nested chunk multiprocessing",
         "planning is mutation-free",
@@ -94,7 +96,6 @@ def test_readme_documents_every_scientific_manifest_field_and_rule() -> None:
         "z",
         "reference",
         "round",
-        "channel",
         "registration",
         "crop",
         "linear",
@@ -122,6 +123,8 @@ def test_readme_documents_every_scientific_manifest_field_and_rule() -> None:
         "`linear` or `nearestneighbor`",
         "safe relative posix path",
         "registration channel must be listed",
+        "retired singular `reference.channel` form is rejected",
+        "scientifically identical bounds",
         "moving rounds are unique",
         "unknown keys",
         "duplicate mapping keys",
@@ -242,6 +245,8 @@ def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
         "workflow-runs/",
         "<run-id>.json",
         "rounds/round-002/registration/",
+        "round-001/",
+        "reference_crop_indices.json",
         "linear_transform_2.mat",
         "nonlinear_warp_2.nii.gz",
         "nonlinear_registered_2.tif",
@@ -264,6 +269,9 @@ def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
         "force cannot bypass",
         "requires a new output root",
         "operational summaries never authorize artifact reuse",
+        "do not create a per-round `fixed_reference.tif`",
+        "forcing the reference round invalidates all moving descendants",
+        "reference preparation as its declared round",
     ):
         assert required in normalized
 
@@ -287,7 +295,7 @@ def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> No
     for required in (
         "sequential executor is the numerical and restart reference",
         "process-based `localcluster`",
-        "min(pending rounds, configured workers)",
+        "min(pending tasks, configured workers)",
         "one `round_slot`",
         "one process per job",
         "every connected worker must pass preflight",

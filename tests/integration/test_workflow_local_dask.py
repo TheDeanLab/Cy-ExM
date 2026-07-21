@@ -327,8 +327,10 @@ def test_sequential_and_local_dask_workflows_are_scientifically_equivalent_and_r
     assert tuple(result.status for result in sequential_result.rounds) == (
         "completed",
         "completed",
+        "completed",
     )
-    _assert_distinct_overlapping_workers(local_result.rounds)
+    assert local_result.rounds[0].strategy == "reference-preparation"
+    _assert_distinct_overlapping_workers(local_result.rounds[1:])
     for sequential_task, local_task in zip(
         sequential_plan.tasks,
         local_plan.tasks,
@@ -340,14 +342,26 @@ def test_sequential_and_local_dask_workflows_are_scientifically_equivalent_and_r
     reused = run_workflow(local_plan)
 
     assert reused.succeeded
-    assert tuple(result.status for result in reused.rounds) == ("reused", "reused")
+    assert tuple(result.status for result in reused.rounds) == (
+        "completed",
+        "reused",
+        "reused",
+    )
+    expected_by_round = {
+        local_plan.reference_task.round: tuple(
+            str(channel.output) for channel in local_plan.reference_task.channels
+        ),
+        **{
+            task.round: tuple(
+                str(path)
+                for path in local_plan.expected_artifacts
+                if path.is_relative_to(task.registration_directory.parent)
+            )
+            for task in local_plan.tasks
+        },
+    }
     assert tuple(result.artifact_paths for result in reused.rounds) == tuple(
-        tuple(
-            str(path)
-            for path in local_plan.expected_artifacts
-            if path.is_relative_to(task.registration_directory.parent)
-        )
-        for task in local_plan.tasks
+        expected_by_round[result.round] for result in reused.rounds
     )
     assert tuple(result.reused_artifacts for result in reused.rounds) == tuple(
         result.artifact_paths for result in reused.rounds

@@ -16,7 +16,13 @@ from cyexm.config.models import (
     RegistrationStageSpec,
 )
 from cyexm.execution.dask import LocalDaskExecutor
-from cyexm.workflow.models import ChannelTask, RoundResult, RoundTask
+from cyexm.workflow.models import (
+    ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
+    RoundResult,
+    RoundTask,
+)
 
 from .local_dask_helpers import (
     independent_failure_runner,
@@ -26,7 +32,7 @@ from .local_dask_helpers import (
 
 pytestmark = pytest.mark.integration
 
-type _Runner = Callable[[RoundTask], RoundResult]
+type _Runner = Callable[[ReferenceTask | RoundTask], RoundResult]
 
 
 def _profile(
@@ -89,6 +95,25 @@ def _task(tmp_path: Path, round_number: int) -> RoundTask:
     )
 
 
+def _reference_task(tmp_path: Path) -> ReferenceTask:
+    round_root = (tmp_path / "output" / "round-001").resolve()
+    source = (tmp_path / "dataset" / "reference-source.tif").resolve()
+    output = (tmp_path / "dataset" / "fixed.tif").resolve()
+    return ReferenceTask(
+        dataset_id="bounded-local-dask",
+        round=1,
+        registration_channel_source=source,
+        registration_channel_output=output,
+        registration_directory=round_root / "registration",
+        crop_bounds_path=None,
+        log_path=round_root / "logs" / "round-001.log",
+        voxel_spacing_xyz=(1.0, 1.0, 1.0),
+        crop=False,
+        native_threads=NativeThreadSpec(itk=1, blas=1),
+        channels=(ReferenceChannelTask(source=source, output=output),),
+    )
+
+
 def _observations(task: RoundTask) -> tuple[dict[str, object], ...]:
     evidence_directory = task.registration_directory.parent / "synthetic-evidence"
     return tuple(
@@ -134,7 +159,9 @@ def _execute_and_assert_cleanup(
     tasks: tuple[RoundTask, ...],
 ) -> tuple[RoundResult, ...]:
     before = _cluster_owned_child_pids()
-    results = LocalDaskExecutor(profile, _runner=runner).execute(tasks)
+    results = LocalDaskExecutor(profile, _runner=runner).execute(
+        _reference_task(profile.source_path.parent), tasks
+    )
     scratch = profile.paths.worker_local_directory
     assert scratch is not None
 
@@ -148,7 +175,10 @@ def _execute_and_assert_cleanup(
 
     assert _cluster_owned_child_pids() - before == set()
     assert _active_dask_scratch_entries(scratch) == ()
-    return results
+    assert tuple((result.round, result.status) for result in results[:1]) == (
+        (1, "completed"),
+    )
+    return results[1:]
 
 
 def _overlap(first: dict[str, object], second: dict[str, object]) -> bool:

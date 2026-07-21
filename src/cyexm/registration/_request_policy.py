@@ -57,6 +57,26 @@ def crop_parameters(role: Literal["fixed", "moving"]) -> dict[str, object]:
     }
 
 
+def reference_crop_parameters() -> dict[str, object]:
+    return {
+        "policy": "reference-crop-v1",
+        "down_sampling": 4,
+        "lower_pct": 0.1,
+        "upper_pct": 99.9,
+    }
+
+
+def reference_channel_parameters(*, index: int, cropped: bool) -> dict[str, object]:
+    return {
+        "policy": "reference-channel-v1",
+        "channel_index": index,
+        "cropped": cropped,
+        "axis_convention": AXIS_CONVENTION_VERSION,
+        "output_format": OUTPUT_FORMAT_POLICY,
+        "postprocessing": CHANNEL_POSTPROCESSING_POLICY,
+    }
+
+
 def fixed_reference_parameters(minimum: float, maximum: float) -> dict[str, object]:
     """Return canonical fixed-reference persistence parameters."""
     return {"minimum": minimum, "maximum": maximum}

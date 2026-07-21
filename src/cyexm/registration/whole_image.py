@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
-from numbers import Integral, Real
+from numbers import Real
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,7 +15,6 @@ from cyexm.errors import (
     ChunkRegistrationError,
     RegistrationStageError,
 )
-from cyexm.io.images import Bounds3D, robust_bounding_box
 from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration._native_paths import discard_path
 from cyexm.registration._request_policy import (
@@ -34,6 +32,12 @@ from cyexm.registration._request_policy import (
 )
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import AntsRegistrationBackend, RegistrationBackend
+from cyexm.registration.crop import (
+    bounds_text,
+    estimate_bounds,
+    read_bounds,
+    validate_bounds,
+)
 from cyexm.runtime import (
     NativeThreadConfig,
     ResolvedNativeThreads,
@@ -416,47 +420,9 @@ class ImageRegistration:
         )
         return fixed_cropped, moving_cropped
 
-    @staticmethod
-    def _validated_bounds(value: object, shape: tuple[int, int, int]) -> Bounds3D:
-        if isinstance(value, str | bytes):
-            raise TypeError("crop bounds must contain exactly six integers")
-        try:
-            values = tuple(value)  # type: ignore[arg-type]
-        except TypeError as error:
-            raise TypeError("crop bounds must contain exactly six integers") from error
-        if len(values) != 6:
-            raise ValueError("crop bounds must contain exactly six integers")
-        if any(
-            isinstance(item, bool) or not isinstance(item, Integral) for item in values
-        ):
-            raise TypeError("crop bounds must contain exactly six integers")
-        z0, z1, y0, y1, x0, x1 = (int(item) for item in values)
-        pairs = ((z0, z1), (y0, y1), (x0, x1))
-        if any(
-            start < 0 or stop > size or start >= stop
-            for (start, stop), size in zip(pairs, shape, strict=True)
-        ):
-            raise ValueError("crop bounds must define a non-empty image region")
-        return z0, z1, y0, y1, x0, x1
-
-    @staticmethod
-    def _bounds_text(bounds: Bounds3D) -> str:
-        return canonical_compact_json(list(bounds))
-
-    @classmethod
-    def _read_bounds(
-        cls,
-        path: Path,
-        shape: tuple[int, int, int],
-    ) -> Bounds3D:
-        text = path.read_text(encoding="utf-8")
-        payload = json.loads(text)
-        if not isinstance(payload, list):
-            raise TypeError("crop bounds must be a JSON array")
-        bounds = cls._validated_bounds(payload, shape)
-        if cls._bounds_text(bounds) != text:
-            raise ValueError("crop bounds artifact is not canonical")
-        return bounds
+    _validated_bounds = staticmethod(validate_bounds)
+    _bounds_text = staticmethod(bounds_text)
+    _read_bounds = staticmethod(read_bounds)
 
     def _crop_image(
         self,
@@ -493,13 +459,7 @@ class ImageRegistration:
             )
         if bounds is None:
             try:
-                estimated = robust_bounding_box(
-                    backend.to_array(image),
-                    down_sampling=4,
-                    lower_pct=0.1,
-                    upper_pct=99.9,
-                )
-                bounds = self._validated_bounds(estimated, geometry.shape)
+                bounds = estimate_bounds(backend, image)
                 text = self._bounds_text(bounds)
 
                 def writer(destination: Path) -> None:

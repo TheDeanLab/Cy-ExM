@@ -1238,7 +1238,9 @@ def test_crop_bounds_are_reused_only_for_matching_inputs(
         del args, kwargs
         raise AssertionError("crop bounds were re-estimated")
 
-    monkeypatch.setattr(whole_image, "robust_bounding_box", unexpected_estimation)
+    monkeypatch.setattr(
+        "cyexm.registration.crop.robust_bounding_box", unexpected_estimation
+    )
     resumed = FakeBackend()
     make_registration(tmp_path, backend=resumed, crop=True).register()
 

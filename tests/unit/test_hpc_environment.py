@@ -379,6 +379,7 @@ _SLURM_22_NODE = {
     "RealMemory": "512000",
     "CfgTRES": "cpu=72,mem=500G,billing=72",
     "AllocTRES": "cpu=72,mem=500G,billing=72",
+    "AllocMem": "0",
 }
 
 
@@ -502,6 +503,32 @@ def test_node_identity_and_cpu_facts_fail_closed(
     node[field] = value
 
     with pytest.raises(HpcAcceptanceError, match=message):
+        _validate_slurm_22_resources(node=node)
+
+
+def test_zero_allocmem_is_unavailable_when_other_memory_proof_exists() -> None:
+    node = dict(_SLURM_22_NODE)
+    node.pop("AllocTRES")
+
+    _validate_slurm_22_resources(node=node)
+
+
+def test_positive_allocmem_can_supply_node_allocation_proof() -> None:
+    job = dict(_SLURM_22_JOB)
+    job.pop("MinMemoryNode")
+    node = dict(_SLURM_22_NODE)
+    node.pop("AllocTRES")
+    node["AllocMem"] = "512000"
+
+    _validate_slurm_22_resources(job=job, node=node)
+
+
+@pytest.mark.parametrize("value", ("invalid", "-1"))
+def test_allocmem_rejects_malformed_or_negative_values(value: str) -> None:
+    node = dict(_SLURM_22_NODE)
+    node["AllocMem"] = value
+
+    with pytest.raises(HpcAcceptanceError, match=r"AllocMem.*integer"):
         _validate_slurm_22_resources(node=node)
 
 
@@ -834,7 +861,8 @@ def test_environment_smoke_records_real_worker_facts_without_registration(
             )
         return _Completed(
             "NodeName=slurm-node-a State=ALLOCATED CPUTot=72 CPUAlloc=72 "
-            "RealMemory=512000 CfgTRES=cpu=72,mem=500G,billing=72 "
+            "RealMemory=512000 AllocMem=0 "
+            "CfgTRES=cpu=72,mem=500G,billing=72 "
             "AllocTRES=cpu=72,mem=500G,billing=72\n"
         )
 

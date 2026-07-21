@@ -53,6 +53,10 @@
   validate reported node `RealMemory`, `CfgTRES`, `AllocTRES`, or `AllocMem`. Never
   index an optional controller-version field before checking its presence, and fail
   if neither job-request nor node-allocation memory can be proved.
+  Treat `AllocMem=0` as unavailable legacy evidence, not as a zero allocation, only
+  when another authoritative job request or node allocation proves memory. Require
+  positive `AllocMem` to cover normalized bytes and reject malformed or negative
+  values without weakening `RealMemory`, `CfgTRES`, or `AllocTRES` validation.
 - Make no acceptance claim without a real allocation and complete machine-readable
   evidence. Never commit caller data, external evidence, generated arrays, job logs,
   credentials, or site-specific approved paths.

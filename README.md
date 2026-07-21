@@ -563,6 +563,10 @@ CPU and one node. When present, `MinMemoryNode` must equal the exact normalized
 scheduler request; job `ReqTRES` and `AllocTRES` are optional but must prove adequate
 CPU, node, and memory resources when reported. Node `RealMemory` must cover the
 request, and reported `CfgTRES` and `AllocTRES` must cover its CPU and memory facts.
+Slurm 22.05 may also report the legacy sentinel `AllocMem=0`; `AllocMem=0` is
+unavailable as allocation evidence rather than proof of zero allocated memory. A
+positive `AllocMem` must cover the normalized request, while malformed or negative
+values fail validation.
 The harness fails closed if neither an authoritative job memory request nor a node
 memory-allocation fact is available.
 

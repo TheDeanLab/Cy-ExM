@@ -205,6 +205,7 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "`minmemorynode`",
         "`cfgtres` and `alloctres`",
         "job `reqtres` and `alloctres` are optional",
+        "`allocmem=0` is unavailable",
     ):
         assert rule in normalized
 

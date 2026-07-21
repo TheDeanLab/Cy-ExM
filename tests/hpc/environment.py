@@ -470,13 +470,25 @@ def validate_slurm_job_node_resources(
         )
         node_allocation_proven = True
     if "AllocMem" in node:
-        allocated_bytes = _resource_integer(node, "AllocMem", "node") * 1024**2
-        if allocated_bytes < expected_memory_bytes:
+        allocated_text = _resource_text(node, "AllocMem", "node")
+        try:
+            allocated_mib = int(allocated_text, 10)
+        except ValueError as error:
             raise HpcAcceptanceError(
-                f"node.AllocMem must cover {expected_memory_bytes} bytes; "
-                f"got {allocated_bytes}"
+                f"node.AllocMem must be a nonnegative integer; got {allocated_text!r}"
+            ) from error
+        if allocated_mib < 0:
+            raise HpcAcceptanceError(
+                f"node.AllocMem must be a nonnegative integer; got {allocated_text!r}"
             )
-        node_allocation_proven = True
+        if allocated_mib > 0:
+            allocated_bytes = allocated_mib * 1024**2
+            if allocated_bytes < expected_memory_bytes:
+                raise HpcAcceptanceError(
+                    f"node.AllocMem must cover {expected_memory_bytes} bytes; "
+                    f"got {allocated_bytes}"
+                )
+            node_allocation_proven = True
     if not job_memory_proven and not node_allocation_proven:
         raise HpcAcceptanceError(
             "SLURM evidence contains neither an authoritative memory request "

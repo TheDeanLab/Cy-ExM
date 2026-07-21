@@ -175,3 +175,11 @@ field, but configured capacity without either a job request or an allocated-memo
 fact is insufficient. The minimized portable fixture preserves the exact Slurm 22.05
 field presence and absence so later tests cannot silently restore the newer-schema
 assumption.
+
+The minimized record also includes Slurm 22.05's `AllocMem=0`. This zero is a legacy
+unavailable sentinel, not an authoritative claim that the fully allocated node has
+zero memory. It contributes no allocation proof and is accepted only when a valid
+job memory field or node `AllocTRES` supplies that proof. A positive `AllocMem` is
+converted from MiB and must cover the normalized request; malformed, negative, or
+insufficient positive values fail. Existing `RealMemory`, `CfgTRES`, and `AllocTRES`
+checks remain unchanged.

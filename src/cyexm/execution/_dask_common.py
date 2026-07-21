@@ -12,12 +12,18 @@ from types import TracebackType
 from typing import Any, cast
 
 from cyexm.errors import RoundExecutionError
-from cyexm.execution.base import RoundTaskRunner
+from cyexm.execution.base import WorkflowTaskRunner
 from cyexm.workflow._execution_validation import (
+    _validate_executor_reference_task,
     _validate_executor_round_task,
     _validate_round_result,
 )
-from cyexm.workflow.models import RoundFailure, RoundResult, RoundTask
+from cyexm.workflow.models import (
+    ReferenceTask,
+    RoundFailure,
+    RoundResult,
+    WorkflowTask,
+)
 
 ROUND_RESOURCE = {"round_slot": 1}
 
@@ -30,7 +36,7 @@ def dask_scheduler_config_overlay() -> dict[str, object]:
 @dataclass(frozen=True, slots=True)
 class Submission:
     task_index: int
-    task: RoundTask
+    task: WorkflowTask
     key: str
     started_at: str
     started: float
@@ -40,15 +46,16 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def task_key(task: RoundTask, attempt: int) -> str:
-    base = f"cyexm-{task.dataset_id}-round-{task.round:03d}"
+def task_key(task: WorkflowTask, attempt: int) -> str:
+    role = "reference-round" if isinstance(task, ReferenceTask) else "round"
+    base = f"cyexm-{task.dataset_id}-{role}-{task.round:03d}"
     if attempt == 1:
         return base
     return f"{base}-attempt-{attempt:03d}"
 
 
 def exception_result(
-    task: RoundTask,
+    task: WorkflowTask,
     error: BaseException,
     *,
     key: str,
@@ -66,7 +73,11 @@ def exception_result(
         pid=os.getpid(),
         dask_task_key=key,
         slurm_job_id=None,
-        strategy=task.strategy,
+        strategy=(
+            "reference-preparation"
+            if isinstance(task, ReferenceTask)
+            else task.strategy
+        ),
         native_threads=(
             ("itk", task.native_threads.itk),
             ("blas", task.native_threads.blas),
@@ -115,13 +126,16 @@ def future_is_unfinished(future: Any, *, logger: logging.Logger) -> bool:
 
 
 def validate_distributed_tasks(
-    tasks: tuple[RoundTask, ...],
+    tasks: tuple[WorkflowTask, ...],
     *,
     executor_name: str,
 ) -> None:
     identities: set[tuple[str, int]] = set()
     for index, task in enumerate(tasks):
-        _validate_executor_round_task(task, index)
+        if isinstance(task, ReferenceTask):
+            _validate_executor_reference_task(task)
+        else:
+            _validate_executor_round_task(task, index)
         identity = (task.dataset_id, task.round)
         if identity in identities:
             raise RoundExecutionError(
@@ -131,9 +145,9 @@ def validate_distributed_tasks(
 
 
 def collect_distributed_results(
-    tasks: tuple[RoundTask, ...],
+    tasks: tuple[WorkflowTask, ...],
     *,
-    runner: RoundTaskRunner,
+    runner: WorkflowTaskRunner,
     client: Any,
     as_completed: Callable[..., Any],
     task_retries: int,
@@ -146,7 +160,7 @@ def collect_distributed_results(
         raise ValueError("attempt count storage must match the submitted task count")
     submissions: dict[Any, Submission] = {}
 
-    def submit(task_index: int, task: RoundTask) -> Any:
+    def submit(task_index: int, task: WorkflowTask) -> Any:
         attempt = attempt_counts[task_index] + 1
         started_at = utc_now()
         started = time.monotonic()

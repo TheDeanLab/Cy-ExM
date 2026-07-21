@@ -15,9 +15,12 @@ from cyexm.errors import RoundExecutionError, WorkflowPlanError
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow.models import (
     ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundFailure,
     RoundResult,
     RoundTask,
+    WorkflowTask,
 )
 
 
@@ -183,6 +186,8 @@ def _validate_round_task_value(
             f"{location}.chunk_size_zyx and {location}.overlap_fraction are "
             "required for serial_chunked"
         )
+    if type(task.prepared_fixed) is not bool:
+        raise error_type(f"{location}.prepared_fixed must be a built-in boolean")
     if type(task.force) is not bool:
         raise error_type(f"{location}.force must be a built-in boolean")
 
@@ -203,7 +208,80 @@ def _validate_executor_round_task(task: object, index: int) -> None:
     )
 
 
-def _planned_task_artifacts(task: RoundTask) -> tuple[str, ...]:
+def _validate_executor_reference_task(task: object) -> None:
+    location = "DistributedExecutor.reference_task"
+    if type(task) is not ReferenceTask:
+        raise RoundExecutionError(f"{location} must be an exact ReferenceTask")
+    if type(task.dataset_id) is not str or not task.dataset_id:
+        raise RoundExecutionError(f"{location}.dataset_id must be nonempty")
+    if type(task.round) is not int or task.round < 0:
+        raise RoundExecutionError(f"{location}.round must be nonnegative")
+    for field_name, path in (
+        ("registration_channel_source", task.registration_channel_source),
+        ("registration_channel_output", task.registration_channel_output),
+        ("registration_directory", task.registration_directory),
+        ("log_path", task.log_path),
+    ):
+        _task_path(path, f"{location}.{field_name}", RoundExecutionError)
+    if task.crop_bounds_path is not None:
+        _task_path(
+            task.crop_bounds_path,
+            f"{location}.crop_bounds_path",
+            RoundExecutionError,
+        )
+    if type(task.crop) is not bool or task.crop != (task.crop_bounds_path is not None):
+        raise RoundExecutionError(f"{location}.crop must match crop_bounds_path")
+    if type(task.force) is not bool:
+        raise RoundExecutionError(f"{location}.force must be a boolean")
+    if type(task.native_threads) is not NativeThreadSpec:
+        raise RoundExecutionError(f"{location}.native_threads must be exact")
+    if task.native_threads.itk < 1 or task.native_threads.blas < 1:
+        raise RoundExecutionError(f"{location}.native_threads must be positive")
+    spacing = task.voxel_spacing_xyz
+    if (
+        type(spacing) is not tuple
+        or len(spacing) != 3
+        or any(
+            type(value) is not float or not math.isfinite(value) or value <= 0.0
+            for value in spacing
+        )
+    ):
+        raise RoundExecutionError(f"{location}.voxel_spacing_xyz is invalid")
+    if type(task.channels) is not tuple or not task.channels:
+        raise RoundExecutionError(f"{location}.channels must be a nonempty tuple")
+    sources: list[Path] = []
+    outputs: list[Path] = []
+    for index, channel in enumerate(task.channels):
+        if type(channel) is not ReferenceChannelTask:
+            raise RoundExecutionError(
+                f"{location}.channels[{index}] must be exact ReferenceChannelTask"
+            )
+        _task_path(
+            channel.source,
+            f"{location}.channels[{index}].source",
+            RoundExecutionError,
+        )
+        _task_path(
+            channel.output,
+            f"{location}.channels[{index}].output",
+            RoundExecutionError,
+        )
+        sources.append(channel.source)
+        outputs.append(channel.output)
+    if len(set(sources)) != len(sources) or len(set(outputs)) != len(outputs):
+        raise RoundExecutionError(f"{location} channel paths must be unique")
+    if task.registration_channel_source not in sources:
+        raise RoundExecutionError(f"{location} registration source is undeclared")
+    if task.registration_channel_output not in outputs:
+        raise RoundExecutionError(f"{location} registration output is undeclared")
+
+
+def _planned_task_artifacts(task: WorkflowTask) -> tuple[str, ...]:
+    if type(task) is ReferenceTask:
+        return (
+            *(() if task.crop_bounds_path is None else (str(task.crop_bounds_path),)),
+            *(str(channel.output) for channel in task.channels),
+        )
     return (
         str(task.registration_directory / f"linear_transform_{task.round}.mat"),
         str(task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz"),
@@ -321,14 +399,17 @@ def _validate_round_result_structure(result: object, location: str) -> None:
                 )
 
 
-def _validate_round_result(task: RoundTask, result: RoundResult) -> None:
+def _validate_round_result(task: WorkflowTask, result: RoundResult) -> None:
     location = f"Executor result for round {task.round}"
     _validate_round_result_structure(result, location)
     if result.dataset_id != task.dataset_id:
         raise RoundExecutionError(f"{location} dataset_id does not match the task")
     if type(result.round) is not int or result.round != task.round:
         raise RoundExecutionError(f"{location} round does not match the task")
-    if result.strategy != task.strategy:
+    expected_strategy = (
+        "reference-preparation" if isinstance(task, ReferenceTask) else task.strategy
+    )
+    if result.strategy != expected_strategy:
         raise RoundExecutionError(f"{location} strategy does not match the task")
     if result.status not in {"reused", "completed", "failed", "cancelled"}:
         raise RoundExecutionError(f"{location} has unknown status {result.status!r}")

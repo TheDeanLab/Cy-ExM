@@ -9,7 +9,9 @@ voxel_spacing_um:
 
 reference:
   round: 1
-  channel: round_1_488_tubulin.tif
+  registration_channel: round_1_488_tubulin.tif
+  channels:
+    - file: round_1_488_tubulin.tif
 
 registration:
   crop: false

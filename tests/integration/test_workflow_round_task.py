@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Literal
@@ -18,6 +20,7 @@ from cyexm.registration.chunked import ChunkPaths
 from cyexm.registration.transforms import apply_transform_chain
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
 from cyexm.runtime import NativeThreadConfig
+from cyexm.spatial import geometry_compatible
 from cyexm.workflow import round_task as round_task_module
 from cyexm.workflow.models import ChannelTask, RoundTask
 from cyexm.workflow.round_task import run_round_task
@@ -47,6 +50,38 @@ class _FailOnceNonlinearBackend(AntsRegistrationBackend):
             self.fail_nonlinear = False
             raise RuntimeError("injected nonlinear failure after affine persistence")
         return super().nonlinear(**kwargs)
+
+
+class _PreparedFixedBoundaryBackend(AntsRegistrationBackend):
+    def __init__(self, native_threads: NativeThreadConfig) -> None:
+        super().__init__(native_threads)
+        self.affine_scalar_geometry = None
+        self.affine_mask_geometry = None
+        self.nonlinear_scalar_geometry = None
+        self.nonlinear_mask_geometry = None
+
+    def linear(self, **kwargs: object) -> tuple[object, object | None, object]:
+        scalar, mask, transform = super().linear(**kwargs)
+        self.affine_scalar_geometry = self.geometry(scalar)
+        self.affine_mask_geometry = None if mask is None else self.geometry(mask)
+        return scalar, mask, transform
+
+    def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
+        fixed = kwargs["fixed_image"]
+        moving = kwargs["moving_image"]
+        moving_mask = kwargs["moving_mask"]
+        self.nonlinear_scalar_geometry = self.geometry(moving)
+        self.nonlinear_mask_geometry = (
+            None if moving_mask is None else self.geometry(moving_mask)
+        )
+        with tempfile.NamedTemporaryFile(
+            suffix=".nii.gz",
+            delete=False,
+        ) as temporary:
+            candidate = Path(temporary.name)
+        candidate.unlink()
+        self.write_identity_warp(fixed, candidate)
+        return moving, candidate
 
 
 @pytest.fixture
@@ -347,3 +382,97 @@ def test_round_task_reuses_real_affine_after_injected_nonlinear_failure(
             channel.output,
             stage="channel-transform-v1",
         )
+
+
+def test_prepared_fixed_round_resamples_different_xyz_shape_to_reference_grid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    native_threads: NativeThreadConfig,
+) -> None:
+    import ants
+    import numpy as np
+    import tifffile
+
+    backend = _PreparedFixedBoundaryBackend(native_threads)
+    fixed_shape = (10, 20, 24)
+    moving_shape = (14, 26, 30)
+
+    def write(path: Path, shape: tuple[int, int, int], offset: float) -> None:
+        z, y, x = np.mgrid[: shape[0], : shape[1], : shape[2]]
+        array = (
+            np.exp(
+                -(
+                    ((z - shape[0] / 2) / 2.0) ** 2
+                    + ((y - shape[1] / 2) / 4.0) ** 2
+                    + ((x - shape[2] / 2) / 4.0) ** 2
+                )
+            )
+            * np.float32(50_000.0)
+            + np.float32(offset)
+        ).astype(np.float32)
+        image = ants.from_numpy(
+            np.transpose(array, (2, 1, 0)),
+            origin=(2.0, -3.0, 7.0),
+            spacing=_PIXEL_SIZE,
+        )
+        backend.write_clipped_tiff(image, path)
+
+    fixed = tmp_path / "prepared-reference.tif"
+    moving = tmp_path / "moving-registration.tif"
+    dependent = tmp_path / "moving-dependent.tif"
+    write(fixed, fixed_shape, 0.0)
+    write(moving, moving_shape, 10.0)
+    write(dependent, moving_shape, 100.0)
+    task = replace(
+        _task(
+            tmp_path,
+            fixed_path=fixed,
+            moving_path=moving,
+            channel_sources=(moving, dependent),
+            strategy="whole_image",
+            round_number=5,
+        ),
+        prepared_fixed=True,
+    )
+    _whole, chunked, runtime_paths, channel_transform = round_task_module._runtime()
+    monkeypatch.setattr(
+        round_task_module,
+        "_runtime",
+        lambda: (
+            partial(ImageRegistration, _backend=backend),
+            chunked,
+            runtime_paths,
+            channel_transform,
+        ),
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "completed", result.failure
+    fixed_geometry = backend.geometry(backend.load_image(fixed, _PIXEL_SIZE))
+    assert fixed_geometry.shape == fixed_shape
+    assert backend.affine_scalar_geometry is not None
+    assert backend.affine_mask_geometry is not None
+    assert backend.nonlinear_scalar_geometry is not None
+    assert backend.nonlinear_mask_geometry is not None
+    for geometry in (
+        backend.affine_scalar_geometry,
+        backend.affine_mask_geometry,
+        backend.nonlinear_scalar_geometry,
+        backend.nonlinear_mask_geometry,
+    ):
+        assert geometry_compatible(geometry, fixed_geometry)
+
+    paths = RegistrationPaths.for_round(task.registration_directory, task.round)
+    for path in (paths.registered, *(channel.output for channel in task.channels)):
+        assert tifffile.imread(path).shape == fixed_shape
+        written_geometry = backend.geometry(backend.load_image(path, _PIXEL_SIZE))
+        assert geometry_compatible(written_geometry, fixed_geometry)
+    warp_geometry = backend.geometry(backend.read_warp(paths.warp))
+    assert geometry_compatible(warp_geometry, fixed_geometry)
+    affine_record = CompletionRecord.read(ArtifactStore().record_path(paths.affine))
+    assert affine_record.request.parameters["prepared_fixed"] is True
+    assert not paths.fixed_reference.exists()
+    assert not ArtifactStore().record_path(paths.fixed_reference).exists()
+    assert not paths.fixed_crop.exists()
+    assert not ArtifactStore().record_path(paths.fixed_crop).exists()

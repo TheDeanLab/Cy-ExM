@@ -9,9 +9,11 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from cyexm.workflow.models import RoundResult, RoundTask
+from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask
 
 _FAILING_ROUND = 3
+
+type _WorkflowTask = ReferenceTask | RoundTask
 
 
 def _utc_timestamp() -> str:
@@ -123,8 +125,38 @@ def _completed_result(task: RoundTask, observation: dict[str, object]) -> RoundR
     )
 
 
-def placement_runner(task: RoundTask) -> RoundResult:
+def _completed_reference_result(task: ReferenceTask) -> RoundResult:
+    timestamp = _utc_timestamp()
+    return RoundResult(
+        dataset_id=task.dataset_id,
+        round=task.round,
+        status="completed",
+        started_at=timestamp,
+        ended_at=timestamp,
+        duration_seconds=0.0,
+        hostname=socket.gethostname(),
+        pid=os.getpid(),
+        dask_task_key=None,
+        slurm_job_id=None,
+        strategy="reference-preparation",
+        native_threads=(
+            ("itk", task.native_threads.itk),
+            ("blas", task.native_threads.blas),
+        ),
+        artifact_paths=(
+            *(() if task.crop_bounds_path is None else (str(task.crop_bounds_path),)),
+            *(str(channel.output) for channel in task.channels),
+        ),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=None,
+    )
+
+
+def placement_runner(task: _WorkflowTask) -> RoundResult:
     """Record placement and hold a worker's sole round slot for a bounded interval."""
+    if isinstance(task, ReferenceTask):
+        return _completed_reference_result(task)
     attempt, evidence_directory = _reserve_attempt(task)
     observation = _worker_observation(task, attempt)
     # The lowest round deliberately outlives all three short tasks. This proves
@@ -138,8 +170,10 @@ def placement_runner(task: RoundTask) -> RoundResult:
     return _completed_result(task, finished)
 
 
-def independent_failure_runner(task: RoundTask) -> RoundResult:
+def independent_failure_runner(task: _WorkflowTask) -> RoundResult:
     """Raise for one configured round while allowing independent rounds to finish."""
+    if isinstance(task, ReferenceTask):
+        return _completed_reference_result(task)
     attempt, evidence_directory = _reserve_attempt(task)
     observation = _worker_observation(task, attempt)
     time.sleep(0.1)
@@ -154,8 +188,10 @@ def independent_failure_runner(task: RoundTask) -> RoundResult:
     return _completed_result(task, finished)
 
 
-def retry_once_runner(task: RoundTask) -> RoundResult:
+def retry_once_runner(task: _WorkflowTask) -> RoundResult:
     """Fail the atomic marker-creating attempt, then complete the retry."""
+    if isinstance(task, ReferenceTask):
+        return _completed_reference_result(task)
     attempt, evidence_directory = _reserve_attempt(task)
     observation = _worker_observation(task, attempt)
     marker = evidence_directory / "retry.marker"

@@ -8,6 +8,7 @@ import yaml
 from cyexm.config import (
     ChannelSpec,
     DatasetManifest,
+    ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
@@ -28,7 +29,10 @@ voxel_spacing_um:
   z: 0.9
 reference:
   round: 1
-  channel: round_1_488.tif
+  registration_channel: round_1_488.tif
+  channels:
+    - file: round_1_488.tif
+    - file: round_1_647.tif
 registration:
   crop: true
   linear:
@@ -108,6 +112,7 @@ def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
         "ExecutionProfile",
         "LocalDaskSpec",
         "NativeThreadSpec",
+        "ReferenceChannelSpec",
         "ReferenceSpec",
         "RegistrationSpec",
         "RegistrationStageSpec",
@@ -130,7 +135,12 @@ def test_load_dataset_manifest_normalizes_xyz_and_zyx_fields(tmp_path: Path) -> 
     assert manifest.dataset_id == "dataset-1"
     assert manifest.voxel_spacing_um == (0.324, 0.324, 0.9)
     assert manifest.reference == ReferenceSpec(
-        round=1, channel=PurePosixPath("round_1_488.tif")
+        round=1,
+        registration_channel=PurePosixPath("round_1_488.tif"),
+        channels=(
+            ReferenceChannelSpec(PurePosixPath("round_1_488.tif")),
+            ReferenceChannelSpec(PurePosixPath("round_1_647.tif")),
+        ),
     )
     assert manifest.registration == RegistrationSpec(
         crop=True,
@@ -177,7 +187,9 @@ def test_load_dataset_manifest_preserves_round_and_channel_order(
     [
         ((), "dataset_id"),
         (("voxel_spacing_um",), "x"),
-        (("reference",), "channel"),
+        (("reference",), "registration_channel"),
+        (("reference",), "channels"),
+        (("reference", "channels", 0), "file"),
         (("registration",), "crop"),
         (("registration", "linear"), "accuracy"),
         (("registration", "nonlinear"), "type"),
@@ -202,6 +214,7 @@ def test_load_dataset_manifest_rejects_missing_keys_at_every_mapping_layer(
         (),
         ("voxel_spacing_um",),
         ("reference",),
+        ("reference", "channels", 0),
         ("registration",),
         ("registration", "linear"),
         ("registration", "nonlinear"),
@@ -308,6 +321,75 @@ def test_load_dataset_manifest_requires_registration_channel_membership(
     _set_at(data, ("rounds", 0, "registration_channel"), "missing.tif")
 
     with pytest.raises(ConfigurationValidationError, match="registration_channel"):
+        _load_data(tmp_path, data)
+
+
+def test_load_dataset_manifest_requires_reference_registration_channel_membership(
+    tmp_path: Path,
+) -> None:
+    data = _valid_data()
+    _set_at(data, ("reference", "registration_channel"), "missing.tif")
+
+    with pytest.raises(ConfigurationValidationError, match="registration_channel"):
+        _load_data(tmp_path, data)
+
+
+def test_load_dataset_manifest_rejects_empty_reference_channels(tmp_path: Path) -> None:
+    data = _valid_data()
+    _set_at(data, ("reference", "channels"), [])
+
+    with pytest.raises(ConfigurationValidationError, match="must not be empty"):
+        _load_data(tmp_path, data)
+
+
+def test_load_dataset_manifest_rejects_duplicate_reference_files(
+    tmp_path: Path,
+) -> None:
+    data = _valid_data()
+    channels = _mapping_at(data, ("reference",))["channels"]
+    assert isinstance(channels, list)
+    channels.append(deepcopy(channels[0]))
+
+    with pytest.raises(ConfigurationValidationError, match="unique"):
+        _load_data(tmp_path, data)
+
+
+def test_load_dataset_manifest_rejects_duplicate_reference_output_basenames(
+    tmp_path: Path,
+) -> None:
+    data = _valid_data()
+    _set_at(
+        data,
+        ("reference", "channels"),
+        [{"file": "a/fixed.tif"}, {"file": "b/fixed.tif"}],
+    )
+    _set_at(data, ("reference", "registration_channel"), "a/fixed.tif")
+
+    with pytest.raises(ConfigurationValidationError, match=r"basenames.*unique"):
+        _load_data(tmp_path, data)
+
+
+def test_load_dataset_manifest_rejects_reference_channel_interpolation(
+    tmp_path: Path,
+) -> None:
+    data = _valid_data()
+    channel = _mapping_at(data, ("reference", "channels", 0))
+    channel["interpolation"] = "linear"
+
+    with pytest.raises(ConfigurationValidationError, match="keys must be exactly"):
+        _load_data(tmp_path, data)
+
+
+def test_load_dataset_manifest_reports_schema_one_reference_migration(
+    tmp_path: Path,
+) -> None:
+    data = _valid_data()
+    data["reference"] = {"round": 1, "channel": "round_1_488.tif"}
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=r"reference\.registration_channel.*reference\.channels",
+    ):
         _load_data(tmp_path, data)
 
 
@@ -496,7 +578,8 @@ def test_load_dataset_manifest_rejects_values_outside_phase_one_stage_choices(
 @pytest.mark.parametrize(
     ("field_path", "value"),
     [
-        (("reference", "channel"), "/absolute.tif"),
+        (("reference", "registration_channel"), "/absolute.tif"),
+        (("reference", "channels", 0, "file"), "../outside.tif"),
         (("rounds", 0, "registration_channel"), "../outside.tif"),
         (("rounds", 0, "channels", 0, "file"), "bad//path.tif"),
     ],

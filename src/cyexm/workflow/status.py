@@ -23,6 +23,7 @@ from cyexm.registration._request_policy import (
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
+from cyexm.workflow._reference_provenance import reference_completion_evidence
 from cyexm.workflow._round_provenance import (
     ArtifactSnapshot,
     RegistrationArtifactPaths,
@@ -33,9 +34,12 @@ from cyexm.workflow._round_provenance import (
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundStatus,
     RoundTask,
     WorkflowStatus,
+    WorkflowTask,
     canonical_json,
     sha256_fingerprint,
 )
@@ -53,7 +57,17 @@ _SCIENTIFIC_KEYS = frozenset(
         "policies",
     }
 )
-_REFERENCE_KEYS = frozenset({"round", "channel"})
+_REFERENCE_KEYS = frozenset(
+    {
+        "round",
+        "registration_channel",
+        "registration_manifest_file",
+        "registration_output",
+        "crop_output",
+        "channels",
+    }
+)
+_REFERENCE_CHANNEL_KEYS = frozenset({"file", "manifest_file", "output"})
 _REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
 _STAGE_KEYS = frozenset({"type", "accuracy"})
 _SOURCE_KEYS = frozenset(
@@ -105,6 +119,13 @@ class _ChannelContract:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReferenceChannelContract:
+    source: _SourceContract
+    manifest_file: PurePosixPath
+    output: Path
+
+
+@dataclass(frozen=True, slots=True)
 class _ArtifactExpectation:
     path: Path
     role: ArtifactRole
@@ -139,6 +160,9 @@ class _ScientificSnapshot:
     voxel_spacing_xyz: tuple[float, float, float]
     reference_round: int
     fixed_source: _SourceContract
+    fixed_output: Path
+    reference_channels: tuple[_ReferenceChannelContract, ...]
+    reference_crop_output: Path | None
     registration: _RegistrationContract
     sources: tuple[_SourceContract, ...]
     rounds: tuple[_RoundContract, ...]
@@ -641,14 +665,92 @@ def _parse_scientific_snapshot(
     )
     reference_round = _integer(reference["round"], "scientific plan reference.round")
     fixed_path = _absolute_path(
-        reference["channel"], "scientific plan reference.channel"
+        reference["registration_channel"],
+        "scientific plan reference.registration_channel",
     )
     try:
         fixed_source = sources_by_path[fixed_path]
     except KeyError as error:
         raise WorkflowPlanError(
-            "scientific plan reference.channel must reference a declared source"
+            "scientific plan reference.registration_channel must reference a "
+            "declared source"
         ) from error
+    registration_manifest = _relative_path(
+        reference["registration_manifest_file"],
+        "scientific plan reference.registration_manifest_file",
+    )
+    registration_output_relative = _relative_path(
+        reference["registration_output"],
+        "scientific plan reference.registration_output",
+    )
+    fixed_output = layout.root.joinpath(*registration_output_relative.parts)
+    expected_fixed_output = layout.round(reference_round).channel(registration_manifest)
+    if fixed_output != expected_fixed_output:
+        raise WorkflowPlanError(
+            "scientific plan reference.registration_output does not match the "
+            "reference-round output layout"
+        )
+    _safe_descendant(
+        fixed_output,
+        root=layout.root,
+        location="scientific plan reference.registration_output",
+    )
+    reference_channels: list[_ReferenceChannelContract] = []
+    for index, value in enumerate(
+        _list(reference["channels"], "scientific plan reference.channels")
+    ):
+        location = f"scientific plan reference.channels[{index}]"
+        mapping = _exact_mapping(value, _REFERENCE_CHANNEL_KEYS, location)
+        source_path = _absolute_path(mapping["file"], f"{location}.file")
+        try:
+            source = sources_by_path[source_path]
+        except KeyError as error:
+            raise WorkflowPlanError(
+                f"{location}.file must reference a declared source"
+            ) from error
+        manifest_file = _relative_path(
+            mapping["manifest_file"], f"{location}.manifest_file"
+        )
+        output_relative = _relative_path(mapping["output"], f"{location}.output")
+        output = layout.root.joinpath(*output_relative.parts)
+        if output != layout.round(reference_round).channel(manifest_file):
+            raise WorkflowPlanError(
+                f"{location}.output does not match the reference-round output layout"
+            )
+        _safe_descendant(output, root=layout.root, location=f"{location}.output")
+        reference_channels.append(
+            _ReferenceChannelContract(source, manifest_file, output)
+        )
+    if (
+        not reference_channels
+        or sum(
+            channel.source.path == fixed_source.path
+            and channel.manifest_file == registration_manifest
+            and channel.output == fixed_output
+            for channel in reference_channels
+        )
+        != 1
+    ):
+        raise WorkflowPlanError(
+            "scientific plan reference registration channel must match exactly one "
+            "declared reference channel"
+        )
+    raw_crop_output = reference["crop_output"]
+    reference_crop_output = None
+    if raw_crop_output is not None:
+        crop_relative = _relative_path(
+            raw_crop_output, "scientific plan reference.crop_output"
+        )
+        reference_crop_output = layout.root.joinpath(*crop_relative.parts)
+        if reference_crop_output != layout.round(reference_round).reference_crop:
+            raise WorkflowPlanError(
+                "scientific plan reference.crop_output does not match the "
+                "reference-round output layout"
+            )
+    if (reference_crop_output is not None) != registration.crop:
+        raise WorkflowPlanError(
+            "scientific plan reference.crop_output must match registration.crop"
+        )
     rounds = tuple(
         _parse_round(round_value, layout=layout, sources=sources_by_path, index=index)
         for index, round_value in enumerate(
@@ -666,7 +768,7 @@ def _parse_scientific_snapshot(
             f"scientific plan rounds must not reuse reference round {reference_round}"
         )
     used_sources = {
-        fixed_source.path,
+        *(channel.source.path for channel in reference_channels),
         *(
             channel.source.path
             for round_contract in rounds
@@ -680,10 +782,18 @@ def _parse_scientific_snapshot(
         raise WorkflowPlanError(
             f"scientific plan declares unused sources: {unused_sources!r}"
         )
-    artifact_paths = tuple(
-        expectation.path.resolve(strict=False)
-        for round_contract in rounds
-        for expectation in round_contract.artifacts
+    artifact_paths = (
+        *(channel.output.resolve(strict=False) for channel in reference_channels),
+        *(
+            ()
+            if reference_crop_output is None
+            else (reference_crop_output.resolve(strict=False),)
+        ),
+        *tuple(
+            expectation.path.resolve(strict=False)
+            for round_contract in rounds
+            for expectation in round_contract.artifacts
+        ),
     )
     if len(set(artifact_paths)) != len(artifact_paths):
         raise WorkflowPlanError(
@@ -710,6 +820,9 @@ def _parse_scientific_snapshot(
         voxel_spacing_xyz=spacing,
         reference_round=reference_round,
         fixed_source=fixed_source,
+        fixed_output=fixed_output,
+        reference_channels=tuple(reference_channels),
+        reference_crop_output=reference_crop_output,
         registration=registration,
         sources=sources,
         rounds=rounds,
@@ -826,7 +939,7 @@ def _task_from_snapshot(
         dataset_id=snapshot.dataset_id,
         round=round_contract.round,
         strategy=round_contract.strategy,
-        fixed_image=snapshot.fixed_source.path,
+        fixed_image=snapshot.fixed_output,
         moving_image=round_contract.registration_source.path,
         registration_directory=round_layout.registration,
         log_path=round_layout.log,
@@ -951,11 +1064,86 @@ def _round_status(
     )
 
 
+def _reference_status(
+    snapshot: _ScientificSnapshot,
+    *,
+    layout: WorkflowLayout,
+    task: ReferenceTask | None = None,
+) -> RoundStatus:
+    if task is None:
+        task = ReferenceTask(
+            dataset_id=snapshot.dataset_id,
+            round=snapshot.reference_round,
+            registration_channel_source=snapshot.fixed_source.path,
+            registration_channel_output=snapshot.fixed_output,
+            registration_directory=layout.round(snapshot.reference_round).registration,
+            crop_bounds_path=snapshot.reference_crop_output,
+            log_path=layout.round(snapshot.reference_round).log,
+            voxel_spacing_xyz=snapshot.voxel_spacing_xyz,
+            crop=snapshot.registration.crop,
+            native_threads=NativeThreadSpec(itk=1, blas=1),
+            channels=tuple(
+                ReferenceChannelTask(channel.source.path, channel.output)
+                for channel in snapshot.reference_channels
+            ),
+        )
+
+    def snapshot_reader(path: Path) -> ArtifactSnapshot | None:
+        return _safe_completion_snapshot(path, layout=layout)
+
+    def geometry_reader(
+        path: Path, _spacing: tuple[float, float, float]
+    ) -> ImageGeometry:
+        return _read_uint16_tiff_geometry_without_runtime(path)
+
+    expected = (
+        *(() if task.crop_bounds_path is None else (task.crop_bounds_path,)),
+        *(channel.output for channel in task.channels),
+    )
+    authoritative = reference_completion_evidence(
+        task,
+        tuple(channel.source.geometry for channel in snapshot.reference_channels),
+        snapshot_reader=snapshot_reader,
+        geometry_reader=geometry_reader,
+    )
+    accepted = frozenset(authoritative.artifacts)
+    complete: list[str] = []
+    incomplete: list[str] = []
+    invalid: list[str] = []
+    for path in expected:
+        artifact_state = _filesystem_entry_state(path)
+        record_state = _filesystem_entry_state(
+            path.with_name(f"{path.name}.complete.json")
+        )
+        if artifact_state == "missing" and record_state == "missing":
+            incomplete.append(str(path))
+        elif path in accepted:
+            complete.append(str(path))
+        else:
+            invalid.append(str(path))
+    status: Literal["pending", "partial", "complete", "invalid"]
+    if invalid:
+        status = "invalid"
+    elif len(complete) == len(expected):
+        status = "complete"
+    elif complete:
+        status = "partial"
+    else:
+        status = "pending"
+    return RoundStatus(
+        round=task.round,
+        status=status,
+        complete_artifacts=tuple(complete),
+        incomplete_artifacts=tuple(incomplete),
+        invalid_artifacts=tuple(invalid),
+    )
+
+
 def _inspect_workflow_status(
     output_root: str | Path,
     dataset_id: str,
     *,
-    _tasks: tuple[RoundTask, ...] | None = None,
+    _tasks: tuple[WorkflowTask, ...] | None = None,
 ) -> WorkflowStatus:
     """Inspect authoritative completion provenance without changing workflow state."""
     layout = _safe_workflow_layout(output_root, dataset_id)
@@ -965,10 +1153,13 @@ def _inspect_workflow_status(
     snapshot = _read_scientific_snapshot(layout.plan_path, dataset_id)
     if snapshot is None:
         return WorkflowStatus(dataset_id, None, (), False)
-    tasks_by_round: dict[int, RoundTask] = {}
+    tasks_by_round: dict[int, WorkflowTask] = {}
     if _tasks is not None:
         tasks_by_round = {task.round: task for task in _tasks}
-        expected_rounds = tuple(item.round for item in snapshot.rounds)
+        expected_rounds = (
+            snapshot.reference_round,
+            *(item.round for item in snapshot.rounds),
+        )
         if len(tasks_by_round) != len(_tasks) or set(tasks_by_round) != set(
             expected_rounds
         ):
@@ -977,14 +1168,31 @@ def _inspect_workflow_status(
                 "Status task rounds must match the persisted scientific plan; "
                 f"expected={expected_rounds!r}, got={actual_rounds!r}"
             )
-    rounds = tuple(
-        _round_status(
-            snapshot,
-            round_contract,
-            layout=layout,
-            task=tasks_by_round.get(round_contract.round),
+    reference_task = tasks_by_round.get(snapshot.reference_round)
+    if reference_task is not None and type(reference_task) is not ReferenceTask:
+        raise WorkflowPlanError("Status reference task must be an exact ReferenceTask")
+    accepted_reference_task = (
+        reference_task if isinstance(reference_task, ReferenceTask) else None
+    )
+    moving_statuses: list[RoundStatus] = []
+    for round_contract in snapshot.rounds:
+        candidate = tasks_by_round.get(round_contract.round)
+        moving_task = candidate if isinstance(candidate, RoundTask) else None
+        moving_statuses.append(
+            _round_status(
+                snapshot,
+                round_contract,
+                layout=layout,
+                task=moving_task,
+            )
         )
-        for round_contract in snapshot.rounds
+    rounds = (
+        _reference_status(
+            snapshot,
+            layout=layout,
+            task=accepted_reference_task,
+        ),
+        *moving_statuses,
     )
     return WorkflowStatus(
         dataset_id=dataset_id,

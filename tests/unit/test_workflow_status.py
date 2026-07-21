@@ -26,9 +26,10 @@ from cyexm.registration._request_policy import (
     common_parameters,
     crop_geometry,
     crop_parameters,
-    fixed_reference_parameters,
     local_chunk_parameters,
     nonlinear_stage_parameters,
+    reference_channel_parameters,
+    reference_crop_parameters,
     registered_image_parameters,
 )
 from cyexm.registration.artifacts import (
@@ -78,7 +79,17 @@ def _scientific_mapping(
         "voxel_spacing_xyz_um": [1.0, 1.0, 1.0],
         "reference": {
             "round": 1,
-            "channel": str((dataset_root / "fixed.tif").resolve()),
+            "registration_channel": str((dataset_root / "fixed.tif").resolve()),
+            "registration_manifest_file": "fixed.tif",
+            "registration_output": "rounds/round-001/channels/fixed.tif",
+            "crop_output": None,
+            "channels": [
+                {
+                    "file": str((dataset_root / "fixed.tif").resolve()),
+                    "manifest_file": "fixed.tif",
+                    "output": "rounds/round-001/channels/fixed.tif",
+                }
+            ],
         },
         "registration": {
             "crop": False,
@@ -125,6 +136,7 @@ def _write_plan(output_root: Path, rounds: tuple[int, ...] = (2,)) -> str:
     path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
     path.parent.mkdir(parents=True)
     path.write_text(scientific_json + "\n", encoding="utf-8")
+    _commit_reference(output_root)
     return sha256_fingerprint(scientific_json)
 
 
@@ -149,6 +161,33 @@ def _geometry() -> ImageGeometry:
     )
 
 
+def _commit_reference(output_root: Path) -> Path:
+    dataset_root = output_root.parent / "dataset"
+    source = dataset_root / "fixed.tif"
+    output = (
+        WorkflowLayout.for_dataset(output_root, "dataset-1")
+        .round(1)
+        .channel(Path("fixed.tif"))
+    )
+    request = StageRequest.for_identities(
+        stage="reference-channel",
+        inputs=(FileIdentity.from_path(source),),
+        geometry=_geometry(),
+        method="uint16-tiff",
+        accuracy="exact",
+        native_threads=_native_threads(),
+        upstream=None,
+        parameters=reference_channel_parameters(index=0, cropped=False),
+    )
+    ArtifactStore().commit(
+        output,
+        request,
+        lambda path: write_cyexm_uint16_tiff(path, _geometry()),
+        lambda _path: True,
+    )
+    return output
+
+
 def _native_threads() -> dict[str, int]:
     return {name: 1 for name in NATIVE_THREAD_ENV_VARS}
 
@@ -158,7 +197,11 @@ def _request_for_artifact(path: Path, output_root: Path) -> StageRequest:
         next(part for part in path.parts if part.startswith("round-"))[6:]
     )
     dataset_root = output_root.parent / "dataset"
-    fixed = dataset_root / "fixed.tif"
+    fixed = (
+        WorkflowLayout.for_dataset(output_root, "dataset-1")
+        .round(1)
+        .channel(Path("fixed.tif"))
+    )
     moving = dataset_root / f"round_{round_number}_488.tif"
     inputs = (FileIdentity.from_path(fixed), FileIdentity.from_path(moving))
     common = {
@@ -166,6 +209,7 @@ def _request_for_artifact(path: Path, output_root: Path) -> StageRequest:
         "crop": False,
         "imaging_round": round_number,
         "pixel_size_xyz": [1.0, 1.0, 1.0],
+        "prepared_fixed": True,
     }
     registration = (
         WorkflowLayout.for_dataset(output_root, "dataset-1")
@@ -277,48 +321,6 @@ def _commit_artifact(
     *,
     stage_override: str | None = None,
 ) -> None:
-    if path.name.startswith("linear_transform_"):
-        round_number = int(
-            next(part for part in path.parts if part.startswith("round-"))[6:]
-        )
-        registration = (
-            WorkflowLayout.for_dataset(output_root, "dataset-1")
-            .round(round_number)
-            .registration
-        )
-        fixed_reference = registration / "fixed_reference.tif"
-        dataset_root = output_root.parent / "dataset"
-        inputs = (
-            FileIdentity.from_path(dataset_root / "fixed.tif"),
-            FileIdentity.from_path(dataset_root / f"round_{round_number}_488.tif"),
-        )
-        fixed_reference.parent.mkdir(parents=True, exist_ok=True)
-        write_cyexm_uint16_tiff(fixed_reference, _geometry())
-        fixed_request = StageRequest.for_identities(
-            stage="fixed-reference",
-            inputs=inputs,
-            geometry=_geometry(),
-            method="uint16-tiff",
-            accuracy="exact",
-            native_threads=_native_threads(),
-            upstream=None,
-            parameters={
-                **common_parameters(
-                    crop=False,
-                    imaging_round=round_number,
-                    pixel_size_xyz=(1.0, 1.0, 1.0),
-                ),
-                **fixed_reference_parameters(0.0, 1.0),
-            },
-        )
-        fixed_record = CompletionRecord(
-            schema_version=1,
-            request=fixed_request,
-            artifact=FileIdentity.from_path(fixed_reference),
-        )
-        ArtifactStore().record_path(fixed_reference).write_text(
-            fixed_record.to_json(), encoding="utf-8"
-        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"artifact")
     request = _request_for_artifact(path, output_root)
@@ -375,7 +377,7 @@ def _replace_fixed_reference_geometry(path: Path, geometry: ImageGeometry) -> No
 def _commit_serial_round(output_root: Path) -> tuple[Path, ...]:
     round_number = 2
     dataset_root = output_root.parent / "dataset"
-    fixed = dataset_root / "fixed.tif"
+    fixed = _commit_reference(output_root)
     moving = dataset_root / "round_2_488.tif"
     inputs = (FileIdentity.from_path(fixed), FileIdentity.from_path(moving))
     threads = _native_threads()
@@ -385,25 +387,12 @@ def _commit_serial_round(output_root: Path) -> tuple[Path, ...]:
         imaging_round=round_number,
         pixel_size_xyz=(1.0, 1.0, 1.0),
     )
+    common["prepared_fixed"] = True
     round_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(
         round_number
     )
     artifacts = _expected_artifacts(output_root, round_number)
     affine, warp, registered, channel = artifacts
-    fixed_reference = round_layout.registration / "fixed_reference.tif"
-    _write_request_artifact(
-        fixed_reference,
-        StageRequest.for_identities(
-            stage="fixed-reference",
-            inputs=inputs,
-            geometry=geometry,
-            method="uint16-tiff",
-            accuracy="exact",
-            native_threads=threads,
-            upstream=None,
-            parameters={**common, **fixed_reference_parameters(0.0, 1.0)},
-        ),
-    )
     _write_request_artifact(
         affine,
         StageRequest.for_identities(
@@ -571,53 +560,66 @@ def _commit_serial_round(output_root: Path) -> tuple[Path, ...]:
 def _commit_cropped_round(output_root: Path) -> tuple[Path, ...]:
     round_number = 2
     dataset_root = output_root.parent / "dataset"
-    fixed = dataset_root / "fixed.tif"
+    source_fixed = dataset_root / "fixed.tif"
     moving = dataset_root / "round_2_488.tif"
-    inputs = (FileIdentity.from_path(fixed), FileIdentity.from_path(moving))
     threads = _native_threads()
     geometry = _geometry()
     bounds = (0, 4, 0, 8, 0, 8)
+    reference_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(1)
+    reference_crop = reference_layout.reference_crop
+    _write_request_artifact(
+        reference_crop,
+        StageRequest.for_identities(
+            stage="reference-crop",
+            inputs=(FileIdentity.from_path(source_fixed),),
+            geometry=geometry,
+            method="robust-bounding-box",
+            accuracy="legacy-robust",
+            native_threads=threads,
+            upstream=None,
+            parameters=reference_crop_parameters(),
+        ),
+        contents=canonical_compact_json(list(bounds)).encode(),
+    )
+    fixed = reference_layout.channel(Path("fixed.tif"))
+    _write_request_artifact(
+        fixed,
+        StageRequest.for_identities(
+            stage="reference-channel",
+            inputs=(FileIdentity.from_path(source_fixed),),
+            geometry=geometry,
+            method="uint16-tiff",
+            accuracy="exact",
+            native_threads=threads,
+            upstream=FileIdentity.from_path(reference_crop),
+            parameters=reference_channel_parameters(index=0, cropped=True),
+        ),
+    )
+    inputs = (FileIdentity.from_path(fixed), FileIdentity.from_path(moving))
     common = common_parameters(
         crop=True,
         imaging_round=round_number,
         pixel_size_xyz=(1.0, 1.0, 1.0),
     )
+    common["prepared_fixed"] = True
     round_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(
         round_number
     )
     artifacts = _expected_artifacts(output_root, round_number)
     affine, warp, registered, channel = artifacts
-    for role, crop_path in (
-        ("fixed", round_layout.registration / "fixed_crop_indices_2.json"),
-        ("moving", round_layout.registration / "moving_crop_indices_2.json"),
-    ):
-        _write_request_artifact(
-            crop_path,
-            StageRequest.for_identities(
-                stage=f"crop:{role}",
-                inputs=inputs,
-                geometry=geometry,
-                method="robust-bounding-box",
-                accuracy="legacy-robust",
-                native_threads=threads,
-                upstream=None,
-                parameters={**common, **crop_parameters(role)},  # type: ignore[arg-type]
-            ),
-            contents=canonical_compact_json(list(bounds)).encode(),
-        )
-    fixed_reference = round_layout.registration / "fixed_reference.tif"
     _write_request_artifact(
-        fixed_reference,
+        round_layout.registration / "moving_crop_indices_2.json",
         StageRequest.for_identities(
-            stage="fixed-reference",
+            stage="crop:moving",
             inputs=inputs,
             geometry=geometry,
-            method="uint16-tiff",
-            accuracy="exact",
+            method="robust-bounding-box",
+            accuracy="legacy-robust",
             native_threads=threads,
             upstream=None,
-            parameters={**common, **fixed_reference_parameters(0.0, 1.0)},
+            parameters={**common, **crop_parameters("moving")},
         ),
+        contents=canonical_compact_json(list(bounds)).encode(),
     )
     _write_request_artifact(
         affine,
@@ -759,7 +761,7 @@ def test_status_accepts_embedded_spacing_within_planner_tolerance(
 
     status = inspect_workflow_status(output_root, "dataset-1")
 
-    assert status.rounds[0].status == "pending"
+    assert status.rounds[1].status == "pending"
 
 
 def test_status_rejects_duplicate_channel_source_files(tmp_path: Path) -> None:
@@ -778,7 +780,7 @@ def test_status_rejects_duplicate_channel_source_files(tmp_path: Path) -> None:
 def test_status_rejects_duplicate_channel_output_paths(tmp_path: Path) -> None:
     output_root = tmp_path / "output"
     scientific = _scientific_mapping(output_root)
-    fixed_path = scientific["reference"]["channel"]  # type: ignore[index]
+    fixed_path = scientific["reference"]["registration_channel"]  # type: ignore[index]
     scientific["rounds"][0]["channels"].append(  # type: ignore[index]
         {
             "file": fixed_path,
@@ -850,7 +852,7 @@ def test_status_accepts_independently_valid_source_shapes(
 
     status = inspect_workflow_status(output_root, "dataset-1")
 
-    assert status.rounds[0].status == "pending"
+    assert status.rounds[1].status == "pending"
 
 
 @pytest.mark.parametrize(
@@ -941,12 +943,12 @@ def test_status_classifies_a_round_with_no_artifacts_as_pending(tmp_path: Path) 
     status = inspect_workflow_status(output_root, "dataset-1")
 
     assert status.scientific_fingerprint == fingerprint
-    assert status.rounds[0].status == "pending"
-    assert status.rounds[0].complete_artifacts == ()
-    assert status.rounds[0].incomplete_artifacts == tuple(
+    assert status.rounds[1].status == "pending"
+    assert status.rounds[1].complete_artifacts == ()
+    assert status.rounds[1].incomplete_artifacts == tuple(
         str(path) for path in _expected_artifacts(output_root, 2)
     )
-    assert status.rounds[0].invalid_artifacts == ()
+    assert status.rounds[1].invalid_artifacts == ()
 
 
 def test_status_classifies_mixed_complete_and_missing_artifacts_as_partial(
@@ -957,7 +959,7 @@ def test_status_classifies_mixed_complete_and_missing_artifacts_as_partial(
     artifacts = _expected_artifacts(output_root, 2)
     _commit_artifact(artifacts[0], output_root)
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "partial"
     assert round_status.complete_artifacts == (str(artifacts[0]),)
@@ -975,11 +977,35 @@ def test_status_requires_every_artifact_completion_record(tmp_path: Path) -> Non
 
     status = inspect_workflow_status(output_root, "dataset-1")
 
-    assert status.rounds[0].status == "complete"
-    assert status.rounds[0].complete_artifacts == tuple(map(str, artifacts))
-    assert status.rounds[0].incomplete_artifacts == ()
-    assert status.rounds[0].invalid_artifacts == ()
+    assert status.rounds[1].status == "complete"
+    assert status.rounds[1].complete_artifacts == tuple(map(str, artifacts))
+    assert status.rounds[1].incomplete_artifacts == ()
+    assert status.rounds[1].invalid_artifacts == ()
     assert status.complete
+
+
+def test_status_rejects_reference_channel_with_wrong_scientific_request(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    reference = (
+        WorkflowLayout.for_dataset(output_root, "dataset-1")
+        .round(1)
+        .channel(Path("fixed.tif"))
+    )
+    record_path = ArtifactStore().record_path(reference)
+    record = CompletionRecord.read(record_path)
+    record_path.write_text(
+        replace(record, request=replace(record.request, method="copy")).to_json(),
+        encoding="utf-8",
+    )
+
+    status = inspect_workflow_status(output_root, "dataset-1")
+
+    assert status.rounds[0].status == "invalid"
+    assert status.rounds[0].invalid_artifacts == (str(reference),)
+    assert not status.complete
 
 
 def test_status_rejects_a_corrupt_fixed_reference_with_restored_identity(
@@ -991,8 +1017,9 @@ def test_status_rejects_a_corrupt_fixed_reference_with_restored_identity(
     for artifact in artifacts:
         _commit_artifact(artifact, output_root)
     fixed_reference = (
-        WorkflowLayout.for_dataset(output_root, "dataset-1").round(2).registration
-        / "fixed_reference.tif"
+        WorkflowLayout.for_dataset(output_root, "dataset-1")
+        .round(1)
+        .channel(Path("fixed.tif"))
     )
     _corrupt_tiff_while_preserving_record_identity(fixed_reference)
 
@@ -1000,7 +1027,7 @@ def test_status_rejects_a_corrupt_fixed_reference_with_restored_identity(
 
     assert round_status.status == "invalid"
     assert round_status.complete_artifacts == ()
-    assert round_status.invalid_artifacts == tuple(map(str, artifacts))
+    assert round_status.invalid_artifacts == (str(fixed_reference),)
 
 
 @pytest.mark.parametrize(
@@ -1021,8 +1048,9 @@ def test_status_compares_fixed_reference_tiff_geometry_with_tolerance(
     for artifact in artifacts:
         _commit_artifact(artifact, output_root)
     fixed_reference = (
-        WorkflowLayout.for_dataset(output_root, "dataset-1").round(2).registration
-        / "fixed_reference.tif"
+        WorkflowLayout.for_dataset(output_root, "dataset-1")
+        .round(1)
+        .channel(Path("fixed.tif"))
     )
     original = _geometry()
     _replace_fixed_reference_geometry(
@@ -1043,7 +1071,7 @@ def test_status_marks_an_artifact_directory_without_a_record_invalid(
     artifacts = _expected_artifacts(output_root, 2)
     artifacts[0].mkdir(parents=True)
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(artifacts[0]),)
@@ -1058,7 +1086,7 @@ def test_status_marks_a_completion_record_directory_invalid(tmp_path: Path) -> N
     artifact.write_bytes(b"artifact")
     ArtifactStore().record_path(artifact).mkdir()
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(artifact),)
@@ -1093,7 +1121,7 @@ def test_status_uses_the_shared_authoritative_completion_scan(
         raising=False,
     )
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert calls == [2]
     assert round_status.status == "invalid"
@@ -1115,7 +1143,7 @@ def test_status_accepts_only_a_complete_serial_chunk_provenance_chain(
     plan_path.write_text(canonical_json(scientific), encoding="utf-8")
     artifacts = _commit_serial_round(output_root)
 
-    complete = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    complete = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert complete.status == "complete"
     assert complete.complete_artifacts == tuple(map(str, artifacts))
@@ -1127,7 +1155,7 @@ def test_status_accepts_only_a_complete_serial_chunk_provenance_chain(
     )
     ArtifactStore().record_path(local_warp).unlink()
 
-    stale = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    stale = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert stale.status == "invalid"
     assert stale.complete_artifacts == (str(artifacts[0]),)
@@ -1138,23 +1166,26 @@ def test_status_requires_the_complete_crop_provenance_chain(tmp_path: Path) -> N
     output_root = tmp_path / "output"
     scientific = _scientific_mapping(output_root)
     scientific["registration"]["crop"] = True  # type: ignore[index]
+    scientific["reference"]["crop_output"] = (  # type: ignore[index]
+        "rounds/round-001/registration/reference_crop_indices.json"
+    )
     plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
     plan_path.parent.mkdir(parents=True)
     plan_path.write_text(canonical_json(scientific), encoding="utf-8")
     artifacts = _commit_cropped_round(output_root)
 
-    complete = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    complete = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert complete.status == "complete"
     assert complete.complete_artifacts == tuple(map(str, artifacts))
 
-    fixed_crop = (
+    moving_crop = (
         WorkflowLayout.for_dataset(output_root, "dataset-1").round(2).registration
-        / "fixed_crop_indices_2.json"
+        / "moving_crop_indices_2.json"
     )
-    fixed_crop.write_text("[0,4,0,8,0,7]\n", encoding="utf-8")
+    moving_crop.write_text("[0,4,0,8,0,7]\n", encoding="utf-8")
 
-    stale = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    stale = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert stale.status == "invalid"
     assert stale.complete_artifacts == ()
@@ -1170,7 +1201,7 @@ def test_status_marks_a_corrupt_completion_record_invalid(tmp_path: Path) -> Non
     record = ArtifactStore().record_path(artifact)
     record.write_text("{not-json", encoding="utf-8")
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(artifact),)
@@ -1185,7 +1216,7 @@ def test_status_treats_an_artifact_without_a_record_as_incomplete(
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"uncommitted")
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "pending"
     assert str(artifact) in round_status.incomplete_artifacts
@@ -1200,7 +1231,7 @@ def test_status_marks_a_completion_record_without_its_artifact_invalid(
     _commit_artifact(artifact, output_root)
     artifact.unlink()
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(artifact),)
@@ -1221,7 +1252,7 @@ def test_status_ignores_missing_or_corrupt_operational_run_summaries(
     status = inspect_workflow_status(output_root, "dataset-1")
 
     assert status.complete
-    assert status.rounds[0].status == "complete"
+    assert status.rounds[1].status == "complete"
 
 
 def test_status_does_not_treat_metrics_or_run_summaries_as_completion(
@@ -1245,7 +1276,7 @@ def test_status_does_not_treat_metrics_or_run_summaries_as_completion(
         '{"status":"completed"}', encoding="utf-8"
     )
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "partial"
     assert round_status.complete_artifacts == tuple(map(str, (affine, warp, channel)))
@@ -1261,8 +1292,8 @@ def test_status_marks_identity_mismatch_invalid(tmp_path: Path) -> None:
 
     status = inspect_workflow_status(output_root, "dataset-1")
 
-    assert status.rounds[0].status == "invalid"
-    assert status.rounds[0].invalid_artifacts == (str(artifact),)
+    assert status.rounds[1].status == "invalid"
+    assert status.rounds[1].invalid_artifacts == (str(artifact),)
 
 
 def test_status_rejects_identity_matching_artifact_with_unexpected_request(
@@ -1273,7 +1304,7 @@ def test_status_rejects_identity_matching_artifact_with_unexpected_request(
     artifact = _expected_artifacts(output_root, 2)[0]
     _commit_artifact(artifact, output_root, stage_override="test")
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(artifact),)
@@ -1293,7 +1324,7 @@ def test_status_rejects_affine_request_with_wrong_scientific_method(
         encoding="utf-8",
     )
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(artifact),)
@@ -1314,7 +1345,7 @@ def test_status_rejects_descendants_of_invalid_affine_provenance(
         encoding="utf-8",
     )
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(affine), str(warp))
@@ -1338,7 +1369,7 @@ def test_status_rejects_noncanonical_duplicate_completion_record_keys(
         encoding="utf-8",
     )
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(artifact),)
@@ -1350,9 +1381,13 @@ def test_status_conservatively_rejects_crop_geometry_without_full_provenance(
     output_root = tmp_path / "output"
     scientific = _scientific_mapping(output_root)
     scientific["registration"]["crop"] = True  # type: ignore[index]
+    scientific["reference"]["crop_output"] = (  # type: ignore[index]
+        "rounds/round-001/registration/reference_crop_indices.json"
+    )
     plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
     plan_path.parent.mkdir(parents=True)
     plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+    _commit_reference(output_root)
     artifact = _expected_artifacts(output_root, 2)[0]
     _commit_artifact(artifact, output_root)
     record_path = ArtifactStore().record_path(artifact)
@@ -1379,7 +1414,7 @@ def test_status_conservatively_rejects_crop_geometry_without_full_provenance(
         encoding="utf-8",
     )
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(artifact),)
@@ -1398,7 +1433,7 @@ def test_status_rejects_warp_without_affine_provenance(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == (str(warp),)
@@ -1414,7 +1449,7 @@ def test_status_rejects_records_after_a_scientific_source_changes(
         _commit_artifact(artifact, output_root)
     (output_root.parent / "dataset" / "round_2_488.tif").write_bytes(b"changed")
 
-    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[0]
+    round_status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
 
     assert round_status.status == "invalid"
     assert round_status.invalid_artifacts == tuple(map(str, artifacts))
@@ -1426,7 +1461,7 @@ def test_status_serializes_as_json_compatible_values(tmp_path: Path) -> None:
 
     payload = inspect_workflow_status(output_root, "dataset-1").to_dict()
 
-    assert [item["round"] for item in payload["rounds"]] == [2, 3]  # type: ignore[index]
+    assert [item["round"] for item in payload["rounds"]] == [1, 2, 3]  # type: ignore[index]
     json.dumps(payload, allow_nan=False)
 
 

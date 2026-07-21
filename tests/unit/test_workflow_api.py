@@ -22,6 +22,7 @@ from cyexm.config.models import (
     ExecutionProfile,
     LocalDaskSpec,
     NativeThreadSpec,
+    ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
@@ -53,10 +54,13 @@ from cyexm.workflow import run_workflow
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundFailure,
     RoundResult,
     RoundTask,
     WorkflowPlan,
+    WorkflowTask,
     canonical_json,
     sha256_fingerprint,
 )
@@ -89,14 +93,13 @@ def _registration() -> RegistrationSpec:
 
 
 def _task(output_root: Path, round_number: int) -> RoundTask:
-    round_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(
-        round_number
-    )
+    layout = WorkflowLayout.for_dataset(output_root, "dataset-1")
+    round_layout = layout.round(round_number)
     return RoundTask(
         dataset_id="dataset-1",
         round=round_number,
         strategy="whole_image",
-        fixed_image=output_root.parent / "dataset" / "fixed.tif",
+        fixed_image=layout.round(1).channel("fixed.tif"),
         moving_image=output_root.parent / "dataset" / f"moving-{round_number}.tif",
         registration_directory=round_layout.registration,
         log_path=round_layout.log,
@@ -127,7 +130,8 @@ def _artifacts(task: RoundTask) -> tuple[Path, ...]:
 def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
     output_root = tmp_path / "output"
     tasks = tuple(_task(output_root, round_number) for round_number in rounds)
-    sources = (tasks[0].fixed_image, *(task.moving_image for task in tasks))
+    fixed_source = tmp_path / "dataset" / "fixed.tif"
+    sources = (fixed_source, *(task.moving_image for task in tasks))
     for source in sources:
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_bytes(f"source:{source.name}".encode())
@@ -135,7 +139,11 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(1.0, 1.0, 1.0),
-        reference=ReferenceSpec(round=1, channel=PurePosixPath("fixed.tif")),
+        reference=ReferenceSpec(
+            round=1,
+            registration_channel=PurePosixPath("fixed.tif"),
+            channels=(ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
         registration=_registration(),
         rounds=tuple(
             RoundSpec(
@@ -163,6 +171,25 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         source_path=tmp_path / "execution.yaml",
     )
     layout = WorkflowLayout.for_dataset(output_root, "dataset-1")
+    reference_layout = layout.round(1)
+    reference_task = ReferenceTask(
+        dataset_id="dataset-1",
+        round=1,
+        registration_channel_source=fixed_source.resolve(),
+        registration_channel_output=reference_layout.channel("fixed.tif"),
+        registration_directory=reference_layout.registration,
+        crop_bounds_path=None,
+        log_path=reference_layout.log,
+        voxel_spacing_xyz=(1.0, 1.0, 1.0),
+        crop=False,
+        native_threads=NativeThreadSpec(itk=1, blas=1),
+        channels=(
+            ReferenceChannelTask(
+                source=fixed_source.resolve(),
+                output=reference_layout.channel("fixed.tif"),
+            ),
+        ),
+    )
 
     def source_mapping(path: Path) -> dict[str, object]:
         stat = path.stat()
@@ -183,7 +210,23 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
             "voxel_spacing_xyz_um": [1.0, 1.0, 1.0],
             "reference": {
                 "round": 1,
-                "channel": str(tasks[0].fixed_image.resolve()),
+                "registration_channel": str(fixed_source.resolve()),
+                "registration_manifest_file": "fixed.tif",
+                "registration_output": (
+                    reference_task.registration_channel_output.relative_to(
+                        layout.root
+                    ).as_posix()
+                ),
+                "crop_output": None,
+                "channels": [
+                    {
+                        "file": str(fixed_source.resolve()),
+                        "manifest_file": "fixed.tif",
+                        "output": reference_task.channels[0]
+                        .output.relative_to(layout.root)
+                        .as_posix(),
+                    }
+                ],
             },
             "registration": {
                 "crop": False,
@@ -225,10 +268,14 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         dataset_id="dataset-1",
         manifest=manifest,
         execution=execution,
-        fixed_image=tasks[0].fixed_image,
+        reference_task=reference_task,
+        fixed_image=reference_task.registration_channel_output,
         tasks=tasks,
         expected_artifacts=tuple(
-            artifact for task in tasks for artifact in _artifacts(task)
+            (
+                reference_task.channels[0].output,
+                *(artifact for task in tasks for artifact in _artifacts(task)),
+            )
         ),
         scientific_json=scientific_json,
         scientific_fingerprint=sha256_fingerprint(scientific_json),
@@ -499,7 +546,10 @@ def _slurm_evidence(*, outcome: str = "succeeded") -> dict[str, object]:
             "scale_attempted": True,
             "scale_succeeded": True,
         },
-        "attempt_counts": [{"dataset_id": "dataset-1", "round": 2, "attempts": 1}],
+        "attempt_counts": [
+            {"dataset_id": "dataset-1", "round": 1, "attempts": 1},
+            {"dataset_id": "dataset-1", "round": 2, "attempts": 1},
+        ],
         "timestamps": {
             "started_at": "2026-07-20T10:00:00Z",
             "ended_at": "2026-07-20T10:00:01Z",
@@ -648,6 +698,35 @@ def _result(task: RoundTask, *, failed: bool = False) -> RoundResult:
     )
 
 
+def _reference_result(task: ReferenceTask, *, failed: bool = False) -> RoundResult:
+    return RoundResult(
+        dataset_id=task.dataset_id,
+        round=task.round,
+        status="failed" if failed else "completed",
+        started_at="2026-07-20T10:00:00Z",
+        ended_at="2026-07-20T10:00:01Z",
+        duration_seconds=1.0,
+        hostname="worker-01",
+        pid=123,
+        dask_task_key=None,
+        slurm_job_id=None,
+        strategy="reference-preparation",
+        native_threads=(
+            ("itk", task.native_threads.itk),
+            ("blas", task.native_threads.blas),
+        ),
+        artifact_paths=(
+            *(() if task.crop_bounds_path is None else (str(task.crop_bounds_path),)),
+            *(str(channel.output) for channel in task.channels),
+        ),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=(
+            RoundFailure("reference", "RuntimeError", "injected") if failed else None
+        ),
+    )
+
+
 def _invalid_result(task: RoundTask, case: str) -> RoundResult:
     result = _result(task, failed=case.startswith("failure_"))
     if case == "dataset_id":
@@ -770,12 +849,19 @@ class _FakeExecutor:
     ) -> None:
         self.callback = callback
         self.calls: list[tuple[RoundTask, ...]] = []
+        self.reference_calls: list[ReferenceTask] = []
         if execution_evidence is not None:
             self.execution_evidence = execution_evidence
 
-    def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+    def execute(
+        self,
+        reference_task: ReferenceTask,
+        tasks: tuple[RoundTask, ...],
+    ) -> tuple[RoundResult, ...]:
+        self.reference_calls.append(reference_task)
         self.calls.append(tasks)
-        return self.callback(tasks)
+        reference_result = _reference_result(reference_task)
+        return (reference_result, *self.callback(tasks))
 
 
 def _factory(
@@ -794,6 +880,9 @@ def _commit_artifact(path: Path, plan: WorkflowPlan) -> None:
         direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
     )
     task = next(task for task in plan.tasks if path in _artifacts(task))
+    if not task.fixed_image.exists():
+        task.fixed_image.parent.mkdir(parents=True, exist_ok=True)
+        write_cyexm_uint16_tiff(task.fixed_image, geometry)
     affine, warp, registered, *_ = _artifacts(task)
     inputs = (
         FileIdentity.from_path(task.fixed_image),
@@ -804,6 +893,7 @@ def _commit_artifact(path: Path, plan: WorkflowPlan) -> None:
         "crop": False,
         "imaging_round": task.round,
         "pixel_size_xyz": [1.0, 1.0, 1.0],
+        "prepared_fixed": True,
     }
     threads = {name: 1 for name in NATIVE_THREAD_ENV_VARS}
     if path == affine:
@@ -981,6 +1071,7 @@ def test_run_workflow_lazily_uses_the_production_round_worker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from cyexm.workflow import reference_task as reference_task_module
     from cyexm.workflow import round_task as round_task_module
 
     plan = _plan(tmp_path, rounds=(2,))
@@ -991,11 +1082,12 @@ def test_run_workflow_lazily_uses_the_production_round_worker(
         return _result(task)
 
     monkeypatch.setattr(round_task_module, "run_round_task", run_round)
+    monkeypatch.setattr(reference_task_module, "run_reference_task", _reference_result)
 
     result = run_workflow(plan)
 
     assert calls == [2]
-    assert tuple(item.status for item in result.rounds) == ("completed",)
+    assert tuple(item.status for item in result.rounds) == ("completed", "completed")
 
 
 def test_run_workflow_selects_local_dask_without_manufacturing_observations(
@@ -1013,12 +1105,13 @@ def test_run_workflow_selects_local_dask_without_manufacturing_observations(
 
     def execute(
         executor: dask_execution.LocalDaskExecutor,
+        reference_task: ReferenceTask,
         tasks: tuple[RoundTask, ...],
     ) -> tuple[RoundResult, ...]:
         selected.append(
             (executor.profile.executor, tuple(task.round for task in tasks))
         )
-        return tuple(_result(task) for task in tasks)
+        return (_reference_result(reference_task), *(_result(task) for task in tasks))
 
     monkeypatch.setattr(dask_execution.LocalDaskExecutor, "execute", execute)
 
@@ -1058,7 +1151,10 @@ def test_local_dask_failed_round_does_not_manufacture_cluster_evidence(
     monkeypatch.setattr(
         dask_execution.LocalDaskExecutor,
         "execute",
-        lambda _self, tasks: tuple(_result(task, failed=True) for task in tasks),
+        lambda _self, reference_task, tasks: (
+            _reference_result(reference_task),
+            *(_result(task, failed=True) for task in tasks),
+        ),
     )
 
     with pytest.raises(WorkflowExecutionError) as captured:
@@ -1084,6 +1180,7 @@ def test_local_dask_cancellation_does_not_manufacture_cluster_evidence(
 
     def interrupt(
         _executor: dask_execution.LocalDaskExecutor,
+        _reference_task: ReferenceTask,
         _tasks: tuple[RoundTask, ...],
     ) -> tuple[RoundResult, ...]:
         raise KeyboardInterrupt
@@ -1106,7 +1203,7 @@ def test_local_dask_cancellation_does_not_manufacture_cluster_evidence(
     assert run_record["execution_profile"]["executor"] == "local_dask"
 
 
-def test_all_reused_local_workflow_does_not_open_an_executor(
+def test_all_reused_local_workflow_still_runs_reference_barrier(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1126,9 +1223,13 @@ def test_all_reused_local_workflow_does_not_open_an_executor(
     }
 
     class UnexpectedExecutor:
-        def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
             executor_calls.append(tuple(task.round for task in tasks))
-            return tuple(_result(task) for task in tasks)
+            return (_reference_result(reference_task),)
 
     def tracking_factory(profile: ExecutionProfile) -> WorkflowExecutor:
         factory_calls.append(profile.executor)
@@ -1138,14 +1239,17 @@ def test_all_reused_local_workflow_does_not_open_an_executor(
 
     result = run_workflow(plan)
 
-    assert factory_calls == []
-    assert executor_calls == []
+    assert factory_calls == ["local_dask"]
+    assert executor_calls == [()]
     assert {
         name
         for name in sys.modules
         if name == "distributed" or name.startswith("distributed.")
     } == scheduler_modules_before
-    assert tuple(round_result.status for round_result in result.rounds) == ("reused",)
+    assert tuple(round_result.status for round_result in result.rounds) == (
+        "completed",
+        "reused",
+    )
     assert result.execution_evidence_json == "{}"
     run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
     assert run_record["execution"] == {}
@@ -1178,7 +1282,7 @@ def test_local_dask_constructor_failure_never_falls_back_to_sequential(
     monkeypatch.setattr(
         SequentialExecutor,
         "execute",
-        lambda _self, tasks: (
+        lambda _self, _reference_task, tasks: (
             sequential_calls.append(tuple(task.round for task in tasks))
             or tuple(_result(task) for task in tasks)
         ),
@@ -1222,17 +1326,24 @@ def test_run_workflow_lazily_selects_slurm_without_falling_back_to_sequential(
         def execution_evidence(self) -> object:
             return evidence
 
-        def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
             slurm_calls.append(
                 (self.profile.executor, tuple(task.round for task in tasks))
             )
-            return tuple(_result(task) for task in tasks)
+            return (
+                _reference_result(reference_task),
+                *(_result(task) for task in tasks),
+            )
 
     monkeypatch.setattr(slurm_execution, "SlurmExecutor", FakeSlurmExecutor)
     monkeypatch.setattr(
         SequentialExecutor,
         "execute",
-        lambda _self, tasks: (
+        lambda _self, _reference_task, tasks: (
             sequential_calls.append(tuple(task.round for task in tasks))
             or tuple(_result(task) for task in tasks)
         ),
@@ -1562,7 +1673,8 @@ def test_slurm_invalid_evidence_fails_closed_with_a_durable_operational_summary(
     }
     assert run_record["operational_failure"]["phase"] == "execution_evidence"
     assert [item["status"] for item in run_record["rounds"]] == [
-        "failed" if round_failed else "completed"
+        "completed",
+        "failed" if round_failed else "completed",
     ]
 
 
@@ -1660,7 +1772,11 @@ def test_slurm_evidence_property_baseexception_cannot_replace_primary_cancel(
         def execution_evidence(self) -> object:
             raise SystemExit("injected evidence property defect")
 
-        def execute(self, _tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        def execute(
+            self,
+            _reference_task: ReferenceTask,
+            _tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
             raise interruption
 
     with (
@@ -1703,8 +1819,15 @@ def test_slurm_evidence_property_system_exit_is_a_mapped_contract_failure(
         def execution_evidence(self) -> object:
             raise SystemExit("injected evidence property defect")
 
-        def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
-            return tuple(_result(task) for task in tasks)
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            return (
+                _reference_result(reference_task),
+                *(_result(task) for task in tasks),
+            )
 
     with pytest.raises(
         ExecutorStartupError,
@@ -1772,7 +1895,7 @@ def test_local_dask_does_not_claim_injected_slurm_evidence(tmp_path: Path) -> No
     assert run_record["execution"] == {}
 
 
-def test_all_reused_slurm_workflow_does_not_construct_an_executor_or_evidence(
+def test_all_reused_slurm_workflow_still_runs_reference_barrier(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1784,23 +1907,34 @@ def test_all_reused_slurm_workflow_does_not_construct_an_executor_or_evidence(
     for artifact in _artifacts(plan.tasks[0]):
         _commit_artifact(artifact, plan)
 
-    def unexpected_factory(_profile: ExecutionProfile) -> WorkflowExecutor:
-        raise AssertionError("all-reused SLURM workflow constructed an executor")
+    evidence = _slurm_evidence()
+    attempts = evidence["attempt_counts"]
+    assert isinstance(attempts, list)
+    attempts.pop()
+    fake = _FakeExecutor(lambda tasks: (), execution_evidence=evidence)
 
-    monkeypatch.setattr(workflow_api, "_default_executor_factory", unexpected_factory)
+    def tracking_factory(_profile: ExecutionProfile) -> WorkflowExecutor:
+        return fake
+
+    monkeypatch.setattr(workflow_api, "_default_executor_factory", tracking_factory)
 
     result = run_workflow(plan)
 
-    assert tuple(round_result.status for round_result in result.rounds) == ("reused",)
-    assert result.execution_evidence_json == "{}"
+    assert fake.calls == [()]
+    assert tuple(round_result.status for round_result in result.rounds) == (
+        "completed",
+        "reused",
+    )
+    assert result.execution_evidence_json == canonical_json(evidence)
     run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
-    assert run_record["execution"] == {}
+    assert run_record["execution"] == evidence
 
 
 def test_run_workflow_skips_a_complete_round_without_opening_execution(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from cyexm.workflow import reference_task as reference_task_module
     from cyexm.workflow import round_task as round_task_module
 
     plan = _plan(tmp_path, rounds=(2,))
@@ -1812,17 +1946,19 @@ def test_run_workflow_skips_a_complete_round_without_opening_execution(
         "run_round_task",
         lambda task: calls.append(task.round) or _result(task),
     )
+    monkeypatch.setattr(reference_task_module, "run_reference_task", _reference_result)
 
     result = run_workflow(plan)
 
     assert calls == []
-    assert tuple(item.status for item in result.rounds) == ("reused",)
+    assert tuple(item.status for item in result.rounds) == ("completed", "reused")
 
 
 def test_run_workflow_executes_when_a_channel_record_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from cyexm.workflow import reference_task as reference_task_module
     from cyexm.workflow import round_task as round_task_module
 
     plan = _plan(tmp_path, rounds=(2,))
@@ -1834,17 +1970,19 @@ def test_run_workflow_executes_when_a_channel_record_is_missing(
         "run_round_task",
         lambda task: calls.append(task.round) or _result(task),
     )
+    monkeypatch.setattr(reference_task_module, "run_reference_task", _reference_result)
 
     result = run_workflow(plan)
 
     assert calls == [2]
-    assert tuple(item.status for item in result.rounds) == ("completed",)
+    assert tuple(item.status for item in result.rounds) == ("completed", "completed")
 
 
 def test_run_workflow_executes_when_registration_evidence_is_stale(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from cyexm.workflow import reference_task as reference_task_module
     from cyexm.workflow import round_task as round_task_module
 
     plan = _plan(tmp_path, rounds=(2,))
@@ -1858,17 +1996,19 @@ def test_run_workflow_executes_when_registration_evidence_is_stale(
         "run_round_task",
         lambda task: calls.append(task.round) or _result(task),
     )
+    monkeypatch.setattr(reference_task_module, "run_reference_task", _reference_result)
 
     result = run_workflow(plan)
 
     assert calls == [2]
-    assert tuple(item.status for item in result.rounds) == ("completed",)
+    assert tuple(item.status for item in result.rounds) == ("completed", "completed")
 
 
-def test_run_workflow_executes_when_fixed_reference_tiff_is_corrupt(
+def test_run_workflow_ignores_obsolete_per_round_fixed_reference_tiff(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from cyexm.workflow import reference_task as reference_task_module
     from cyexm.workflow import round_task as round_task_module
 
     plan = _plan(tmp_path, rounds=(2,))
@@ -1882,11 +2022,17 @@ def test_run_workflow_executes_when_fixed_reference_tiff_is_corrupt(
         "run_round_task",
         lambda task: calls.append(task.round) or _result(task),
     )
+    monkeypatch.setattr(reference_task_module, "run_reference_task", _reference_result)
 
-    result = run_workflow(plan)
+    result = run_workflow(
+        plan,
+        _executor_factory=_factory(
+            _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+        ),
+    )
 
-    assert calls == [2]
-    assert result.rounds[0].status == "completed"
+    assert calls == []
+    assert tuple(item.status for item in result.rounds) == ("completed", "reused")
 
 
 def test_run_workflow_forces_only_selected_rounds(tmp_path: Path) -> None:
@@ -1902,7 +2048,33 @@ def test_run_workflow_forces_only_selected_rounds(tmp_path: Path) -> None:
     submitted = fake.calls[0]
     assert tuple(task.round for task in submitted) == (2, 3)
     assert tuple(task.force for task in submitted) == (False, True)
+    assert not fake.reference_calls[0].force
     assert tuple(task.force for task in plan.tasks) == (False, False)
+
+
+def test_run_workflow_forcing_reference_invalidates_and_forces_all_descendants(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    for task in plan.tasks:
+        for artifact in _artifacts(task):
+            _commit_artifact(artifact, plan)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    run_workflow(
+        plan,
+        force_rounds=frozenset({1}),
+        _executor_factory=_factory(fake),
+    )
+
+    assert fake.reference_calls[0].force
+    assert tuple(task.round for task in fake.calls[0]) == (2, 3)
+    assert all(task.force for task in fake.calls[0])
+    store = ArtifactStore()
+    for task in plan.tasks:
+        for artifact in _artifacts(task):
+            assert not store.record_path(artifact).exists()
+            assert store.stale_path(artifact).is_file()
 
 
 def test_run_workflow_force_all_replaces_every_immutable_task(tmp_path: Path) -> None:
@@ -1911,6 +2083,7 @@ def test_run_workflow_force_all_replaces_every_immutable_task(tmp_path: Path) ->
 
     run_workflow(plan, force_all=True, _executor_factory=_factory(fake))
 
+    assert fake.reference_calls[0].force
     assert all(task.force for task in fake.calls[0])
     assert not any(task.force for task in plan.tasks)
 
@@ -2065,6 +2238,25 @@ def test_run_workflow_rejects_expected_artifact_mismatch_before_mutation(
         run_workflow(forged, _executor_factory=_factory(fake))
 
     assert not plan.execution.paths.output_root.exists()
+    assert fake.calls == []
+
+
+def test_run_workflow_rejects_forged_reference_output_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    forged_reference = replace(
+        plan.reference_task,
+        registration_channel_output=tmp_path / "outside" / "fixed.tif",
+    )
+    forged = replace(plan, reference_task=forged_reference)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="registration_channel_output"):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert not (tmp_path / "outside").exists()
     assert fake.calls == []
 
 
@@ -2255,9 +2447,13 @@ def test_run_workflow_excludes_complete_rounds_and_reports_them_reused(
     result = run_workflow(plan, _executor_factory=_factory(fake))
 
     assert tuple(task.round for task in fake.calls[0]) == (3,)
-    assert tuple(item.round for item in result.rounds) == (2, 3)
-    assert tuple(item.status for item in result.rounds) == ("reused", "completed")
-    assert result.rounds[0].reused_artifacts == tuple(
+    assert tuple(item.round for item in result.rounds) == (1, 2, 3)
+    assert tuple(item.status for item in result.rounds) == (
+        "completed",
+        "reused",
+        "completed",
+    )
+    assert result.rounds[1].reused_artifacts == tuple(
         str(path) for path in _artifacts(plan.tasks[0])
     )
 
@@ -2289,7 +2485,15 @@ def test_run_workflow_does_not_reuse_artifacts_from_other_native_threads(
     requested_threads = NativeThreadSpec(itk=2, blas=3)
     task = replace(original.tasks[0], native_threads=requested_threads)
     execution = replace(original.execution, native_threads=requested_threads)
-    plan = replace(original, tasks=(task,), execution=execution)
+    plan = replace(
+        original,
+        reference_task=replace(
+            original.reference_task,
+            native_threads=requested_threads,
+        ),
+        tasks=(task,),
+        execution=execution,
+    )
     configured: list[ExecutionProfile] = []
     monkeypatch.setattr(
         workflow_api,
@@ -2332,7 +2536,7 @@ def test_run_workflow_writes_failed_summary_then_raises_sorted_rounds(
     assert record.is_file()
     payload = json.loads(record.read_text(encoding="utf-8"))
     assert payload["status"] == "failed"
-    assert [item["round"] for item in payload["rounds"]] == [2, 3]
+    assert [item["round"] for item in payload["rounds"]] == [1, 2, 3]
     assert not tuple(record.parent.glob(".*.tmp*"))
 
 
@@ -2537,7 +2741,9 @@ def test_run_workflow_cancelled_summary_preserves_completed_sequential_rounds(
 ) -> None:
     plan = _plan(tmp_path)
 
-    def runner(task: RoundTask) -> RoundResult:
+    def runner(task: WorkflowTask) -> RoundResult:
+        if type(task) is ReferenceTask:
+            return _reference_result(task)
         if task.round == 3:
             raise KeyboardInterrupt("injected")
         return _result(task)
@@ -2556,7 +2762,7 @@ def test_run_workflow_cancelled_summary_preserves_completed_sequential_rounds(
     assert len(records) == 1
     payload = json.loads(records[0].read_text(encoding="utf-8"))
     assert payload["status"] == "cancelled"
-    assert [item["round"] for item in payload["rounds"]] == [2]
+    assert [item["round"] for item in payload["rounds"]] == [1, 2]
 
 
 def test_run_workflow_records_cancellation_during_snapshot_creation(
@@ -2620,4 +2826,4 @@ def test_run_workflow_recovers_a_cancelled_final_record_write(
     assert len(records) == 1
     payload = json.loads(records[0].read_text(encoding="utf-8"))
     assert payload["status"] == "cancelled"
-    assert [item["round"] for item in payload["rounds"]] == [2, 3]
+    assert [item["round"] for item in payload["rounds"]] == [1, 2, 3]

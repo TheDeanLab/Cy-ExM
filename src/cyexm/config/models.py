@@ -26,9 +26,15 @@ class RoundSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ReferenceChannelSpec:
+    file: PurePosixPath
+
+
+@dataclass(frozen=True, slots=True)
 class ReferenceSpec:
     round: int
-    channel: PurePosixPath
+    registration_channel: PurePosixPath
+    channels: tuple[ReferenceChannelSpec, ...]
 
 
 @dataclass(frozen=True, slots=True)

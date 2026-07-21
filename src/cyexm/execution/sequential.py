@@ -5,8 +5,8 @@ import socket
 import time
 from datetime import UTC, datetime
 
-from cyexm.execution.base import RoundTaskRunner
-from cyexm.workflow.models import RoundResult, RoundTask
+from cyexm.execution.base import WorkflowTaskRunner
+from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask, WorkflowTask
 
 
 def _utc_now() -> str:
@@ -29,10 +29,12 @@ class _SequentialExecutionInterrupted(KeyboardInterrupt):
 class SequentialExecutor:
     """Run independent round tasks in canonical order in the current process."""
 
-    def __init__(self, *, runner: RoundTaskRunner) -> None:
+    def __init__(self, *, runner: WorkflowTaskRunner) -> None:
         self._runner = runner
 
-    def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+    def _execute_tasks(
+        self, tasks: tuple[WorkflowTask, ...]
+    ) -> tuple[RoundResult, ...]:
         results: list[RoundResult] = []
         for task in tasks:
             started_at = _utc_now()
@@ -56,7 +58,11 @@ class SequentialExecutor:
                         pid=os.getpid(),
                         dask_task_key=None,
                         slurm_job_id=None,
-                        strategy=task.strategy,
+                        strategy=(
+                            "reference-preparation"
+                            if isinstance(task, ReferenceTask)
+                            else task.strategy
+                        ),
                         native_threads=(
                             ("itk", task.native_threads.itk),
                             ("blas", task.native_threads.blas),
@@ -74,6 +80,23 @@ class SequentialExecutor:
             else:
                 results.append(result)
         return tuple(results)
+
+    def execute(
+        self,
+        reference_task: ReferenceTask,
+        round_tasks: tuple[RoundTask, ...],
+    ) -> tuple[RoundResult, ...]:
+        reference_results = self._execute_tasks((reference_task,))
+        if reference_results[0].status not in {"completed", "reused"}:
+            return reference_results
+        try:
+            moving_results = self._execute_tasks(round_tasks)
+        except _SequentialExecutionInterrupted as error:
+            raise _SequentialExecutionInterrupted(
+                error.original,
+                (*reference_results, *error.completed_results),
+            ) from error
+        return (*reference_results, *moving_results)
 
 
 __all__ = ["SequentialExecutor"]

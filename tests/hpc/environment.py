@@ -874,7 +874,7 @@ def build_smoke_tasks(
             f"found {len(context.manifest.rounds)}"
         )
     dataset_root = context.profile.paths.dataset_root
-    fixed_image = dataset_root / context.manifest.reference.channel
+    fixed_image = dataset_root / context.manifest.reference.registration_channel
     tasks: list[RoundTask] = []
     for round_spec in context.manifest.rounds[:worker_count]:
         no_registration_root = (
@@ -1253,7 +1253,7 @@ def _validate_dataset_files(
 ) -> tuple[Path, ...]:
     dataset_root = _resolved_directory(profile.paths.dataset_root, "dataset root")
     _resolved_directory(profile.paths.output_root, "output root")
-    relative_paths = [manifest.reference.channel]
+    relative_paths = [channel.file for channel in manifest.reference.channels]
     for round_spec in manifest.rounds:
         relative_paths.extend(channel.file for channel in round_spec.channels)
     resolved_inputs: list[Path] = []

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
-from numbers import Integral, Real
+from numbers import Real
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,14 +15,12 @@ from cyexm.errors import (
     ChunkRegistrationError,
     RegistrationStageError,
 )
-from cyexm.io.images import Bounds3D, robust_bounding_box
 from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration._native_paths import discard_path
 from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
     WHOLE_SCALAR_POLICY,
     affine_parameters,
-    canonical_compact_json,
     common_parameters,
     crop_parameters,
     fixed_reference_parameters,
@@ -34,6 +31,12 @@ from cyexm.registration._request_policy import (
 )
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import AntsRegistrationBackend, RegistrationBackend
+from cyexm.registration.crop import (
+    bounds_text,
+    estimate_bounds,
+    read_bounds,
+    validate_bounds,
+)
 from cyexm.runtime import (
     NativeThreadConfig,
     ResolvedNativeThreads,
@@ -126,6 +129,7 @@ class ImageRegistration:
         enable_logging: bool = True,
         force_override: bool = False,
         *,
+        prepared_fixed: bool = False,
         native_threads: NativeThreadConfig | None = None,
         linear_type: str = "TRSAA",
         linear_accuracy: str = "low",
@@ -146,6 +150,7 @@ class ImageRegistration:
         self.crop = _validated_bool(crop, "crop")
         self.enable_logging = _validated_bool(enable_logging, "enable_logging")
         self.force_override = _validated_bool(force_override, "force_override")
+        self.prepared_fixed = _validated_bool(prepared_fixed, "prepared_fixed")
         self.native_threads = native_threads
         self.linear_type = _validated_choice(linear_type, "linear_type", _LINEAR_TYPES)
         self.linear_accuracy = _validated_choice(
@@ -201,7 +206,8 @@ class ImageRegistration:
         fixed_mask = backend.zero_mask(fixed)
         moving_mask = backend.zero_mask(moving)
 
-        self._commit_fixed_reference(backend, fixed, paths, resolved)
+        if not self.prepared_fixed:
+            self._commit_fixed_reference(backend, fixed, paths, resolved)
         self._commit_metrics(
             "pre-registration",
             backend,
@@ -378,6 +384,7 @@ class ImageRegistration:
             imaging_round=self.imaging_round,
             pixel_size_xyz=self.pixel_size,
         )
+        evidence["prepared_fixed"] = self.prepared_fixed
         evidence.update(parameters)
         return StageRequest.for_identities(
             stage=stage,
@@ -400,13 +407,15 @@ class ImageRegistration:
     ) -> tuple[object, object]:
         if not self.crop:
             return fixed, moving
-        fixed_cropped = self._crop_image(
-            backend,
-            fixed,
-            paths.fixed_crop,
-            "fixed",
-            resolved,
-        )
+        fixed_cropped = fixed
+        if not self.prepared_fixed:
+            fixed_cropped = self._crop_image(
+                backend,
+                fixed,
+                paths.fixed_crop,
+                "fixed",
+                resolved,
+            )
         moving_cropped = self._crop_image(
             backend,
             moving,
@@ -416,47 +425,9 @@ class ImageRegistration:
         )
         return fixed_cropped, moving_cropped
 
-    @staticmethod
-    def _validated_bounds(value: object, shape: tuple[int, int, int]) -> Bounds3D:
-        if isinstance(value, str | bytes):
-            raise TypeError("crop bounds must contain exactly six integers")
-        try:
-            values = tuple(value)  # type: ignore[arg-type]
-        except TypeError as error:
-            raise TypeError("crop bounds must contain exactly six integers") from error
-        if len(values) != 6:
-            raise ValueError("crop bounds must contain exactly six integers")
-        if any(
-            isinstance(item, bool) or not isinstance(item, Integral) for item in values
-        ):
-            raise TypeError("crop bounds must contain exactly six integers")
-        z0, z1, y0, y1, x0, x1 = (int(item) for item in values)
-        pairs = ((z0, z1), (y0, y1), (x0, x1))
-        if any(
-            start < 0 or stop > size or start >= stop
-            for (start, stop), size in zip(pairs, shape, strict=True)
-        ):
-            raise ValueError("crop bounds must define a non-empty image region")
-        return z0, z1, y0, y1, x0, x1
-
-    @staticmethod
-    def _bounds_text(bounds: Bounds3D) -> str:
-        return canonical_compact_json(list(bounds))
-
-    @classmethod
-    def _read_bounds(
-        cls,
-        path: Path,
-        shape: tuple[int, int, int],
-    ) -> Bounds3D:
-        text = path.read_text(encoding="utf-8")
-        payload = json.loads(text)
-        if not isinstance(payload, list):
-            raise TypeError("crop bounds must be a JSON array")
-        bounds = cls._validated_bounds(payload, shape)
-        if cls._bounds_text(bounds) != text:
-            raise ValueError("crop bounds artifact is not canonical")
-        return bounds
+    _validated_bounds = staticmethod(validate_bounds)
+    _bounds_text = staticmethod(bounds_text)
+    _read_bounds = staticmethod(read_bounds)
 
     def _crop_image(
         self,
@@ -493,13 +464,7 @@ class ImageRegistration:
             )
         if bounds is None:
             try:
-                estimated = robust_bounding_box(
-                    backend.to_array(image),
-                    down_sampling=4,
-                    lower_pct=0.1,
-                    upper_pct=99.9,
-                )
-                bounds = self._validated_bounds(estimated, geometry.shape)
+                bounds = estimate_bounds(backend, image)
                 text = self._bounds_text(bounds)
 
                 def writer(destination: Path) -> None:
@@ -619,6 +584,23 @@ class ImageRegistration:
             "nonlinear-registered": paths.nonlinear_metrics,
         }
         try:
+            source_moving_geometry = backend.geometry(moving)
+            resampled_to_fixed = not geometry_compatible(
+                backend.geometry(fixed), source_moving_geometry
+            )
+            if resampled_to_fixed:
+                moving = backend.resample_to_target(
+                    image=moving,
+                    target=fixed,
+                    interpolation="linear",
+                )
+                moving_mask = backend.threshold_mask(
+                    backend.resample_to_target(
+                        image=moving_mask,
+                        target=fixed_mask,
+                        interpolation="nearestNeighbor",
+                    )
+                )
             upstream = None
             if stage == "linearly-registered":
                 upstream = FileIdentity.from_path(paths.affine)
@@ -626,6 +608,8 @@ class ImageRegistration:
                 upstream = FileIdentity.from_path(paths.warp)
             parameters: dict[str, object] = {
                 "moving_geometry": backend.geometry(moving).to_dict(),
+                "source_moving_geometry": source_moving_geometry.to_dict(),
+                "resampled_to_fixed": resampled_to_fixed,
                 "sampling": "regular",
                 "sampling_pct": 1.0,
             }

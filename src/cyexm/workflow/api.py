@@ -32,7 +32,7 @@ from cyexm.execution.sequential import (
     _SequentialExecutionInterrupted,
 )
 from cyexm.io.atomic import atomic_write
-from cyexm.registration.artifacts import FileIdentity
+from cyexm.registration.artifacts import ArtifactStore, FileIdentity
 from cyexm.workflow._execution_validation import (
     _canonical_path,
     _validate_round_result,
@@ -41,10 +41,13 @@ from cyexm.workflow._execution_validation import (
 )
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundResult,
     RoundTask,
     WorkflowPlan,
     WorkflowResult,
+    WorkflowTask,
     canonical_json,
     sha256_fingerprint,
 )
@@ -95,9 +98,9 @@ def _configure_sequential_native_threads(profile: ExecutionProfile) -> None:
 
 def _default_executor_factory(profile: ExecutionProfile) -> WorkflowExecutor:
     if profile.executor == "sequential":
-        from cyexm.workflow.round_task import run_round_task
+        from cyexm.workflow.task import run_workflow_task
 
-        return SequentialExecutor(runner=run_round_task)
+        return SequentialExecutor(runner=run_workflow_task)
     if profile.executor == "local_dask":
         from cyexm.execution.dask import LocalDaskExecutor
 
@@ -316,16 +319,72 @@ def _validate_workflow_plan(
         raise WorkflowPlanError(
             "WorkflowPlan manifest does not match the scientific plan"
         )
-    fixed_image = _manifest_source_path(
-        manifest.reference.channel,
+    reference_task = plan.reference_task
+    if type(reference_task) is not ReferenceTask:
+        raise WorkflowPlanError(
+            "WorkflowPlan.reference_task must be an exact ReferenceTask"
+        )
+    if type(reference_task.channels) is not tuple or any(
+        type(channel) is not ReferenceChannelTask for channel in reference_task.channels
+    ):
+        raise WorkflowPlanError(
+            "WorkflowPlan.reference_task.channels must be an exact tuple of "
+            "ReferenceChannelTask values"
+        )
+    reference_layout = layout.round(snapshot.reference_round)
+    reference_sources = tuple(
+        _manifest_source_path(
+            channel.file,
+            dataset_root=dataset_root,
+            location=f"WorkflowPlan.manifest.reference.channels[{index}].file",
+        )
+        for index, channel in enumerate(manifest.reference.channels)
+    )
+    registration_source = _manifest_source_path(
+        manifest.reference.registration_channel,
         dataset_root=dataset_root,
-        location="WorkflowPlan.manifest.reference.channel",
+        location="WorkflowPlan.manifest.reference.registration_channel",
+    )
+    _safe_descendant(
+        reference_task.registration_channel_output,
+        root=layout.root,
+        location="WorkflowPlan.reference_task.registration_channel_output",
+    )
+    _safe_descendant(
+        reference_task.registration_directory,
+        root=layout.root,
+        location="WorkflowPlan.reference_task.registration_directory",
+    )
+    _safe_descendant(
+        reference_task.log_path,
+        root=layout.root,
+        location="WorkflowPlan.reference_task.log_path",
     )
     if (
         type(manifest.reference.round) is not int
         or manifest.reference.round != snapshot.reference_round
-        or fixed_image != snapshot.fixed_source.path
-        or plan.fixed_image != fixed_image
+        or tuple(channel.file for channel in manifest.reference.channels)
+        != tuple(channel.manifest_file for channel in snapshot.reference_channels)
+        or reference_sources
+        != tuple(channel.source.path for channel in snapshot.reference_channels)
+        or registration_source != snapshot.fixed_source.path
+        or reference_task.dataset_id != plan.dataset_id
+        or reference_task.round != snapshot.reference_round
+        or reference_task.registration_channel_source != snapshot.fixed_source.path
+        or reference_task.registration_channel_output != snapshot.fixed_output
+        or reference_task.registration_directory != reference_layout.registration
+        or reference_task.crop_bounds_path != snapshot.reference_crop_output
+        or reference_task.log_path != reference_layout.log
+        or reference_task.voxel_spacing_xyz != snapshot.voxel_spacing_xyz
+        or reference_task.crop != snapshot.registration.crop
+        or reference_task.native_threads != execution.native_threads
+        or type(reference_task.force) is not bool
+        or reference_task.force
+        or tuple(channel.source for channel in reference_task.channels)
+        != reference_sources
+        or tuple(channel.output for channel in reference_task.channels)
+        != tuple(channel.output for channel in snapshot.reference_channels)
+        or plan.fixed_image != snapshot.fixed_output
     ):
         raise WorkflowPlanError(
             "WorkflowPlan reference does not match the scientific plan"
@@ -351,7 +410,9 @@ def _validate_workflow_plan(
             "WorkflowPlan tasks must match the unique sorted scientific rounds"
         )
 
-    expected_artifacts: list[Path] = []
+    expected_artifacts = [channel.output for channel in snapshot.reference_channels]
+    if snapshot.reference_crop_output is not None:
+        expected_artifacts.append(snapshot.reference_crop_output)
     for task in plan.tasks:
         contract = round_contracts[task.round]
         manifest_round = manifest_rounds[task.round]
@@ -397,13 +458,15 @@ def _validate_workflow_plan(
         if (
             task.dataset_id != plan.dataset_id
             or task.strategy != contract.strategy
-            or task.fixed_image != fixed_image
+            or task.fixed_image != snapshot.fixed_output
             or task.moving_image != contract.registration_source.path
             or task.voxel_spacing_xyz != snapshot.voxel_spacing_xyz
             or not _registration_matches_snapshot(task.registration, snapshot)
             or task.native_threads != execution.native_threads
             or task.chunk_size_zyx != contract.chunk_size_zyx
             or task.overlap_fraction != contract.overlap_fraction
+            or type(task.prepared_fixed) is not bool
+            or not task.prepared_fixed
             or type(task.force) is not bool
             or task.force
         ):
@@ -490,7 +553,7 @@ def _validate_force_arguments(
         )
     if force_all and force_rounds:
         raise WorkflowPlanError("force_all and force_rounds are mutually exclusive")
-    known = frozenset(task.round for task in plan.tasks)
+    known = frozenset((plan.reference_task.round, *(task.round for task in plan.tasks)))
     unknown = tuple(sorted(force_rounds - known))
     if unknown:
         raise WorkflowPlanError(f"force_rounds contains unknown rounds: {unknown!r}")
@@ -589,7 +652,7 @@ def _reused_result(
 
 
 def _ordered_results(
-    submitted: tuple[RoundTask, ...],
+    submitted: tuple[WorkflowTask, ...],
     results: tuple[RoundResult, ...],
 ) -> tuple[RoundResult, ...]:
     if type(results) is not tuple:
@@ -613,7 +676,7 @@ def _ordered_results(
 
 
 def _validated_partial_results(
-    submitted: tuple[RoundTask, ...],
+    submitted: tuple[WorkflowTask, ...],
     results: tuple[RoundResult, ...],
 ) -> tuple[RoundResult, ...]:
     if type(results) is not tuple:
@@ -680,7 +743,7 @@ def _write_run_record(
 def _executor_execution_evidence_json(
     profile: ExecutionProfile,
     executor: object | None,
-    expected_tasks: tuple[RoundTask, ...],
+    expected_tasks: tuple[WorkflowTask, ...],
 ) -> str:
     if profile.executor != "slurm" or executor is None:
         return "{}"
@@ -731,6 +794,7 @@ def run_workflow(
     )
     preserved_results: tuple[RoundResult, ...] = ()
     submitted: tuple[RoundTask, ...] = ()
+    reference_task = plan.reference_task
     executor: WorkflowExecutor | None = None
     execution_evidence_json = "{}"
     try:
@@ -738,20 +802,25 @@ def run_workflow(
         status = _inspect_workflow_status(
             plan.execution.paths.output_root,
             plan.dataset_id,
-            _tasks=plan.tasks,
+            _tasks=(plan.reference_task, *plan.tasks),
         )
         if status.scientific_fingerprint != plan.scientific_fingerprint:
             raise WorkflowPlanError(
                 "Persisted scientific-plan fingerprint changed before execution"
             )
         status_by_round = {item.round: item for item in status.rounds}
-        plan_rounds = tuple(task.round for task in plan.tasks)
+        plan_rounds = (
+            plan.reference_task.round,
+            *(task.round for task in plan.tasks),
+        )
         if set(status_by_round) != set(plan_rounds):
             raise WorkflowPlanError(
                 "Persisted scientific plan rounds do not match WorkflowPlan tasks; "
                 f"snapshot={tuple(sorted(status_by_round))!r}, plan={plan_rounds!r}"
             )
 
+        force_reference = force_all or plan.reference_task.round in force_rounds
+        force_moving = force_all or force_reference
         reused = tuple(
             _reused_result(
                 plan,
@@ -761,34 +830,45 @@ def run_workflow(
             )
             for task in plan.tasks
             if status_by_round[task.round].status == "complete"
-            and not force_all
+            and not force_moving
             and task.round not in force_rounds
         )
         preserved_results = reused
         reused_rounds = frozenset(result.round for result in reused)
+        reference_task = replace(plan.reference_task, force=force_reference)
         submitted = tuple(
             replace(
                 task,
-                force=force_all or task.round in force_rounds,
+                force=force_moving or task.round in force_rounds,
             )
             for task in plan.tasks
             if task.round not in reused_rounds
         )
-        if submitted:
-            factory = _executor_factory or _default_executor_factory
-            executor = factory(plan.execution)
-            raw_results = executor.execute(submitted)
-            executed = _ordered_results(submitted, raw_results)
-            preserved_results = tuple(
-                sorted((*reused, *executed), key=lambda result: result.round)
-            )
-            execution_evidence_json = _executor_execution_evidence_json(
-                plan.execution,
-                executor,
-                submitted,
-            )
-        else:
-            executed = ()
+        if force_reference:
+            store = ArtifactStore()
+            reference_artifacts = {
+                *(channel.output for channel in plan.reference_task.channels),
+                *(
+                    ()
+                    if plan.reference_task.crop_bounds_path is None
+                    else (plan.reference_task.crop_bounds_path,)
+                ),
+            }
+            for artifact in plan.expected_artifacts:
+                if artifact not in reference_artifacts:
+                    store.mark_stale(artifact)
+        factory = _executor_factory or _default_executor_factory
+        executor = factory(plan.execution)
+        raw_results = executor.execute(reference_task, submitted)
+        executed = _ordered_results((reference_task, *submitted), raw_results)
+        preserved_results = tuple(
+            sorted((*reused, *executed), key=lambda result: result.round)
+        )
+        execution_evidence_json = _executor_execution_evidence_json(
+            plan.execution,
+            executor,
+            (reference_task, *submitted),
+        )
         rounds = tuple(sorted((*reused, *executed), key=lambda result: result.round))
         preserved_results = rounds
         unsuccessful = tuple(
@@ -829,7 +909,7 @@ def run_workflow(
                 execution_evidence_json = _executor_execution_evidence_json(
                     plan.execution,
                     executor,
-                    submitted,
+                    (reference_task, *submitted),
                 )
             except _ExecutorEvidenceError as contract_error:
                 evidence_error = contract_error
@@ -883,7 +963,7 @@ def run_workflow(
             execution_evidence_json = _executor_execution_evidence_json(
                 plan.execution,
                 executor,
-                submitted,
+                (reference_task, *submitted),
             )
         except BaseException as evidence_access_error:
             evidence_error = (
@@ -898,7 +978,7 @@ def run_workflow(
         original_interruption = interruption
         if isinstance(interruption, _SequentialExecutionInterrupted):
             partial_results = _validated_partial_results(
-                submitted,
+                (reference_task, *submitted),
                 interruption.completed_results,
             )
             preserved_results = tuple(

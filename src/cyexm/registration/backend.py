@@ -81,6 +81,15 @@ class RegistrationBackend(Protocol):
     ) -> object:
         raise NotImplementedError
 
+    def resample_to_target(
+        self,
+        *,
+        image: object,
+        target: object,
+        interpolation: str,
+    ) -> object:
+        raise NotImplementedError
+
     def apply_warp(
         self,
         *,
@@ -164,8 +173,9 @@ class AntsRegistrationBackend:
     def threshold_mask(self, image: object) -> object:
         self._prepare()
         ants, _ = _scientific_runtime()
+        runtime_image: Any = image
         return ants.threshold_image(
-            image,
+            runtime_image.clone("float"),
             low_thresh=0.5,
             high_thresh=1.0,
             inval=1,
@@ -269,6 +279,21 @@ class AntsRegistrationBackend:
             transform=transform,
             interpolation=interpolation,
             native_threads=self.native_threads,
+        )
+
+    def resample_to_target(
+        self,
+        *,
+        image: object,
+        target: object,
+        interpolation: str,
+    ) -> object:
+        self._prepare()
+        ants, _ = _scientific_runtime()
+        return ants.resample_image_to_target(
+            image=image,
+            target=target,
+            interp_type=interpolation,
         )
 
     def apply_warp(

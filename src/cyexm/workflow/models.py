@@ -18,6 +18,8 @@ from cyexm.config.models import (
 )
 from cyexm.spatial import ImageGeometry
 
+type TaskStrategy = Literal["reference-preparation", "whole_image", "serial_chunked"]
+
 
 def canonical_json(value: object) -> str:
     """Encode a JSON-compatible value in the workflow's canonical form."""
@@ -42,6 +44,28 @@ class ChannelTask:
 
 
 @dataclass(frozen=True, slots=True)
+class ReferenceChannelTask:
+    source: Path
+    output: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceTask:
+    dataset_id: str
+    round: int
+    registration_channel_source: Path
+    registration_channel_output: Path
+    registration_directory: Path
+    crop_bounds_path: Path | None
+    log_path: Path
+    voxel_spacing_xyz: PixelSpacingXYZ
+    crop: bool
+    native_threads: NativeThreadSpec
+    channels: tuple[ReferenceChannelTask, ...]
+    force: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class RoundTask:
     dataset_id: str
     round: int
@@ -56,7 +80,11 @@ class RoundTask:
     channels: tuple[ChannelTask, ...]
     chunk_size_zyx: ChunkSizeZYX | None
     overlap_fraction: float | None
+    prepared_fixed: bool = True
     force: bool = False
+
+
+type WorkflowTask = ReferenceTask | RoundTask
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +124,7 @@ class RoundResult:
     pid: int
     dask_task_key: str | None
     slurm_job_id: str | None
-    strategy: RegistrationStrategy
+    strategy: TaskStrategy
     native_threads: tuple[tuple[str, int], ...]
     artifact_paths: tuple[str, ...]
     reused_artifacts: tuple[str, ...]
@@ -130,6 +158,7 @@ class WorkflowPlan:
     dataset_id: str
     manifest: DatasetManifest
     execution: ExecutionProfile
+    reference_task: ReferenceTask
     fixed_image: Path
     tasks: tuple[RoundTask, ...]
     expected_artifacts: tuple[Path, ...]
@@ -209,6 +238,8 @@ class WorkflowStatus:
 __all__ = (
     "ChannelTask",
     "ImageHeader",
+    "ReferenceChannelTask",
+    "ReferenceTask",
     "RoundFailure",
     "RoundResult",
     "RoundStatus",
@@ -216,6 +247,7 @@ __all__ = (
     "WorkflowPlan",
     "WorkflowResult",
     "WorkflowStatus",
+    "WorkflowTask",
     "canonical_json",
     "sha256_fingerprint",
 )

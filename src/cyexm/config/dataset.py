@@ -18,6 +18,7 @@ from cyexm.config.models import (
     ChunkSizeZYX,
     DatasetManifest,
     PixelSpacingXYZ,
+    ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
@@ -43,7 +44,8 @@ _DATASET_KEYS = frozenset(
     }
 )
 _VOXEL_SPACING_KEYS = frozenset({"x", "y", "z"})
-_REFERENCE_KEYS = frozenset({"round", "channel"})
+_REFERENCE_KEYS = frozenset({"round", "registration_channel", "channels"})
+_REFERENCE_CHANNEL_KEYS = frozenset({"file"})
 _REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
 _STAGE_KEYS = frozenset({"type", "accuracy"})
 _WHOLE_IMAGE_ROUND_KEYS = frozenset(
@@ -89,10 +91,49 @@ def _voxel_spacing(value: object) -> PixelSpacingXYZ:
 
 
 def _reference(value: object) -> ReferenceSpec:
+    if isinstance(value, Mapping) and "channel" in value:
+        raise ConfigurationValidationError(
+            "schema_version 1 reference.channel is no longer supported; declare "
+            "reference.registration_channel and reference.channels"
+        )
     mapping = require_exact_keys(value, _REFERENCE_KEYS, "reference")
+    channels = tuple(
+        ReferenceChannelSpec(
+            file=relative_posix_path(
+                require_exact_keys(
+                    item,
+                    _REFERENCE_CHANNEL_KEYS,
+                    f"reference.channels[{index}]",
+                )["file"],
+                f"reference.channels[{index}].file",
+            )
+        )
+        for index, item in enumerate(_list(mapping["channels"], "reference.channels"))
+    )
+    if not channels:
+        raise ConfigurationValidationError("reference.channels must not be empty")
+    channel_files = tuple(channel.file for channel in channels)
+    if len(set(channel_files)) != len(channel_files):
+        raise ConfigurationValidationError(
+            f"reference.channels file values must be unique; got {channel_files!r}"
+        )
+    basenames = tuple(channel.file.name for channel in channels)
+    if len(set(basenames)) != len(basenames):
+        raise ConfigurationValidationError(
+            f"reference.channels output basenames must be unique; got {basenames!r}"
+        )
+    registration_channel = relative_posix_path(
+        mapping["registration_channel"], "reference.registration_channel"
+    )
+    if channel_files.count(registration_channel) != 1:
+        raise ConfigurationValidationError(
+            "reference.registration_channel must match exactly one reference.channels "
+            f"file; got {registration_channel!s}"
+        )
     return ReferenceSpec(
         round=built_in_int(mapping["round"], "reference.round"),
-        channel=relative_posix_path(mapping["channel"], "reference.channel"),
+        registration_channel=registration_channel,
+        channels=channels,
     )
 
 
@@ -272,11 +313,27 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
             "reference.round must be a nonnegative built-in integer; "
             f"got {manifest.reference.round!r}"
         )
-    if type(manifest.reference.channel) is not PurePosixPath:
+    if type(manifest.reference.registration_channel) is not PurePosixPath:
         raise ConfigurationValidationError(
-            "reference.channel must be a PurePosixPath; "
-            f"got {manifest.reference.channel!r}"
+            "reference.registration_channel must be a PurePosixPath; "
+            f"got {manifest.reference.registration_channel!r}"
         )
+    if type(manifest.reference.channels) is not tuple:
+        raise ConfigurationValidationError(
+            "reference.channels must be an exact immutable tuple"
+        )
+    reference_channels: list[dict[str, object]] = []
+    for index, channel in enumerate(manifest.reference.channels):
+        channel_path = f"reference.channels[{index}]"
+        if type(channel) is not ReferenceChannelSpec:
+            raise ConfigurationValidationError(
+                f"{channel_path} must be a ReferenceChannelSpec; got {channel!r}"
+            )
+        if type(channel.file) is not PurePosixPath:
+            raise ConfigurationValidationError(
+                f"{channel_path}.file must be a PurePosixPath; got {channel.file!r}"
+            )
+        reference_channels.append({"file": _model_relative_path(channel.file)})
     if type(manifest.registration) is not RegistrationSpec:
         raise ConfigurationValidationError(
             f"registration must be a RegistrationSpec; got {manifest.registration!r}"
@@ -319,7 +376,10 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
     parsed_reference = _reference(
         {
             "round": manifest.reference.round,
-            "channel": _model_relative_path(manifest.reference.channel),
+            "registration_channel": _model_relative_path(
+                manifest.reference.registration_channel
+            ),
+            "channels": reference_channels,
         }
     )
     parsed_registration = _registration(

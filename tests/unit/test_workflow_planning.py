@@ -15,6 +15,7 @@ from cyexm.config.models import (
     ExecutionPaths,
     ExecutionProfile,
     NativeThreadSpec,
+    ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
@@ -80,7 +81,8 @@ def _manifest(round_order: tuple[int, ...] = (3, 2)) -> DatasetManifest:
         voxel_spacing_um=(0.324, 0.324, 0.9),
         reference=ReferenceSpec(
             round=1,
-            channel=PurePosixPath("round_1_488.tif"),
+            registration_channel=PurePosixPath("round_1_488.tif"),
+            channels=(ReferenceChannelSpec(PurePosixPath("round_1_488.tif")),),
         ),
         registration=_registration(),
         rounds=tuple(_round(round_number) for round_number in round_order),
@@ -109,7 +111,8 @@ def _invalid_manifest(manifest: DatasetManifest, case: str) -> DatasetManifest:
             manifest,
             reference=SimpleNamespace(
                 round=manifest.reference.round,
-                channel=manifest.reference.channel,
+                registration_channel=manifest.reference.registration_channel,
+                channels=manifest.reference.channels,
             ),
         )
     if case == "reference_round":
@@ -122,7 +125,7 @@ def _invalid_manifest(manifest: DatasetManifest, case: str) -> DatasetManifest:
             manifest,
             reference=replace(  # type: ignore[arg-type]
                 manifest.reference,
-                channel=str(manifest.reference.channel),
+                registration_channel=str(manifest.reference.registration_channel),
             ),
         )
     if case == "registration_model":
@@ -273,7 +276,7 @@ def _execution(
 
 
 def _create_manifest_inputs(root: Path, manifest: DatasetManifest) -> None:
-    relative_paths = {manifest.reference.channel}
+    relative_paths = {channel.file for channel in manifest.reference.channels}
     relative_paths.update(
         channel.file
         for round_spec in manifest.rounds
@@ -320,7 +323,12 @@ def test_plan_resolves_inputs_orders_rounds_and_creates_nothing(
 
     assert tuple(task.round for task in plan.tasks) == (2, 3)
     assert (
-        plan.fixed_image == (execution.paths.dataset_root / "round_1_488.tif").resolve()
+        plan.reference_task.registration_channel_source
+        == (execution.paths.dataset_root / "round_1_488.tif").resolve()
+    )
+    assert plan.fixed_image == (
+        execution.paths.output_root
+        / "dataset-1/rounds/round-001/channels/round_1_488.tif"
     )
     assert plan.tasks[0].fixed_image == plan.fixed_image
     assert (
@@ -336,6 +344,96 @@ def test_plan_resolves_inputs_orders_rounds_and_creates_nothing(
         "round_3_488.tif",
     )
     assert not execution.paths.output_root.exists()
+
+
+def test_plan_materializes_ordered_reference_channels_on_one_shared_grid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    reference = replace(
+        manifest.reference,
+        channels=(
+            *manifest.reference.channels,
+            ReferenceChannelSpec(PurePosixPath("round_1_647.tif")),
+        ),
+    )
+    manifest = replace(
+        manifest,
+        reference=reference,
+        registration=replace(manifest.registration, crop=True),
+    )
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    plan = build_workflow_plan(manifest, execution)
+
+    assert tuple(channel.source.name for channel in plan.reference_task.channels) == (
+        "round_1_488.tif",
+        "round_1_647.tif",
+    )
+    assert tuple(channel.output.name for channel in plan.reference_task.channels) == (
+        "round_1_488.tif",
+        "round_1_647.tif",
+    )
+    assert plan.reference_task.crop_bounds_path == (
+        execution.paths.output_root
+        / "dataset-1/rounds/round-001/registration/reference_crop_indices.json"
+    )
+    assert plan.expected_artifacts[:3] == (
+        *(channel.output for channel in plan.reference_task.channels),
+        plan.reference_task.crop_bounds_path,
+    )
+    assert not execution.paths.output_root.exists()
+
+
+@pytest.mark.parametrize("field", ["shape", "origin", "spacing", "direction"])
+def test_plan_rejects_reference_channel_grid_mismatch(
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    manifest = replace(
+        manifest,
+        reference=replace(
+            manifest.reference,
+            channels=(
+                *manifest.reference.channels,
+                ReferenceChannelSpec(PurePosixPath("round_1_647.tif")),
+            ),
+        ),
+    )
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    identity = ImageGeometry(
+        shape=(4, 8, 8),
+        origin=(0.0, 0.0, 0.0),
+        spacing=manifest.voxel_spacing_um,
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    mismatched = {
+        "shape": replace(identity, shape=(5, 8, 8)),
+        "origin": replace(identity, origin=(0.1, 0.0, 0.0)),
+        "spacing": replace(identity, spacing=(0.324, 0.324, 0.900001)),
+        "direction": replace(
+            identity,
+            direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        ),
+    }[field]
+
+    def inspect(path: Path) -> ImageHeader:
+        geometry = mismatched if path.name == "round_1_647.tif" else identity
+        return _header(path, shape_zyx=geometry.shape, geometry=geometry)
+
+    monkeypatch.setattr("cyexm.workflow.planning._inspect_tiff_header", inspect)
+
+    with pytest.raises(WorkflowPlanError, match=r"reference|Reference"):
+        build_workflow_plan(manifest, execution)
 
 
 def test_plan_revalidates_directly_constructed_manifest_before_inspection(
@@ -372,7 +470,7 @@ def test_plan_revalidates_directly_constructed_manifest_before_inspection(
         ("spacing_subclass", "voxel_spacing_um[0]"),
         ("reference_model", "reference"),
         ("reference_round", "reference.round"),
-        ("reference_channel", "reference.channel"),
+        ("reference_channel", "reference.registration_channel"),
         ("registration_model", "registration"),
         ("registration_crop", "registration.crop"),
         ("registration_stage_model", "registration.linear"),
@@ -462,11 +560,13 @@ def test_plan_aggregates_missing_inputs_in_manifest_order_without_inspection(
         build_workflow_plan(manifest, execution)
 
     message = str(captured.value)
-    assert "reference.channel" in message
+    assert "reference.channels[0].file" in message
     assert "rounds[0].channels[0].file" in message
     assert str(execution.paths.dataset_root / "round_1_488.tif") in message
     assert str(execution.paths.dataset_root / "round_2_488.tif") in message
-    assert message.index("reference.channel") < message.index("rounds[0].channels[0]")
+    assert message.index("reference.channels[0]") < message.index(
+        "rounds[0].channels[0]"
+    )
     assert calls == []
     assert not execution.paths.output_root.exists()
 
@@ -480,7 +580,7 @@ def test_plan_rejects_a_symlink_that_escapes_the_dataset_root(
     _create_manifest_inputs(execution.paths.dataset_root, manifest)
     outside = tmp_path / "outside.tif"
     outside.touch()
-    reference = execution.paths.dataset_root / manifest.reference.channel
+    reference = execution.paths.dataset_root / manifest.reference.registration_channel
     reference.unlink()
     reference.symlink_to(outside)
     monkeypatch.setattr(
@@ -491,7 +591,7 @@ def test_plan_rejects_a_symlink_that_escapes_the_dataset_root(
     with pytest.raises(WorkflowPlanError, match="outside the dataset root") as captured:
         build_workflow_plan(manifest, execution)
 
-    assert "reference.channel" in str(captured.value)
+    assert "reference.channels[0].file" in str(captured.value)
     assert str(outside) in str(captured.value)
 
 
@@ -504,7 +604,11 @@ def test_plan_inspects_each_unique_resolved_file_once(
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(1.0, 1.0, 1.0),
-        reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+        reference=ReferenceSpec(
+            1,
+            PurePosixPath("fixed.tif"),
+            (ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
         registration=_registration(),
         rounds=(
             RoundSpec(2, "whole_image", shared, (ChannelSpec(shared, "linear"),)),
@@ -539,7 +643,11 @@ def test_plan_rejects_channel_output_name_collisions_after_resolution(
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(1.0, 1.0, 1.0),
-        reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+        reference=ReferenceSpec(
+            1,
+            PurePosixPath("fixed.tif"),
+            (ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
         registration=_registration(),
         rounds=(
             RoundSpec(
@@ -655,7 +763,11 @@ def test_plan_rejects_channel_aliases_to_registration_final_artifacts(
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(1.0, 1.0, 1.0),
-        reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+        reference=ReferenceSpec(
+            1,
+            PurePosixPath("fixed.tif"),
+            (ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
         registration=_registration(),
         rounds=(
             RoundSpec(
@@ -784,7 +896,17 @@ def test_scientific_fingerprint_contains_complete_policy_but_not_execution_choic
 
     assert scientific["reference"] == {
         "round": 1,
-        "channel": str(plan.fixed_image),
+        "registration_channel": str(plan.reference_task.registration_channel_source),
+        "registration_manifest_file": "round_1_488.tif",
+        "registration_output": ("rounds/round-001/channels/round_1_488.tif"),
+        "crop_output": None,
+        "channels": [
+            {
+                "file": str(plan.reference_task.registration_channel_source),
+                "manifest_file": "round_1_488.tif",
+                "output": "rounds/round-001/channels/round_1_488.tif",
+            }
+        ],
     }
     assert [item["round"] for item in scientific["rounds"]] == [2, 3]
     assert scientific["rounds"][0]["registration_channel"].endswith("round_2_488.tif")
@@ -800,15 +922,18 @@ def test_scientific_fingerprint_contains_complete_policy_but_not_execution_choic
     assert "executor" not in plan.scientific_json
     assert "native_threads" not in plan.scientific_json
     assert "output_root" not in plan.scientific_json
-    assert plan.expected_artifacts == tuple(
-        artifact
-        for task in plan.tasks
-        for artifact in (
-            task.registration_directory / f"linear_transform_{task.round}.mat",
-            task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
-            task.registration_directory / f"nonlinear_registered_{task.round}.tif",
-            *(channel.output for channel in task.channels),
-        )
+    assert plan.expected_artifacts == (
+        *(channel.output for channel in plan.reference_task.channels),
+        *(
+            artifact
+            for task in plan.tasks
+            for artifact in (
+                task.registration_directory / f"linear_transform_{task.round}.mat",
+                task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz",
+                task.registration_directory / f"nonlinear_registered_{task.round}.tif",
+                *(channel.output for channel in task.channels),
+            )
+        ),
     )
 
 
@@ -835,7 +960,11 @@ def test_manifest_alias_and_relative_channel_output_are_scientific_identity(
             schema_version=1,
             dataset_id="dataset-1",
             voxel_spacing_um=(1.0, 1.0, 1.0),
-            reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+            reference=ReferenceSpec(
+                1,
+                PurePosixPath("fixed.tif"),
+                (ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+            ),
             registration=_registration(),
             rounds=(
                 RoundSpec(
@@ -995,7 +1124,11 @@ def test_existing_plan_signed_zero_mismatch_has_a_dotted_value_difference(
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(0.324, 0.324, 0.9),
-        reference=ReferenceSpec(1, PurePosixPath("round_1_488.tif")),
+        reference=ReferenceSpec(
+            1,
+            PurePosixPath("round_1_488.tif"),
+            (ReferenceChannelSpec(PurePosixPath("round_1_488.tif")),),
+        ),
         registration=_registration(),
         rounds=(
             RoundSpec(

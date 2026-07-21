@@ -110,10 +110,12 @@ def _ensure_completion(
 def _effective_geometries(task: RoundTask) -> tuple[ImageGeometry, ImageGeometry]:
     if not task.registration.crop:
         return _FULL_FIXED_GEOMETRY, _FULL_MOVING_GEOMETRY
-    return (
-        crop_geometry(_FULL_FIXED_GEOMETRY, _FIXED_CROP_BOUNDS),
-        crop_geometry(_FULL_MOVING_GEOMETRY, _MOVING_CROP_BOUNDS),
+    fixed = (
+        _FULL_FIXED_GEOMETRY
+        if task.prepared_fixed
+        else crop_geometry(_FULL_FIXED_GEOMETRY, _FIXED_CROP_BOUNDS)
     )
+    return fixed, crop_geometry(_FULL_MOVING_GEOMETRY, _MOVING_CROP_BOUNDS)
 
 
 def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) -> None:
@@ -127,6 +129,7 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
         imaging_round=task.round,
         pixel_size_xyz=task.voxel_spacing_xyz,
     )
+    common["prepared_fixed"] = task.prepared_fixed
     fixed_geometry, moving_geometry = _effective_geometries(task)
     if task.registration.crop:
         crop_cases: tuple[
@@ -138,11 +141,17 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
             ],
             ...,
         ] = (
-            (
-                paths.fixed_crop,
-                "fixed",
-                _FULL_FIXED_GEOMETRY,
-                _FIXED_CROP_BOUNDS,
+            *(
+                ()
+                if task.prepared_fixed
+                else (
+                    (
+                        paths.fixed_crop,
+                        "fixed",
+                        _FULL_FIXED_GEOMETRY,
+                        _FIXED_CROP_BOUNDS,
+                    ),
+                )
             ),
             (
                 paths.moving_crop,
@@ -167,20 +176,21 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
                 crop_request,
                 contents=canonical_compact_json(list(bounds)).encode(),
             )
-    fixed_reference_request = StageRequest.for_identities(
-        stage="fixed-reference",
-        inputs=inputs,
-        geometry=fixed_geometry,
-        method="uint16-tiff",
-        accuracy="exact",
-        native_threads=_native_thread_values(task),
-        upstream=None,
-        parameters={
-            **common,
-            **fixed_reference_parameters(0.0, 100.0),
-        },
-    )
-    _ensure_completion(paths.fixed_reference, fixed_reference_request)
+    if not task.prepared_fixed:
+        fixed_reference_request = StageRequest.for_identities(
+            stage="fixed-reference",
+            inputs=inputs,
+            geometry=fixed_geometry,
+            method="uint16-tiff",
+            accuracy="exact",
+            native_threads=_native_thread_values(task),
+            upstream=None,
+            parameters={
+                **common,
+                **fixed_reference_parameters(0.0, 100.0),
+            },
+        )
+        _ensure_completion(paths.fixed_reference, fixed_reference_request)
     affine_request = StageRequest.for_identities(
         stage="affine",
         inputs=inputs,
@@ -583,6 +593,27 @@ def test_round_task_registers_then_transforms_channels_in_manifest_order(
     )
 
 
+def test_round_task_rejects_unprepared_fixed_mode_before_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cyexm.workflow import round_task as module
+
+    task = replace(_task(tmp_path, channel_names=()), prepared_fixed=False)
+    monkeypatch.setattr(
+        module,
+        "configure_native_threads",
+        lambda config: pytest.fail(f"unexpected runtime configuration: {config}"),
+    )
+
+    result = run_round_task(task)
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "initialization"
+    assert "prepared_fixed=True" in result.failure.message
+    assert result.artifact_paths == ()
+
+
 def test_round_task_uses_only_initial_post_registration_and_final_full_scans(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -715,6 +746,7 @@ def test_round_task_passes_exact_strategy_constructor_arguments(
         "crop": task.registration.crop,
         "enable_logging": True,
         "force_override": True,
+        "prepared_fixed": True,
         "native_threads": NativeThreadConfig(itk_threads=2, blas_threads=3),
         "linear_type": task.registration.linear.type,
         "linear_accuracy": task.registration.linear.accuracy,
@@ -848,7 +880,7 @@ def test_round_task_inspects_tiff_headers_in_process_after_thread_configuration(
     assert result.status == "completed"
     assert events[0] == "threads"
     assert events[1:3] == ["header:fixed.tif", "header:registration.tif"]
-    assert "header:fixed_reference.tif" in events
+    assert "header:fixed_reference.tif" not in events
 
 
 def test_round_task_creates_output_directories_and_log_only_when_invoked(
@@ -1408,7 +1440,6 @@ def test_registration_completion_accepts_tiff_geometry_roundoff(
     def perturb(task: RoundTask) -> None:
         paths = _registration_paths(task)
         for path in (
-            paths.fixed_reference,
             paths.affine,
             paths.warp,
             paths.registered,

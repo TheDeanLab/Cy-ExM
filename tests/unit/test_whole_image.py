@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 import pytest
-from fakes import FakeBackend, FakeImage
+from fakes import FakeBackend, FakeImage, fake_image
 
 import cyexm.registration.whole_image as whole_image
 from cyexm.errors import CacheValidationError, RegistrationStageError
@@ -353,6 +353,29 @@ def test_constructor_stores_custom_scalar_configuration(tmp_path: Path) -> None:
     assert registration.linear_accuracy == "high"
     assert registration.nonlinear_type == "SyN"
     assert registration.nonlinear_accuracy == "low"
+    assert registration.prepared_fixed is False
+
+
+def test_prepared_fixed_mode_crops_only_moving_and_omits_fixed_duplicates(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    registration = make_registration(
+        tmp_path,
+        backend=backend,
+        crop=True,
+        prepared_fixed=True,
+    )
+
+    registration.register()
+
+    paths = round_paths(tmp_path)
+    assert backend.crop_bounds == [(2, 6, 1, 5, 2, 6)]
+    assert not paths.fixed_reference.exists()
+    assert not ArtifactStore().record_path(paths.fixed_reference).exists()
+    assert not paths.fixed_crop.exists()
+    assert not ArtifactStore().record_path(paths.fixed_crop).exists()
+    assert paths.moving_crop.is_file()
 
 
 @pytest.mark.parametrize(
@@ -1238,7 +1261,9 @@ def test_crop_bounds_are_reused_only_for_matching_inputs(
         del args, kwargs
         raise AssertionError("crop bounds were re-estimated")
 
-    monkeypatch.setattr(whole_image, "robust_bounding_box", unexpected_estimation)
+    monkeypatch.setattr(
+        "cyexm.registration.crop.robust_bounding_box", unexpected_estimation
+    )
     resumed = FakeBackend()
     make_registration(tmp_path, backend=resumed, crop=True).register()
 
@@ -1887,3 +1912,23 @@ def test_crop_completion_records_capture_inputs_and_effective_threads(
         )
         assert request.native_threads == resolved_native_threads.values
         assert "native_thread_sources" not in request.parameters
+
+
+def test_pre_registration_metrics_resample_unequal_moving_grid_to_fixed(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend(
+        fixed_image=fake_image(data=np.ones((6, 8, 10), dtype=np.float32)),
+        moving_image=fake_image(data=np.ones((7, 9, 11), dtype=np.float32)),
+    )
+
+    make_registration(tmp_path, backend=backend, prepared_fixed=True).register()
+
+    assert len(backend.resample_calls) == 2
+    assert tuple(call[2] for call in backend.resample_calls) == (
+        "linear",
+        "nearestNeighbor",
+    )
+    fixed, moving, fixed_mask, moving_mask = backend.metric_calls[0]
+    assert backend.geometry(moving) == backend.geometry(fixed)
+    assert backend.geometry(moving_mask) == backend.geometry(fixed_mask)

@@ -20,6 +20,9 @@
   a real-library regression whose native fixed and moving shapes differ along Z, Y,
   and X. Assert exact fixed-reference geometry immediately after affine resampling
   and for every persisted scalar, mask, warp, and transformed-channel output.
+- Reference-task integration tests use real small TIFFs and must prove full and
+  identically cropped multi-channel materialization, geometry/dtype/axes preservation,
+  evidence reuse, and fail-before-write behavior for mismatched reference grids.
 - Failure injection may replace only the expensive stage boundary under test. Keep
   artifact persistence, reconstruction, and the remaining ANTs operations real, and
   prove restart from the committed upstream record.

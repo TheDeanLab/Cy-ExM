@@ -4,6 +4,10 @@
   scientific-manifest and execution-profile models. Keep the two documents separate.
 - Reject unknown and duplicate keys, non-scalar YAML keys, aliases, custom tags,
   additional documents, and unsafe paths.
+- Schema version 1 requires `reference.registration_channel` plus a nonempty ordered
+  `reference.channels` list. Require the registration channel exactly once, require
+  unique source paths and output basenames, and do not maintain legacy
+  `reference.channel` dual parsing.
 - Scientific and execution roots are disjoint, neither containing the other.
 - Parse `slurm.memory` centrally as positive whole decimal memory with exact `KB`,
   `MB`, `GB`, or `TB` suffixes. Reject invalid, fractional, zero, unsupported, or

@@ -28,15 +28,21 @@ from cyexm.execution._dask_common import (
     utc_now,
     validate_distributed_tasks,
 )
-from cyexm.execution.base import RoundTaskRunner
+from cyexm.execution.base import WorkflowTaskRunner
 from cyexm.execution.preflight import (
     WorkerProbe,
     probe_worker,
     validate_worker_probes,
 )
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.workflow.models import RoundResult, RoundTask, canonical_json
-from cyexm.workflow.round_task import run_round_task
+from cyexm.workflow.models import (
+    ReferenceTask,
+    RoundResult,
+    RoundTask,
+    WorkflowTask,
+    canonical_json,
+)
+from cyexm.workflow.task import run_workflow_task
 
 _LOGGER = logging.getLogger(__name__)
 _COORDINATOR_PACKAGES = (
@@ -102,22 +108,22 @@ _CLEANUP_RESOURCES = ("client", "cluster", "configuration")
 
 
 @dataclass(frozen=True, slots=True)
-class _SerializedRoundTaskRunner:
+class _SerializedWorkflowTaskRunner:
     payload: bytes
 
-    def __call__(self, task: RoundTask) -> RoundResult:
+    def __call__(self, task: WorkflowTask) -> RoundResult:
         import cloudpickle
 
-        runner = cast(RoundTaskRunner, cloudpickle.loads(self.payload))
+        runner = cast(WorkflowTaskRunner, cloudpickle.loads(self.payload))
         return runner(task)
 
 
-def _serialize_round_task_runner(
-    runner: RoundTaskRunner,
-) -> _SerializedRoundTaskRunner:
+def _serialize_workflow_task_runner(
+    runner: WorkflowTaskRunner,
+) -> _SerializedWorkflowTaskRunner:
     import cloudpickle
 
-    return _SerializedRoundTaskRunner(cloudpickle.dumps(runner))
+    return _SerializedWorkflowTaskRunner(cloudpickle.dumps(runner))
 
 
 def _evidence_object(
@@ -691,7 +697,7 @@ def _validate_cleanup(value: object, *, completed_startup: bool) -> None:
 def _canonical_execution_evidence(
     value: object,
     *,
-    expected_tasks: tuple[RoundTask, ...],
+    expected_tasks: tuple[WorkflowTask, ...],
     task_retries: int,
 ) -> str:
     """Validate and detach Task 2 evidence against the submitted work context."""
@@ -699,8 +705,8 @@ def _canonical_execution_evidence(
         raise TypeError("expected_tasks must be an exact tuple")
     expected_identities: list[tuple[str, int]] = []
     for index, task in enumerate(expected_tasks):
-        if type(task) is not RoundTask:
-            raise TypeError(f"expected_tasks[{index}] must be an exact RoundTask")
+        if type(task) not in {ReferenceTask, RoundTask}:
+            raise TypeError(f"expected_tasks[{index}] must be an exact WorkflowTask")
         identity = (task.dataset_id, task.round)
         if identity in expected_identities:
             raise ValueError(f"duplicate submitted task identity: {identity!r}")
@@ -1071,7 +1077,7 @@ class SlurmExecutor:
         self,
         profile: ExecutionProfile,
         *,
-        _runner: RoundTaskRunner = run_round_task,
+        _runner: WorkflowTaskRunner = run_workflow_task,
         _modules: Callable[[], Any] = _slurm_modules,
         _version: Callable[[str], str] = package_version,
     ) -> None:
@@ -1173,7 +1179,7 @@ class SlurmExecutor:
 
     @staticmethod
     def _attempt_evidence(
-        tasks: tuple[RoundTask, ...],
+        tasks: tuple[WorkflowTask, ...],
         attempts: list[int],
     ) -> list[dict[str, object]]:
         return [
@@ -1221,27 +1227,24 @@ class SlurmExecutor:
         if order:
             cleanup["order"] = order
 
-    def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
-        if not tasks:
-            _rendered, _observed, _startup, _cleanup, evidence = self._begin_evidence(
-                worker_count=0,
-                spec=None,
-                memory=None,
-            )
-            cast(dict[str, str], evidence["timestamps"])["ended_at"] = utc_now()
-            return ()
-
+    def execute(
+        self,
+        reference_task: ReferenceTask,
+        round_tasks: tuple[RoundTask, ...],
+    ) -> tuple[RoundResult, ...]:
         spec = self._spec()
         memory = normalize_slurm_memory(spec.memory)
+        tasks: tuple[WorkflowTask, ...] = (reference_task, *round_tasks)
         validate_distributed_tasks(tasks, executor_name="SlurmExecutor")
-        submission_runner = _serialize_round_task_runner(self._runner)
-        worker_count = min(len(tasks), spec.workers)
+        submission_runner = _serialize_workflow_task_runner(self._runner)
+        worker_count = min(max(1, len(round_tasks)), spec.workers)
         rendered, observed, startup, cleanup, evidence = self._begin_evidence(
             worker_count=worker_count,
             spec=spec,
             memory=memory,
         )
-        attempts = [0 for _task in tasks]
+        reference_attempts = [0]
+        moving_attempts = [0 for _task in round_tasks]
         cluster: Any | None = None
         client: Any | None = None
         configuration: AbstractContextManager[Any] | None = None
@@ -1383,16 +1386,29 @@ class SlurmExecutor:
 
             execution_client = client
             assert execution_client is not None
-            results, _attempts = collect_distributed_results(
-                tasks,
+            reference_results, _attempts = collect_distributed_results(
+                (reference_task,),
                 runner=submission_runner,
                 client=execution_client,
                 as_completed=modules.as_completed,
                 task_retries=spec.task_retries,
                 active=active,
-                attempts=attempts,
+                attempts=reference_attempts,
             )
-            return results
+            if reference_results[0].status not in {"completed", "reused"}:
+                return reference_results
+            if not round_tasks:
+                return reference_results
+            moving_results, _attempts = collect_distributed_results(
+                round_tasks,
+                runner=submission_runner,
+                client=execution_client,
+                as_completed=modules.as_completed,
+                task_retries=spec.task_retries,
+                active=active,
+                attempts=moving_attempts,
+            )
+            return (*reference_results, *moving_results)
         except BaseException as error:
             if startup["outcome"] == "in_progress":
                 startup["outcome"] = (
@@ -1429,7 +1445,9 @@ class SlurmExecutor:
                 observed["cancellation"] = cancellation
             raise
         finally:
-            evidence["attempt_counts"] = self._attempt_evidence(tasks, attempts)
+            evidence["attempt_counts"] = self._attempt_evidence(
+                tasks, [*reference_attempts, *moving_attempts]
+            )
             self._close_owned(client, cluster, configuration, cleanup)
             cast(dict[str, str], evidence["timestamps"])["ended_at"] = utc_now()
 

@@ -24,6 +24,10 @@
   them to be canonically disjoint where required from each other, this repository,
   ClearEx, and each live spheroid path. Require an existing empty evidence directory
   and write only caller-owned evidence there.
+- Dataset validation includes every declared `reference.channels[].file`, not only the
+  reference registration channel. Future full workflow acceptance must prove the
+  reference task and moving tasks share one owned cluster and that no moving task is
+  submitted before successful reference preparation.
 - Scheduler inspection is read-only: use `sinfo` and `scontrol` for partition,
   allocation, node, and interface evidence, and a current-user `squeue` query for
   owned cleanup. Bound smoke allocation to `min(2, configured workers)`,

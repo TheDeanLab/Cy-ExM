@@ -81,9 +81,11 @@ class FakeImage:
     def max(self) -> np.generic:
         return self.data.max()
 
-    def clone(self) -> FakeImage:
+    def clone(self, pixeltype: str | None = None) -> FakeImage:
+        if pixeltype not in (None, "float"):
+            raise ValueError(f"unsupported fake pixel type: {pixeltype}")
         return FakeImage(
-            data=self.data.copy(),
+            data=self.data.astype(np.float32, copy=True),
             origin=self.origin,
             spacing=self.spacing,
             direction=self.direction,
@@ -251,6 +253,7 @@ class FakeBackend:
     metric_calls: list[tuple[object, object, object | None, object | None]] = field(
         default_factory=list
     )
+    resample_calls: list[tuple[object, object, str]] = field(default_factory=list)
     tiff_writes: list[tuple[Path, float, float]] = field(default_factory=list)
     tiff_images: list[object] = field(default_factory=list)
     clipped_tiff_writes: list[Path] = field(default_factory=list)
@@ -534,6 +537,23 @@ class FakeBackend:
         if not isinstance(transform, bytes):
             raise TypeError("transform must be bytes")
         path.write_bytes(transform)
+
+    def resample_to_target(
+        self,
+        *,
+        image: object,
+        target: object,
+        interpolation: str,
+    ) -> object:
+        if not isinstance(image, FakeImage) or not isinstance(target, FakeImage):
+            raise TypeError("image and target must be FakeImage values")
+        self.resample_calls.append((image, target, interpolation))
+        return fake_image(
+            data=np.zeros(target.shape, dtype=image.data.dtype),
+            origin=target.origin,
+            spacing=target.spacing,
+            direction=target.direction,
+        )
 
     def read_affine(self, path: Path) -> object:
         self.events.append("read-affine")

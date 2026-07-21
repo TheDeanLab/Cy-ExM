@@ -1,6 +1,6 @@
 # Different Source Shapes Scientific Compatibility Design
 
-**Status:** Approved design pending written-spec review
+**Status:** Approved and implemented
 
 **Date:** 2026-07-21
 

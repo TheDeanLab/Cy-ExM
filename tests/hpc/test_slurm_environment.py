@@ -14,13 +14,19 @@ from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow.models import RoundResult
 from hpc.environment import (
     HpcAcceptanceContext,
+    HpcAcceptanceError,
     build_smoke_tasks,
+    collect_interface_facts,
     collect_partition_snapshot,
+    collect_path_fact,
     collect_queue_snapshot,
     parse_slurm_tres_memory_bytes,
     partition_is_exclusive,
     run_environment_smoke,
+    shared_path_identity,
     smoke_module_by_value,
+    validate_rendered_job_script,
+    validate_scheduler_interface,
     wait_for_queue_empty,
     write_evidence_json,
     write_evidence_text,
@@ -70,6 +76,7 @@ def _assert_worker_records(
     context: HpcAcceptanceContext,
     results: tuple[RoundResult, ...],
     records: list[dict[str, object]],
+    coordinator_paths: dict[str, dict[str, object]],
 ) -> None:
     spec = context.profile.slurm
     assert spec is not None
@@ -93,6 +100,7 @@ def _assert_worker_records(
         job = cast(dict[str, str], record["job"])
         assert job["JobId"] == job_id
         assert job["JobState"].upper() == "RUNNING"
+        assert job["Partition"] == spec.queue
         assert int(job["NumNodes"]) == 1
         assert int(job["NumCPUs"]) == spec.cores_per_worker
         assert int(job["NumTasks"]) == 1
@@ -131,6 +139,19 @@ def _assert_worker_records(
         assert paths["output_root"]["resolved"] == str(
             context.profile.paths.output_root
         )
+        assert paths["evidence_dir"]["resolved"] == str(context.evidence_dir)
+        for role in (
+            "dataset_root",
+            "output_root",
+            "worker_local_directory",
+            "evidence_dir",
+        ):
+            assert shared_path_identity(paths[role]) == shared_path_identity(
+                coordinator_paths[role]
+            )
+        dataset_identity = shared_path_identity(coordinator_paths["dataset_root"])
+        assert shared_path_identity(paths["fixed_image"]) == dataset_identity
+        assert shared_path_identity(paths["moving_image"]) == dataset_identity
         assert record["scratch_probe"] == {"created": True, "deleted": True}
 
 
@@ -138,6 +159,7 @@ def _assert_executor_evidence(
     context: HpcAcceptanceContext,
     evidence: dict[str, object],
     worker_count: int,
+    scheduler_interface: dict[str, object],
 ) -> None:
     spec = context.profile.slurm
     assert spec is not None
@@ -146,6 +168,7 @@ def _assert_executor_evidence(
     assert requested["configured_workers"] == spec.workers
     rendered = cast(dict[str, str], evidence["rendered"])
     script = rendered["rendered_job_script_template"]
+    validate_rendered_job_script(script, context.profile)
     assert "round_slot=1" in script
     for index, name in enumerate(NATIVE_THREAD_ENV_VARS):
         count = (
@@ -156,6 +179,11 @@ def _assert_executor_evidence(
         assert f"export {name}={count}" in script
 
     observed = cast(dict[str, object], evidence["observed"])
+    validate_scheduler_interface(
+        cast(str, observed["scheduler_address"]),
+        spec.scheduler_interface,
+        scheduler_interface,
+    )
     assert observed["coordinator_versions"] == context.package_versions
     assert len(cast(list[str], observed["connected_workers"])) == worker_count
     probes = cast(list[dict[str, object]], observed["worker_probes"])
@@ -203,6 +231,15 @@ def test_real_slurm_environment_acceptance(
     assert spec is not None
     assert spec.processes_per_worker == 1
     worker_count = min(2, spec.workers)
+    scratch = context.profile.paths.worker_local_directory
+    assert scratch is not None
+    scheduler_interface = collect_interface_facts(spec.scheduler_interface)
+    coordinator_paths = {
+        "dataset_root": collect_path_fact(context.profile.paths.dataset_root),
+        "output_root": collect_path_fact(context.profile.paths.output_root),
+        "worker_local_directory": collect_path_fact(scratch),
+        "evidence_dir": collect_path_fact(context.evidence_dir),
+    }
 
     partition = collect_partition_snapshot(spec.queue)
     write_evidence_json(context.evidence_dir / "partition-snapshot.json", partition)
@@ -228,17 +265,46 @@ def test_real_slurm_environment_acceptance(
     executor = SlurmExecutor(context.profile, _runner=runner)
     results: tuple[RoundResult, ...] = ()
     after: dict[str, object] = {}
+    execution_error: BaseException | None = None
     with smoke_module_by_value():
         try:
             results = executor.execute(tasks)
+        except BaseException as error:
+            execution_error = error
         finally:
-            after = wait_for_queue_empty(spec.job_name, user=user)
+            execution_evidence = dict(executor.execution_evidence)
+            observed = execution_evidence.get("observed", {})
+            probes = (
+                observed.get("worker_probes", []) if isinstance(observed, dict) else []
+            )
+            owned_job_ids = {
+                job_id
+                for job_id in (
+                    *(result.slurm_job_id for result in results),
+                    *(
+                        probe.get("slurm_job_id")
+                        for probe in probes
+                        if isinstance(probe, dict)
+                    ),
+                )
+                if isinstance(job_id, str) and job_id
+            }
+            after = wait_for_queue_empty(
+                spec.job_name,
+                user=user,
+                job_ids=tuple(sorted(owned_job_ids)),
+            )
             write_evidence_json(context.evidence_dir / "queue-after.json", after)
             write_evidence_json(
                 context.evidence_dir / "slurm-execution-evidence.json",
-                dict(executor.execution_evidence),
+                execution_evidence,
             )
-            assert after["jobs"] == [], "owned SLURM jobs remain after cluster close"
+    if after["outcome"] != "empty":
+        raise HpcAcceptanceError(
+            "owned SLURM cleanup could not be proven; inspect queue-after.json"
+        ) from execution_error
+    if execution_error is not None:
+        raise execution_error
 
     evidence = dict(executor.execution_evidence)
     records = [json.loads(task.log_path.read_text(encoding="utf-8")) for task in tasks]
@@ -255,14 +321,20 @@ def test_real_slurm_environment_acceptance(
             "submitted_job_script_sha256": script_hash,
             "results": [result.to_dict() for result in results],
             "worker_records": records,
+            "coordinator_scheduler_interface": scheduler_interface,
+            "coordinator_paths": coordinator_paths,
             "cleanup_queue": after,
         },
     )
 
     assert len(results) == worker_count
     assert all(result.status == "completed" for result in results)
-    _assert_executor_evidence(context, evidence, worker_count)
-    _assert_worker_records(context, results, records)
+    cleanup_query = cast(dict[str, object], after["query"])
+    assert cleanup_query["job_ids"] == sorted(
+        cast(str, result.slurm_job_id) for result in results
+    )
+    _assert_executor_evidence(context, evidence, worker_count, scheduler_interface)
+    _assert_worker_records(context, results, records, coordinator_paths)
     for task in tasks:
         assert not task.registration_directory.exists(), (
             "environment smoke unexpectedly created registration output"

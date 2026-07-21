@@ -8,7 +8,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from hpc.environment import (
@@ -16,15 +16,21 @@ from hpc.environment import (
     HpcAcceptanceError,
     build_smoke_tasks,
     collect_partition_snapshot,
+    collect_path_fact,
     collect_queue_snapshot,
     parse_scontrol_record,
     parse_slurm_tres_memory_bytes,
     partition_is_exclusive,
     prepare_acceptance_context,
     require_cli_paths,
+    require_explicit_hpc_selection,
     run_environment_smoke,
+    shared_path_identity,
     smoke_module_by_value,
+    validate_rendered_job_script,
+    validate_scheduler_interface,
     wait_for_queue_empty,
+    write_evidence_json,
 )
 
 from cyexm.config.models import (
@@ -89,7 +95,7 @@ slurm:
   startup_timeout: 15m
   task_retries: 0
   job_name: cyexm-smoke
-  job_extra_directives: []
+  job_extra_directives: ["--exclusive"]
 """,
         encoding="utf-8",
     )
@@ -98,7 +104,7 @@ slurm:
 
 @pytest.mark.parametrize("missing", ("dataset", "execution", "evidence"))
 def test_hpc_cli_paths_require_all_three_explicit_options(missing: str) -> None:
-    values = {
+    values: dict[str, str | None] = {
         "dataset": "/archive/dataset.yaml",
         "execution": "/archive/execution.yaml",
         "evidence": "/archive/evidence",
@@ -107,6 +113,29 @@ def test_hpc_cli_paths_require_all_three_explicit_options(missing: str) -> None:
 
     with pytest.raises(HpcAcceptanceError, match=rf"--cyexm-{missing}"):
         require_cli_paths(values["dataset"], values["execution"], values["evidence"])
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (),
+        ("-m", "not hpc"),
+        ("-m", "hpc or unit"),
+        ("--markers",),
+    ),
+)
+def test_hpc_acceptance_requires_exact_explicit_marker_selection(
+    arguments: tuple[str, ...],
+) -> None:
+    with pytest.raises(HpcAcceptanceError, match=r"explicit.*-m hpc"):
+        require_explicit_hpc_selection(arguments)
+
+
+@pytest.mark.parametrize("arguments", (("-m", "hpc"), ("-mhpc",), ("-m=hpc",)))
+def test_hpc_acceptance_accepts_exact_explicit_marker_selection(
+    arguments: tuple[str, ...],
+) -> None:
+    require_explicit_hpc_selection(arguments)
 
 
 def test_prepare_context_loads_public_yaml_and_writes_atomic_provenance(
@@ -128,7 +157,7 @@ def test_prepare_context_loads_public_yaml_and_writes_atomic_provenance(
         repository_root=repository_root,
         archive_root=archive_root,
         project_root=project_root,
-        live_roots=(tmp_path / "live-spheroid",),
+        protected_roots=(tmp_path / "live-spheroid",),
         argv=("pytest", "-m", "hpc"),
         _now=lambda: datetime(2026, 7, 21, 12, 30, tzinfo=UTC),
         _git_commit=lambda _root: "a" * 40,
@@ -181,7 +210,7 @@ def test_prepare_context_rejects_evidence_near_protected_workflows(
             repository_root=repository_root,
             archive_root=archive_root,
             project_root=project_root,
-            live_roots=(live_root,),
+            protected_roots=(live_root,),
             argv=("pytest",),
             _git_commit=lambda _root: "a" * 40,
             _version=lambda name: name,
@@ -206,11 +235,115 @@ def test_prepare_context_rejects_a_nonempty_evidence_directory(tmp_path: Path) -
             repository_root=repository_root,
             archive_root=archive_root,
             project_root=project_root,
-            live_roots=(),
+            protected_roots=(),
             argv=("pytest",),
             _git_commit=lambda _root: "a" * 40,
             _version=lambda name: name,
         )
+
+
+def test_prepare_context_rejects_manifest_input_symlink_to_protected_tree(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    project_root = tmp_path / "project"
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    protected_root = archive_root / "live-spheroid"
+    protected_root.mkdir(parents=True)
+    protected_input = protected_root / "do-not-read.tif"
+    protected_input.write_bytes(b"protected")
+    dataset, execution = _write_approved_inputs(archive_root, project_root)
+    moving = archive_root / "approved" / "dataset" / "moving.tif"
+    moving.unlink()
+    moving.symlink_to(protected_input)
+    evidence = archive_root / "approved" / "evidence"
+    evidence.mkdir()
+
+    with pytest.raises(HpcAcceptanceError, match=r"manifest input.*protected"):
+        prepare_acceptance_context(
+            dataset,
+            execution,
+            evidence,
+            repository_root=repository_root,
+            archive_root=archive_root,
+            project_root=project_root,
+            protected_roots=(protected_root,),
+            argv=("pytest", "-m", "hpc"),
+            _git_commit=lambda _root: "a" * 40,
+            _version=lambda name: name,
+        )
+
+    assert tuple(evidence.iterdir()) == ()
+
+
+@pytest.mark.parametrize("config_name", ("dataset.yaml", "execution.yaml"))
+def test_prepare_context_rejects_configuration_inside_data_root(
+    tmp_path: Path,
+    config_name: str,
+) -> None:
+    archive_root = tmp_path / "archive"
+    project_root = tmp_path / "project"
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    dataset, execution = _write_approved_inputs(archive_root, project_root)
+    selected = dataset if config_name == "dataset.yaml" else execution
+    relocated = archive_root / "approved" / "dataset" / config_name
+    selected.rename(relocated)
+    dataset = relocated if selected == dataset else dataset
+    execution = relocated if selected == execution else execution
+    evidence = archive_root / "approved" / "evidence"
+    evidence.mkdir()
+
+    with pytest.raises(HpcAcceptanceError, match=r"configuration.*disjoint"):
+        prepare_acceptance_context(
+            dataset,
+            execution,
+            evidence,
+            repository_root=repository_root,
+            archive_root=archive_root,
+            project_root=project_root,
+            protected_roots=(),
+            argv=("pytest", "-m", "hpc"),
+            _git_commit=lambda _root: "a" * 40,
+            _version=lambda name: name,
+        )
+
+    assert tuple(evidence.iterdir()) == ()
+
+
+def test_prepare_context_rejects_scratch_ancestor_of_protected_repository(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    project_root = tmp_path / "project"
+    repository_root = project_root / "scratch" / "Cy-ExM"
+    repository_root.mkdir(parents=True)
+    dataset, execution = _write_approved_inputs(archive_root, project_root)
+    execution.write_text(
+        execution.read_text(encoding="utf-8").replace(
+            str(project_root / "cyexm-smoke"), str(project_root / "scratch")
+        ),
+        encoding="utf-8",
+    )
+    evidence = archive_root / "approved" / "evidence"
+    evidence.mkdir()
+
+    with pytest.raises(HpcAcceptanceError, match=r"worker scratch.*protected"):
+        prepare_acceptance_context(
+            dataset,
+            execution,
+            evidence,
+            repository_root=repository_root,
+            archive_root=archive_root,
+            project_root=project_root,
+            protected_roots=(),
+            argv=("pytest", "-m", "hpc"),
+            _git_commit=lambda _root: "a" * 40,
+            _version=lambda name: name,
+        )
+
+    assert tuple(evidence.iterdir()) == ()
 
 
 def test_parse_scontrol_record_preserves_embedded_equals() -> None:
@@ -258,22 +391,29 @@ def test_partition_snapshot_uses_only_read_only_sinfo_and_scontrol() -> None:
         raise AssertionError(arguments)
 
     snapshot = collect_partition_snapshot("512GB", _run=run)
+    partition = cast(dict[str, str], snapshot["partition"])
+    rows = cast(list[dict[str, object]], snapshot["rows"])
+    configuration = cast(dict[str, str], snapshot["configuration"])
 
     assert [call[0] for call in calls] == ["sinfo", "scontrol", "scontrol", "sinfo"]
-    assert snapshot["partition"]["OverSubscribe"] == "EXCLUSIVE"
-    assert snapshot["rows"][0]["memory_mb"] == 515000
-    assert snapshot["configuration"]["SlurmctldHost"] == "controller"
+    assert partition["OverSubscribe"] == "EXCLUSIVE"
+    assert rows[0]["memory_mb"] == 515000
+    assert configuration["SlurmctldHost"] == "controller"
     assert snapshot["slurm_version"] == "slurm 24.11.5"
 
 
-def test_queue_snapshot_is_scoped_to_user_and_exact_job_name() -> None:
+def test_queue_snapshot_is_scoped_to_user_name_and_owned_job_ids() -> None:
     calls: list[tuple[str, ...]] = []
 
     def run(arguments: list[str], **_kwargs: Any) -> _Completed:
         calls.append(tuple(arguments))
-        return _Completed("913|cyexm-smoke|RUNNING|node-a\n")
+        return _Completed(
+            "913|cyexm-smoke|RUNNING|node-a\n999|cyexm-smoke|RUNNING|node-z\n"
+        )
 
-    snapshot = collect_queue_snapshot("cyexm-smoke", user="dean", _run=run)
+    snapshot = collect_queue_snapshot(
+        "cyexm-smoke", user="dean", job_ids=("913", "914"), _run=run
+    )
 
     assert calls == [
         (
@@ -283,6 +423,8 @@ def test_queue_snapshot_is_scoped_to_user_and_exact_job_name() -> None:
             "dean",
             "--name",
             "cyexm-smoke",
+            "--jobs",
+            "913,914",
             "--format=%i|%j|%T|%N",
         )
     ]
@@ -292,6 +434,19 @@ def test_queue_snapshot_is_scoped_to_user_and_exact_job_name() -> None:
             "job_name": "cyexm-smoke",
             "state": "RUNNING",
             "nodes": "node-a",
+        }
+    ]
+    assert snapshot["query"] == {
+        "job_name": "cyexm-smoke",
+        "user": "dean",
+        "job_ids": ["913", "914"],
+    }
+    assert snapshot["unrelated_jobs"] == [
+        {
+            "job_id": "999",
+            "job_name": "cyexm-smoke",
+            "state": "RUNNING",
+            "nodes": "node-z",
         }
     ]
 
@@ -306,6 +461,7 @@ def test_cleanup_wait_is_bounded_and_records_the_empty_observation() -> None:
     observed = wait_for_queue_empty(
         "cyexm-smoke",
         user="dean",
+        job_ids=("913",),
         timeout_seconds=5.0,
         poll_seconds=0.0,
         _run=run,
@@ -313,9 +469,79 @@ def test_cleanup_wait_is_bounded_and_records_the_empty_observation() -> None:
         _sleep=lambda _seconds: None,
     )
 
-    assert len(observed["attempts"]) == 2
+    attempts = cast(list[dict[str, object]], observed["attempts"])
+    assert len(attempts) == 2
+    assert observed["outcome"] == "empty"
     assert observed["jobs"] == []
     assert observed["elapsed_seconds"] == 1.0
+
+
+def test_cleanup_wait_returns_durable_squeue_error_evidence(tmp_path: Path) -> None:
+    def run(_arguments: list[str], **_kwargs: Any) -> _Completed:
+        raise OSError("controller unavailable")
+
+    observed = wait_for_queue_empty(
+        "cyexm-smoke",
+        user="dean",
+        job_ids=("913",),
+        _run=run,
+        _monotonic=lambda: 10.0,
+    )
+    write_evidence_json(tmp_path / "queue-after.json", observed)
+
+    assert observed["outcome"] == "query_error"
+    assert observed["query"] == {
+        "job_name": "cyexm-smoke",
+        "user": "dean",
+        "job_ids": ["913"],
+    }
+    assert observed["attempts"] == [
+        {
+            "attempt": 1,
+            "elapsed_seconds": 0.0,
+            "outcome": "query_error",
+            "error": {
+                "type": "HpcAcceptanceError",
+                "message": (
+                    "read-only command failed to start: ['squeue', '--noheader', "
+                    "'--user', 'dean', '--name', 'cyexm-smoke', '--jobs', '913', "
+                    """'--format=%i|%j|%T|%N']: OSError: controller unavailable"""
+                ),
+            },
+        }
+    ]
+    assert json.loads((tmp_path / "queue-after.json").read_text()) == observed
+
+
+def test_cleanup_wait_returns_durable_timeout_evidence(tmp_path: Path) -> None:
+    clock = iter((10.0, 10.0, 11.0))
+
+    observed = wait_for_queue_empty(
+        "cyexm-smoke",
+        user="dean",
+        job_ids=("913",),
+        timeout_seconds=1.0,
+        poll_seconds=1.0,
+        _run=lambda _arguments, **_kwargs: _Completed(
+            "913|cyexm-smoke|COMPLETING|node-a\n"
+        ),
+        _monotonic=lambda: next(clock),
+        _sleep=lambda _seconds: None,
+    )
+    write_evidence_json(tmp_path / "queue-after.json", observed)
+
+    assert observed["outcome"] == "timeout"
+    assert observed["jobs"] == [
+        {
+            "job_id": "913",
+            "job_name": "cyexm-smoke",
+            "state": "COMPLETING",
+            "nodes": "node-a",
+        }
+    ]
+    attempts = cast(list[dict[str, object]], observed["attempts"])
+    assert attempts[-1]["outcome"] == "jobs_remain"
+    assert json.loads((tmp_path / "queue-after.json").read_text()) == observed
 
 
 def _smoke_task(tmp_path: Path) -> RoundTask:
@@ -433,7 +659,7 @@ def test_build_smoke_tasks_bounds_workers_and_uses_manifest_inputs(
         repository_root=repository_root,
         archive_root=archive_root,
         project_root=project_root,
-        live_roots=(),
+        protected_roots=(),
         argv=("pytest",),
         _git_commit=lambda _root: "a" * 40,
         _version=lambda name: name,
@@ -458,6 +684,145 @@ def test_exclusive_policy_requires_partition_policy_or_explicit_directive() -> N
     )
     assert not partition_is_exclusive(
         {"partition": {"OverSubscribe": "NO"}}, directives=()
+    )
+
+
+def test_rendered_job_script_proves_exact_single_process_node_contract(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    project_root = tmp_path / "project"
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    dataset, execution = _write_approved_inputs(archive_root, project_root)
+    evidence = archive_root / "approved" / "evidence"
+    evidence.mkdir()
+    context = prepare_acceptance_context(
+        dataset,
+        execution,
+        evidence,
+        repository_root=repository_root,
+        archive_root=archive_root,
+        project_root=project_root,
+        argv=("pytest", "-m", "hpc"),
+        _git_commit=lambda _root: "a" * 40,
+        _version=lambda name: name,
+    )
+    script = f"""\
+#!/usr/bin/env bash
+#SBATCH -J cyexm-smoke
+#SBATCH -p 512GB
+#SBATCH -n 1
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=500GB
+#SBATCH -t 01:00:00
+#SBATCH --exclusive
+export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1
+python -m distributed.cli.dask_worker tcp://10.0.0.1:8786 --name dummy \\
+ --nthreads 72 --memory-limit 500GB --nanny --death-timeout 60 \\
+ --local-directory {project_root / "cyexm-smoke"} --resources round_slot=1 \\
+ --interface ib0
+"""
+
+    validate_rendered_job_script(script, context.profile)
+
+    with pytest.raises(HpcAcceptanceError, match="rendered job script"):
+        validate_rendered_job_script(
+            script.replace(
+                "#SBATCH -p 512GB\n",
+                "#SBATCH -p 512GB\n#SBATCH -p unauthorized\n",
+            ),
+            context.profile,
+        )
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    (
+        "#SBATCH -J cyexm-smoke\n",
+        "#SBATCH -p 512GB\n",
+        "#SBATCH -n 1\n",
+        "#SBATCH --cpus-per-task=72\n",
+        "#SBATCH --mem=500GB\n",
+        "#SBATCH --exclusive\n",
+        "--nthreads 72",
+        "--resources round_slot=1",
+        "--interface ib0",
+    ),
+)
+def test_rendered_job_script_fails_closed_when_managed_fact_is_missing(
+    tmp_path: Path,
+    fragment: str,
+) -> None:
+    archive_root = tmp_path / "archive"
+    project_root = tmp_path / "project"
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    dataset, execution = _write_approved_inputs(archive_root, project_root)
+    evidence = archive_root / "approved" / "evidence"
+    evidence.mkdir()
+    context = prepare_acceptance_context(
+        dataset,
+        execution,
+        evidence,
+        repository_root=repository_root,
+        archive_root=archive_root,
+        project_root=project_root,
+        argv=("pytest", "-m", "hpc"),
+        _git_commit=lambda _root: "a" * 40,
+        _version=lambda name: name,
+    )
+    script = """\
+#!/usr/bin/env bash
+#SBATCH -J cyexm-smoke
+#SBATCH -p 512GB
+#SBATCH -n 1
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=500GB
+#SBATCH -t 01:00:00
+#SBATCH --exclusive
+python -m distributed.cli.dask_worker tcp://10.0.0.1:8786 \
+ --nthreads 72 --memory-limit 500GB --nanny \
+ --local-directory /project/scratch --resources round_slot=1 --interface ib0
+"""
+
+    with pytest.raises(HpcAcceptanceError, match="rendered job script"):
+        validate_rendered_job_script(script.replace(fragment, ""), context.profile)
+
+
+def test_scheduler_address_must_use_requested_scheduler_interface() -> None:
+    facts = {
+        "name": "ib0",
+        "exists": True,
+        "operstate": "up",
+        "address": "00:11:22:33:44:55",
+        "ipv4": "10.0.0.1",
+    }
+
+    validate_scheduler_interface("tcp://10.0.0.1:8786", "ib0", facts)
+
+    with pytest.raises(HpcAcceptanceError, match="scheduler address"):
+        validate_scheduler_interface("tcp://192.0.2.10:8786", "ib0", facts)
+
+
+def test_path_fact_records_device_and_mount_identity(tmp_path: Path) -> None:
+    fact = collect_path_fact(tmp_path)
+
+    assert fact["device"] == tmp_path.stat().st_dev
+    assert fact["device_major_minor"] == (
+        f"{os.major(tmp_path.stat().st_dev)}:{os.minor(tmp_path.stat().st_dev)}"
+    )
+    mount = fact["mount"]
+    assert isinstance(mount, dict)
+    assert mount["mount_point"]
+    assert mount["filesystem_type"]
+    assert mount["source"]
+    assert shared_path_identity(fact) == (
+        fact["device_major_minor"],
+        mount["filesystem_type"],
+        mount["source"],
+        mount["root"],
+        mount["mount_point"],
     )
 
 
@@ -489,3 +854,46 @@ def test_smoke_runner_serializes_without_worker_importing_test_package() -> None
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_smoke_module_by_value_restores_absent_state_across_nested_contexts() -> None:
+    import cloudpickle
+
+    module = sys.modules[run_environment_smoke.__module__]
+    registry = cloudpickle.cloudpickle._PICKLE_BY_VALUE_MODULES
+    registry.discard(module.__name__)
+
+    with smoke_module_by_value():
+        assert module.__name__ in registry
+        with smoke_module_by_value():
+            assert module.__name__ in registry
+        assert module.__name__ in registry
+
+    assert module.__name__ not in registry
+
+
+def test_smoke_module_by_value_preserves_preregistered_state_after_exception() -> None:
+    import cloudpickle
+
+    module = sys.modules[run_environment_smoke.__module__]
+    registry = cloudpickle.cloudpickle._PICKLE_BY_VALUE_MODULES
+    cloudpickle.register_pickle_by_value(module)
+    try:
+        with pytest.raises(RuntimeError, match="injected"), smoke_module_by_value():
+            raise RuntimeError("injected")
+        assert module.__name__ in registry
+    finally:
+        registry.discard(module.__name__)
+
+
+def test_smoke_module_by_value_restores_absent_state_after_exception() -> None:
+    import cloudpickle
+
+    module = sys.modules[run_environment_smoke.__module__]
+    registry = cloudpickle.cloudpickle._PICKLE_BY_VALUE_MODULES
+    registry.discard(module.__name__)
+
+    with pytest.raises(RuntimeError, match="injected"), smoke_module_by_value():
+        raise RuntimeError("injected")
+
+    assert module.__name__ not in registry

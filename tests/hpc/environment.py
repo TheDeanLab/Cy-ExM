@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from cyexm.config import (
     DatasetManifest,
@@ -39,6 +41,10 @@ ACCEPTANCE_PACKAGES = (
     "scipy",
     "tifffile",
 )
+
+_SMOKE_PICKLE_LOCK = threading.RLock()
+_SMOKE_PICKLE_DEPTH = 0
+_SMOKE_PICKLE_WAS_REGISTERED = False
 
 
 class HpcAcceptanceError(RuntimeError):
@@ -75,6 +81,30 @@ def require_cli_paths(
             raise HpcAcceptanceError(f"explicit HPC acceptance requires {option} PATH")
         parsed.append(Path(value))
     return parsed[0], parsed[1], parsed[2]
+
+
+def require_explicit_hpc_selection(arguments: Sequence[str]) -> None:
+    """Require the process invocation itself to select exactly ``hpc`` tests."""
+    selected: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "-m":
+            if index + 1 >= len(arguments):
+                break
+            selected.append(arguments[index + 1])
+            index += 2
+            continue
+        if argument.startswith("-m="):
+            selected.append(argument[3:])
+        elif argument.startswith("-m") and argument != "-m":
+            selected.append(argument[2:])
+        index += 1
+    if selected != ["hpc"]:
+        raise HpcAcceptanceError(
+            "explicit HPC acceptance requires the actual pytest invocation to "
+            "contain exactly '-m hpc'"
+        )
 
 
 def _is_disjoint(first: Path, second: Path) -> bool:
@@ -388,29 +418,36 @@ def collect_queue_snapshot(
     job_name: str,
     *,
     user: str,
+    job_ids: Sequence[str] = (),
     _run: Callable[..., Any] = subprocess.run,
 ) -> dict[str, object]:
-    """Read the current user's jobs with the exact harness job name."""
+    """Read only the current user's exact harness name and recorded job IDs."""
+    owned_ids = tuple(dict.fromkeys(job_ids))
+    if any(type(job_id) is not str or not job_id for job_id in owned_ids):
+        raise HpcAcceptanceError(f"owned SLURM job IDs are invalid: {owned_ids!r}")
+    arguments = [
+        "squeue",
+        "--noheader",
+        "--user",
+        user,
+        "--name",
+        job_name,
+    ]
+    if owned_ids:
+        arguments.extend(("--jobs", ",".join(owned_ids)))
+    arguments.append("--format=%i|%j|%T|%N")
     command = _run_read_only(
-        [
-            "squeue",
-            "--noheader",
-            "--user",
-            user,
-            "--name",
-            job_name,
-            "--format=%i|%j|%T|%N",
-        ],
+        arguments,
         run=_run,
     )
-    jobs: list[dict[str, str]] = []
+    observed_jobs: list[dict[str, str]] = []
     for line_number, line in enumerate(cast(str, command["stdout"]).splitlines(), 1):
         if not line.strip():
             continue
         values = [value.strip() for value in line.split("|")]
         if len(values) != 4 or not all(values[:3]):
             raise HpcAcceptanceError(f"squeue row {line_number} is malformed: {line!r}")
-        jobs.append(
+        observed_jobs.append(
             dict(
                 zip(
                     ("job_id", "job_name", "state", "nodes"),
@@ -419,11 +456,23 @@ def collect_queue_snapshot(
                 )
             )
         )
+    owned_id_set = set(owned_ids)
+    jobs = [
+        job
+        for job in observed_jobs
+        if job["job_name"] == job_name
+        and (not owned_id_set or job["job_id"] in owned_id_set)
+    ]
+    unrelated_jobs = [job for job in observed_jobs if job not in jobs]
     return {
         "schema_version": 1,
-        "job_name": job_name,
-        "user": user,
+        "query": {
+            "job_name": job_name,
+            "user": user,
+            "job_ids": list(owned_ids),
+        },
         "jobs": jobs,
+        "unrelated_jobs": unrelated_jobs,
         "command": command,
     }
 
@@ -432,35 +481,81 @@ def wait_for_queue_empty(
     job_name: str,
     *,
     user: str,
+    job_ids: Sequence[str] = (),
     timeout_seconds: float = 60.0,
     poll_seconds: float = 1.0,
     _run: Callable[..., Any] = subprocess.run,
     _monotonic: Callable[[], float] = time.monotonic,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
-    """Bound cleanup observation while SLURM retires completed job records."""
+    """Return durable bounded cleanup observations, including failures."""
     if timeout_seconds <= 0.0 or poll_seconds < 0.0:
         raise HpcAcceptanceError("queue cleanup timeout must be positive and bounded")
     started = _monotonic()
     deadline = started + timeout_seconds
     attempts: list[dict[str, object]] = []
+    owned_ids = tuple(dict.fromkeys(job_ids))
+    query = {
+        "job_name": job_name,
+        "user": user,
+        "job_ids": list(owned_ids),
+    }
     while True:
-        snapshot = collect_queue_snapshot(job_name, user=user, _run=_run)
-        attempts.append(snapshot)
+        try:
+            snapshot = collect_queue_snapshot(
+                job_name,
+                user=user,
+                job_ids=owned_ids,
+                _run=_run,
+            )
+        except Exception as error:
+            now = _monotonic()
+            attempts.append(
+                {
+                    "attempt": len(attempts) + 1,
+                    "elapsed_seconds": float(max(0.0, now - started)),
+                    "outcome": "query_error",
+                    "error": {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                    },
+                }
+            )
+            return {
+                "schema_version": 1,
+                "outcome": "query_error",
+                "query": query,
+                "jobs": [],
+                "attempts": attempts,
+                "elapsed_seconds": float(max(0.0, now - started)),
+            }
+        now = _monotonic()
+        attempts.append(
+            {
+                "attempt": len(attempts) + 1,
+                "elapsed_seconds": float(max(0.0, now - started)),
+                "outcome": "empty" if snapshot["jobs"] == [] else "jobs_remain",
+                "snapshot": snapshot,
+            }
+        )
         if snapshot["jobs"] == []:
             return {
                 "schema_version": 1,
-                "job_name": job_name,
-                "user": user,
+                "outcome": "empty",
+                "query": query,
                 "jobs": [],
                 "attempts": attempts,
-                "elapsed_seconds": float(max(0.0, _monotonic() - started)),
+                "elapsed_seconds": float(max(0.0, now - started)),
             }
-        now = _monotonic()
         if now >= deadline:
-            raise HpcAcceptanceError(
-                f"owned jobs remain after {timeout_seconds:.1f}s: {snapshot['jobs']!r}"
-            )
+            return {
+                "schema_version": 1,
+                "outcome": "timeout",
+                "query": query,
+                "jobs": snapshot["jobs"],
+                "attempts": attempts,
+                "elapsed_seconds": float(max(0.0, now - started)),
+            }
         _sleep(min(poll_seconds, max(0.0, deadline - now)))
 
 
@@ -485,6 +580,98 @@ def partition_is_exclusive(
         ):
             return True
     return False
+
+
+def validate_rendered_job_script(script: str, profile: ExecutionProfile) -> None:
+    """Fail closed unless dask-jobqueue rendered the approved one-job contract."""
+    spec = profile.slurm
+    if profile.executor != "slurm" or spec is None:
+        raise HpcAcceptanceError("rendered job script requires a SLURM profile")
+    if spec.processes_per_worker != 1:
+        raise HpcAcceptanceError("rendered job script requires one worker process")
+    if type(script) is not str or not script.strip():
+        raise HpcAcceptanceError("rendered job script must be nonempty")
+    exact_lines = {
+        f"#SBATCH -J {spec.job_name}",
+        f"#SBATCH -p {spec.queue}",
+        "#SBATCH -n 1",
+        f"#SBATCH --cpus-per-task={spec.cores_per_worker}",
+        f"#SBATCH --mem={spec.memory}",
+        f"#SBATCH -t {spec.walltime}",
+        *(f"#SBATCH {directive}" for directive in spec.job_extra_directives),
+    }
+    observed_lines = [line.strip() for line in script.splitlines()]
+    missing_lines = sorted(
+        line for line in exact_lines if observed_lines.count(line) != 1
+    )
+    managed_headers = {
+        "#SBATCH -J ": f"#SBATCH -J {spec.job_name}",
+        "#SBATCH -p ": f"#SBATCH -p {spec.queue}",
+        "#SBATCH -n ": "#SBATCH -n 1",
+        "#SBATCH --cpus-per-task=": (
+            f"#SBATCH --cpus-per-task={spec.cores_per_worker}"
+        ),
+        "#SBATCH --mem=": f"#SBATCH --mem={spec.memory}",
+        "#SBATCH -t ": f"#SBATCH -t {spec.walltime}",
+    }
+    conflicting_headers = {
+        prefix: matching
+        for prefix, expected in managed_headers.items()
+        if (matching := [line for line in observed_lines if line.startswith(prefix)])
+        != [expected]
+    }
+    normalized = " ".join(script.replace("\\\n", " ").split())
+    required_fragments = (
+        " -m distributed.cli.dask_worker ",
+        f"--nthreads {spec.cores_per_worker}",
+        f"--local-directory {profile.paths.worker_local_directory}",
+        "--resources round_slot=1",
+        f"--interface {spec.interface}",
+        "--memory-limit ",
+    )
+    missing_fragments = [
+        fragment for fragment in required_fragments if fragment not in normalized
+    ]
+    if (
+        missing_lines
+        or conflicting_headers
+        or missing_fragments
+        or "--nworkers" in normalized
+    ):
+        raise HpcAcceptanceError(
+            "rendered job script does not prove the exact approved SLURM/Dask "
+            f"contract; missing lines={missing_lines!r}, missing command facts="
+            f"{missing_fragments!r}, conflicting headers={conflicting_headers!r}, "
+            "unexpected_nworkers="
+            f"{'--nworkers' in normalized}"
+        )
+
+
+def validate_scheduler_interface(
+    scheduler_address: str,
+    expected_name: str,
+    facts: Mapping[str, object],
+) -> None:
+    """Prove the scheduler address is bound to the requested live interface."""
+    if (
+        facts.get("name") != expected_name
+        or facts.get("exists") is not True
+        or facts.get("operstate") != "up"
+    ):
+        raise HpcAcceptanceError(
+            f"scheduler interface {expected_name!r} is missing or not up: {facts!r}"
+        )
+    ipv4 = facts.get("ipv4")
+    if type(ipv4) is not str or not ipv4:
+        raise HpcAcceptanceError(
+            f"scheduler interface {expected_name!r} has no IPv4 address"
+        )
+    host = urlsplit(scheduler_address).hostname
+    if host != ipv4:
+        raise HpcAcceptanceError(
+            f"scheduler address {scheduler_address!r} does not use requested "
+            f"interface {expected_name!r} at {ipv4!r}"
+        )
 
 
 def build_smoke_tasks(
@@ -544,18 +731,43 @@ def build_smoke_tasks(
 
 @contextmanager
 def smoke_module_by_value() -> Iterator[None]:
-    """Make the test-only smoke runner self-contained for remote workers."""
+    """Temporarily serialize this module by value and restore exact prior state."""
     import cloudpickle
 
+    global _SMOKE_PICKLE_DEPTH, _SMOKE_PICKLE_WAS_REGISTERED
+
     module = sys.modules[__name__]
-    cloudpickle.register_pickle_by_value(module)
+    registry = getattr(cloudpickle.cloudpickle, "_PICKLE_BY_VALUE_MODULES", None)
+    if not isinstance(registry, set):
+        raise HpcAcceptanceError(
+            "cloudpickle does not expose registration state needed for exact cleanup"
+        )
+    with _SMOKE_PICKLE_LOCK:
+        if _SMOKE_PICKLE_DEPTH == 0:
+            _SMOKE_PICKLE_WAS_REGISTERED = module.__name__ in registry
+        if module.__name__ not in registry:
+            cloudpickle.register_pickle_by_value(module)
+        _SMOKE_PICKLE_DEPTH += 1
     try:
         yield
     finally:
-        cloudpickle.unregister_pickle_by_value(module)
+        with _SMOKE_PICKLE_LOCK:
+            _SMOKE_PICKLE_DEPTH -= 1
+            if _SMOKE_PICKLE_DEPTH < 0:
+                _SMOKE_PICKLE_DEPTH = 0
+                raise HpcAcceptanceError(
+                    "cloudpickle registration nesting was corrupted"
+                )
+            if _SMOKE_PICKLE_DEPTH == 0:
+                if _SMOKE_PICKLE_WAS_REGISTERED:
+                    if module.__name__ not in registry:
+                        cloudpickle.register_pickle_by_value(module)
+                elif module.__name__ in registry:
+                    cloudpickle.unregister_pickle_by_value(module)
+                _SMOKE_PICKLE_WAS_REGISTERED = False
 
 
-def _default_interface_facts(name: str) -> dict[str, object]:
+def collect_interface_facts(name: str) -> dict[str, object]:
     root = Path("/sys/class/net") / name
     facts: dict[str, object] = {
         "name": name,
@@ -582,15 +794,82 @@ def _default_interface_facts(name: str) -> dict[str, object]:
     return facts
 
 
-def _path_fact(path: Path) -> dict[str, object]:
+def _decode_mountinfo_path(value: str) -> str:
+    for encoded, decoded in (
+        ("\\040", " "),
+        ("\\011", "\t"),
+        ("\\012", "\n"),
+        ("\\134", "\\"),
+    ):
+        value = value.replace(encoded, decoded)
+    return value
+
+
+def collect_path_fact(path: Path) -> dict[str, object]:
+    """Record canonical stat and Linux mount identity for a visible path."""
     resolved = path.resolve(strict=True)
     status = resolved.stat()
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise HpcAcceptanceError("could not read /proc/self/mountinfo") from error
+    candidates: list[tuple[Path, dict[str, object]]] = []
+    for line in lines:
+        before, separator, after = line.partition(" - ")
+        if not separator:
+            continue
+        left = before.split()
+        right = after.split()
+        if len(left) < 6 or len(right) < 3:
+            continue
+        mount_point = Path(_decode_mountinfo_path(left[4]))
+        if resolved != mount_point and not resolved.is_relative_to(mount_point):
+            continue
+        candidates.append(
+            (
+                mount_point,
+                {
+                    "mount_id": left[0],
+                    "parent_id": left[1],
+                    "device": left[2],
+                    "root": _decode_mountinfo_path(left[3]),
+                    "mount_point": str(mount_point),
+                    "options": left[5],
+                    "filesystem_type": right[0],
+                    "source": _decode_mountinfo_path(right[1]),
+                    "super_options": right[2],
+                },
+            )
+        )
+    if not candidates:
+        raise HpcAcceptanceError(f"no Linux mount fact contains {resolved}")
+    _mount_point, mount = max(candidates, key=lambda item: len(item[0].parts))
     return {
         "resolved": str(resolved),
         "exists": True,
         "is_directory": resolved.is_dir(),
         "device": status.st_dev,
+        "device_major_minor": f"{os.major(status.st_dev)}:{os.minor(status.st_dev)}",
+        "mount": mount,
     }
+
+
+def shared_path_identity(fact: Mapping[str, object]) -> tuple[str, str, str, str, str]:
+    """Return the exact device/mount identity compared across coordinator/workers."""
+    device = fact.get("device_major_minor")
+    mount = fact.get("mount")
+    if type(device) is not str or not isinstance(mount, Mapping):
+        raise HpcAcceptanceError(f"path fact lacks device/mount identity: {fact!r}")
+    values = (
+        device,
+        mount.get("filesystem_type"),
+        mount.get("source"),
+        mount.get("root"),
+        mount.get("mount_point"),
+    )
+    if any(type(value) is not str or not value for value in values):
+        raise HpcAcceptanceError(f"path mount identity is incomplete: {fact!r}")
+    return cast(tuple[str, str, str, str, str], values)
 
 
 def _scratch_probe(root: Path) -> dict[str, bool]:
@@ -631,7 +910,7 @@ def run_environment_smoke(
     _run: Callable[..., Any] = subprocess.run,
     _get_worker: Callable[[], Any] | None = None,
     _hostname: Callable[[], str] = socket.gethostname,
-    _interface_facts: Callable[[str], dict[str, object]] = _default_interface_facts,
+    _interface_facts: Callable[[str], dict[str, object]] = collect_interface_facts,
 ) -> RoundResult:
     """Record one allocated worker without importing or running registration."""
     started_at = datetime.now(UTC)
@@ -686,11 +965,12 @@ def run_environment_smoke(
         "worker_memory_limit_bytes": memory_limit,
         "interface": _interface_facts(interface),
         "paths": {
-            "dataset_root": _path_fact(Path(dataset_root)),
-            "output_root": _path_fact(Path(output_root)),
-            "worker_local_directory": _path_fact(Path(worker_local_directory)),
-            "fixed_image": _path_fact(task.fixed_image),
-            "moving_image": _path_fact(task.moving_image),
+            "dataset_root": collect_path_fact(Path(dataset_root)),
+            "output_root": collect_path_fact(Path(output_root)),
+            "worker_local_directory": collect_path_fact(Path(worker_local_directory)),
+            "evidence_dir": collect_path_fact(Path(evidence_dir)),
+            "fixed_image": collect_path_fact(task.fixed_image),
+            "moving_image": collect_path_fact(task.moving_image),
         },
         "scratch_probe": scratch,
         "job": parse_scontrol_record(cast(str, job_command["stdout"])),
@@ -735,7 +1015,7 @@ def _validate_storage(
     repository_root: Path,
     archive_root: Path,
     project_root: Path,
-    live_roots: Sequence[Path],
+    protected_roots: Sequence[Path],
 ) -> None:
     dataset_path, execution_path, evidence_dir = context_paths
     for path, role in (
@@ -752,34 +1032,69 @@ def _validate_storage(
         raise HpcAcceptanceError("SLURM acceptance requires worker scratch")
     _require_under(scratch, project_root, "worker scratch")
 
-    protected = (repository_root, *live_roots)
-    if any(not _is_disjoint(evidence_dir, root) for root in protected):
-        raise HpcAcceptanceError(
-            "evidence directory must be disjoint from every protected repository "
-            "and live spheroid path"
-        )
-    for root, role in (
+    protected = (repository_root, *protected_roots)
+    configurations = (
+        (dataset_path, "dataset manifest configuration"),
+        (execution_path, "execution profile configuration"),
+    )
+    roots = (
         (profile.paths.dataset_root, "dataset root"),
         (profile.paths.output_root, "output root"),
         (scratch, "worker scratch"),
-    ):
-        if not _is_disjoint(evidence_dir, root):
+        (evidence_dir, "evidence directory"),
+    )
+    for path, role in (*configurations, *roots):
+        if any(not _is_disjoint(path, protected_root) for protected_root in protected):
             raise HpcAcceptanceError(
-                f"evidence directory must be disjoint from {role}: {root}"
+                f"{role} must be disjoint from every protected repository and "
+                f"live spheroid path: {path}"
             )
+    for configuration, role in configurations:
+        if any(not _is_disjoint(configuration, root) for root, _ in roots):
+            raise HpcAcceptanceError(
+                f"configuration {role} must be disjoint from all data, output, "
+                f"scratch, and evidence roots: {configuration}"
+            )
+    for index, (first, first_role) in enumerate(roots):
+        for second, second_role in roots[index + 1 :]:
+            if not _is_disjoint(first, second):
+                raise HpcAcceptanceError(
+                    f"{first_role} and {second_role} must be canonically disjoint; "
+                    f"got {first} and {second}"
+                )
 
 
 def _validate_dataset_files(
     manifest: DatasetManifest,
     profile: ExecutionProfile,
-) -> None:
+    *,
+    archive_root: Path,
+    protected_roots: Sequence[Path],
+) -> tuple[Path, ...]:
     dataset_root = _resolved_directory(profile.paths.dataset_root, "dataset root")
     _resolved_directory(profile.paths.output_root, "output root")
     relative_paths = [manifest.reference.channel]
     for round_spec in manifest.rounds:
         relative_paths.extend(channel.file for channel in round_spec.channels)
+    resolved_inputs: list[Path] = []
     for relative in dict.fromkeys(relative_paths):
-        _resolved_file(dataset_root / relative, f"manifest input {relative}")
+        role = f"manifest input {relative}"
+        resolved = _resolved_file(dataset_root / relative, role)
+        if not resolved.is_relative_to(dataset_root):
+            raise HpcAcceptanceError(
+                f"{role} resolves outside the dataset root or into a protected "
+                f"path: {resolved}"
+            )
+        _require_under(resolved, archive_root, role)
+        if any(
+            not _is_disjoint(resolved, protected_root)
+            for protected_root in protected_roots
+        ):
+            raise HpcAcceptanceError(
+                f"{role} resolves into a protected path: {resolved}"
+            )
+        resolved_inputs.append(resolved)
+    return tuple(resolved_inputs)
 
 
 def prepare_acceptance_context(
@@ -790,7 +1105,7 @@ def prepare_acceptance_context(
     repository_root: Path,
     archive_root: Path = Path("/archive"),
     project_root: Path = Path("/project"),
-    live_roots: Sequence[Path] = (),
+    protected_roots: Sequence[Path] = (),
     argv: Sequence[str] | None = None,
     _now: Callable[[], datetime] = lambda: datetime.now(UTC),
     _git_commit: Callable[[Path], str] = _git_head,
@@ -811,7 +1126,7 @@ def prepare_acceptance_context(
     repository = repository_root.resolve(strict=True)
     archive = archive_root.resolve(strict=True)
     project = project_root.resolve(strict=True)
-    live = tuple(path.resolve(strict=False) for path in live_roots)
+    protected = tuple(path.resolve(strict=False) for path in protected_roots)
     manifest = load_dataset_manifest(dataset_path)
     profile = load_execution_profile(execution_path)
     if profile.executor != "slurm" or profile.slurm is None:
@@ -824,9 +1139,14 @@ def prepare_acceptance_context(
         repository_root=repository,
         archive_root=archive,
         project_root=project,
-        live_roots=live,
+        protected_roots=protected,
     )
-    _validate_dataset_files(manifest, profile)
+    _validate_dataset_files(
+        manifest,
+        profile,
+        archive_root=archive,
+        protected_roots=(repository, *protected),
+    )
 
     versions = _package_versions(_version)
     commit = _git_commit(repository)
@@ -872,15 +1192,21 @@ __all__ = [
     "HpcAcceptanceContext",
     "HpcAcceptanceError",
     "build_smoke_tasks",
+    "collect_interface_facts",
     "collect_partition_snapshot",
+    "collect_path_fact",
     "collect_queue_snapshot",
     "parse_scontrol_record",
     "parse_slurm_tres_memory_bytes",
     "partition_is_exclusive",
     "prepare_acceptance_context",
     "require_cli_paths",
+    "require_explicit_hpc_selection",
     "run_environment_smoke",
+    "shared_path_identity",
     "smoke_module_by_value",
+    "validate_rendered_job_script",
+    "validate_scheduler_interface",
     "wait_for_queue_empty",
     "write_evidence_json",
     "write_evidence_text",

@@ -24,6 +24,10 @@
 - Force never bypasses a scientific-plan fingerprint mismatch.
 - Forcing the reference task forces every moving descendant; forcing only a moving
   task must preserve reusable reference evidence. Status includes the reference round.
+- A failed reference barrier prevents descendant submission, so an executor may
+  return only that failed reference result. Record the real reference failure through
+  ordinary workflow failure semantics; do not require results for unsubmitted moving
+  descendants or mask the failure with a result-cardinality error.
 - Use no module-scope scientific or scheduler imports.
 - `round_task.py` is the only real registration execution boundary in workflow. It
   configures the task's native threads before its lazy registration/scientific

@@ -14,8 +14,8 @@ from cyexm.workflow.api import run_workflow
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import RoundResult, RoundTask, WorkflowPlan, WorkflowResult
 from cyexm.workflow.planning import build_workflow_plan
-from cyexm.workflow.round_task import run_round_task
 from cyexm.workflow.status import inspect_workflow_status
+from cyexm.workflow.task import run_workflow_task
 from hpc.environment import (
     HpcAcceptanceContext,
     HpcAcceptanceError,
@@ -157,7 +157,7 @@ def _run_task5_acceptance(
         WorkflowResult,
         execute_owned_slurm_workflow(
             parallel_plan,
-            runner=run_round_task,
+            runner=run_workflow_task,
             evidence_dir=context.evidence_dir,
             operation="parallel",
             user=user,
@@ -210,7 +210,7 @@ def _run_task5_acceptance(
         WorkflowResult,
         execute_owned_slurm_workflow(
             failure_plan,
-            runner=run_round_task,
+            runner=run_workflow_task,
             evidence_dir=context.evidence_dir,
             operation="failure-resume",
             user=user,
@@ -293,7 +293,7 @@ def _run_task5_acceptance(
         WorkflowResult,
         execute_owned_slurm_workflow(
             cancellation_plan,
-            runner=run_round_task,
+            runner=run_workflow_task,
             evidence_dir=context.evidence_dir,
             operation="cancellation-resume",
             user=user,

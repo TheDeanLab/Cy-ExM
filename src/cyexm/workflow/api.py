@@ -675,6 +675,22 @@ def _ordered_results(
     return ordered
 
 
+def _ordered_execution_results(
+    submitted: tuple[WorkflowTask, ...],
+    results: tuple[RoundResult, ...],
+) -> tuple[RoundResult, ...]:
+    if (
+        len(submitted) > 1
+        and type(submitted[0]) is ReferenceTask
+        and type(results) is tuple
+        and len(results) == 1
+        and type(results[0]) is RoundResult
+        and results[0].status == "failed"
+    ):
+        return _ordered_results((submitted[0],), results)
+    return _ordered_results(submitted, results)
+
+
 def _validated_partial_results(
     submitted: tuple[WorkflowTask, ...],
     results: tuple[RoundResult, ...],
@@ -860,7 +876,7 @@ def run_workflow(
         factory = _executor_factory or _default_executor_factory
         executor = factory(plan.execution)
         raw_results = executor.execute(reference_task, submitted)
-        executed = _ordered_results((reference_task, *submitted), raw_results)
+        executed = _ordered_execution_results((reference_task, *submitted), raw_results)
         preserved_results = tuple(
             sorted((*reused, *executed), key=lambda result: result.round)
         )

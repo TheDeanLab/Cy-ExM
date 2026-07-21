@@ -19,7 +19,13 @@ from cyexm.config.models import DatasetManifest, ExecutionProfile
 from cyexm.execution.slurm import SlurmExecutor
 from cyexm.io.atomic import atomic_write
 from cyexm.workflow.api import run_workflow
-from cyexm.workflow.models import RoundResult, RoundTask, WorkflowPlan
+from cyexm.workflow.models import (
+    ReferenceTask,
+    RoundResult,
+    RoundTask,
+    WorkflowPlan,
+    WorkflowTask,
+)
 from hpc.environment import (
     collect_queue_snapshot,
     wait_for_queue_empty,
@@ -690,6 +696,12 @@ def _production_round_task(task: RoundTask) -> RoundResult:
     return run_round_task(task)
 
 
+def _production_workflow_task(task: WorkflowTask) -> RoundResult:
+    from cyexm.workflow.task import run_workflow_task
+
+    return run_workflow_task(task)
+
+
 def _commit_round_marker(
     path: Path,
     result: RoundResult,
@@ -781,18 +793,23 @@ def validate_injected_failure_record(
 
 
 def run_failure_task(
-    task: RoundTask,
+    task: WorkflowTask,
     *,
     successful_round: int,
     failing_round: int,
     committed_marker: Path,
     timeout_seconds: float,
     _run_round_task: Callable[[RoundTask], RoundResult] = _production_round_task,
+    _run_workflow_task: Callable[
+        [WorkflowTask], RoundResult
+    ] = _production_workflow_task,
     _monotonic: Callable[[], float] = time.monotonic,
     _sleep: Callable[[float], None] = time.sleep,
     _utc_now: Callable[[], str] = _utc_now,
 ) -> RoundResult:
     """Commit one real round before deterministically failing its independent peer."""
+    if type(task) is ReferenceTask:
+        return _run_workflow_task(task)
     if task.round == successful_round:
         result = _run_round_task(task)
         _commit_round_marker(
@@ -820,7 +837,7 @@ def run_failure_task(
 
 
 def run_cancellation_task(
-    task: RoundTask,
+    task: WorkflowTask,
     *,
     successful_round: int,
     blocked_round: int,
@@ -828,11 +845,16 @@ def run_cancellation_task(
     ready_marker: Path,
     timeout_seconds: float,
     _run_round_task: Callable[[RoundTask], RoundResult] = _production_round_task,
+    _run_workflow_task: Callable[
+        [WorkflowTask], RoundResult
+    ] = _production_workflow_task,
     _monotonic: Callable[[], float] = time.monotonic,
     _sleep: Callable[[float], None] = time.sleep,
     _utc_now: Callable[[], str] = _utc_now,
 ) -> RoundResult:
     """Commit one real round while its peer stays cancellably unfinished."""
+    if type(task) is ReferenceTask:
+        return _run_workflow_task(task)
     if task.round == successful_round:
         result = _run_round_task(task)
         _commit_round_marker(

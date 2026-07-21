@@ -1166,6 +1166,35 @@ def test_local_dask_failed_round_does_not_manufacture_cluster_evidence(
     assert run_record["execution_profile"]["executor"] == "local_dask"
 
 
+def test_reference_failure_records_only_the_unsubmitted_barrier(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2, 3))
+
+    class FailedReferenceExecutor:
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            assert tuple(task.round for task in tasks) == (2, 3)
+            return (_reference_result(reference_task, failed=True),)
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: FailedReferenceExecutor(),
+        )
+
+    assert captured.value.failed_rounds == (1,)
+    run_record = json.loads(Path(captured.value.run_record).read_text(encoding="utf-8"))
+    assert run_record["status"] == "failed"
+    assert [
+        (item["round"], item["strategy"], item["status"])
+        for item in run_record["rounds"]
+    ] == [(1, "reference-preparation", "failed")]
+
+
 def test_local_dask_cancellation_does_not_manufacture_cluster_evidence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

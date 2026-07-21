@@ -38,6 +38,10 @@
   value serialization and restore its prior registry state in every exit path. The
   production executor must carry those bytes in its importable runner wrapper;
   never add `tests` to worker `PYTHONPATH` or submit a direct test-module callable.
+- Every Task 5 runner receives the complete workflow-task union. Dispatch the
+  `ReferenceTask` through ordinary reference preparation before applying injected
+  failure or cancellation behavior only to moving `RoundTask` values; never bypass
+  or reinterpret the hard reference barrier in acceptance-only code.
 - Own every job created by the harness. Close the Dask client before its cluster on
   success or failure, and query only the current user plus exact name after cleanup;
   never pass recorded job IDs to squeue. Sort and deduplicate the recorded IDs,

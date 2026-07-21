@@ -43,7 +43,11 @@ from cyexm.config.models import (
     RoundSpec,
     SlurmSpec,
 )
-from cyexm.workflow.models import RoundResult
+from cyexm.workflow.models import (
+    ReferenceChannelTask,
+    ReferenceTask,
+    RoundResult,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -263,6 +267,95 @@ def test_owned_slurm_failure_atomically_preserves_evidence_and_proves_cleanup(
         "message": "injected workflow failure",
     }
     assert outcome["cleanup_outcome"] == "empty"
+
+
+def _reference_task(tmp_path: Path) -> ReferenceTask:
+    source = tmp_path / "reference.tif"
+    output = tmp_path / "channels" / "reference.tif"
+    return ReferenceTask(
+        dataset_id="bounded",
+        round=1,
+        registration_channel_source=source,
+        registration_channel_output=output,
+        registration_directory=tmp_path / "registration",
+        crop_bounds_path=None,
+        log_path=tmp_path / "reference.log",
+        voxel_spacing_xyz=(1.0, 1.0, 1.0),
+        crop=False,
+        native_threads=NativeThreadSpec(itk=8, blas=8),
+        channels=(ReferenceChannelTask(source=source, output=output),),
+    )
+
+
+def _reference_result(task: ReferenceTask) -> RoundResult:
+    return RoundResult(
+        dataset_id=task.dataset_id,
+        round=task.round,
+        status="completed",
+        started_at="2026-07-21T10:00:00Z",
+        ended_at="2026-07-21T10:00:01Z",
+        duration_seconds=1.0,
+        hostname="node-reference",
+        pid=101,
+        dask_task_key="cyexm-bounded-reference-round-001",
+        slurm_job_id="10",
+        strategy="reference-preparation",
+        native_threads=(
+            ("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", 8),
+            ("OMP_NUM_THREADS", 8),
+        ),
+        artifact_paths=(str(task.registration_channel_output),),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=None,
+    )
+
+
+def test_failure_runner_dispatches_reference_without_moving_coordination(
+    tmp_path: Path,
+) -> None:
+    task = _reference_task(tmp_path)
+    expected = _reference_result(task)
+    marker = tmp_path / "failure-marker.json"
+
+    result = run_failure_task(
+        task,
+        successful_round=4,
+        failing_round=7,
+        committed_marker=marker,
+        timeout_seconds=1_800.0,
+        _run_workflow_task=lambda observed: (
+            expected if observed is task else pytest.fail("unexpected task")
+        ),
+    )
+
+    assert result is expected
+    assert not marker.exists()
+
+
+def test_cancellation_runner_dispatches_reference_without_moving_coordination(
+    tmp_path: Path,
+) -> None:
+    task = _reference_task(tmp_path)
+    expected = _reference_result(task)
+    committed = tmp_path / "committed.json"
+    ready = tmp_path / "ready.json"
+
+    result = run_cancellation_task(
+        task,
+        successful_round=4,
+        blocked_round=7,
+        committed_marker=committed,
+        ready_marker=ready,
+        timeout_seconds=1_800.0,
+        _run_workflow_task=lambda observed: (
+            expected if observed is task else pytest.fail("unexpected task")
+        ),
+    )
+
+    assert result is expected
+    assert not committed.exists()
+    assert not ready.exists()
 
 
 def test_failure_runner_waits_for_committed_peer_before_failing(tmp_path: Path) -> None:

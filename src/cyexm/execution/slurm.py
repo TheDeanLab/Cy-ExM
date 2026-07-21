@@ -23,6 +23,7 @@ from cyexm.errors import (
 )
 from cyexm.execution._dask_common import (
     collect_distributed_results,
+    dask_scheduler_config_overlay,
     future_is_unfinished,
     utc_now,
     validate_distributed_tasks,
@@ -806,7 +807,7 @@ def _native_thread_prologue(profile: ExecutionProfile) -> list[str]:
 
 def _jobqueue_config_overlay() -> dict[str, object]:
     """Isolate worker rendering from ambient ``jobqueue.slurm`` settings."""
-    values: dict[str, object] = {
+    jobqueue_values: dict[str, object] = {
         "account": None,
         "project": None,
         "cores": None,
@@ -834,7 +835,14 @@ def _jobqueue_config_overlay() -> dict[str, object]:
         "log-directory": None,
         "scheduler-options": {},
     }
-    return {f"jobqueue.{_CONFIG_NAME}.{name}": value for name, value in values.items()}
+    values = dask_scheduler_config_overlay()
+    values.update(
+        {
+            f"jobqueue.{_CONFIG_NAME}.{name}": value
+            for name, value in jobqueue_values.items()
+        }
+    )
+    return values
 
 
 def _rendered_script_error(detail: str) -> ValueError:

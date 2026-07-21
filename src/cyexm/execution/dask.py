@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +14,7 @@ from cyexm.errors import ExecutorStartupError
 from cyexm.execution._dask_common import (
     ROUND_RESOURCE,
     collect_distributed_results,
+    dask_scheduler_config_overlay,
     future_is_unfinished,
     validate_distributed_tasks,
 )
@@ -28,17 +31,30 @@ class _DistributedModules:
     LocalCluster: Any
     as_completed: Any
     parse_timedelta: Any
+    config_set: Any
 
 
 def _distributed_modules() -> _DistributedModules:
     """Load scheduler dependencies only when a local executor is opened."""
+    from dask import config as dask_config
     from dask.utils import parse_timedelta
     from distributed import Client, LocalCluster, as_completed
 
-    return _DistributedModules(Client, LocalCluster, as_completed, parse_timedelta)
+    return _DistributedModules(
+        Client,
+        LocalCluster,
+        as_completed,
+        parse_timedelta,
+        dask_config.set,
+    )
 
 
-def _close_owned(client: Any | None, cluster: Any | None) -> None:
+def _close_owned(
+    client: Any | None,
+    cluster: Any | None,
+    configuration: AbstractContextManager[Any] | None,
+) -> None:
+    exit_info = sys.exc_info()
     if client is not None:
         try:
             client.close()
@@ -49,6 +65,11 @@ def _close_owned(client: Any | None, cluster: Any | None) -> None:
             cluster.close()
         except BaseException as error:
             _LOGGER.warning("Failed to close owned local Dask cluster: %s", error)
+    if configuration is not None:
+        try:
+            configuration.__exit__(*exit_info)
+        except BaseException as error:
+            _LOGGER.warning("Failed to close owned local Dask configuration: %s", error)
 
 
 class LocalDaskExecutor:
@@ -85,11 +106,17 @@ class LocalDaskExecutor:
         worker_count = min(len(tasks), spec.workers)
         cluster: Any | None = None
         client: Any | None = None
+        configuration: AbstractContextManager[Any] | None = None
         active: set[Any] = set()
 
         try:
             try:
                 modules = self._modules()
+                opened_configuration = modules.config_set(
+                    dask_scheduler_config_overlay()
+                )
+                opened_configuration.__enter__()
+                configuration = opened_configuration
                 cluster = modules.LocalCluster(
                     n_workers=worker_count,
                     threads_per_worker=spec.threads_per_worker,
@@ -137,7 +164,7 @@ class LocalDaskExecutor:
                     )
             raise
         finally:
-            _close_owned(client, cluster)
+            _close_owned(client, cluster, configuration)
 
 
 __all__ = ["LocalDaskExecutor"]

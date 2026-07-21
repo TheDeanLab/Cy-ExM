@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
@@ -41,6 +42,10 @@ def test_real_module_loader_gets_timeout_parser_from_dask_utils(
     distributed_utils = ModuleType("distributed.utils")
     dask = ModuleType("dask")
     dask.__path__ = []  # type: ignore[attr-defined]
+    dask_config = ModuleType("dask.config")
+    config_set = object()
+    dask_config.set = config_set  # type: ignore[attr-defined]
+    dask.config = dask_config  # type: ignore[attr-defined]
     dask_utils = ModuleType("dask.utils")
     timeout_parser = object()
     dask_utils.parse_timedelta = timeout_parser  # type: ignore[attr-defined]
@@ -52,6 +57,7 @@ def test_real_module_loader_gets_timeout_parser_from_dask_utils(
     modules = dask_module._distributed_modules()
 
     assert modules.parse_timedelta is timeout_parser
+    assert modules.config_set is config_set
 
 
 def _profile(
@@ -216,6 +222,7 @@ class _FakeCluster:
         self._modules = modules
 
     def close(self) -> None:
+        self._modules.cluster_close_config_active = self._modules.config_context_active
         self._modules.events.append("cluster.close")
         if self._modules.cluster_close_error is not None:
             raise self._modules.cluster_close_error
@@ -241,6 +248,9 @@ class _FakeClient:
         resources: dict[str, int],
     ) -> _FakeFuture:
         del runner
+        self._modules.submission_config_active.append(
+            self._modules.config_context_active
+        )
         self._modules.submit_calls.append(
             _SubmitCall(task, key, pure, retries, resources)
         )
@@ -259,6 +269,7 @@ class _FakeClient:
             raise self._modules.cancel_error
 
     def close(self) -> None:
+        self._modules.client_close_config_active = self._modules.config_context_active
         self._modules.events.append("client.close")
         if self._modules.client_close_error is not None:
             raise self._modules.client_close_error
@@ -283,8 +294,46 @@ class _FakeDistributedModules:
         self.cancel_error: BaseException | None = None
         self.client_close_error: BaseException | None = None
         self.cluster_close_error: BaseException | None = None
+        self.config_exit_error: BaseException | None = None
+        self.config_overlays: list[dict[str, object]] = []
+        self.config_context_active = False
+        self.config_exit_info: list[tuple[object, object, object]] = []
+        self.cluster_config_active: bool | None = None
+        self.submission_config_active: list[bool] = []
+        self.client_close_config_active: bool | None = None
+        self.cluster_close_config_active: bool | None = None
+
+    class _ConfigContext(AbstractContextManager[None]):
+        def __init__(
+            self,
+            modules: _FakeDistributedModules,
+            values: dict[str, object],
+        ) -> None:
+            self._modules = modules
+            self._values = values
+
+        def __enter__(self) -> None:
+            self._modules.config_overlays.append(self._values)
+            self._modules.config_context_active = True
+
+        def __exit__(
+            self,
+            exception_type: object,
+            exception: object,
+            traceback: object,
+        ) -> None:
+            self._modules.config_exit_info.append(
+                (exception_type, exception, traceback)
+            )
+            self._modules.config_context_active = False
+            if self._modules.config_exit_error is not None:
+                raise self._modules.config_exit_error
+
+    def config_set(self, values: dict[str, object]) -> AbstractContextManager[None]:
+        return self._ConfigContext(self, values)
 
     def LocalCluster(self, **kwargs: object) -> _FakeCluster:
+        self.cluster_config_active = self.config_context_active
         if self.cluster_error is not None:
             raise self.cluster_error
         self.cluster_kwargs = kwargs
@@ -334,6 +383,24 @@ def test_local_executor_uses_one_round_slot_per_bounded_worker(tmp_path: Path) -
         {"round_slot": 1},
     ]
     assert tuple(result.round for result in results) == (2, 3)
+
+
+def test_local_executor_owns_worker_ttl_config_for_cluster_and_execution(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+
+    LocalDaskExecutor(_profile(tmp_path), _modules=lambda: modules).execute(
+        (_task(tmp_path, 2),)
+    )
+
+    assert modules.config_overlays == [{"distributed.scheduler.worker-ttl": None}]
+    assert modules.cluster_config_active is True
+    assert modules.submission_config_active == [True]
+    assert modules.client_close_config_active is True
+    assert modules.cluster_close_config_active is True
+    assert modules.config_context_active is False
+    assert len(modules.config_exit_info) == 1
 
 
 def test_local_executor_submits_deterministic_non_pure_zero_retry_keys(
@@ -580,6 +647,9 @@ def test_local_executor_wraps_startup_failures_and_cleans_owned_resources(
         "wait": ["client.close", "cluster.close"],
     }
     assert modules.events == expected[failure_point]
+    assert modules.config_overlays == [{"distributed.scheduler.worker-ttl": None}]
+    assert modules.config_context_active is False
+    assert len(modules.config_exit_info) == 1
 
 
 def test_local_executor_closes_client_before_cluster_on_success(tmp_path: Path) -> None:
@@ -629,6 +699,11 @@ def test_local_executor_cancels_only_unfinished_futures_on_keyboard_interrupt(
     assert {future.task.round for future in cancelled} == {4}
     assert force is True
     assert modules.events == ["client.close", "cluster.close"]
+    assert modules.client_close_config_active is True
+    assert modules.cluster_close_config_active is True
+    assert modules.config_context_active is False
+    assert len(modules.config_exit_info) == 1
+    assert modules.config_exit_info[0][0] is KeyboardInterrupt
 
 
 def test_local_executor_preserves_interrupt_when_cancel_and_cleanup_fail(

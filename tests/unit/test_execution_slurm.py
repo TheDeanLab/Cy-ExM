@@ -619,6 +619,7 @@ def test_slurm_executor_supplies_isolated_jobqueue_launch_configuration(
 
     assert len(modules.config_overlays) == 1
     overlay = modules.config_overlays[0]
+    assert overlay["distributed.scheduler.worker-ttl"] is None
     for name, hostile_value in malicious.items():
         key = f"jobqueue.cyexm-slurm.{name}"
         assert key in overlay

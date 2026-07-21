@@ -22,6 +22,11 @@ from cyexm.workflow.models import RoundFailure, RoundResult, RoundTask
 ROUND_RESOURCE = {"round_slot": 1}
 
 
+def dask_scheduler_config_overlay() -> dict[str, object]:
+    """Return owned scheduler settings required by coarse native round tasks."""
+    return {"distributed.scheduler.worker-ttl": None}
+
+
 @dataclass(frozen=True, slots=True)
 class Submission:
     task_index: int
@@ -216,6 +221,7 @@ def collect_distributed_results(
 __all__ = [
     "ROUND_RESOURCE",
     "collect_distributed_results",
+    "dask_scheduler_config_overlay",
     "future_is_unfinished",
     "utc_now",
     "validate_distributed_tasks",

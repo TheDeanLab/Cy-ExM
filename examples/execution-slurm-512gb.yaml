@@ -1,0 +1,30 @@
+schema_version: 1
+executor: slurm
+
+paths:
+  # Site-specific editable shared dataset path; do not use this placeholder as-is.
+  dataset_root: /archive/path/to/dataset
+  # Site-specific editable shared results path; keep it disjoint from dataset_root.
+  output_root: /archive/path/to/results
+  # Site-specific editable worker scratch path; keep active scratch off /archive.
+  worker_local_directory: /project/path/to/cyexm-worker
+
+# Site-specific editable native resources; keep one thread until scientifically tested.
+native_threads:
+  itk: 1
+  blas: 1
+
+# Every resource below is site-specific and editable. Confirm current cluster policy.
+slurm:
+  queue: 512GB
+  workers: 3
+  cores_per_worker: 72
+  processes_per_worker: 1
+  memory: 500GB
+  walltime: "72:00:00"
+  interface: ib0
+  scheduler_interface: ib0
+  startup_timeout: "15m"
+  task_retries: 0
+  job_name: cyexm-registration
+  job_extra_directives: []

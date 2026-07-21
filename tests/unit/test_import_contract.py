@@ -78,6 +78,166 @@ for root in ("ants", "numpy", "scipy", "tifffile"):
     assert completed.returncode == 0, completed.stderr
 
 
+def test_phase_two_configuration_and_planning_imports_are_lightweight() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.config
+import cyexm.workflow
+import cyexm.execution
+import cyexm.cli
+
+assert before == dict(os.environ)
+for root in (
+    "ants",
+    "numpy",
+    "scipy",
+    "tifffile",
+    "dask",
+    "distributed",
+    "dask_jobqueue",
+):
+    assert not any(name == root or name.startswith(root + ".") for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_import_local_dask_executor_is_scheduler_and_environment_neutral() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.execution.dask
+
+assert before == dict(os.environ)
+for root in ("dask", "distributed", "dask_jobqueue"):
+    assert not any(name == root or name.startswith(root + ".") for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_import_slurm_modules_is_scheduler_and_environment_neutral() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.execution.preflight
+import cyexm.execution.slurm
+
+assert before == dict(os.environ)
+for root in ("dask", "distributed", "dask_jobqueue"):
+    assert not any(name == root or name.startswith(root + ".") for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_round_worker_import_defers_registration_operations_until_invocation() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.workflow.round_task
+
+assert before == dict(os.environ)
+for name in (
+    "cyexm.registration.channels",
+    "cyexm.registration.chunked",
+    "cyexm.registration.whole_image",
+):
+    assert name not in sys.modules, name
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_round_task_module_defers_scientific_imports_until_execution() -> None:
+    code = """
+import os
+import sys
+
+before = dict(os.environ)
+import cyexm.registration.channels
+import cyexm.workflow.round_task
+
+assert before == dict(os.environ)
+for root in (
+    "ants",
+    "numpy",
+    "scipy",
+    "tifffile",
+    "dask",
+    "distributed",
+    "dask_jobqueue",
+):
+    assert not any(name == root or name.startswith(root + ".") for name in sys.modules)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_registration_namespace_resolves_stable_exports_lazily() -> None:
+    code = """
+import sys
+import cyexm.registration as registration
+
+assert registration.__all__ == [
+    "ChunkedImageRegistration",
+    "ImageRegistration",
+    "register_round",
+    "transform_channel",
+]
+for name in (
+    "cyexm.registration.channels",
+    "cyexm.registration.chunked",
+    "cyexm.registration.whole_image",
+):
+    assert name not in sys.modules, name
+
+assert registration.ImageRegistration.__name__ == "ImageRegistration"
+assert "cyexm.registration.whole_image" in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_whole_image_constructor_is_import_and_filesystem_neutral() -> None:
     code = """
 import logging

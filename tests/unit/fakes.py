@@ -244,12 +244,18 @@ class FakeBackend:
     nonlinear_kwargs: list[dict[str, object]] = field(default_factory=list)
     affine_interpolations: list[str] = field(default_factory=list)
     warp_applications: list[tuple[Path, str]] = field(default_factory=list)
+    transform_lists: list[tuple[Path, Path]] = field(default_factory=list)
+    transform_inversions: list[tuple[bool, bool]] = field(default_factory=list)
+    transform_interpolations: list[str] = field(default_factory=list)
     histogram_match_calls: list[tuple[object, object]] = field(default_factory=list)
     metric_calls: list[tuple[object, object, object | None, object | None]] = field(
         default_factory=list
     )
     tiff_writes: list[tuple[Path, float, float]] = field(default_factory=list)
     tiff_images: list[object] = field(default_factory=list)
+    clipped_tiff_writes: list[Path] = field(default_factory=list)
+    clipped_tiff_images: list[FakeImage] = field(default_factory=list)
+    clipped_tiff_values: list[np.ndarray] = field(default_factory=list)
     crop_bounds: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
     temporary_warps: list[Path] = field(default_factory=list)
     nonlinear_candidates: list[FakeImage] = field(default_factory=list)
@@ -380,13 +386,20 @@ class FakeBackend:
         if self.fail_linear:
             raise RuntimeError("injected linear failure")
         moving = kwargs["moving_image"]
+        fixed = kwargs["fixed_image"]
         moving_mask = kwargs.get("moving_mask")
-        if not isinstance(moving, FakeImage):
-            raise TypeError("moving_image must be a FakeImage")
+        if not isinstance(moving, FakeImage) or not isinstance(fixed, FakeImage):
+            raise TypeError("fixed_image and moving_image must be FakeImages")
         transformed_mask = (
-            None if moving_mask is None else moving_mask.clone()  # type: ignore[union-attr]
+            None
+            if moving_mask is None
+            else self._resample_to_reference(moving_mask, fixed)  # type: ignore[arg-type]
         )
-        return moving.clone(), transformed_mask, self.affine_bytes
+        return (
+            self._resample_to_reference(moving, fixed),
+            transformed_mask,
+            self.affine_bytes,
+        )
 
     def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
         self.events.append("nonlinear")
@@ -421,14 +434,28 @@ class FakeBackend:
         transform: object,
         interpolation: str,
     ) -> object:
-        del fixed, transform
-        if not isinstance(moving, FakeImage):
-            raise TypeError("moving must be a FakeImage")
+        del transform
+        if not isinstance(fixed, FakeImage) or not isinstance(moving, FakeImage):
+            raise TypeError("fixed and moving must be FakeImages")
         self.events.append(f"apply-affine:{interpolation}")
         self.affine_interpolations.append(interpolation)
         if self.fail_affine_interpolation == interpolation:
             raise RuntimeError(f"injected {interpolation} affine application failure")
-        return moving.clone()
+        return self._resample_to_reference(moving, fixed)
+
+    @staticmethod
+    def _resample_to_reference(moving: FakeImage, fixed: FakeImage) -> FakeImage:
+        data = np.zeros(fixed.shape, dtype=moving.data.dtype)
+        overlap = tuple(
+            slice(0, min(moving.shape[axis], fixed.shape[axis])) for axis in range(3)
+        )
+        data[overlap] = moving.data[overlap]
+        return fake_image(
+            data=data,
+            origin=fixed.origin,
+            spacing=fixed.spacing,
+            direction=fixed.direction,
+        )
 
     def apply_warp(
         self,
@@ -453,6 +480,36 @@ class FakeBackend:
             origin=moving.origin,
             spacing=moving.spacing,
             direction=moving.direction,
+        )
+
+    def apply_transform_chain(
+        self,
+        *,
+        fixed: object,
+        moving: object,
+        affine_path: Path,
+        warp_path: Path,
+        interpolation: str,
+    ) -> object:
+        if not isinstance(fixed, FakeImage) or not isinstance(moving, FakeImage):
+            raise TypeError("fixed and moving must be FakeImages")
+        if not affine_path.is_file():
+            raise FileNotFoundError(affine_path)
+        if not warp_path.is_file():
+            raise FileNotFoundError(warp_path)
+        self.events.append(f"apply-transform-chain:{interpolation}")
+        self.transform_lists.append((warp_path.resolve(), affine_path.resolve()))
+        self.transform_inversions.append((False, False))
+        self.transform_interpolations.append(interpolation)
+        if self.fail_warp_interpolation == interpolation:
+            raise RuntimeError(
+                f"injected {interpolation} transform-chain application failure"
+            )
+        return fake_image(
+            data=moving.data,
+            origin=fixed.origin,
+            spacing=fixed.spacing,
+            direction=fixed.direction,
         )
 
     def histogram_match(self, *, source: object, reference: object) -> object:
@@ -524,6 +581,22 @@ class FakeBackend:
         if self.fail_tiff_role is not None and self.fail_tiff_role in path.name:
             path.write_bytes(b"partial-tiff")
             raise RuntimeError("injected TIFF writer failure")
+        payload = {"geometry": self.geometry(image).to_dict()}
+        path.write_bytes(b"tiff-fake:" + json.dumps(payload, sort_keys=True).encode())
+
+    def write_clipped_tiff(self, image: object, path: Path) -> None:
+        if not isinstance(image, FakeImage):
+            raise TypeError("image must be a FakeImage")
+        self.events.append("write-clipped-tiff")
+        self.clipped_tiff_writes.append(path)
+        self.clipped_tiff_images.append(image.clone())
+        data = image.data
+        if np.issubdtype(data.dtype, np.floating):
+            data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        self.clipped_tiff_values.append(np.clip(data, 0, 65535).astype(np.uint16))
+        if self.fail_tiff_role is not None and self.fail_tiff_role in path.name:
+            path.write_bytes(b"partial-tiff")
+            raise RuntimeError("injected clipped TIFF writer failure")
         payload = {"geometry": self.geometry(image).to_dict()}
         path.write_bytes(b"tiff-fake:" + json.dumps(payload, sort_keys=True).encode())
 

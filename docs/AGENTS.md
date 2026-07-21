@@ -1,11 +1,13 @@
 # Documentation guidance
 
-- Describe merged Phase 1 behavior—the repository's current behavior—separately from
-  proposed Phase 2 work. YAML
-  manifests, round-level schedulers, and cluster execution are not installable
-  behavior until their dedicated runtime design, implementation, and acceptance gates
-  are complete.
-- Design and plan documents may describe proposed Phase 2 decisions when they label
+- Describe current behavior by separating merged Phase 1 behavior from the Phase 2D
+  portable runtime available on this branch: strict YAML validation, deterministic
+  planning and status inspection, real sequential round execution, restart-safe
+  transformed channels, the workflow CLI, bounded process-based local Dask execution,
+  SLURMCluster construction, and all-worker preflight. Clearly label fake-based
+  portable SLURM evidence as construction evidence only; real SLURM submission and
+  HPC acceptance remain Phase 2E work until their explicit acceptance gates complete.
+- Design and plan documents may describe later Phase 2 decisions when they label
   status and assumptions explicitly. User guides and API examples describe only the
   runtime available on the referenced branch.
 - Keep API examples synchronized with signatures in `src/cyexm`. Use public XYZ

@@ -11,5 +11,16 @@
   artifacts and inject failures at stage boundaries to prove restart behavior.
 - Document a scientific reason for each floating-point tolerance. Assert exact values
   for pure geometry and metadata where numerical variability is not expected.
+- Any change to registration-grid behavior must include fixed and moving native
+  volumes whose shapes differ along all three spatial axes. Prove the affine result
+  enters nonlinear work on the fixed grid and assert fixed-reference geometry for
+  persisted scalar, mask, warp, and dependent-channel products.
 - Portable unit and integration tests must not access lab storage or silently skip by
   hostname. HPC tests require a documented, explicitly selected command.
+- The portable scheduler firewall covers semantic command positions for subprocess,
+  `os.system`, and representative `os.exec*`/`os.spawn*` launch surfaces, propagates
+  into ordinary child Python interpreters, and prepends owned SLURM-client shims for
+  contained child shells. It is defense in depth for the exercised portable surfaces,
+  not a claim that arbitrary process-launch mechanisms are fail-closed. HPC-marked
+  tests are explicitly exempt and retain the environment needed for approved real
+  scheduler acceptance.

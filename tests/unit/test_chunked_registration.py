@@ -15,6 +15,10 @@ from cyexm.errors import (
     ChunkRegistrationError,
     RegistrationStageError,
 )
+from cyexm.registration._request_policy import (
+    CHUNK_SCALAR_POLICY,
+    WHOLE_SCALAR_POLICY,
+)
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
 from cyexm.registration.chunked import ChunkedImageRegistration, ChunkPaths
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
@@ -101,12 +105,6 @@ def rewrite_completion_artifact_identity(artifact: Path) -> None:
         json.dumps(payload, allow_nan=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-
-
-CHUNKED_SCALAR_POSTPROCESSING_POLICY = (
-    "serial-chunk-local-histogram-match-core-stitch-v1"
-)
-WHOLE_SCALAR_POSTPROCESSING_POLICY = "whole-global-histogram-match-v1"
 
 
 class DistributionSensitiveHistogramBackend(FakeChunkBackend):
@@ -375,10 +373,7 @@ def test_chunked_full_request_records_transitive_chunk_evidence(
     chunks = request.parameters["chunk_grid"]
     assert request.parameters["registration_mode"] == "serial-chunked"
     assert request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
-    assert (
-        request.parameters["scalar_postprocessing_policy"]
-        == CHUNKED_SCALAR_POSTPROCESSING_POLICY
-    )
+    assert request.parameters["scalar_postprocessing_policy"] == CHUNK_SCALAR_POLICY
     assert request.parameters["chunk_size_zyx"] == [8, 8, 8]
     assert request.parameters["overlap_fraction"] == 0.25
     assert [item["chunk_id"] for item in chunks] == [0, 1, 2]  # type: ignore[index]
@@ -674,8 +669,7 @@ def test_scalar_policy_is_recorded_on_local_full_metrics_and_final_requests(
         CompletionRecord.read(store.record_path(path)).request for path in artifacts
     )
     assert all(
-        request.parameters["scalar_postprocessing_policy"]
-        == CHUNKED_SCALAR_POSTPROCESSING_POLICY
+        request.parameters["scalar_postprocessing_policy"] == CHUNK_SCALAR_POLICY
         for request in requests
     )
 
@@ -725,8 +719,7 @@ def test_whole_image_scalar_remains_global_and_canonical_on_warp_reuse(
         for path in (paths.warp, paths.nonlinear_metrics, paths.registered)
     )
     assert all(
-        request.parameters["scalar_postprocessing_policy"]
-        == WHOLE_SCALAR_POSTPROCESSING_POLICY
+        request.parameters["scalar_postprocessing_policy"] == WHOLE_SCALAR_POLICY
         for request in requests
     )
     store.mark_stale(paths.nonlinear_metrics)
@@ -797,10 +790,7 @@ def test_local_request_captures_sources_geometries_threads_affine_and_grid(
     assert request.parameters["chunk_size_zyx"] == [8, 8, 8]
     assert request.parameters["image_shape_zyx"] == [16, 8, 8]
     assert request.parameters["overlap_fraction"] == 0.25
-    assert (
-        request.parameters["scalar_postprocessing_policy"]
-        == CHUNKED_SCALAR_POSTPROCESSING_POLICY
-    )
+    assert request.parameters["scalar_postprocessing_policy"] == CHUNK_SCALAR_POLICY
     assert "registration_parameters" in request.parameters
 
 
@@ -1188,6 +1178,7 @@ assert registration.__all__ == [
     "ChunkedImageRegistration",
     "ImageRegistration",
     "register_round",
+    "transform_channel",
 ]
 for root in ("ants", "numpy", "scipy", "tifffile"):
     assert not any(name == root or name.startswith(root + ".") for name in sys.modules)

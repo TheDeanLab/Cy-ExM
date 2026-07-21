@@ -18,8 +18,20 @@
   ZYX crop-bound convention when adapting ANTs images.
 - Backend artifact writer methods must write exactly to the supplied path so callers
   can provide atomic temporary destinations. `backend.py` must not own workflow
-  scheduling or artifact lifecycle; completion records and orchestration remain in
-  `artifacts.py`, `whole_image.py`, and `chunked.py`.
+  scheduling or artifact lifecycle. Completion-record primitives remain in
+  `artifacts.py`; `whole_image.py`, `chunked.py`, and `channels.py` each own
+  orchestration of their scoped artifacts.
+- `channels.py` owns only one source channel's restart-safe transform artifact
+  lifecycle. It configures native threads before requesting the lazy scientific
+  backend, transforms through the accepted warp-plus-affine chain, and must not
+  schedule rounds, create clients or child tasks, or import workflow/executor code.
+- Native fixed, registration-channel, and dependent-channel shapes may differ along
+  every spatial axis. Apply each dependent channel from its native grid with the
+  fixed image as the transform reference, then require exact fixed-reference shape,
+  origin, spacing, and direction before artifact promotion.
+- Linear registration accepts native fixed and moving grids, but affine resampling
+  must produce the exact fixed-reference scalar and mask geometry before whole-image
+  or serial-chunked nonlinear work. Keep chunk geometry strict on that fixed grid.
 - `RegistrationBackend.nonlinear` and every `_estimate_nonlinear` override transfer
   ownership of one unique disposable warp candidate to their immediate caller. The
   caller must persist or consume it and then use the shared best-effort cleanup helper;

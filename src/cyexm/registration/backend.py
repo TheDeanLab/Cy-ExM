@@ -12,7 +12,7 @@ from cyexm.io.images import (
     load_ants_image,
     zero_mask,
 )
-from cyexm.io.tiff import write_uint16_tiff
+from cyexm.io.tiff import write_clipped_uint16_tiff, write_uint16_tiff
 from cyexm.metrics import calculate_metrics as calculate_image_metrics
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 from cyexm.spatial import ImageGeometry, PixelSize
@@ -91,6 +91,17 @@ class RegistrationBackend(Protocol):
     ) -> object:
         raise NotImplementedError
 
+    def apply_transform_chain(
+        self,
+        *,
+        fixed: object,
+        moving: object,
+        affine_path: Path,
+        warp_path: Path,
+        interpolation: str,
+    ) -> object:
+        raise NotImplementedError
+
     def histogram_match(self, *, source: object, reference: object) -> object:
         raise NotImplementedError
 
@@ -117,6 +128,9 @@ class RegistrationBackend(Protocol):
         min_value: float,
         max_value: float,
     ) -> None:
+        raise NotImplementedError
+
+    def write_clipped_tiff(self, image: object, path: Path) -> None:
         raise NotImplementedError
 
     def calculate_metrics(
@@ -273,6 +287,25 @@ class AntsRegistrationBackend:
             native_threads=self.native_threads,
         )
 
+    def apply_transform_chain(
+        self,
+        *,
+        fixed: object,
+        moving: object,
+        affine_path: Path,
+        warp_path: Path,
+        interpolation: str,
+    ) -> object:
+        self._prepare()
+        return transform_helpers.apply_transform_chain(
+            fixed=fixed,
+            moving=moving,
+            affine_path=affine_path,
+            warp_path=warp_path,
+            interpolation=interpolation,
+            native_threads=self.native_threads,
+        )
+
     def histogram_match(self, *, source: object, reference: object) -> object:
         self._prepare()
         ants, _ = _scientific_runtime()
@@ -329,6 +362,10 @@ class AntsRegistrationBackend:
     ) -> None:
         self._prepare()
         write_uint16_tiff(image, path, min_value, max_value)
+
+    def write_clipped_tiff(self, image: object, path: Path) -> None:
+        self._prepare()
+        write_clipped_uint16_tiff(image, path)
 
     def calculate_metrics(
         self,

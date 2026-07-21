@@ -1,7 +1,15 @@
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from _scheduler_firewall import (
+    SCHEDULER_COMMANDS,
+    SCHEDULER_FIREWALL_ENV,
+    create_scheduler_shims,
+    install_process_guards,
+    scheduler_command,
+)
 
 TEST_ROOT = Path(__file__).resolve().parent
 TEST_CATEGORY_BY_DIRECTORY = {
@@ -18,9 +26,46 @@ NATIVE_THREAD_ENV_VARS = (
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 )
+EXTERNAL_SCHEDULER_COMMANDS = SCHEDULER_COMMANDS
+_external_scheduler_command = scheduler_command
 
 for name in NATIVE_THREAD_ENV_VARS:
     os.environ.setdefault(name, "1")
+
+
+def _activate_scheduler_firewall(
+    patcher: pytest.MonkeyPatch,
+    root: Path,
+) -> None:
+    shim_root = create_scheduler_shims(root / "cyexm-scheduler-firewall-bin")
+    patcher.setenv(
+        "PATH",
+        f"{shim_root}{os.pathsep}{os.environ.get('PATH', '')}",
+    )
+    patcher.setenv(
+        "PYTHONPATH",
+        f"{TEST_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+    )
+    patcher.setenv(SCHEDULER_FIREWALL_ENV, "1")
+    install_process_guards(patcher.setattr)
+
+
+@pytest.fixture(autouse=True)
+def prevent_portable_scheduler_commands(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> Iterator[None]:
+    """Fail closed before a portable test can invoke a SLURM command."""
+    if request.node.get_closest_marker("hpc") is not None:
+        yield
+        return
+
+    patcher = pytest.MonkeyPatch()
+    _activate_scheduler_firewall(patcher, tmp_path)
+    try:
+        yield
+    finally:
+        patcher.undo()
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

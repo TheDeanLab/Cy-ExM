@@ -18,8 +18,23 @@ dependencies = [
   "tifffile>=2025.1.10",
 ]
 
+[project.scripts]
+cyexm = "cyexm.cli:main"
+
 [project.optional-dependencies]
 examples = ["jupyterlab>=4", "matplotlib>=3.8", "nbconvert>=7"]
+workflow = ["PyYAML>=6,<7"]
+distributed = [
+  "PyYAML>=6,<7",
+  "dask==2025.1.0",
+  "distributed==2025.1.0",
+]
+hpc = [
+  "PyYAML>=6,<7",
+  "dask==2025.1.0",
+  "distributed==2025.1.0",
+  "dask-jobqueue==0.9.0",
+]
 
 [dependency-groups]
 dev = [

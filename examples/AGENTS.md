@@ -15,8 +15,14 @@
   interpolation.
 - Notebooks must have no saved outputs or execution counts. Scripts and notebooks
   must remain useful on local workstations without cluster services.
-- Phase 1 examples are the current runnable surface. Add a Phase 2 example only after
-  its runtime API is implemented and accepted; examples never lead production
-  behavior. Future manifest examples keep the scientific manifest separate from any
-  local or HPC execution profile and remain runnable without cluster services where
-  the API permits.
+- Phase 2 is the current workflow runtime: strict YAML validation,
+  deterministic planning, real sequential round execution, restart-safe transformed
+  channels, the workflow CLI, and bounded process-based local Dask execution. The
+  SLURMCluster adapter is implemented behind portable construction and preflight gates.
+  Examples never lead production behavior. Keep each scientific manifest separate from
+  its local or HPC execution profile. Real cluster claims require explicitly selected
+  HPC acceptance with operator-approved inputs and allocation.
+- The four current workflow examples are `examples/spheroid-dataset.yaml`,
+  `examples/execution-sequential.yaml`, `examples/execution-local-dask.yaml`, and
+  `examples/execution-slurm-512gb.yaml`. Keep them strict-loader compatible and preserve
+  their separation between reusable scientific settings and editable machine resources.

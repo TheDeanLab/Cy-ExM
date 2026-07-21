@@ -13,7 +13,8 @@
   rebuilding a monolithic registration module.
 - Prefer explicit typed value objects and narrow internal interfaces. Keep the ANTs
   backend adapter internal so unit tests can exercise policy without a native runtime.
-- A future workflow or configuration namespace requires its own approved runtime
-  design and plan. Scheduler concerns do not belong in `cyexm.registration`; keep the
-  stable Phase 1 registration API usable without Dask, distributed, dask-jobqueue, or
+- The configuration, workflow, execution, and CLI namespaces implement the Phase 2
+  workflow surface and must not become package-root exports. Scheduler concerns do
+  not belong in `cyexm.registration`; keep the stable Phase 1 registration API and
+  the Phase 2B channel primitive usable without Dask, distributed, dask-jobqueue, or
   YAML workflow dependencies.

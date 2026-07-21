@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import stat
+import struct
+from dataclasses import dataclass
+from io import BufferedReader
+from itertools import pairwise
 from numbers import Real
 from pathlib import Path
 from typing import Any
@@ -18,6 +24,393 @@ _TIFF_GEOMETRY_SCHEMA_VERSION = 1
 _CYEXM_TIFF_KEYS = frozenset({"schema_version", "axis_convention_version", "geometry"})
 _JSON_UNICODE_ESCAPE = re.compile(r"(\\+)u([0-9A-Fa-f]{4})")
 _CYEXM_ASCII_CODEPOINTS = {ord(letter): letter for letter in "cyexm"}
+_TIFF_FIELD_SIZES = {
+    1: 1,
+    2: 1,
+    3: 2,
+    4: 4,
+    5: 8,
+    6: 1,
+    7: 1,
+    8: 2,
+    9: 4,
+    10: 8,
+    11: 4,
+    12: 8,
+    13: 4,
+    16: 8,
+    17: 8,
+    18: 8,
+}
+_MAX_TIFF_IFD_ENTRIES = 4096
+_MAX_TIFF_FIELD_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _TiffField:
+    field_type: int
+    count: int
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _TiffFormat:
+    byte_order: str
+    header_size: int
+    inline_size: int
+    count_format: str
+    count_size: int
+    entry_size: int
+    next_size: int
+
+
+def _tiff_error(message: str) -> InputValidationError:
+    return InputValidationError(f"Malformed Cy-ExM uint16 TIFF: {message}")
+
+
+def _read_tiff_bytes(
+    stream: BufferedReader,
+    offset: int,
+    size: int,
+    file_size: int,
+) -> bytes:
+    _validate_tiff_byte_range(offset, size, file_size)
+    stream.seek(offset)
+    data = stream.read(size)
+    if len(data) != size:
+        raise _tiff_error(f"could not read {size} bytes at offset {offset}")
+    return data
+
+
+def _validate_tiff_byte_range(offset: int, size: int, file_size: int) -> None:
+    if offset < 0 or size < 0 or offset > file_size - size:
+        raise _tiff_error(
+            f"byte range [{offset}, {offset + size}) is outside a {file_size}-byte file"
+        )
+
+
+def _tiff_format(header: bytes) -> tuple[_TiffFormat, int]:
+    if len(header) < 8 or header[:2] not in {b"II", b"MM"}:
+        raise _tiff_error("byte-order marker is invalid")
+    byte_order = "<" if header[:2] == b"II" else ">"
+    version = struct.unpack_from(f"{byte_order}H", header, 2)[0]
+    if version == 42:
+        return (
+            _TiffFormat(byte_order, 8, 4, "H", 2, 12, 4),
+            struct.unpack_from(f"{byte_order}I", header, 4)[0],
+        )
+    if version != 43:
+        raise _tiff_error(f"unsupported TIFF version {version}")
+    if len(header) < 16:
+        raise _tiff_error("BigTIFF header is truncated")
+    offset_size, reserved = struct.unpack_from(f"{byte_order}HH", header, 4)
+    if offset_size != 8 or reserved != 0:
+        raise _tiff_error("BigTIFF offset-size header is invalid")
+    return (
+        _TiffFormat(byte_order, 16, 8, "Q", 8, 20, 8),
+        struct.unpack_from(f"{byte_order}Q", header, 8)[0],
+    )
+
+
+def _tiff_unsigned_values(
+    field: _TiffField,
+    tag: int,
+    *,
+    allowed_types: frozenset[int] = frozenset({1, 3, 4, 16}),
+    byte_order: str,
+) -> tuple[int, ...]:
+    if field.field_type not in allowed_types:
+        raise _tiff_error(f"tag {tag} has unsupported field type {field.field_type}")
+    formats = {1: "B", 3: "H", 4: "I", 16: "Q"}
+    code = formats[field.field_type]
+    return tuple(
+        item[0] for item in struct.iter_unpack(f"{byte_order}{code}", field.data)
+    )
+
+
+def _tiff_scalar(
+    fields: dict[int, _TiffField],
+    tag: int,
+    *,
+    byte_order: str,
+    allowed_types: frozenset[int] = frozenset({1, 3, 4, 16}),
+) -> int:
+    try:
+        field = fields[tag]
+    except KeyError as error:
+        raise _tiff_error(f"required tag {tag} is absent") from error
+    values = _tiff_unsigned_values(
+        field,
+        tag,
+        allowed_types=allowed_types,
+        byte_order=byte_order,
+    )
+    if len(values) != 1:
+        raise _tiff_error(f"tag {tag} must contain exactly one value")
+    return values[0]
+
+
+def _strict_tiff_json(text: str) -> object:
+    def object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        decoded: dict[str, object] = {}
+        for key, value in pairs:
+            if key in decoded:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            decoded[key] = value
+        return decoded
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"non-finite JSON constant {value}")
+
+    return json.loads(
+        text,
+        object_pairs_hook=object_pairs,
+        parse_constant=reject_constant,
+    )
+
+
+def _geometry_from_tiff_description(field: _TiffField) -> ImageGeometry:
+    if field.field_type != 2 or field.count < 2:
+        raise _tiff_error("ImageDescription must be a nonempty ASCII value")
+    if not field.data.endswith(b"\0") or b"\0" in field.data[:-1]:
+        raise _tiff_error("ImageDescription must have exactly one trailing NUL")
+    try:
+        description = field.data[:-1].decode("ascii")
+        metadata = _strict_tiff_json(description)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise _tiff_error(f"ImageDescription JSON is invalid: {error}") from error
+    if not isinstance(metadata, dict) or set(metadata) != {"shape", "axes", "cyexm"}:
+        raise _tiff_error(
+            "ImageDescription keys must be exactly axes, cyexm, and shape"
+        )
+    raw_shape = metadata["shape"]
+    if (
+        not isinstance(raw_shape, list)
+        or len(raw_shape) != 3
+        or any(type(value) is not int or value <= 0 for value in raw_shape)
+    ):
+        raise _tiff_error("ImageDescription shape must contain three positive integers")
+    data_shape = (raw_shape[0], raw_shape[1], raw_shape[2])
+    try:
+        geometry = _geometry_from_shaped_metadata(metadata, data_shape)
+    except InputValidationError as error:
+        raise _tiff_error(str(error)) from error
+    if geometry is None:
+        raise _tiff_error("ImageDescription lacks Cy-ExM geometry")
+    return geometry
+
+
+def _validate_nonoverlapping_ranges(
+    structural: list[tuple[int, int]],
+    pixels: list[tuple[int, int]],
+) -> None:
+    # TIFF permits multiple tags to reference the same immutable metadata value
+    # (tifffile shares X/Y resolution rationals across later pages).
+    ordered_structural = sorted(set(structural))
+    for previous, current in pairwise(ordered_structural):
+        if current[0] < previous[1]:
+            raise _tiff_error("TIFF structural byte ranges overlap")
+    ordered_pixels = sorted(pixels)
+    for previous, current in pairwise(ordered_pixels):
+        if current[0] < previous[1]:
+            raise _tiff_error("TIFF pixel byte ranges overlap")
+    structural_index = 0
+    for pixel_start, pixel_end in ordered_pixels:
+        while (
+            structural_index < len(ordered_structural)
+            and ordered_structural[structural_index][1] <= pixel_start
+        ):
+            structural_index += 1
+        if (
+            structural_index < len(ordered_structural)
+            and ordered_structural[structural_index][0] < pixel_end
+        ):
+            raise _tiff_error("TIFF pixel data overlaps structural metadata")
+
+
+def _read_uint16_tiff_geometry_without_runtime(path: str | Path) -> ImageGeometry:
+    """Read exact uncompressed Cy-ExM TIFF structure without scientific runtimes."""
+    source = Path(path)
+    try:
+        with source.open("rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise _tiff_error("source is not a regular file")
+            file_size = metadata.st_size
+            header = _read_tiff_bytes(stream, 0, min(file_size, 16), file_size)
+            tiff_format, next_ifd = _tiff_format(header)
+            structural_ranges = [(0, tiff_format.header_size)]
+            pixel_ranges: list[tuple[int, int]] = []
+            seen_ifds: set[int] = set()
+            geometry: ImageGeometry | None = None
+            page_number = 0
+            while next_ifd:
+                if next_ifd in seen_ifds:
+                    raise _tiff_error("IFD chain contains a cycle")
+                seen_ifds.add(next_ifd)
+                count_bytes = _read_tiff_bytes(
+                    stream,
+                    next_ifd,
+                    tiff_format.count_size,
+                    file_size,
+                )
+                entry_count = struct.unpack(
+                    f"{tiff_format.byte_order}{tiff_format.count_format}",
+                    count_bytes,
+                )[0]
+                if entry_count == 0 or entry_count > _MAX_TIFF_IFD_ENTRIES:
+                    raise _tiff_error(f"IFD entry count {entry_count} is invalid")
+                ifd_size = (
+                    tiff_format.count_size
+                    + entry_count * tiff_format.entry_size
+                    + tiff_format.next_size
+                )
+                ifd_data = _read_tiff_bytes(stream, next_ifd, ifd_size, file_size)
+                structural_ranges.append((next_ifd, next_ifd + ifd_size))
+                fields: dict[int, _TiffField] = {}
+                for index in range(entry_count):
+                    offset = tiff_format.count_size + index * tiff_format.entry_size
+                    tag, field_type = struct.unpack_from(
+                        f"{tiff_format.byte_order}HH", ifd_data, offset
+                    )
+                    if tag in fields:
+                        raise _tiff_error(f"IFD contains duplicate tag {tag}")
+                    try:
+                        field_size = _TIFF_FIELD_SIZES[field_type]
+                    except KeyError as error:
+                        raise _tiff_error(
+                            f"tag {tag} has unknown field type {field_type}"
+                        ) from error
+                    if tiff_format.inline_size == 4:
+                        count = struct.unpack_from(
+                            f"{tiff_format.byte_order}I", ifd_data, offset + 4
+                        )[0]
+                        slot_offset = offset + 8
+                    else:
+                        count = struct.unpack_from(
+                            f"{tiff_format.byte_order}Q", ifd_data, offset + 4
+                        )[0]
+                        slot_offset = offset + 12
+                    total_size = count * field_size
+                    if count == 0 or total_size > _MAX_TIFF_FIELD_BYTES:
+                        raise _tiff_error(
+                            f"tag {tag} field size {total_size} is invalid"
+                        )
+                    slot = ifd_data[slot_offset : slot_offset + tiff_format.inline_size]
+                    if total_size <= tiff_format.inline_size:
+                        field_data = slot[:total_size]
+                    else:
+                        value_offset = int.from_bytes(
+                            slot,
+                            byteorder=(
+                                "little" if tiff_format.byte_order == "<" else "big"
+                            ),
+                        )
+                        field_data = _read_tiff_bytes(
+                            stream,
+                            value_offset,
+                            total_size,
+                            file_size,
+                        )
+                        structural_ranges.append(
+                            (value_offset, value_offset + total_size)
+                        )
+                    fields[tag] = _TiffField(field_type, count, field_data)
+
+                next_offset = ifd_size - tiff_format.next_size
+                next_ifd = int.from_bytes(
+                    ifd_data[next_offset:],
+                    byteorder=("little" if tiff_format.byte_order == "<" else "big"),
+                )
+                if page_number == 0:
+                    try:
+                        description = fields[270]
+                    except KeyError as error:
+                        raise _tiff_error("first IFD lacks ImageDescription") from error
+                    geometry = _geometry_from_tiff_description(description)
+                elif 270 in fields:
+                    raise _tiff_error("only the first IFD may contain ImageDescription")
+                assert geometry is not None
+                if page_number >= geometry.shape[0]:
+                    raise _tiff_error("TIFF contains more pages than declared")
+                width = _tiff_scalar(fields, 256, byte_order=tiff_format.byte_order)
+                height = _tiff_scalar(fields, 257, byte_order=tiff_format.byte_order)
+                if (height, width) != geometry.shape[1:]:
+                    raise _tiff_error(
+                        f"page shape {(height, width)!r} does not match geometry"
+                    )
+                required_scalars = {
+                    258: 16,
+                    259: 1,
+                    277: 1,
+                }
+                for tag, expected in required_scalars.items():
+                    if (
+                        _tiff_scalar(
+                            fields,
+                            tag,
+                            byte_order=tiff_format.byte_order,
+                        )
+                        != expected
+                    ):
+                        raise _tiff_error(f"tag {tag} must be {expected}")
+                if _tiff_scalar(fields, 262, byte_order=tiff_format.byte_order) not in {
+                    0,
+                    1,
+                }:
+                    raise _tiff_error("photometric interpretation is not grayscale")
+                if (
+                    284 in fields
+                    and _tiff_scalar(fields, 284, byte_order=tiff_format.byte_order)
+                    != 1
+                ):
+                    raise _tiff_error("planar configuration must be chunky")
+                if (
+                    339 in fields
+                    and _tiff_scalar(fields, 339, byte_order=tiff_format.byte_order)
+                    != 1
+                ):
+                    raise _tiff_error("sample format must be unsigned integer")
+                if 324 in fields or 325 in fields:
+                    raise _tiff_error("tiled TIFF data is not supported")
+                rows_per_strip = _tiff_scalar(
+                    fields, 278, byte_order=tiff_format.byte_order
+                )
+                if rows_per_strip <= 0:
+                    raise _tiff_error("RowsPerStrip must be positive")
+                offsets = _tiff_unsigned_values(
+                    fields[273],
+                    273,
+                    allowed_types=frozenset({3, 4, 16}),
+                    byte_order=tiff_format.byte_order,
+                )
+                byte_counts = _tiff_unsigned_values(
+                    fields[279],
+                    279,
+                    allowed_types=frozenset({3, 4, 16}),
+                    byte_order=tiff_format.byte_order,
+                )
+                strip_count = (height + rows_per_strip - 1) // rows_per_strip
+                if len(offsets) != strip_count or len(byte_counts) != strip_count:
+                    raise _tiff_error("strip offset/count cardinality is invalid")
+                for strip, (data_offset, byte_count) in enumerate(
+                    zip(offsets, byte_counts, strict=True)
+                ):
+                    rows = min(rows_per_strip, height - strip * rows_per_strip)
+                    expected_bytes = rows * width * 2
+                    if byte_count != expected_bytes:
+                        raise _tiff_error(
+                            f"strip byte count {byte_count} is not {expected_bytes}"
+                        )
+                    _validate_tiff_byte_range(data_offset, byte_count, file_size)
+                    pixel_ranges.append((data_offset, data_offset + byte_count))
+                page_number += 1
+            if geometry is None or page_number != geometry.shape[0]:
+                raise _tiff_error("TIFF page count does not match declared Z shape")
+            _validate_nonoverlapping_ranges(structural_ranges, pixel_ranges)
+            return geometry
+    except OSError as error:
+        raise _tiff_error(f"could not read {source}: {error}") from error
 
 
 def _metadata_error(
@@ -198,24 +591,16 @@ def _range_value(value: object, name: str) -> float:
     return number
 
 
-def write_uint16_tiff(
-    image: Any,
-    path: str | Path,
-    min_value: object,
-    max_value: object,
-) -> None:
-    """Scale a real three-dimensional image into a uint16 TIFF atomically."""
-    minimum = _range_value(min_value, "min_value")
-    maximum = _range_value(max_value, "max_value")
-    if minimum > maximum:
-        raise InputValidationError("TIFF output range minimum must not exceed maximum")
-
+def _tiff_destination(path: str | Path) -> Path:
     destination = Path(path)
     if destination.suffix.lower() not in {".tif", ".tiff"}:
         raise InputValidationError(
             "TIFF output path must use a .tif or .tiff extension"
         )
+    return destination
 
+
+def _external_zyx_data(image: Any) -> tuple[Any, ImageGeometry | None]:
     import numpy as np
 
     geometry: ImageGeometry | None = None
@@ -242,31 +627,18 @@ def write_uint16_tiff(
         raise InputValidationError("TIFF image data must contain real numeric values")
     if source.size == 0:
         raise InputValidationError("TIFF image data must not be empty")
+    return source, geometry
 
-    if np.issubdtype(source.dtype, np.integer):
-        data = np.array(source, copy=True)
-        if np.issubdtype(data.dtype, np.signedinteger):
-            np.maximum(data, 0, out=data)
-        data_minimum = data.min()
-        data_maximum = data.max()
-    else:
-        data = np.array(source, dtype=np.longdouble, copy=True)
-        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-        np.maximum(data, np.longdouble(0), out=data)
-        data_minimum = data.min()
-        data_maximum = data.max()
-    if data_minimum == data_maximum:
-        scaled = np.full(data.shape, minimum, dtype=np.longdouble)
-    else:
-        offsets = data - data_minimum
-        normalized = offsets.astype(np.longdouble) / np.longdouble(
-            data_maximum - data_minimum
-        )
-        scaled = minimum + normalized * (maximum - minimum)
-    encoded = np.clip(scaled, minimum, maximum).astype(np.uint16)
-    metadata = _metadata_for_geometry(geometry)
 
+def _write_encoded_uint16_tiff(
+    encoded: Any,
+    destination: Path,
+    geometry: ImageGeometry | None,
+) -> None:
+    import numpy as np
     import tifffile
+
+    metadata = _metadata_for_geometry(geometry)
 
     def writer(temporary: Path) -> None:
         tifffile.imwrite(
@@ -312,4 +684,65 @@ def write_uint16_tiff(
     atomic_write(destination, writer, validator)
 
 
-__all__ = ["read_tiff_geometry", "write_uint16_tiff"]
+def write_uint16_tiff(
+    image: Any,
+    path: str | Path,
+    min_value: object,
+    max_value: object,
+) -> None:
+    """Scale a real three-dimensional image into a uint16 TIFF atomically."""
+    minimum = _range_value(min_value, "min_value")
+    maximum = _range_value(max_value, "max_value")
+    if minimum > maximum:
+        raise InputValidationError("TIFF output range minimum must not exceed maximum")
+
+    destination = _tiff_destination(path)
+
+    import numpy as np
+
+    source, geometry = _external_zyx_data(image)
+
+    if np.issubdtype(source.dtype, np.integer):
+        data = np.array(source, copy=True)
+        if np.issubdtype(data.dtype, np.signedinteger):
+            np.maximum(data, 0, out=data)
+        data_minimum = data.min()
+        data_maximum = data.max()
+    else:
+        data = np.array(source, dtype=np.longdouble, copy=True)
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+        np.maximum(data, np.longdouble(0), out=data)
+        data_minimum = data.min()
+        data_maximum = data.max()
+    if data_minimum == data_maximum:
+        scaled = np.full(data.shape, minimum, dtype=np.longdouble)
+    else:
+        offsets = data - data_minimum
+        normalized = offsets.astype(np.longdouble) / np.longdouble(
+            data_maximum - data_minimum
+        )
+        scaled = minimum + normalized * (maximum - minimum)
+    encoded = np.clip(scaled, minimum, maximum).astype(np.uint16)
+    _write_encoded_uint16_tiff(encoded, destination, geometry)
+
+
+def write_clipped_uint16_tiff(image: Any, path: str | Path) -> None:
+    """Clip a real three-dimensional image to uint16 without normalization."""
+    destination = _tiff_destination(path)
+
+    import numpy as np
+
+    source, geometry = _external_zyx_data(image)
+    if np.issubdtype(source.dtype, np.floating):
+        data = np.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        data = source
+    encoded = np.clip(data, 0, 65535).astype(np.uint16)
+    _write_encoded_uint16_tiff(encoded, destination, geometry)
+
+
+__all__ = [
+    "read_tiff_geometry",
+    "write_clipped_uint16_tiff",
+    "write_uint16_tiff",
+]

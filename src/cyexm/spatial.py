@@ -123,6 +123,24 @@ class ImageGeometry:
         )
 
 
+def spacing_compatible(
+    actual: PixelSize,
+    expected: PixelSize,
+    *,
+    absolute_tolerance: float = TIFF_GEOMETRY_ATOL,
+) -> bool:
+    """Return whether embedded spacing satisfies the TIFF/manifest contract."""
+    return all(
+        math.isclose(
+            embedded,
+            requested,
+            rel_tol=0.0,
+            abs_tol=absolute_tolerance,
+        )
+        for embedded, requested in zip(actual, expected, strict=True)
+    )
+
+
 def geometry_compatible(
     actual: ImageGeometry,
     expected: ImageGeometry,
@@ -169,4 +187,5 @@ __all__ = [
     "ImageGeometry",
     "PixelSize",
     "geometry_compatible",
+    "spacing_compatible",
 ]

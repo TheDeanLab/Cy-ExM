@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -17,6 +19,12 @@ THREAD_ENVIRONMENT = (
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 )
+PHASE_TWO_EXAMPLE_PATHS = (
+    "examples/spheroid-dataset.yaml",
+    "examples/execution-sequential.yaml",
+    "examples/execution-local-dask.yaml",
+    "examples/execution-slurm-512gb.yaml",
+)
 AGENT_GUIDANCE_PATHS = frozenset(
     {
         "AGENTS.md",
@@ -31,14 +39,98 @@ AGENT_GUIDANCE_PATHS = frozenset(
         "examples/scripts/AGENTS.md",
         "src/AGENTS.md",
         "src/cyexm/AGENTS.md",
+        "src/cyexm/cli/AGENTS.md",
+        "src/cyexm/config/AGENTS.md",
+        "src/cyexm/execution/AGENTS.md",
         "src/cyexm/io/AGENTS.md",
         "src/cyexm/registration/AGENTS.md",
         "src/cyexm/runtime/AGENTS.md",
+        "src/cyexm/workflow/AGENTS.md",
         "tests/AGENTS.md",
+        "tests/hpc/AGENTS.md",
         "tests/integration/AGENTS.md",
         "tests/unit/AGENTS.md",
     }
 )
+PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
+    "src/cyexm/cli/AGENTS.md": (
+        "phase 2a",
+        "parsing, logging setup, lifecycle, formatting, and exit-code mapping",
+        "public workflow api",
+        "diagnostics go to stderr",
+        "structured json and human results to stdout",
+        "no scientific algorithms",
+        "scheduler construction",
+        "filesystem or network activity",
+        "environment mutation at import time",
+        "0 success",
+        "2 config/plan",
+        "3 startup/preflight",
+        "4 round failure",
+        "130 interruption",
+    ),
+    "src/cyexm/config/AGENTS.md": (
+        "phase 2a",
+        "strict safe yaml decoding",
+        "frozen scientific-manifest and execution-profile models",
+        "two documents separate",
+        "unknown and duplicate keys",
+        "non-scalar yaml keys",
+        "aliases",
+        "custom tags",
+        "additional documents",
+        "unsafe paths",
+        "scientific and execution roots are disjoint, neither containing the other",
+        "must not import ants, numpy, scipy, dask, distributed, or dask-jobqueue",
+        "must not mutate the filesystem or environment",
+        "initialize a scheduler",
+        "resource-shaping slurm aliases",
+        "positive whole decimal memory",
+    ),
+    "src/cyexm/execution/AGENTS.md": (
+        "phase 2d implements sequential, bounded local-dask, and slurm execution",
+        "executor protocol",
+        "sequential, dask, and slurm adapter lifecycle",
+        "never registration algorithms or artifact-validity decisions",
+        "scheduler imports occur only inside the selected operation",
+        "process-isolated workers",
+        "min(pending rounds, configured workers)",
+        "one coarse task per round",
+        "each worker advertises one `round_slot`",
+        "every submitted round task requests and consumes one",
+        "default retries are zero",
+        "no nested chunk scheduling or silent fallback",
+        "all connected workers pass preflight before any registration task is "
+        "submitted",
+        "post-preflight round failure does not cancel independent round tasks",
+        "cancel unfinished futures",
+        "client before its owned cluster",
+        "success, failure, and cancellation",
+        "operational evidence",
+        "never authorizes artifact reuse",
+        "before the first scale call",
+        "whole binary gib",
+        "production-owned callable",
+        "real slurm submission and hpc acceptance remain unaccepted until phase 2e",
+    ),
+    "src/cyexm/workflow/AGENTS.md": (
+        "phase 2b binds sequential execution to the real round worker",
+        "immutable plans, tasks, and results",
+        "deterministic path and header validation",
+        "output layout, status, fingerprinting, and public orchestration",
+        "planning creates no files, directories, clients, clusters, or workers",
+        "workflow must not mutate a plan or create a scheduler",
+        "phase 1 completion records remain the only restart authority",
+        "scientific fingerprints exclude executor, resource, and logging settings",
+        "force never bypasses a scientific-plan fingerprint mismatch",
+        "no module-scope scientific or scheduler imports",
+        "only real registration execution boundary in workflow",
+        "configures the task's native threads before its lazy "
+        "registration/scientific imports",
+        "must not create a dask client, submit child tasks, schedule other rounds, "
+        "or start multiprocessing",
+    ),
+}
 
 
 def _read_repository_file(path: str) -> str:
@@ -94,14 +186,14 @@ def test_pre_commit_runs_the_locked_portable_gates_through_uv() -> None:
     }
 
 
-def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> None:
+def test_ci_runs_portable_phase_two_gates_with_hpc_dependencies() -> None:
     assert _load_yaml(".github/workflows/ci.yml", github_actions=True) == {
         "name": "CI",
         "on": {"push": "", "pull_request": ""},
         "permissions": {"contents": "read"},
         "jobs": {
             "portable": {
-                "name": "Portable Phase 1 gates",
+                "name": "Portable Phase 2 repository gates",
                 "runs-on": "ubuntu-latest",
                 "timeout-minutes": "30",
                 "env": dict.fromkeys(THREAD_ENVIRONMENT, "1"),
@@ -121,7 +213,9 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
                     },
                     {
                         "name": "Sync locked environment",
-                        "run": "uv sync --locked --group dev --extra examples",
+                        "run": (
+                            "uv sync --locked --group dev --extra examples --extra hpc"
+                        ),
                     },
                     {"name": "Ruff check", "run": "uv run ruff check ."},
                     {
@@ -146,21 +240,61 @@ def test_ci_runs_only_portable_phase_one_gates_with_bounded_native_threads() -> 
     }
 
     workflow = _read_repository_file(".github/workflows/ci.yml").lower()
-    for forbidden in ("clearex", "dask", "slurm", "/archive", "/project"):
+    for forbidden in (
+        "clearex",
+        "/archive",
+        "/project",
+        "-m hpc",
+        '-m "hpc"',
+        "--cyexm-dataset",
+        "--cyexm-execution",
+        "--cyexm-evidence-dir",
+        "sbatch",
+        "squeue",
+        "scontrol",
+        "scancel",
+        "sacct",
+        "sinfo",
+        "srun",
+    ):
         assert forbidden not in workflow
 
+    configuration = tomllib.loads(_read_repository_file("pyproject.toml"))
+    distributed = configuration["project"]["optional-dependencies"]["distributed"]
+    assert "dask==2025.1.0" in distributed
+    assert "distributed==2025.1.0" in distributed
 
-def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
+
+def test_root_guidance_tracks_current_phase_two_runtime() -> None:
     root = _normalized_repository_file("AGENTS.md")
     for required in (
-        "phase 1 is the current stable runtime",
-        "dedicated phase 2 runtime design and implementation plan",
-        "scientific dataset manifests",
-        "execution profiles",
+        "phase 2 is the current workflow runtime",
+        "phase 1 api",
+        "phase 1 artifact store remains the only restart authority",
+        "approved phase 2 runtime design and implementation plans",
+        "strict scientific dataset manifests",
+        "separate strict execution profiles",
+        "deterministic planning",
+        "`cyexm workflow validate`",
+        "`cyexm workflow plan`",
+        "`cyexm workflow run`",
+        "`cyexm workflow status`",
+        "sequential, bounded process-based local dask, and slurm executors",
+        "real scheduler-neutral round runner",
+        "restart-safe transformed-channel artifacts",
+        "one coarse task per moving round",
+        "one `round_slot` per worker",
+        "one process per slurm job",
+        "one node per round",
+        "all-worker preflight",
+        "portable ci installs the hpc python extra",
+        "never contacts an external scheduler",
+        "explicitly selected `hpc` tests",
         "serial chunk workflow remains",
         "nested chunk multiprocessing",
+        "dask chunk graph",
         "uv lock --check",
-        "uv sync --locked --group dev --extra examples",
+        "uv sync --locked --group dev --extra examples --extra hpc",
     ):
         assert required in root
 
@@ -169,31 +303,130 @@ def test_root_guidance_tracks_stable_phase_one_and_gates_phase_two() -> None:
     assert "uv sync --group dev --extra examples" not in root_lines
 
 
-def test_documentation_and_examples_cannot_lead_phase_two_runtime() -> None:
+def test_phase_two_optional_dependencies_are_cumulative_and_pinned() -> None:
+    configuration = tomllib.loads(_read_repository_file("pyproject.toml"))
+    extras = configuration["project"]["optional-dependencies"]
+    assert extras["workflow"] == ["PyYAML>=6,<7"]
+    assert extras["distributed"] == [
+        "PyYAML>=6,<7",
+        "dask==2025.1.0",
+        "distributed==2025.1.0",
+    ]
+    assert extras["hpc"] == [
+        "PyYAML>=6,<7",
+        "dask==2025.1.0",
+        "distributed==2025.1.0",
+        "dask-jobqueue==0.9.0",
+    ]
+    assert configuration["project"]["scripts"] == {"cyexm": "cyexm.cli:main"}
+
+    direct = "\n".join(configuration["project"]["dependencies"]).lower()
+    for forbidden in ("pyyaml", "dask", "distributed", "dask-jobqueue"):
+        assert forbidden not in direct
+
+
+def test_documentation_and_examples_track_the_current_phase_two_boundary() -> None:
     documentation = _normalized_repository_file("docs/AGENTS.md")
     for required in (
         "merged phase 1 behavior",
-        "proposed phase 2",
-        "not installable behavior",
-        "dedicated runtime design",
+        "phase 2d portable runtime available on this branch",
+        "strict yaml validation",
+        "deterministic planning",
+        "real sequential round execution",
+        "bounded process-based local dask execution",
+        "restart-safe transformed channels",
+        "slurmcluster construction",
+        "all-worker preflight",
+        "real slurm submission and hpc acceptance",
+        "phase 2e",
     ):
         assert required in documentation
 
     examples = _normalized_repository_file("examples/AGENTS.md")
     for required in (
-        "phase 1 examples are the current runnable surface",
-        "runtime api is implemented and accepted",
+        "phase 2 is the current workflow runtime",
+        "strict yaml validation",
+        "deterministic planning",
+        "real sequential round execution",
+        "bounded process-based local dask execution",
+        "restart-safe transformed channels",
+        "workflow cli",
         "examples never lead production behavior",
         "scientific manifest",
         "execution profile",
+        "slurmcluster adapter",
+        "explicitly selected hpc acceptance",
     ):
         assert required in examples
+    for path in PHASE_TWO_EXAMPLE_PATHS:
+        assert path in examples
+
+
+def test_all_agent_guidance_is_free_of_stale_phase_two_c_slurm_claims() -> None:
+    stale_claims = (
+        "phase 2c is the current",
+        "phase 2c runtime available on this branch",
+        "phase 2c implements sequential and bounded local-dask execution",
+        "slurm execution remains proposed for phase 2d",
+        "slurm execution and hpc acceptance remain deferred",
+        "slurm execution and hpc acceptance remain later milestones",
+    )
+    for path in AGENT_GUIDANCE_PATHS:
+        guidance = _normalized_repository_file(path)
+        for claim in stale_claims:
+            assert claim not in guidance, (path, claim)
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("sbatch", "squeue", "scontrol", "scancel", "sacct", "sinfo", "srun"),
+)
+def test_portable_test_scheduler_firewall_rejects_slurm_commands(
+    command: str,
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match=rf"portable tests must not invoke external scheduler command {command!r}",
+    ):
+        subprocess.run([command], check=False)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "command"),
+    (
+        (("bash", "-c", "squeue"), "squeue"),
+        (("env", "CYEXM_TEST=1", "scontrol"), "scontrol"),
+    ),
+)
+def test_portable_test_scheduler_firewall_rejects_wrapped_slurm_commands(
+    arguments: tuple[str, ...],
+    command: str,
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match=rf"portable tests must not invoke external scheduler command {command!r}",
+    ):
+        subprocess.run(arguments, check=False)
+
+
+def test_portable_test_scheduler_firewall_allows_command_names_as_data() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "value = 'sbatch squeue scontrol scancel sacct sinfo srun'; assert value",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> None:
     source = _normalized_repository_file("src/AGENTS.md")
     for required in (
-        "future execution boundary",
+        "scheduler-enabled execution adapters",
         "scheduler imports",
         "module scope",
         "no import-time cluster",
@@ -201,14 +434,28 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
         assert required in source
 
     package = _normalized_repository_file("src/cyexm/AGENTS.md")
-    assert "workflow or configuration namespace" in package
+    for required in (
+        "configuration, workflow, execution, and cli namespaces implement the "
+        "phase 2 workflow surface",
+        "must not become package-root exports",
+        "phase 2b channel primitive usable without dask, distributed, "
+        "dask-jobqueue, or yaml workflow dependencies",
+    ):
+        assert required in package
     assert "scheduler concerns do not belong in `cyexm.registration`" in package
 
     registration = _normalized_repository_file("src/cyexm/registration/AGENTS.md")
     for required in (
         "backend artifact writer methods",
-        "`artifacts.py`, `whole_image.py`, and `chunked.py`",
         "must not own workflow scheduling",
+        "completion-record primitives remain in `artifacts.py`",
+        "`whole_image.py`, `chunked.py`, and `channels.py` each own orchestration "
+        "of their scoped artifacts",
+        "`channels.py` owns only one source channel's restart-safe transform "
+        "artifact lifecycle",
+        "configures native threads before requesting the lazy scientific backend",
+        "must not schedule rounds, create clients or child tasks, or import "
+        "workflow/executor code",
     ):
         assert required in registration
 
@@ -231,14 +478,21 @@ def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> 
         "bounded in-process or local-scheduler checks",
         "portable integration",
         "hpc",
+        "portable scheduler firewall",
+        "subprocess, `os.system`, and representative `os.exec*`/`os.spawn*`",
+        "hpc-marked tests are explicitly exempt",
     ):
         assert required in tests
 
     unit = _normalized_repository_file("tests/unit/AGENTS.md")
     for required in (
-        "future manifest and planning policy",
+        "phase 2 manifest, execution-profile, planning, sequential-executor, "
+        "workflow, and cli policy",
         "plain python data",
-        "must not import scheduler",
+        "channel and round-task modules defer scheduler and scientific runtimes",
+        "real registration remains in integration tests",
+        "inert scheduler shims",
+        "red tests never reach host scheduler clients",
     ):
         assert required in unit
 
@@ -286,12 +540,46 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "lab paths",
         ),
         ".github/workflows/AGENTS.md": (
-            "uv sync --locked --group dev --extra examples",
+            "uv sync --locked --group dev --extra examples --extra hpc",
             "python 3.12",
             "all six native-thread",
             "unit and not hpc",
             "integration and not hpc",
-            "slurm",
+            "bounded process-based localcluster",
+            "portable slurm import, type, fake-construction, and preflight checks",
+            "never invoke external scheduler commands",
+            "explicitly selected hpc tests",
+        ),
+        "tests/hpc/AGENTS.md": (
+            "explicitly selected `hpc`",
+            "actual pytest invocation",
+            "--cyexm-dataset",
+            "--cyexm-execution",
+            "--cyexm-evidence-dir",
+            "acceptance-context.json",
+            "min(2, configured workers)",
+            "sinfo",
+            "scontrol",
+            "squeue",
+            "never skip by hostname",
+            "caller-owned evidence",
+            "/archive",
+            "/project",
+            "live spheroid",
+            "clearex",
+            "canonically disjoint",
+            "recorded job ids",
+            "classify recorded job ids locally",
+            "never pass recorded job ids to squeue",
+            "query error or timeout",
+            "device and mount",
+            "rendered job script",
+            "semantic and scheduler-normalized memory",
+            "never add `tests` to worker `pythonpath`",
+            "version-compatible slurm job and node fields",
+            "treat `allocmem=0` as unavailable",
+            "cleanup",
+            "no acceptance claim without a real allocation",
         ),
         "docs/superpowers/AGENTS.md": (
             "dated",
@@ -317,6 +605,21 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
         guidance = _normalized_repository_file(path)
         for fragment in required_fragments:
             assert fragment in guidance, (path, fragment)
+
+
+@pytest.mark.parametrize(
+    ("path", "required_fragment"),
+    tuple(
+        (path, required_fragment)
+        for path, required_fragments in PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS.items()
+        for required_fragment in required_fragments
+    ),
+)
+def test_phase_two_package_guidance_enforces_boundaries(
+    path: str, required_fragment: str
+) -> None:
+    guidance = _normalized_repository_file(path)
+    assert required_fragment in guidance, (path, required_fragment)
 
 
 def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> None:

@@ -1,24 +1,55 @@
 # Cy-ExM
 
 Cy-ExM provides reusable cyclic expansion microscopy registration without a runtime
-dependency on ClearEx. Phase 1 supports restartable whole-image registration and a
-restartable **serial** chunked nonlinear workflow. Both use affine registration
-before nonlinear registration and preserve physical image geometry.
+dependency on ClearEx. Its Phase 1 API supports restartable whole-image registration
+and a restartable **serial** chunked nonlinear workflow. Its Phase 2 workflow adds
+strict YAML configuration, immutable round planning, sequential and local-Dask
+execution, and a SLURM adapter whose real-cluster acceptance is still pending. Both
+registration strategies use affine registration before nonlinear registration and
+preserve physical image geometry.
 
 Cy-ExM requires Python 3.12 and retains the academic-research-use terms in
 [LICENSE.md](LICENSE.md).
 
 ## Installation
 
-Create a lean locked runtime plus notebook/example dependencies with uv:
+Create the locked base environment for the Phase 1 Python API:
 
 ```bash
-uv sync --no-dev --extra examples
+uv sync --locked
 ```
 
-For development, include the development group:
+Install only the optional capability needed by a workflow. The extras are
+cumulative: `distributed` includes `workflow`, and `hpc` includes `distributed`.
 
 ```bash
+# YAML loading and sequential workflow execution
+uv sync --locked --extra workflow
+
+# Process-based local Dask execution
+uv sync --locked --extra distributed
+
+# SLURMCluster support through dask-jobqueue
+uv sync --locked --extra hpc
+
+# Notebooks and parameterized example scripts
+uv sync --locked --extra examples
+```
+
+For a lean non-development environment, add `--no-dev`. The optional dependency
+versions, including Dask/distributed 2025.1.0 and dask-jobqueue 0.9.0, are locked;
+change them only with fresh compatibility evidence.
+
+`uv sync` does not activate `.venv`, so all workflow commands below use `uv run` to
+execute in the managed project environment.
+
+The established Phase 1 notebook/example convenience commands remain available:
+
+```bash
+# Lean Phase 1 runtime plus examples
+uv sync --no-dev --extra examples
+
+# Phase 1 examples plus the development group
 uv sync --group dev --extra examples
 ```
 
@@ -146,13 +177,475 @@ corrected legacy behavior. The numerical extraction evidence is recorded in the
 The complete portable gate and measured Phase 1 evidence are recorded in the
 [Phase 1 acceptance audit](docs/phase-1-acceptance.md).
 
-## Phase 2 boundary
+## Phase 2 workflow
 
-Phase 1 does not implement a YAML scientific dataset manifest, round-level Dask task
-submission, or SLURM cluster provisioning. Those capabilities belong to a separately
-designed Phase 2. That design will keep scientific dataset description separate from
-execution profiles and will build on Phase 1 completion records rather than creating
-a second checkpoint mechanism.
+Phase 2 orchestrates the accepted Phase 1 registration implementations; it does not
+replace their scientific or restart behavior. A **scientific dataset manifest**
+contains portable inputs and scientific choices. A separate **execution profile**
+contains paths, native threads, executor selection, and machine resources. This
+separation lets the same manifest run sequentially, on a local workstation, or on an
+HPC system without changing its scientific identity.
+
+Planning validates inputs and creates one immutable `RoundTask` per moving round.
+The selected executor schedules those coarse tasks. Registration and channel
+transformation remain serial inside each round task, and Phase 1 completion records
+are the only restart authority. There is no nested chunk multiprocessing, no nested
+Dask graph, and no scheduler-dependent artifact cache.
+
+The public workflow API is available from `cyexm.workflow`:
+
+```python
+from cyexm.workflow import (
+    build_workflow_plan,
+    inspect_workflow_status,
+    load_dataset_manifest,
+    load_execution_profile,
+    run_workflow,
+)
+
+manifest = load_dataset_manifest("examples/spheroid-dataset.yaml")
+execution = load_execution_profile("examples/execution-sequential.yaml")
+plan = build_workflow_plan(manifest, execution)
+result = run_workflow(plan)  # resume is the default
+status = inspect_workflow_status(
+    execution.paths.output_root,
+    manifest.dataset_id,
+)
+```
+
+`build_workflow_plan` performs path and TIFF-header validation but creates no files,
+directories, scheduler clients, clusters, or workers: planning is mutation-free.
+TIFF header inspection runs in an isolated read-only probe process, so planning does
+not import NumPy or tifffile in the coordinator or change its thread environment.
+`inspect_workflow_status` is also read-only. Scheduler libraries and scientific
+runtimes are imported lazily only at the selected execution boundary.
+
+### Checked-in YAML examples
+
+The repository provides four version-1 starting points:
+
+- [Spheroid scientific dataset manifest](examples/spheroid-dataset.yaml)
+- [Sequential execution profile](examples/execution-sequential.yaml)
+- [Local-Dask execution profile](examples/execution-local-dask.yaml)
+- [Editable 512-GB SLURM profile](examples/execution-slurm-512gb.yaml)
+
+The manifest contains no lab-specific root. Edit each execution profile's paths and
+resources before use. In particular, do not run the SLURM placeholders unchanged.
+
+### Scientific dataset manifest
+
+Every mapping has exact keys; there are no implicit scientific defaults in the YAML.
+The fields are:
+
+| Location | Type and accepted values | Meaning |
+| --- | --- | --- |
+| `schema_version` | built-in integer `1` | Selects the strict manifest contract. |
+| `dataset_id` | string matching `[A-Za-z0-9][A-Za-z0-9._-]*` | Becomes the dataset output-directory name. |
+| `voxel_spacing_um` / `x`, `y`, `z` | three finite positive numbers | Physical voxel spacing in micrometers in XYZ order. |
+| `reference` / `round` | nonnegative built-in integer | Fixed-reference imaging round. |
+| `reference` / `channel` | safe relative POSIX path | Fixed-reference image, resolved below `paths.dataset_root`. |
+| `registration` / `crop` | built-in boolean | Enables or disables Phase 1 fixed/moving foreground cropping. |
+| `registration` / `linear` / `type` | `Translation`, `Rigid`, `Similarity`, `Affine`, or `TRSAA` | Phase 1 linear method. |
+| `registration` / `linear` / `accuracy` | `high`, `medium`, `low`, or `dry run` | Phase 1 linear schedule. |
+| `registration` / `nonlinear` / `type` | `Elastic`, `SyNOnly`, or `SyN` | Phase 1 nonlinear method. |
+| `registration` / `nonlinear` / `accuracy` | `high`, `medium`, `low`, or `dry run` | Phase 1 nonlinear schedule. |
+| `rounds` | non-empty list | Moving-round objects; moving rounds are unique and cannot equal the reference round. |
+| moving `round` | nonnegative built-in integer | Round identifier used in task and output names. |
+| `strategy` | `whole_image` or `serial_chunked` | Selects the accepted Phase 1 registration implementation. |
+| `registration_channel` | safe relative POSIX path | The moving image used to estimate transforms. The registration channel must be listed in that round's `channels`. |
+| `channels` | list with unique `file` values | Original moving channels resampled through the round transform, in manifest order. |
+| channel `file` | safe relative POSIX path | Source below `paths.dataset_root`; its basename becomes the channel output name. |
+| channel `interpolation` | `linear` or `nearestNeighbor` | Explicit scalar interpolation for that channel. |
+| `chunk_size_zyx` | three positive built-in integers | Required only for `serial_chunked`; chunk size in NumPy ZYX order. Forbidden for `whole_image`. |
+| `overlap_fraction` | finite number satisfying `0 <= value < 1` | Required only for `serial_chunked`; forbidden for `whole_image`. |
+
+Scientific image paths must be safe relative POSIX paths. Absolute paths, empty or
+`.` components, `..`, NULs, newlines, and paths that resolve outside the execution
+profile's dataset root are rejected. Round numbers are built-in integers rather than
+booleans, channel files are unique within a round, and the registration channel must
+match a channel entry exactly. Planning requires all inputs to be scalar 3-D TIFFs
+with compatible shapes and manifest-compatible physical spacing.
+
+The loader uses safe YAML decoding and rejects unknown keys, missing keys, duplicate
+mapping keys, YAML aliases, custom tags, non-scalar keys, specialized collection
+tags, a non-mapping document, invalid UTF-8, and additional YAML documents. These
+rules apply to both YAML files.
+
+### Execution profile
+
+The `executor` controls which one matching resource section is present:
+
+| Location | Type and accepted values | Meaning |
+| --- | --- | --- |
+| `schema_version` | built-in integer `1` | Selects the strict execution-profile contract. |
+| `executor` | `sequential`, `local_dask`, or `slurm` | Selects exactly one executor-specific section. |
+| `paths` / `dataset_root` | non-empty single-line path string | Root to which manifest image paths are bound. |
+| `paths` / `output_root` | non-empty single-line path string | Parent of `<dataset_id>` workflow output. |
+| `paths` / `worker_local_directory` | path string or `null` | Dask worker scratch; worker-backed executors require a non-null value. |
+| `native_threads` / `itk` | positive built-in integer | ITK thread count carried into every round task. |
+| `native_threads` / `blas` | positive built-in integer | Count exported to every supported BLAS-family variable. |
+| `local_dask` / `workers` | positive built-in integer | Maximum local worker processes. |
+| `local_dask` / `threads_per_worker` | positive built-in integer | Dask threads in each worker; independent of native library counts. |
+| `local_dask` / `processes` | built-in boolean `true` | Process isolation is mandatory; `processes` must be `true`. |
+| `local_dask` / `memory_limit` | non-empty single-line string | Dask memory limit passed to `LocalCluster`. |
+| `local_dask` / `startup_timeout` | non-empty single-line string | Bounds only Dask `Client` connection and `wait_for_workers`. |
+| `local_dask` / `task_retries` | nonnegative built-in integer | Executor-managed retry count after the first attempt. |
+| `slurm` / `queue` | non-empty single-line string | SLURM queue/partition. |
+| `slurm` / `workers` | positive built-in integer | Maximum number of worker jobs. |
+| `slurm` / `cores_per_worker` | positive built-in integer | Requested cores and job CPU count. |
+| `slurm` / `processes_per_worker` | built-in integer `1` | One Dask worker process per SLURM job; `processes_per_worker` must be exactly `1`. |
+| `slurm` / `memory` | positive whole decimal `KB`, `MB`, `GB`, or `TB` string | Semantic memory request; the executor rounds up to whole binary GiB for SLURM and Dask. |
+| `slurm` / `walltime` | non-empty single-line string | Job walltime. |
+| `slurm` / `interface` | non-empty single-line string | Worker network interface. |
+| `slurm` / `scheduler_interface` | non-empty single-line string | Coordinator/scheduler network interface. |
+| `slurm` / `startup_timeout` | non-empty single-line string | Bounds only Dask `Client` connection and `wait_for_workers`. |
+| `slurm` / `task_retries` | nonnegative built-in integer | Executor-managed retry count after the first attempt. |
+| `slurm` / `job_name` | non-empty single-line string | Owned worker-job name. |
+| `slurm` / `job_extra_directives` | list of non-empty single-line strings | Site additions that do not conflict with managed SLURM options. |
+
+Sequential profiles omit both `local_dask` and `slurm`. Local-Dask profiles contain
+only `local_dask`; SLURM profiles contain only `slurm`. Exactly one
+executor-specific section must match `executor`, and unknown or mismatched sections
+are rejected.
+
+Absolute profile paths remain absolute; relative paths resolve from the
+execution-profile file, not the current working directory. Dataset and output roots
+must be disjoint after resolution: neither may contain the other. Existing symlinks
+and planned outputs are checked for root escapes and collisions. Distributed
+worker-backed executors require `worker_local_directory`, and worker scratch must not
+be `/archive` or a descendant of `/archive`; use active `/project` or approved
+node-local storage instead.
+
+All worker/core fields are positive built-in integers and retry fields are a
+nonnegative built-in integer; booleans are never accepted as counts. SLURM memory
+uses positive whole decimal memory with exact uppercase `KB`, `MB`, `GB`, or `TB`
+suffixes. These profile units are decimal semantic bytes. The executor rounds upward
+to whole binary GiB, passes the matching `GiB` quantity to Dask, and never passes a
+`GB` suffix to `#SBATCH --mem`. For example, `500GB` becomes `466G`, which is
+500,363,689,984 bytes, and Dask receives `466GiB`. Invalid, fractional, zero,
+unsupported, or overflowing values fail configuration. Operational evidence records
+both semantic and scheduler-normalized memory.
+
+Every other SLURM text value is a non-empty single-line string.
+`job_extra_directives` cannot conflict with
+managed SLURM options for partition (`--partition`, `-p`), memory (`--mem`,
+`--mem-per-cpu`), CPU/task counts (`--cpus-per-task`, `-c`, `--ntasks`, `-n`), or
+stdout/stderr (`--output`, `-o`, `--error`, `-e`), including unambiguous long-option
+abbreviations and grouped or attached short forms.
+
+`startup_timeout` is not an end-to-end startup deadline. It does not bound
+`LocalCluster` or `SLURMCluster` construction, does not bound `scheduler_info()`
+calls, and does not bound the `Client.run()` worker-preflight RPC. Those operations
+currently have no Cy-ExM wall-clock timeout, so a stalled constructor or preflight RPC
+can outlive the configured value. Treat this as an operational limitation when
+choosing where to run the coordinator.
+
+#### Native-thread resolution
+
+An explicit `native_threads` section overrides the inherited environment. If it is
+omitted, the execution profile resolves the inherited environment before building
+tasks. Missing variables use the conservative one-thread default. The five inherited
+BLAS values must agree, or loading fails and asks for an explicit `blas` value.
+
+| YAML value | Worker environment |
+| --- | --- |
+| `itk` | `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` |
+| `blas` | `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` |
+
+The resolved values are applied before ANTs, NumPy, or SciPy is imported in each
+worker. Dask worker threads, requested SLURM cores, and ITK/BLAS native threads are
+different controls. Keep ITK and BLAS at one until a particular dataset and runtime
+have been characterized safely.
+
+A sequential run applies the resolved native-thread environment in the coordinator
+before workflow status inspection or registration begins; the round boundary then
+reapplies the same values idempotently. Dask and SLURM coordinators do not apply task
+native-thread settings. Their separate worker processes receive and apply the values
+before scientific imports. Inside an already configured round worker, source and
+completion-evidence TIFF headers are inspected in-process; workers do not launch
+nested header-probe child processes. If a caller has already imported ANTs, NumPy,
+or SciPy, `run_workflow` still rejects a conflicting late change before writing
+workflow outputs; only an exactly idempotent reapplication is safe.
+
+### Validate, plan, run, and inspect
+
+These examples use the checked-in spheroid manifest. First edit or copy an execution
+profile so its roots point to caller-owned inputs and outputs.
+
+```bash
+# Decode both files, resolve inputs, inspect headers, and construct a plan.
+uv run cyexm workflow validate examples/spheroid-dataset.yaml \
+  --execution examples/execution-sequential.yaml
+
+# Print the canonical scientific plan and resource request without mutation.
+uv run cyexm workflow plan examples/spheroid-dataset.yaml \
+  --execution examples/execution-local-dask.yaml
+
+# Execute pending work; an ordinary run resumes valid artifacts by default.
+uv run cyexm workflow run examples/spheroid-dataset.yaml \
+  --execution examples/execution-local-dask.yaml
+
+# Recompute selected rounds. --force-round is repeatable.
+uv run cyexm workflow run examples/spheroid-dataset.yaml \
+  --execution examples/execution-local-dask.yaml \
+  --force-round 2 --force-round 4
+
+# Recompute every round in the compatible plan.
+uv run cyexm workflow run examples/spheroid-dataset.yaml \
+  --execution examples/execution-local-dask.yaml --force-all
+
+# Inspect artifacts using only an output root and dataset ID.
+uv run cyexm workflow status results spheroid-registration-example
+```
+
+`--force-round` and `--force-all` are mutually exclusive. An unknown forced round is
+an error. Validate and plan both inspect real input TIFF headers; neither is a
+registration dry run. The mutation-free plan prints its canonical scientific JSON
+and resolved resource request but never opens the selected executor.
+
+Common options are accepted at the top-level, `workflow`, or action boundary:
+
+```bash
+uv run cyexm workflow status results spheroid-registration-example --json
+uv run cyexm workflow plan examples/spheroid-dataset.yaml \
+  --execution examples/execution-sequential.yaml --log-level DEBUG --json
+uv run cyexm --version
+```
+
+Human and structured success results go to stdout. `--json` is success-only:
+successful workflow actions that reach result emission emit one JSON object.
+Failures return before result emission, so stdout is empty, plain-text diagnostics
+go to stderr, and there is no JSON error object. `--version` prints version text
+rather than a JSON result. Argparse failures can include usage text, and
+`--log-level DEBUG` can add a traceback to the stderr diagnostic. Option abbreviation
+is disabled.
+
+### Planning, outputs, status, and restart
+
+The scientific fingerprint covers the manifest's scientific choices, resolved input
+identities and headers, output mapping, and versioned channel policies. It excludes
+executor, resource, native-thread, and logging settings. A successful `run` writes an
+atomic canonical `scientific-plan.json`. A later plan with a different scientific
+fingerprint fails with field-level differences: force cannot bypass a scientific-plan
+fingerprint mismatch, and a scientifically incompatible plan requires a new output
+root. `--force-round` and `--force-all` only request recomputation within a compatible
+plan.
+
+For round 2, the workflow uses `rounds/round-002/registration/`,
+`rounds/round-002/channels/`, and `rounds/round-002/logs/round-002.log`. The complete
+layout is:
+
+```text
+<output-root>/<dataset-id>/
+  scientific-plan.json
+  workflow-runs/
+    <run-id>.json
+  rounds/
+    round-002/
+      registration/
+        fixed_reference.tif
+        fixed_reference.tif.complete.json
+        image_metrics_pre-registration.txt
+        image_metrics_pre-registration.txt.complete.json
+        linear_transform_2.mat
+        linear_transform_2.mat.complete.json
+        image_metrics_linearly-registered.txt
+        image_metrics_linearly-registered.txt.complete.json
+        nonlinear_warp_2.nii.gz
+        nonlinear_warp_2.nii.gz.complete.json
+        image_metrics_nonlinear-registered.txt
+        image_metrics_nonlinear-registered.txt.complete.json
+        nonlinear_registered_2.tif
+        nonlinear_registered_2.tif.complete.json
+        fixed_crop_indices_2.json                 # only when crop: true
+        fixed_crop_indices_2.json.complete.json   # only when crop: true
+        moving_crop_indices_2.json                # only when crop: true
+        moving_crop_indices_2.json.complete.json  # only when crop: true
+        round_2_chunks/                            # serial_chunked only
+          chunk_0000_warp.nii.gz
+          chunk_0000_warp.nii.gz.complete.json
+          ...
+          manifest.json
+          manifest.json.complete.json
+      channels/
+        round_2_488_tubulin.tif
+        round_2_488_tubulin.tif.complete.json
+        <each-other-source-basename>
+        <each-other-source-basename>.complete.json
+      logs/
+        round-002.log
+```
+
+Every reusable artifact has its own matching `.complete.json`. A file alone, a
+completion record alone, an invalid identity, or incompatible request evidence is not
+reusable. A normal rerun scans those Phase 1 records, reports fully valid rounds as
+reused without opening an executor, and submits only incomplete work. This ordinary
+resume is the default. Valid earlier affine or chunk work remains reusable after a
+later stage fails.
+
+`workflow-runs/<run-id>.json` is an atomic operational summary containing the
+execution profile, force selection, round results, timestamps, and available SLURM
+evidence. Operational summaries never authorize artifact reuse; they can be deleted
+without invalidating scientific artifacts. The current CLI writes diagnostics to
+stderr and per-round shared logs; it does not currently create the reserved root
+`logs/<run-id>.log` path.
+
+The read-only status command validates the scientific plan and authoritative
+completion records without importing scientific or scheduler runtimes. Each known
+round is classified as `pending`, `partial`, `complete`, or `invalid`, and JSON output
+lists complete, incomplete, and invalid artifact paths.
+
+#### Diagnostic image versus transformed channel
+
+These similarly named outputs have different purposes:
+
+- `registration/nonlinear_registered_<round>.tif` is the normalized Phase 1
+  registration diagnostic produced with Phase 1's established histogram/scalar
+  postprocessing.
+- `channels/<source>.tif` is the original channel resampled through the persisted
+  transform chain, placed in fixed-reference geometry, and clipped to uint16 without
+  intensity normalization. This includes the designated registration channel.
+
+Use the `channels/` copy for downstream original-intensity analysis. Do not treat the
+Phase 1 diagnostic as a substitute for that channel.
+
+### Executor behavior
+
+All executors consume the same immutable tasks and return results in ascending round
+order. They do not decide whether an artifact is scientifically reusable and there is
+no silent fallback when a selected executor fails.
+
+#### Sequential
+
+The sequential executor is the numerical and restart reference. It runs pending
+rounds in canonical order in the CLI process, continues to later independent rounds
+after a structured round failure, and opens no Dask scheduler.
+
+#### Local Dask
+
+`local_dask` lazily creates an owned, process-based `LocalCluster`. It starts
+`min(pending rounds, configured workers)` workers, never starts a cluster for a fully
+reused workflow, and gives every worker one `round_slot`. Every coarse round task
+requires that resource, so only one round runs in a worker even if its Dask
+`threads_per_worker` is larger. The client and cluster are closed for success,
+failure, startup error, and interruption.
+
+#### SLURM
+
+`slurm` lazily constructs an owned dask-jobqueue `SLURMCluster` and scales it to
+`min(pending rounds, configured workers)`. It requests one process per job and gives
+each worker one `round_slot`; each submitted round consumes that slot. This prevents
+more than one registration round in a worker job. A claim of one dedicated node per
+job additionally depends on the site's allocation/exclusivity policy and must be
+confirmed during real HPC acceptance.
+
+Before any registration submission, every connected worker must pass preflight.
+Preflight checks exact Cy-ExM/dependency versions, hostname and SLURM job identity,
+dataset/output visibility, scratch creation and cleanup, all six native-thread
+values, memory evidence, and scheduler/worker network identity. A timeout or mismatch
+closes owned resources and fails as executor startup rather than falling back.
+
+The worker job prologue exports all resolved native-thread values before the worker
+command. The coordinator runs in the process that invokes the CLI; a batch-launched
+coordinator is not implemented. Confirm site policy and the stability of the chosen
+login or interactive coordinator location before a long run.
+
+Before SLURM submission, Cy-ExM directly serializes the configured round runner and
+carries those bytes in a production-owned callable. This prevents Distributed's
+outer task serialization from reducing an acceptance-only runner to a test-module
+import. Workers never need `tests` on `PYTHONPATH`; the embedded runner is rebuilt
+inside ordinary task execution, where a reconstruction error becomes a normal task
+failure instead of a worker-side task-deserialization failure.
+
+Real acceptance validates version-compatible SLURM resource records rather than
+assuming every controller exposes the same keys. Job `TRES` must prove the requested
+CPU and one node. When present, `MinMemoryNode` must equal the exact normalized
+scheduler request; job `ReqTRES` and `AllocTRES` are optional but must prove adequate
+CPU, node, and memory resources when reported. Node `RealMemory` must cover the
+request, and reported `CfgTRES` and `AllocTRES` must cover its CPU and memory facts.
+Slurm 22.05 may also report the legacy sentinel `AllocMem=0`; `AllocMem=0` is
+unavailable as allocation evidence rather than proof of zero allocated memory. A
+positive `AllocMem` must cover the normalized request, while malformed or negative
+values fail validation.
+The harness fails closed if neither an authoritative job memory request nor a node
+memory-allocation fact is available.
+
+Each SLURM workflow-run record carries versioned operational evidence: requested
+workers/retries/timeouts, the rendered job-script template, connected worker and
+preflight observations, task attempt counts, startup phase/outcome, timestamps,
+cancellation evidence when applicable, and ordered client/cluster/configuration
+cleanup results. This evidence is diagnostic only and never replaces artifact
+completion records.
+
+### Failures, retries, cancellation, and exit codes
+
+Configuration and plan errors occur before executor construction. Startup and
+preflight errors abort before expensive tasks. Independent round failures do not
+cancel other submitted rounds; all submitted work settles, successful artifacts stay
+committed, a failed operational summary is written, and the workflow reports the
+failed round numbers.
+
+Post-execution SLURM evidence validation is a separate exit-3 path. After submitted
+rounds return, Cy-ExM validates the executor's operational evidence before reporting
+success. If that validation fails, it preserves the round results in the operational
+run record, the CLI exits `3`, and a later ordinary run can reuse those valid
+artifacts through normal completion-record validation.
+
+Automatic retries default to zero. A positive `task_retries` value is an
+executor-managed resubmission; Dask's opaque future retry count remains zero, and
+each attempt re-enters ordinary Phase 1 artifact validation. Use a small bounded
+value only for plausible transient failures. Diagnose deterministic registration
+errors and out-of-memory failures instead of repeatedly retrying them.
+
+On `KeyboardInterrupt` or CLI termination, distributed executors cancel unfinished
+futures and close the owned client and cluster. The SLURM adapter also leaves its
+temporary Dask configuration. These steps preserve committed artifacts, write a
+cancelled workflow-run summary when possible, and an ordinary later run resumes via
+artifact validation.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Every round completed or was validly reused. |
+| `2` | Argument, YAML, configuration, input, plan, output, or fingerprint validation failed. |
+| `3` | Executor startup, worker connection, or preflight failure; also invalid SLURM operational evidence, including validation after round execution. Valid committed artifacts remain restartable. |
+| `4` | At least one round failed after execution began. |
+| `130` | Operator interruption or termination through the CLI run handler. |
+
+### 512-GB SLURM example and acceptance boundary
+
+The checked-in profile currently proposes queue `512GB`, three workers, 72 cores per
+worker, one process per worker, a semantic `500GB` memory profile (normalized to
+`466G` for SLURM and `466GiB` for Dask), a 72-hour walltime, `ib0`
+worker/scheduler interfaces, a 15-minute startup timeout, and zero retries. These
+512GB values are site-specific and editable. They are not unconditional facts about
+the current cluster; verify partition availability, exclusive-node policy, usable
+memory, interfaces, account/QoS directives, shared mounts, scratch, and coordinator
+policy before submission.
+
+Portable fake-based SLURM construction, job-template rendering, preflight policy,
+failure mapping, evidence validation, cancellation, and cleanup are tested. Real
+SLURM submission and HPC acceptance remain pending. Only tests explicitly selected
+with `-m hpc` may contact a scheduler or use representative lab data; they require an
+explicit allocation and caller-approved dataset, execution profile, output root, and
+external evidence directory. Portable CI always selects `not hpc` and must never
+invoke scheduler clients. Do not use the separate active spheroid registration or
+its output as acceptance input.
+
+Real acceptance must demonstrate distinct jobs/hostnames for concurrent whole-image
+and serial-chunked rounds, dedicated allocation facts, shared-path and scratch
+behavior, package/thread identity, numerical parity with sequential execution,
+independent failure, bounded retry, cancellation, ordinary resume, and final job
+cleanup. Until that evidence is recorded, the SLURM adapter is available for
+controlled evaluation but is not advertised as production-accepted on this cluster.
+
+### Remaining non-goals
+
+Phase 2 intentionally does not provide `ParallelChunkedImageRegistration`, per-chunk
+Dask scheduling, nested multiprocessing, parallel channel transformation, job arrays,
+cross-dataset scheduling, cloud or Kubernetes executors, or automatic resource
+optimization. It does not recreate ClearEx's GUI, pipeline, TRE, or general analysis
+framework, and it never silently changes executor: no silent fallback is permitted.
+Reference-round channels are not copied or transformed by this workflow.
 
 ## Development checks
 

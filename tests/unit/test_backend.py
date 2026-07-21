@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from fakes import fake_image, install_fake_ants
+from fakes import FakeBackend, fake_image, install_fake_ants
 
 import cyexm.registration.backend as backend_module
 from cyexm.registration._native_paths import discard_path
@@ -43,6 +43,14 @@ def test_registration_backend_declares_every_required_operation() -> None:
             "warp_path",
             "interpolation",
         ),
+        "apply_transform_chain": (
+            "self",
+            "fixed",
+            "moving",
+            "affine_path",
+            "warp_path",
+            "interpolation",
+        ),
         "histogram_match": ("self", "source", "reference"),
         "write_affine": ("self", "transform", "path"),
         "read_affine": ("self", "path"),
@@ -50,6 +58,7 @@ def test_registration_backend_declares_every_required_operation() -> None:
         "read_warp": ("self", "path"),
         "write_identity_warp": ("self", "reference", "path"),
         "write_tiff": ("self", "image", "path", "min_value", "max_value"),
+        "write_clipped_tiff": ("self", "image", "path"),
         "calculate_metrics": (
             "self",
             "fixed",
@@ -524,6 +533,80 @@ def test_apply_warp_delegates_path_and_interpolation(
     assert result is expected
 
 
+def test_apply_transform_chain_prepares_then_delegates_the_established_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requested = NativeThreadConfig(itk_threads=2, blas_threads=3)
+    affine_path = tmp_path / "affine.mat"
+    warp_path = tmp_path / "warp.nii.gz"
+    expected = fake_image()
+    events: list[str] = []
+    received: dict[str, object] = {}
+
+    def prepare(config: NativeThreadConfig | None) -> _Resolved:
+        assert config is requested
+        events.append("prepare")
+        return _Resolved()
+
+    def apply_transform_chain(**kwargs: object) -> object:
+        events.append("transform")
+        received.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(backend_module, "configure_native_threads", prepare)
+    monkeypatch.setattr(
+        backend_module.transform_helpers,
+        "apply_transform_chain",
+        apply_transform_chain,
+    )
+
+    result = AntsRegistrationBackend(requested).apply_transform_chain(
+        fixed="fixed",
+        moving="moving",
+        affine_path=affine_path,
+        warp_path=warp_path,
+        interpolation="nearestNeighbor",
+    )
+
+    assert events == ["prepare", "transform"]
+    assert received == {
+        "fixed": "fixed",
+        "moving": "moving",
+        "affine_path": affine_path,
+        "warp_path": warp_path,
+        "interpolation": "nearestNeighbor",
+        "native_threads": requested,
+    }
+    assert result is expected
+
+
+def test_fake_backend_records_transform_order_inversion_and_interpolation(
+    tmp_path: Path,
+) -> None:
+    affine_path = tmp_path / "affine.mat"
+    affine_path.write_bytes(b"affine")
+    warp_path = tmp_path / "warp.nii.gz"
+    warp_path.write_bytes(b"warp")
+    fixed = fake_image(origin=(10.0, 20.0, 30.0))
+    moving = fake_image(data=np.full((8, 8, 8), 12.9, dtype=np.float32))
+    backend = FakeBackend()
+
+    result = backend.apply_transform_chain(
+        fixed=fixed,
+        moving=moving,
+        affine_path=affine_path,
+        warp_path=warp_path,
+        interpolation="linear",
+    )
+
+    assert backend.transform_lists == [(warp_path.resolve(), affine_path.resolve())]
+    assert backend.transform_inversions == [(False, False)]
+    assert backend.transform_interpolations == ["linear"]
+    assert result.origin == fixed.origin  # type: ignore[union-attr]
+    np.testing.assert_array_equal(result.data, moving.data)  # type: ignore[union-attr]
+
+
 @pytest.mark.parametrize(
     "operation", ["apply_affine", "apply_warp", "write_affine", "read_affine"]
 )
@@ -698,6 +781,51 @@ def test_write_tiff_delegates_range_and_supplied_path(
         "min_value": 100.0,
         "max_value": 1100.0,
     }
+
+
+def test_write_clipped_tiff_prepares_before_delegating_the_supplied_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requested = NativeThreadConfig(itk_threads=2, blas_threads=3)
+    destination = tmp_path / ".channel.atomic.tmp.tif"
+    image = fake_image()
+    events: list[str] = []
+    received: dict[str, object] = {}
+
+    def prepare(config: NativeThreadConfig | None) -> _Resolved:
+        assert config is requested
+        events.append("prepare")
+        return _Resolved()
+
+    def write_clipped(value: object, path: Path) -> None:
+        events.append("write")
+        received.update(image=value, path=path)
+
+    monkeypatch.setattr(backend_module, "configure_native_threads", prepare)
+    monkeypatch.setattr(backend_module, "write_clipped_uint16_tiff", write_clipped)
+
+    AntsRegistrationBackend(requested).write_clipped_tiff(image, destination)
+
+    assert events == ["prepare", "write"]
+    assert received == {"image": image, "path": destination}
+
+
+def test_fake_backend_records_clipped_output_values(tmp_path: Path) -> None:
+    image = fake_image(data=np.asarray([[[12.9, 70000.0]]], dtype=np.float32))
+    destination = tmp_path / "channel.tif"
+    backend = FakeBackend()
+
+    backend.write_clipped_tiff(image, destination)
+
+    assert backend.clipped_tiff_writes == [destination]
+    assert len(backend.clipped_tiff_images) == 1
+    np.testing.assert_array_equal(backend.clipped_tiff_images[0].data, image.data)
+    np.testing.assert_array_equal(
+        backend.clipped_tiff_values[0],
+        np.asarray([[[12, 65535]]], dtype=np.uint16),
+    )
+    assert destination.is_file()
 
 
 def test_metric_calculation_configures_threads_before_delegating(

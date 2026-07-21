@@ -9,19 +9,33 @@
   `2311a873b783477add7391ff00245f76490147f0`. Never edit that source repository or
   add a runtime dependency on ClearEx, and retain its academic-use `LICENSE.md`
   exactly.
-- Phase 1 is the current stable runtime: whole-image and serial chunked registration,
+- The Phase 1 API remains supported: whole-image and serial chunked registration,
   restart-safe artifacts, strict geometry/TIFF boundaries, and configurable native
-  threads. Preserve that API and its acceptance evidence while Phase 2 is designed.
-- Do not add Phase 2 runtime code, dependencies, or public APIs until a dedicated
-  Phase 2 runtime design and implementation plan are approved. This gate covers YAML
-  scientific dataset manifests, execution profiles, Dask/distributed execution,
-  dask-jobqueue/SLURM integration, and new workflow CLIs.
+  threads. Preserve that API and its acceptance evidence.
+- Phase 2 is the current workflow runtime. Strict scientific dataset manifests and
+  separate strict execution profiles drive deterministic planning, status inspection,
+  the real scheduler-neutral round runner, and restart-safe transformed-channel
+  artifacts through `cyexm workflow validate`, `cyexm workflow plan`,
+  `cyexm workflow run`, and `cyexm workflow status`.
+- The current executor boundary includes sequential, bounded process-based local Dask,
+  and SLURM executors. Portable tests accept lazy SLURMCluster construction, bounded
+  workers, all-worker preflight, independent failure collection, cancellation, owned
+  cleanup, and operational evidence. Portable CI installs the HPC Python extra but
+  never contacts an external scheduler. Real SLURM submission and HPC acceptance
+  require explicitly selected `hpc` tests with operator-approved inputs and allocation.
+- All Phase 2 additions follow the approved Phase 2 runtime design and implementation
+  plans. Keep optional workflow, distributed, and HPC dependencies out of the base
+  installation, and do not advertise a later milestone before its acceptance gate.
 - Scientific dataset manifests describe rounds, channels, registration inputs, voxel
   spacing, and scientific choices; machine-specific local or HPC settings belong in
   separate execution profiles. The Phase 1 artifact store remains the only restart
   authority, and the serial chunk workflow remains the numerical reference. Do not
   introduce nested chunk multiprocessing, a Dask chunk graph, or
   `ParallelChunkedImageRegistration` inside round-level tasks by default.
+- Schedule one coarse task per moving round and keep serial work inside that task.
+  Worker-backed executors expose one `round_slot` per worker and every submitted round
+  consumes one slot. SLURM uses one process per SLURM job and one node per round; do not
+  weaken that resource contract without explicit scientific and operational acceptance.
 - `clearex.registration.pipeline` and `clearex.registration.tre` remain out of scope;
   do not recreate unrelated ClearEx surfaces in this repository.
 - Child `AGENTS.md` files add scope-specific guidance and inherit, rather than repeat,
@@ -39,6 +53,11 @@
 
 - Fixed and moving roles do not change. Public pixel sizes are micrometers in
   `(x, y, z)` order; NumPy volumes use `(z, y, x)` order.
+- Native reference, registration-channel, and dependent-channel shapes may differ
+  independently along Z, Y, and X. The affine application is the first fixed-grid
+  boundary: its scalar and mask outputs, every nonlinear input and output, the full
+  warp, and every transformed dependent channel must match the fixed-reference
+  geometry.
 - Preserve masks based on values greater than zero, affine-before-nonlinear transform
   order, TRSAA linear registration, SyNOnly nonlinear registration, scalar linear
   interpolation, mask nearest-neighbor interpolation, and ANTs origin, spacing, and
@@ -69,7 +88,7 @@ Run targeted tests first, then the relevant portable gates:
 
 ```bash
 uv lock --check
-uv sync --locked --group dev --extra examples
+uv sync --locked --group dev --extra examples --extra hpc
 uv run pytest -m "unit and not hpc" tests/unit -v
 uv run pytest -m "integration and not hpc" tests/integration -v
 uv run ruff check .

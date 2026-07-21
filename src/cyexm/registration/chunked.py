@@ -12,15 +12,19 @@ from typing import Any, Self
 
 from cyexm.errors import CacheValidationError, ChunkRegistrationError
 from cyexm.registration._native_paths import discard_path
+from cyexm.registration._request_policy import (
+    CHUNK_SCALAR_POLICY,
+    canonical_compact_json,
+    chunk_grid,
+    chunk_manifest_parameters,
+    chunk_manifest_payload,
+    local_chunk_parameters,
+)
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import RegistrationBackend
-from cyexm.registration.whole_image import (
-    _SERIAL_CHUNK_SCALAR_POSTPROCESSING_POLICY,
-    ImageRegistration,
-    RegistrationPaths,
-)
+from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
-from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, PixelSize
+from cyexm.spatial import ImageGeometry, PixelSize
 
 
 class _ChunkOutputValidationError(ValueError):
@@ -178,49 +182,10 @@ def compute_chunk_grid(
     chunk_size: tuple[int, int, int] | list[int] = (512, 512, 512),
     overlap_fraction: float = 0.15,
 ) -> tuple[ChunkInfo, ...]:
-    shape_z, shape_y, shape_x = _positive_int_triple(image_shape, "image_shape")
-    chunk_z, chunk_y, chunk_x = _positive_int_triple(chunk_size, "chunk_size")
-    overlap = _validated_overlap(overlap_fraction)
-
-    overlap_z, overlap_y, overlap_x = (
-        int(chunk_z * overlap),
-        int(chunk_y * overlap),
-        int(chunk_x * overlap),
+    return tuple(
+        ChunkInfo(**item)
+        for item in chunk_grid(image_shape, chunk_size, overlap_fraction)
     )
-    step_z, step_y, step_x = (
-        chunk_z - overlap_z,
-        chunk_y - overlap_y,
-        chunk_x - overlap_x,
-    )
-    z_positions = (0,) if shape_z <= chunk_z else tuple(range(0, shape_z, step_z))
-    y_positions = (0,) if shape_y <= chunk_y else tuple(range(0, shape_y, step_y))
-    x_positions = (0,) if shape_x <= chunk_x else tuple(range(0, shape_x, step_x))
-
-    chunks: list[ChunkInfo] = []
-    for z_start in z_positions:
-        for y_start in y_positions:
-            for x_start in x_positions:
-                z_end = min(z_start + chunk_z, shape_z)
-                y_end = min(y_start + chunk_y, shape_y)
-                x_end = min(x_start + chunk_x, shape_x)
-                chunks.append(
-                    ChunkInfo(
-                        chunk_id=len(chunks),
-                        z_start=z_start,
-                        z_end=z_end,
-                        y_start=y_start,
-                        y_end=y_end,
-                        x_start=x_start,
-                        x_end=x_end,
-                        z_start_ext=max(0, z_start - overlap_z // 2),
-                        z_end_ext=min(shape_z, z_end + overlap_z // 2),
-                        y_start_ext=max(0, y_start - overlap_y // 2),
-                        y_end_ext=min(shape_y, y_end + overlap_y // 2),
-                        x_start_ext=max(0, x_start - overlap_x // 2),
-                        x_end_ext=min(shape_x, x_end + overlap_x // 2),
-                    )
-                )
-    return tuple(chunks)
 
 
 def _array_shape(array: object, name: str) -> tuple[int, ...]:
@@ -336,7 +301,7 @@ class ChunkedImageRegistration(ImageRegistration):
         self.chunk_size = _positive_int_triple(chunk_size, "chunk_size")
         self.overlap_fraction = _validated_overlap(overlap_fraction)
         self._nonlinear_mode = "serial-chunked"
-        self._scalar_postprocessing_policy = _SERIAL_CHUNK_SCALAR_POSTPROCESSING_POLICY
+        self._scalar_postprocessing_policy = CHUNK_SCALAR_POLICY
         self._prepare_nonlinear_before_reuse = True
 
     def chunk_paths(self, chunk_id: int) -> ChunkPaths:
@@ -496,30 +461,24 @@ class ChunkedImageRegistration(ImageRegistration):
         affine_identity: FileIdentity,
     ) -> StageRequest:
         self._verify_source_identities()
-        parameters: dict[str, object] = {
-            "axis_convention_version": AXIS_CONVENTION_VERSION,
-            "chunk": self._chunk_dict(chunk),
-            "chunk_grid": [self._chunk_dict(item) for item in chunks],
-            "chunk_size_zyx": self.chunk_size,
-            "fixed_mask_geometry": (
-                None
-                if fixed_mask_chunk is None
-                else backend.geometry(fixed_mask_chunk).to_dict()
+        parameters = local_chunk_parameters(
+            chunk=self._chunk_dict(chunk),
+            chunks=[self._chunk_dict(item) for item in chunks],
+            chunk_size_zyx=self.chunk_size,
+            fixed_mask_geometry=(
+                None if fixed_mask_chunk is None else backend.geometry(fixed_mask_chunk)
             ),
-            "image_interpolation": "linear",
-            "image_shape_zyx": image_shape,
-            "low_variance_policy": "identity-displacement-below-1e-6",
-            "mask_interpolation": "nearestNeighbor+threshold-0.5",
-            "moving_geometry": backend.geometry(moving_chunk).to_dict(),
-            "moving_mask_geometry": (
+            image_shape_zyx=image_shape,
+            moving_geometry=backend.geometry(moving_chunk),
+            moving_mask_geometry=(
                 None
                 if moving_mask_chunk is None
-                else backend.geometry(moving_mask_chunk).to_dict()
+                else backend.geometry(moving_mask_chunk)
             ),
-            "overlap_fraction": self.overlap_fraction,
-            "registration_parameters": self._nonlinear_parameters(),
-            "scalar_postprocessing_policy": self._scalar_postprocessing_policy,
-        }
+            overlap_fraction=self.overlap_fraction,
+            nonlinear_accuracy=self.nonlinear_accuracy,
+            scalar_postprocessing_policy=self._scalar_postprocessing_policy,
+        )
         return StageRequest.for_identities(
             stage=f"nonlinear-chunk:{chunk.chunk_id}",
             inputs=self._input_identity_snapshot(),
@@ -650,33 +609,18 @@ class ChunkedImageRegistration(ImageRegistration):
         image_shape: tuple[int, int, int],
         warp_identities: tuple[FileIdentity, ...],
     ) -> dict[str, object]:
-        return {
-            "axis_convention_version": AXIS_CONVENTION_VERSION,
-            "chunk_size_zyx": list(self.chunk_size),
-            "chunks": [
-                {
-                    "chunk": self._chunk_dict(chunk),
-                    "warp": identity.to_dict(),
-                }
-                for chunk, identity in zip(chunks, warp_identities, strict=True)
-            ],
-            "image_shape_zyx": list(image_shape),
-            "overlap_fraction": self.overlap_fraction,
-            "round_number": self.imaging_round,
-            "schema_version": 2,
-        }
+        return chunk_manifest_payload(
+            round_number=self.imaging_round,
+            image_shape_zyx=image_shape,
+            chunk_size_zyx=self.chunk_size,
+            overlap_fraction=self.overlap_fraction,
+            chunks=[self._chunk_dict(chunk) for chunk in chunks],
+            local_warps=[identity.to_dict() for identity in warp_identities],
+        )
 
     @staticmethod
     def _canonical_json(payload: dict[str, object]) -> str:
-        return (
-            json.dumps(
-                payload,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
+        return canonical_compact_json(payload)
 
     def _commit_manifest(
         self,
@@ -702,15 +646,14 @@ class ChunkedImageRegistration(ImageRegistration):
             accuracy="exact",
             native_threads=native_threads,
             upstream=affine_identity,
-            parameters={
-                "axis_convention_version": AXIS_CONVENTION_VERSION,
-                "chunk_size_zyx": self.chunk_size,
-                "image_shape_zyx": image_shape,
-                "local_warps": [identity.to_dict() for identity in warp_identities],
-                "nonlinear_accuracy": self.nonlinear_accuracy,
-                "nonlinear_type": self.nonlinear_type,
-                "overlap_fraction": self.overlap_fraction,
-            },
+            parameters=chunk_manifest_parameters(
+                chunk_size_zyx=self.chunk_size,
+                image_shape_zyx=image_shape,
+                local_warps=[identity.to_dict() for identity in warp_identities],
+                nonlinear_accuracy=self.nonlinear_accuracy,
+                nonlinear_type=self.nonlinear_type,
+                overlap_fraction=self.overlap_fraction,
+            ),
         )
 
         def reader(source: Path) -> dict[str, object]:

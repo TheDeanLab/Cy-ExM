@@ -54,6 +54,8 @@ from cyexm.workflow import run_workflow
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundFailure,
     RoundResult,
     RoundTask,
@@ -90,14 +92,13 @@ def _registration() -> RegistrationSpec:
 
 
 def _task(output_root: Path, round_number: int) -> RoundTask:
-    round_layout = WorkflowLayout.for_dataset(output_root, "dataset-1").round(
-        round_number
-    )
+    layout = WorkflowLayout.for_dataset(output_root, "dataset-1")
+    round_layout = layout.round(round_number)
     return RoundTask(
         dataset_id="dataset-1",
         round=round_number,
         strategy="whole_image",
-        fixed_image=output_root.parent / "dataset" / "fixed.tif",
+        fixed_image=layout.round(1).channel("fixed.tif"),
         moving_image=output_root.parent / "dataset" / f"moving-{round_number}.tif",
         registration_directory=round_layout.registration,
         log_path=round_layout.log,
@@ -128,7 +129,8 @@ def _artifacts(task: RoundTask) -> tuple[Path, ...]:
 def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
     output_root = tmp_path / "output"
     tasks = tuple(_task(output_root, round_number) for round_number in rounds)
-    sources = (tasks[0].fixed_image, *(task.moving_image for task in tasks))
+    fixed_source = tmp_path / "dataset" / "fixed.tif"
+    sources = (fixed_source, *(task.moving_image for task in tasks))
     for source in sources:
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_bytes(f"source:{source.name}".encode())
@@ -168,6 +170,25 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         source_path=tmp_path / "execution.yaml",
     )
     layout = WorkflowLayout.for_dataset(output_root, "dataset-1")
+    reference_layout = layout.round(1)
+    reference_task = ReferenceTask(
+        dataset_id="dataset-1",
+        round=1,
+        registration_channel_source=fixed_source.resolve(),
+        registration_channel_output=reference_layout.channel("fixed.tif"),
+        registration_directory=reference_layout.registration,
+        crop_bounds_path=None,
+        log_path=reference_layout.log,
+        voxel_spacing_xyz=(1.0, 1.0, 1.0),
+        crop=False,
+        native_threads=NativeThreadSpec(itk=1, blas=1),
+        channels=(
+            ReferenceChannelTask(
+                source=fixed_source.resolve(),
+                output=reference_layout.channel("fixed.tif"),
+            ),
+        ),
+    )
 
     def source_mapping(path: Path) -> dict[str, object]:
         stat = path.stat()
@@ -188,7 +209,23 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
             "voxel_spacing_xyz_um": [1.0, 1.0, 1.0],
             "reference": {
                 "round": 1,
-                "channel": str(tasks[0].fixed_image.resolve()),
+                "registration_channel": str(fixed_source.resolve()),
+                "registration_manifest_file": "fixed.tif",
+                "registration_output": (
+                    reference_task.registration_channel_output.relative_to(
+                        layout.root
+                    ).as_posix()
+                ),
+                "crop_output": None,
+                "channels": [
+                    {
+                        "file": str(fixed_source.resolve()),
+                        "manifest_file": "fixed.tif",
+                        "output": reference_task.channels[0]
+                        .output.relative_to(layout.root)
+                        .as_posix(),
+                    }
+                ],
             },
             "registration": {
                 "crop": False,
@@ -230,10 +267,14 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         dataset_id="dataset-1",
         manifest=manifest,
         execution=execution,
-        fixed_image=tasks[0].fixed_image,
+        reference_task=reference_task,
+        fixed_image=reference_task.registration_channel_output,
         tasks=tasks,
         expected_artifacts=tuple(
-            artifact for task in tasks for artifact in _artifacts(task)
+            (
+                reference_task.channels[0].output,
+                *(artifact for task in tasks for artifact in _artifacts(task)),
+            )
         ),
         scientific_json=scientific_json,
         scientific_fingerprint=sha256_fingerprint(scientific_json),
@@ -799,6 +840,9 @@ def _commit_artifact(path: Path, plan: WorkflowPlan) -> None:
         direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
     )
     task = next(task for task in plan.tasks if path in _artifacts(task))
+    if not task.fixed_image.exists():
+        task.fixed_image.parent.mkdir(parents=True, exist_ok=True)
+        write_cyexm_uint16_tiff(task.fixed_image, geometry)
     affine, warp, registered, *_ = _artifacts(task)
     inputs = (
         FileIdentity.from_path(task.fixed_image),
@@ -2073,6 +2117,25 @@ def test_run_workflow_rejects_expected_artifact_mismatch_before_mutation(
     assert fake.calls == []
 
 
+def test_run_workflow_rejects_forged_reference_output_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    forged_reference = replace(
+        plan.reference_task,
+        registration_channel_output=tmp_path / "outside" / "fixed.tif",
+    )
+    forged = replace(plan, reference_task=forged_reference)
+    fake = _FakeExecutor(lambda tasks: tuple(_result(task) for task in tasks))
+
+    with pytest.raises(WorkflowPlanError, match="registration_channel_output"):
+        run_workflow(forged, _executor_factory=_factory(fake))
+
+    assert not plan.execution.paths.output_root.exists()
+    assert not (tmp_path / "outside").exists()
+    assert fake.calls == []
+
+
 def test_run_workflow_rejects_boolean_manifest_spacing_before_mutation(
     tmp_path: Path,
 ) -> None:
@@ -2294,7 +2357,15 @@ def test_run_workflow_does_not_reuse_artifacts_from_other_native_threads(
     requested_threads = NativeThreadSpec(itk=2, blas=3)
     task = replace(original.tasks[0], native_threads=requested_threads)
     execution = replace(original.execution, native_threads=requested_threads)
-    plan = replace(original, tasks=(task,), execution=execution)
+    plan = replace(
+        original,
+        reference_task=replace(
+            original.reference_task,
+            native_threads=requested_threads,
+        ),
+        tasks=(task,),
+        execution=execution,
+    )
     configured: list[ExecutionProfile] = []
     monkeypatch.setattr(
         workflow_api,

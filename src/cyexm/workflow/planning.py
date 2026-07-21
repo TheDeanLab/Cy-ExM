@@ -25,11 +25,18 @@ from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
     OUTPUT_FORMAT_POLICY,
 )
-from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
+from cyexm.spatial import (
+    AXIS_CONVENTION_VERSION,
+    ImageGeometry,
+    geometry_compatible,
+    spacing_compatible,
+)
 from cyexm.workflow.layout import RoundLayout, WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
     ImageHeader,
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundTask,
     WorkflowPlan,
     canonical_json,
@@ -52,9 +59,10 @@ class _FinalArtifact:
 def _input_references(manifest: DatasetManifest) -> tuple[_InputReference, ...]:
     references = [
         _InputReference(
-            yaml_path="reference.channel",
-            relative_path=manifest.reference.channel,
+            yaml_path=f"reference.channels[{index}].file",
+            relative_path=channel.file,
         )
+        for index, channel in enumerate(manifest.reference.channels)
     ]
     for round_index, round_spec in enumerate(manifest.rounds):
         references.extend(
@@ -380,9 +388,20 @@ def _inspect_headers(
 
 def _final_artifacts(
     manifest: DatasetManifest,
+    reference_task: ReferenceTask,
     tasks: tuple[RoundTask, ...],
 ) -> tuple[_FinalArtifact, ...]:
-    artifacts: list[_FinalArtifact] = []
+    artifacts = [
+        _FinalArtifact(
+            channel.output,
+            f"reference.channels[{index}].file output",
+        )
+        for index, channel in enumerate(reference_task.channels)
+    ]
+    if reference_task.crop_bounds_path is not None:
+        artifacts.append(
+            _FinalArtifact(reference_task.crop_bounds_path, "reference crop bounds")
+        )
     round_indexes = {
         round_spec.round: round_index
         for round_index, round_spec in enumerate(manifest.rounds)
@@ -420,6 +439,7 @@ def _validate_output_paths(
     layout: WorkflowLayout,
     output_root: Path,
     source_paths: frozenset[Path],
+    reference_task: ReferenceTask,
     tasks: tuple[RoundTask, ...],
     artifacts: tuple[_FinalArtifact, ...],
 ) -> None:
@@ -429,6 +449,12 @@ def _validate_output_paths(
         ("dataset output directory", layout.root),
         ("scientific plan", layout.plan_path),
     ]
+    planned_locations.extend(
+        (
+            ("reference registration directory", reference_task.registration_directory),
+            ("reference log", reference_task.log_path),
+        )
+    )
     for task in tasks:
         planned_locations.extend(
             (
@@ -487,8 +513,8 @@ def _round_tasks(
     execution: ExecutionProfile,
     layout: WorkflowLayout,
     resolved_inputs: Mapping[PurePosixPath, Path],
+    fixed_image: Path,
 ) -> tuple[RoundTask, ...]:
-    fixed_image = resolved_inputs[manifest.reference.channel]
     tasks = []
     for round_spec in sorted(manifest.rounds, key=lambda item: item.round):
         round_layout = layout.round(round_spec.round)
@@ -516,6 +542,75 @@ def _round_tasks(
     return tuple(tasks)
 
 
+def _effective_geometry(
+    header: ImageHeader,
+    spacing: tuple[float, float, float],
+) -> ImageGeometry:
+    return header.geometry or ImageGeometry(
+        shape=header.shape_zyx,
+        origin=(0.0, 0.0, 0.0),
+        spacing=spacing,
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+
+
+def _reference_task(
+    manifest: DatasetManifest,
+    execution: ExecutionProfile,
+    layout: WorkflowLayout,
+    resolved_inputs: Mapping[PurePosixPath, Path],
+    headers: Mapping[Path, ImageHeader],
+) -> ReferenceTask:
+    reference_layout = layout.round(manifest.reference.round)
+    registration_source = resolved_inputs[manifest.reference.registration_channel]
+    expected_geometry = _effective_geometry(
+        headers[registration_source], manifest.voxel_spacing_um
+    )
+    errors: list[str] = []
+    channels: list[ReferenceChannelTask] = []
+    for index, channel in enumerate(manifest.reference.channels):
+        source = resolved_inputs[channel.file]
+        actual_geometry = _effective_geometry(
+            headers[source], manifest.voxel_spacing_um
+        )
+        if not geometry_compatible(actual_geometry, expected_geometry):
+            errors.append(
+                f"reference.channels[{index}].file geometry must match "
+                "reference.registration_channel; "
+                f"got {actual_geometry.to_dict()!r}, expected "
+                f"{expected_geometry.to_dict()!r}"
+            )
+        channels.append(
+            ReferenceChannelTask(
+                source=source,
+                output=reference_layout.channel(channel.file),
+            )
+        )
+    if errors:
+        raise WorkflowPlanError(
+            "Reference channel geometry validation failed:\n"
+            + "\n".join(f"- {message}" for message in errors)
+        )
+    registration_output = reference_layout.channel(
+        manifest.reference.registration_channel
+    )
+    return ReferenceTask(
+        dataset_id=manifest.dataset_id,
+        round=manifest.reference.round,
+        registration_channel_source=registration_source,
+        registration_channel_output=registration_output,
+        registration_directory=reference_layout.registration,
+        crop_bounds_path=(
+            reference_layout.reference_crop if manifest.registration.crop else None
+        ),
+        log_path=reference_layout.log,
+        voxel_spacing_xyz=manifest.voxel_spacing_um,
+        crop=manifest.registration.crop,
+        native_threads=execution.native_threads,
+        channels=tuple(channels),
+    )
+
+
 def _header_mapping(header: ImageHeader) -> dict[str, object]:
     return {
         "path": str(header.path),
@@ -533,6 +628,7 @@ def _scientific_mapping(
     resolved_inputs: Mapping[PurePosixPath, Path],
     headers: Mapping[Path, ImageHeader],
     layout: WorkflowLayout,
+    reference_task: ReferenceTask,
     tasks: tuple[RoundTask, ...],
 ) -> dict[str, object]:
     tasks_by_round = {task.round: task for task in tasks}
@@ -542,7 +638,32 @@ def _scientific_mapping(
         "voxel_spacing_xyz_um": list(manifest.voxel_spacing_um),
         "reference": {
             "round": manifest.reference.round,
-            "channel": str(resolved_inputs[manifest.reference.channel]),
+            "registration_channel": str(reference_task.registration_channel_source),
+            "registration_manifest_file": (
+                manifest.reference.registration_channel.as_posix()
+            ),
+            "registration_output": (
+                reference_task.registration_channel_output.relative_to(
+                    layout.root
+                ).as_posix()
+            ),
+            "crop_output": (
+                None
+                if reference_task.crop_bounds_path is None
+                else reference_task.crop_bounds_path.relative_to(layout.root).as_posix()
+            ),
+            "channels": [
+                {
+                    "file": str(channel_task.source),
+                    "manifest_file": channel.file.as_posix(),
+                    "output": channel_task.output.relative_to(layout.root).as_posix(),
+                }
+                for channel, channel_task in zip(
+                    manifest.reference.channels,
+                    reference_task.channels,
+                    strict=True,
+                )
+            ],
         },
         "registration": {
             "crop": manifest.registration.crop,
@@ -784,17 +905,26 @@ def build_workflow_plan(
         manifest.voxel_spacing_um,
     )
     layout = WorkflowLayout.for_dataset(output_root, manifest.dataset_id)
+    reference_task = _reference_task(
+        manifest,
+        normalized_execution,
+        layout,
+        resolved_inputs,
+        headers,
+    )
     tasks = _round_tasks(
         manifest,
         normalized_execution,
         layout,
         resolved_inputs,
+        reference_task.registration_channel_output,
     )
-    artifacts = _final_artifacts(manifest, tasks)
+    artifacts = _final_artifacts(manifest, reference_task, tasks)
     _validate_output_paths(
         layout,
         output_root,
         frozenset(resolved_inputs.values()),
+        reference_task,
         tasks,
         artifacts,
     )
@@ -803,6 +933,7 @@ def build_workflow_plan(
         resolved_inputs,
         headers,
         layout,
+        reference_task,
         tasks,
     )
     scientific_json = canonical_json(scientific_mapping)
@@ -817,7 +948,8 @@ def build_workflow_plan(
         dataset_id=manifest.dataset_id,
         manifest=manifest,
         execution=normalized_execution,
-        fixed_image=resolved_inputs[manifest.reference.channel],
+        reference_task=reference_task,
+        fixed_image=reference_task.registration_channel_output,
         tasks=tasks,
         expected_artifacts=tuple(artifact.path for artifact in artifacts),
         scientific_json=scientific_json,

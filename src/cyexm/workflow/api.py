@@ -41,6 +41,8 @@ from cyexm.workflow._execution_validation import (
 )
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundResult,
     RoundTask,
     WorkflowPlan,
@@ -316,16 +318,72 @@ def _validate_workflow_plan(
         raise WorkflowPlanError(
             "WorkflowPlan manifest does not match the scientific plan"
         )
-    fixed_image = _manifest_source_path(
-        manifest.reference.channel,
+    reference_task = plan.reference_task
+    if type(reference_task) is not ReferenceTask:
+        raise WorkflowPlanError(
+            "WorkflowPlan.reference_task must be an exact ReferenceTask"
+        )
+    if type(reference_task.channels) is not tuple or any(
+        type(channel) is not ReferenceChannelTask for channel in reference_task.channels
+    ):
+        raise WorkflowPlanError(
+            "WorkflowPlan.reference_task.channels must be an exact tuple of "
+            "ReferenceChannelTask values"
+        )
+    reference_layout = layout.round(snapshot.reference_round)
+    reference_sources = tuple(
+        _manifest_source_path(
+            channel.file,
+            dataset_root=dataset_root,
+            location=f"WorkflowPlan.manifest.reference.channels[{index}].file",
+        )
+        for index, channel in enumerate(manifest.reference.channels)
+    )
+    registration_source = _manifest_source_path(
+        manifest.reference.registration_channel,
         dataset_root=dataset_root,
-        location="WorkflowPlan.manifest.reference.channel",
+        location="WorkflowPlan.manifest.reference.registration_channel",
+    )
+    _safe_descendant(
+        reference_task.registration_channel_output,
+        root=layout.root,
+        location="WorkflowPlan.reference_task.registration_channel_output",
+    )
+    _safe_descendant(
+        reference_task.registration_directory,
+        root=layout.root,
+        location="WorkflowPlan.reference_task.registration_directory",
+    )
+    _safe_descendant(
+        reference_task.log_path,
+        root=layout.root,
+        location="WorkflowPlan.reference_task.log_path",
     )
     if (
         type(manifest.reference.round) is not int
         or manifest.reference.round != snapshot.reference_round
-        or fixed_image != snapshot.fixed_source.path
-        or plan.fixed_image != fixed_image
+        or tuple(channel.file for channel in manifest.reference.channels)
+        != tuple(channel.manifest_file for channel in snapshot.reference_channels)
+        or reference_sources
+        != tuple(channel.source.path for channel in snapshot.reference_channels)
+        or registration_source != snapshot.fixed_source.path
+        or reference_task.dataset_id != plan.dataset_id
+        or reference_task.round != snapshot.reference_round
+        or reference_task.registration_channel_source != snapshot.fixed_source.path
+        or reference_task.registration_channel_output != snapshot.fixed_output
+        or reference_task.registration_directory != reference_layout.registration
+        or reference_task.crop_bounds_path != snapshot.reference_crop_output
+        or reference_task.log_path != reference_layout.log
+        or reference_task.voxel_spacing_xyz != snapshot.voxel_spacing_xyz
+        or reference_task.crop != snapshot.registration.crop
+        or reference_task.native_threads != execution.native_threads
+        or type(reference_task.force) is not bool
+        or reference_task.force
+        or tuple(channel.source for channel in reference_task.channels)
+        != reference_sources
+        or tuple(channel.output for channel in reference_task.channels)
+        != tuple(channel.output for channel in snapshot.reference_channels)
+        or plan.fixed_image != snapshot.fixed_output
     ):
         raise WorkflowPlanError(
             "WorkflowPlan reference does not match the scientific plan"
@@ -351,7 +409,9 @@ def _validate_workflow_plan(
             "WorkflowPlan tasks must match the unique sorted scientific rounds"
         )
 
-    expected_artifacts: list[Path] = []
+    expected_artifacts = [channel.output for channel in snapshot.reference_channels]
+    if snapshot.reference_crop_output is not None:
+        expected_artifacts.append(snapshot.reference_crop_output)
     for task in plan.tasks:
         contract = round_contracts[task.round]
         manifest_round = manifest_rounds[task.round]
@@ -397,7 +457,7 @@ def _validate_workflow_plan(
         if (
             task.dataset_id != plan.dataset_id
             or task.strategy != contract.strategy
-            or task.fixed_image != fixed_image
+            or task.fixed_image != snapshot.fixed_output
             or task.moving_image != contract.registration_source.path
             or task.voxel_spacing_xyz != snapshot.voxel_spacing_xyz
             or not _registration_matches_snapshot(task.registration, snapshot)

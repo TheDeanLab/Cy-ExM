@@ -15,6 +15,10 @@ class RoundLayout:
         return self.root / "registration"
 
     @property
+    def reference_crop(self) -> Path:
+        return self.registration / "reference_crop_indices.json"
+
+    @property
     def channels(self) -> Path:
         return self.root / "channels"
 

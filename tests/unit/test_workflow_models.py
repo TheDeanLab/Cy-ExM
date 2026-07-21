@@ -27,6 +27,8 @@ from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
     ImageHeader,
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundFailure,
     RoundResult,
     RoundStatus,
@@ -111,6 +113,25 @@ def _task(tmp_path: Path, round_number: int) -> RoundTask:
         ),
         chunk_size_zyx=(4, 8, 8) if round_number == 3 else None,
         overlap_fraction=0.25 if round_number == 3 else None,
+    )
+
+
+def _reference_task(tmp_path: Path) -> ReferenceTask:
+    round_root = tmp_path / "round-001"
+    source = tmp_path / "round_1_488.tif"
+    output = round_root / "channels" / source.name
+    return ReferenceTask(
+        dataset_id="dataset-1",
+        round=1,
+        registration_channel_source=source,
+        registration_channel_output=output,
+        registration_directory=round_root / "registration",
+        crop_bounds_path=round_root / "registration" / "reference_crop_indices.json",
+        log_path=round_root / "logs" / "round-001.log",
+        voxel_spacing_xyz=(0.324, 0.324, 0.9),
+        crop=True,
+        native_threads=NativeThreadSpec(itk=1, blas=1),
+        channels=(ReferenceChannelTask(source=source, output=output),),
     )
 
 
@@ -263,6 +284,14 @@ def test_layout_isolates_each_round_and_channel_output(tmp_path: Path) -> None:
     assert round_layout.log == (
         tmp_path / "dataset-1/rounds/round-002/logs/round-002.log"
     )
+    reference_layout = layout.round(1)
+    assert reference_layout.reference_crop == (
+        tmp_path / "dataset-1/rounds/round-001/registration/reference_crop_indices.json"
+    )
+    assert reference_layout.channels == tmp_path / "dataset-1/rounds/round-001/channels"
+    assert reference_layout.log == (
+        tmp_path / "dataset-1/rounds/round-001/logs/round-001.log"
+    )
 
 
 def test_layout_construction_creates_no_files_or_directories(tmp_path: Path) -> None:
@@ -280,6 +309,8 @@ def test_all_workflow_values_are_frozen_and_slotted(tmp_path: Path) -> None:
     fingerprint = sha256_fingerprint(scientific_json)
     round_result = _round_result()
     values = (
+        _reference_task(tmp_path).channels[0],
+        _reference_task(tmp_path),
         task.channels[0],
         task,
         ImageHeader(
@@ -303,6 +334,7 @@ def test_all_workflow_values_are_frozen_and_slotted(tmp_path: Path) -> None:
             dataset_id="dataset-1",
             manifest=_manifest(),
             execution=_execution_profile(tmp_path, "sequential"),
+            reference_task=_reference_task(tmp_path),
             fixed_image=tmp_path / "round_1_488.tif",
             tasks=(task,),
             expected_artifacts=(task.registration_directory,),
@@ -363,6 +395,7 @@ def test_workflow_plan_sorts_rounds_stably_and_preserves_channel_order(
         dataset_id="dataset-1",
         manifest=_manifest(),
         execution=_execution_profile(tmp_path, "sequential"),
+        reference_task=_reference_task(tmp_path),
         fixed_image=tmp_path / "round_1_488.tif",
         tasks=(round_3_first, round_2, round_3_second),
         expected_artifacts=(),
@@ -475,6 +508,7 @@ def test_scientific_identity_excludes_all_execution_profile_choices(
             dataset_id="dataset-1",
             manifest=_manifest(),
             execution=_execution_profile(tmp_path, executor),
+            reference_task=_reference_task(tmp_path),
             fixed_image=tmp_path / "round_1_488.tif",
             tasks=tasks,
             expected_artifacts=tuple(task.registration_directory for task in tasks),

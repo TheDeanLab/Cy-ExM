@@ -4,6 +4,10 @@
   header validation; output layout, status, fingerprinting, and public
   orchestration. Phase 2B binds sequential execution to the real round worker.
 - Planning creates no files, directories, clients, clusters, or workers.
+- Planning owns one immutable reference-preparation prerequisite. It must preserve
+  declared channel order, require identical native reference grids, and point every
+  moving task at the prepared registration-channel TIFF under the reference round's
+  shared `channels` directory.
 - Workflow must not mutate a plan or create a scheduler.
 - Phase 1 completion records remain the only restart authority.
 - Scientific fingerprints exclude executor, resource, and logging settings.

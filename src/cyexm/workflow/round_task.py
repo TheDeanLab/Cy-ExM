@@ -39,11 +39,9 @@ class _RuntimeRegistrationPaths(Protocol):
     affine: str | os.PathLike[str]
     warp: str | os.PathLike[str]
     registered: str | os.PathLike[str]
-    fixed_reference: str | os.PathLike[str]
     pre_metrics: str | os.PathLike[str]
     linear_metrics: str | os.PathLike[str]
     nonlinear_metrics: str | os.PathLike[str]
-    fixed_crop: str | os.PathLike[str]
     moving_crop: str | os.PathLike[str]
 
 
@@ -123,19 +121,23 @@ def _completed_artifacts(
     )
 
 
-def _registration_paths(value: _RuntimeRegistrationPaths) -> RegistrationArtifactPaths:
-    return RegistrationArtifactPaths(
-        output=Path(value.output),
-        affine=Path(value.affine),
-        warp=Path(value.warp),
-        registered=Path(value.registered),
-        fixed_reference=Path(value.fixed_reference),
-        pre_metrics=Path(value.pre_metrics),
-        linear_metrics=Path(value.linear_metrics),
-        nonlinear_metrics=Path(value.nonlinear_metrics),
-        fixed_crop=Path(value.fixed_crop),
-        moving_crop=Path(value.moving_crop),
-    )
+def _registration_paths(
+    value: _RuntimeRegistrationPaths, round_number: int
+) -> RegistrationArtifactPaths:
+    paths = RegistrationArtifactPaths.for_round(Path(value.output), round_number)
+    if (
+        paths.affine != Path(value.affine)
+        or paths.warp != Path(value.warp)
+        or paths.registered != Path(value.registered)
+        or paths.pre_metrics != Path(value.pre_metrics)
+        or paths.linear_metrics != Path(value.linear_metrics)
+        or paths.nonlinear_metrics != Path(value.nonlinear_metrics)
+        or paths.moving_crop != Path(value.moving_crop)
+    ):
+        raise RuntimeError(
+            "runtime registration paths do not match the workflow layout"
+        )
+    return paths
 
 
 def _reused_artifacts(
@@ -232,6 +234,8 @@ def run_round_task(task: RoundTask) -> RoundResult:
     stage = "initialization"
 
     try:
+        if type(task.prepared_fixed) is not bool or not task.prepared_fixed:
+            raise ValueError("workflow round task requires prepared_fixed=True")
         hostname = socket.gethostname()
         pid = os.getpid()
         dask_task_key = _dask_task_key()
@@ -281,6 +285,7 @@ def run_round_task(task: RoundTask) -> RoundResult:
             "crop": task.registration.crop,
             "enable_logging": True,
             "force_override": task.force,
+            "prepared_fixed": task.prepared_fixed,
             "native_threads": threads,
             "linear_type": task.registration.linear.type,
             "linear_accuracy": task.registration.linear.accuracy,
@@ -303,7 +308,7 @@ def run_round_task(task: RoundTask) -> RoundResult:
         runtime_paths_value = RegistrationPaths.for_round(
             task.registration_directory, task.round
         )
-        if _registration_paths(runtime_paths_value) != registration_paths:
+        if _registration_paths(runtime_paths_value, task.round) != registration_paths:
             raise RuntimeError("registration paths do not match the planned artifacts")
 
         affine_path, warp_path, _registered_path = (

@@ -128,11 +128,13 @@ def _registration_inputs(task: RoundTask) -> tuple[FileIdentity, FileIdentity] |
 
 
 def _common(task: RoundTask) -> dict[str, object]:
-    return common_parameters(
+    parameters = common_parameters(
         crop=task.registration.crop,
         imaging_round=task.round,
         pixel_size_xyz=task.voxel_spacing_xyz,
     )
+    parameters["prepared_fixed"] = task.prepared_fixed
+    return parameters
 
 
 def _request_matches(
@@ -289,14 +291,6 @@ def _effective_geometries(
 ) -> SourceGeometries | None:
     if not task.registration.crop:
         return source_geometries
-    fixed = _crop_snapshot(
-        task,
-        paths.fixed_crop,
-        "fixed",
-        source_geometries.fixed,
-        inputs,
-        snapshot_reader,
-    )
     moving = _crop_snapshot(
         task,
         paths.moving_crop,
@@ -305,7 +299,19 @@ def _effective_geometries(
         inputs,
         snapshot_reader,
     )
-    if fixed is None or moving is None:
+    if moving is None:
+        return None
+    if task.prepared_fixed:
+        return SourceGeometries(fixed=source_geometries.fixed, moving=moving[1])
+    fixed = _crop_snapshot(
+        task,
+        paths.fixed_crop,
+        "fixed",
+        source_geometries.fixed,
+        inputs,
+        snapshot_reader,
+    )
+    if fixed is None:
         return None
     return SourceGeometries(fixed=fixed[1], moving=moving[1])
 
@@ -657,7 +663,9 @@ def completion_evidence(
         inputs,
         snapshot_reader=snapshot_reader,
     )
-    if effective is None or not _fixed_reference_valid(
+    if effective is None:
+        return RoundCompletionEvidence(artifacts=(), affine=None, warp=None)
+    if not task.prepared_fixed and not _fixed_reference_valid(
         task,
         paths.fixed_reference,
         effective.fixed,

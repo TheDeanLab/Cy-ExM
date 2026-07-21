@@ -21,7 +21,6 @@ from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
     WHOLE_SCALAR_POLICY,
     affine_parameters,
-    canonical_compact_json,
     common_parameters,
     crop_parameters,
     fixed_reference_parameters,
@@ -130,6 +129,7 @@ class ImageRegistration:
         enable_logging: bool = True,
         force_override: bool = False,
         *,
+        prepared_fixed: bool = False,
         native_threads: NativeThreadConfig | None = None,
         linear_type: str = "TRSAA",
         linear_accuracy: str = "low",
@@ -150,6 +150,7 @@ class ImageRegistration:
         self.crop = _validated_bool(crop, "crop")
         self.enable_logging = _validated_bool(enable_logging, "enable_logging")
         self.force_override = _validated_bool(force_override, "force_override")
+        self.prepared_fixed = _validated_bool(prepared_fixed, "prepared_fixed")
         self.native_threads = native_threads
         self.linear_type = _validated_choice(linear_type, "linear_type", _LINEAR_TYPES)
         self.linear_accuracy = _validated_choice(
@@ -205,7 +206,8 @@ class ImageRegistration:
         fixed_mask = backend.zero_mask(fixed)
         moving_mask = backend.zero_mask(moving)
 
-        self._commit_fixed_reference(backend, fixed, paths, resolved)
+        if not self.prepared_fixed:
+            self._commit_fixed_reference(backend, fixed, paths, resolved)
         self._commit_metrics(
             "pre-registration",
             backend,
@@ -382,6 +384,7 @@ class ImageRegistration:
             imaging_round=self.imaging_round,
             pixel_size_xyz=self.pixel_size,
         )
+        evidence["prepared_fixed"] = self.prepared_fixed
         evidence.update(parameters)
         return StageRequest.for_identities(
             stage=stage,
@@ -404,13 +407,15 @@ class ImageRegistration:
     ) -> tuple[object, object]:
         if not self.crop:
             return fixed, moving
-        fixed_cropped = self._crop_image(
-            backend,
-            fixed,
-            paths.fixed_crop,
-            "fixed",
-            resolved,
-        )
+        fixed_cropped = fixed
+        if not self.prepared_fixed:
+            fixed_cropped = self._crop_image(
+                backend,
+                fixed,
+                paths.fixed_crop,
+                "fixed",
+                resolved,
+            )
         moving_cropped = self._crop_image(
             backend,
             moving,

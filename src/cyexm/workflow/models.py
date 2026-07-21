@@ -80,6 +80,7 @@ class RoundTask:
     channels: tuple[ChannelTask, ...]
     chunk_size_zyx: ChunkSizeZYX | None
     overlap_fraction: float | None
+    prepared_fixed: bool = True
     force: bool = False
 
 

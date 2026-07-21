@@ -353,6 +353,29 @@ def test_constructor_stores_custom_scalar_configuration(tmp_path: Path) -> None:
     assert registration.linear_accuracy == "high"
     assert registration.nonlinear_type == "SyN"
     assert registration.nonlinear_accuracy == "low"
+    assert registration.prepared_fixed is False
+
+
+def test_prepared_fixed_mode_crops_only_moving_and_omits_fixed_duplicates(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    registration = make_registration(
+        tmp_path,
+        backend=backend,
+        crop=True,
+        prepared_fixed=True,
+    )
+
+    registration.register()
+
+    paths = round_paths(tmp_path)
+    assert backend.crop_bounds == [(2, 6, 1, 5, 2, 6)]
+    assert not paths.fixed_reference.exists()
+    assert not ArtifactStore().record_path(paths.fixed_reference).exists()
+    assert not paths.fixed_crop.exists()
+    assert not ArtifactStore().record_path(paths.fixed_crop).exists()
+    assert paths.moving_crop.is_file()
 
 
 @pytest.mark.parametrize(

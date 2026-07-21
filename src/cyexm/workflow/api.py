@@ -464,6 +464,8 @@ def _validate_workflow_plan(
             or task.native_threads != execution.native_threads
             or task.chunk_size_zyx != contract.chunk_size_zyx
             or task.overlap_fraction != contract.overlap_fraction
+            or type(task.prepared_fixed) is not bool
+            or not task.prepared_fixed
             or type(task.force) is not bool
             or task.force
         ):

@@ -32,6 +32,10 @@
 - Linear registration accepts native fixed and moving grids, but affine resampling
   must produce the exact fixed-reference scalar and mask geometry before whole-image
   or serial-chunked nonlinear work. Keep chunk geometry strict on that fixed grid.
+- Standalone Phase 1 registration retains `prepared_fixed=False`, including its
+  fixed crop and persisted `fixed_reference.tif`. Workflow rounds explicitly use
+  `prepared_fixed=True`: never recrop or duplicate the prepared fixed TIFF, but keep
+  the moving crop and every downstream fixed-grid assertion.
 - `RegistrationBackend.nonlinear` and every `_estimate_nonlinear` override transfer
   ownership of one unique disposable warp candidate to their immediate caller. The
   caller must persist or consume it and then use the shared best-effort cleanup helper;

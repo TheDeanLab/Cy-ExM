@@ -853,6 +853,7 @@ def _commit_artifact(path: Path, plan: WorkflowPlan) -> None:
         "crop": False,
         "imaging_round": task.round,
         "pixel_size_xyz": [1.0, 1.0, 1.0],
+        "prepared_fixed": True,
     }
     threads = {name: 1 for name in NATIVE_THREAD_ENV_VARS}
     if path == affine:
@@ -1914,7 +1915,7 @@ def test_run_workflow_executes_when_registration_evidence_is_stale(
     assert tuple(item.status for item in result.rounds) == ("completed",)
 
 
-def test_run_workflow_executes_when_fixed_reference_tiff_is_corrupt(
+def test_run_workflow_ignores_obsolete_per_round_fixed_reference_tiff(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1934,8 +1935,8 @@ def test_run_workflow_executes_when_fixed_reference_tiff_is_corrupt(
 
     result = run_workflow(plan)
 
-    assert calls == [2]
-    assert result.rounds[0].status == "completed"
+    assert calls == []
+    assert result.rounds[0].status == "reused"
 
 
 def test_run_workflow_forces_only_selected_rounds(tmp_path: Path) -> None:

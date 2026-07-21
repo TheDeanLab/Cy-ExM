@@ -183,6 +183,8 @@ def _validate_round_task_value(
             f"{location}.chunk_size_zyx and {location}.overlap_fraction are "
             "required for serial_chunked"
         )
+    if type(task.prepared_fixed) is not bool:
+        raise error_type(f"{location}.prepared_fixed must be a built-in boolean")
     if type(task.force) is not bool:
         raise error_type(f"{location}.force must be a built-in boolean")
 

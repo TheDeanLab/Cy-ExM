@@ -564,7 +564,7 @@ def _round_result(
 
 
 def test_parallel_placement_requires_two_overlapping_unique_jobs_and_hosts() -> None:
-    results = (
+    moving = (
         _round_result(
             4,
             job_id="11",
@@ -580,6 +580,17 @@ def test_parallel_placement_requires_two_overlapping_unique_jobs_and_hosts() -> 
             ended_at="2026-07-21T10:00:05Z",
         ),
     )
+    reference = replace(
+        _round_result(
+            1,
+            job_id="10",
+            hostname="node-a",
+            started_at="2026-07-21T09:59:55Z",
+            ended_at="2026-07-21T09:59:59Z",
+        ),
+        strategy="reference-preparation",
+    )
+    results = (reference, *moving)
 
     evidence = parallel_placement_evidence(results)
 
@@ -592,7 +603,7 @@ def test_parallel_placement_requires_two_overlapping_unique_jobs_and_hosts() -> 
     }
     with pytest.raises(HpcWorkflowAcceptanceError, match="unique hostname"):
         parallel_placement_evidence(
-            (results[0], replace(results[1], hostname="node-a"))
+            (reference, moving[0], replace(moving[1], hostname="node-a"))
         )
 
 

@@ -252,41 +252,53 @@ def _timestamp(value: str) -> datetime:
 def parallel_placement_evidence(
     results: tuple[RoundResult, ...],
 ) -> dict[str, object]:
-    """Prove two strategies overlapped on unique single-job worker hosts."""
-    if len(results) != 2 or any(result.status != "completed" for result in results):
+    """Prove a completed reference barrier and two overlapping moving rounds."""
+    references = tuple(
+        result for result in results if result.strategy == "reference-preparation"
+    )
+    moving = tuple(
+        result for result in results if result.strategy != "reference-preparation"
+    )
+    if (
+        len(references) != 1
+        or references[0].status != "completed"
+        or len(moving) != 2
+        or any(result.status != "completed" for result in moving)
+    ):
         raise HpcWorkflowAcceptanceError(
-            "parallel placement requires exactly two completed round results"
+            "parallel placement requires one completed reference result and "
+            "exactly two completed moving-round results"
         )
-    if {result.strategy for result in results} != {"whole_image", "serial_chunked"}:
+    if {result.strategy for result in moving} != {"whole_image", "serial_chunked"}:
         raise HpcWorkflowAcceptanceError(
             "parallel placement requires whole_image and serial_chunked rounds"
         )
-    job_ids = [result.slurm_job_id for result in results]
+    job_ids = [result.slurm_job_id for result in moving]
     if any(type(job_id) is not str or not job_id for job_id in job_ids) or len(
         set(job_ids)
-    ) != len(results):
+    ) != len(moving):
         raise HpcWorkflowAcceptanceError(
             "parallel rounds must report one unique SLURM job ID each"
         )
-    hostnames = [result.hostname for result in results]
+    hostnames = [result.hostname for result in moving]
     if any(type(host) is not str or not host for host in hostnames) or len(
         set(hostnames)
-    ) != len(results):
+    ) != len(moving):
         raise HpcWorkflowAcceptanceError(
             "parallel rounds must report one unique hostname each"
         )
-    latest_start = max(_timestamp(result.started_at) for result in results)
-    earliest_end = min(_timestamp(result.ended_at) for result in results)
+    latest_start = max(_timestamp(result.started_at) for result in moving)
+    earliest_end = min(_timestamp(result.ended_at) for result in moving)
     if latest_start >= earliest_end:
         raise HpcWorkflowAcceptanceError(
             "parallel round timestamps do not prove concurrent execution"
         )
     return {
-        "rounds": [result.round for result in results],
+        "rounds": [result.round for result in moving],
         "job_ids": job_ids,
         "hostnames": hostnames,
         "overlap_proven": True,
-        "strategies": [result.strategy for result in results],
+        "strategies": [result.strategy for result in moving],
     }
 
 

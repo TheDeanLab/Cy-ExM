@@ -41,7 +41,9 @@
 - Every Task 5 runner receives the complete workflow-task union. Dispatch the
   `ReferenceTask` through ordinary reference preparation before applying injected
   failure or cancellation behavior only to moving `RoundTask` values; never bypass
-  or reinterpret the hard reference barrier in acceptance-only code.
+  or reinterpret the hard reference barrier in acceptance-only code. Workflow-result
+  evidence includes that reference result; placement comparisons must select the two
+  moving strategies rather than assume they are the only returned results.
 - Own every job created by the harness. Close the Dask client before its cluster on
   success or failure, and query only the current user plus exact name after cleanup;
   never pass recorded job IDs to squeue. Sort and deduplicate the recorded IDs,

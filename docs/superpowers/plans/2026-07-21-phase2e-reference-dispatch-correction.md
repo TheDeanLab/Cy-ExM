@@ -92,6 +92,13 @@ uv run pytest tests/unit/test_hpc_workflow_acceptance.py \
 
 Expected: all targeted tests pass without scheduler access.
 
+- [x] **Step 5: Accept reference-inclusive placement evidence**
+
+After the first corrected real-SLURM run completed all three parallel scientific
+tasks, add a red/green regression requiring one completed `reference-preparation`
+result plus the two completed moving strategies. Compute overlap and unique
+job/hostname evidence only from the moving rounds.
+
 ---
 
 ### Task 3: Verify, integrate, and rerun exact-main acceptance

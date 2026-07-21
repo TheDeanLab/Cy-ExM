@@ -28,6 +28,7 @@ from cyexm.config import (
     load_dataset_manifest,
     load_execution_profile,
 )
+from cyexm.execution.slurm import validate_slurm_job_script
 from cyexm.io.atomic import atomic_write
 from cyexm.workflow.models import ChannelTask, RoundResult, RoundTask
 
@@ -422,9 +423,10 @@ def collect_queue_snapshot(
     _run: Callable[..., Any] = subprocess.run,
 ) -> dict[str, object]:
     """Read only the current user's exact harness name and recorded job IDs."""
-    owned_ids = tuple(dict.fromkeys(job_ids))
-    if any(type(job_id) is not str or not job_id for job_id in owned_ids):
-        raise HpcAcceptanceError(f"owned SLURM job IDs are invalid: {owned_ids!r}")
+    raw_job_ids = tuple(job_ids)
+    if any(type(job_id) is not str or not job_id for job_id in raw_job_ids):
+        raise HpcAcceptanceError(f"owned SLURM job IDs are invalid: {raw_job_ids!r}")
+    owned_ids = tuple(sorted(set(raw_job_ids)))
     arguments = [
         "squeue",
         "--noheader",
@@ -433,8 +435,6 @@ def collect_queue_snapshot(
         "--name",
         job_name,
     ]
-    if owned_ids:
-        arguments.extend(("--jobs", ",".join(owned_ids)))
     arguments.append("--format=%i|%j|%T|%N")
     command = _run_read_only(
         arguments,
@@ -494,7 +494,10 @@ def wait_for_queue_empty(
     started = _monotonic()
     deadline = started + timeout_seconds
     attempts: list[dict[str, object]] = []
-    owned_ids = tuple(dict.fromkeys(job_ids))
+    raw_job_ids = tuple(job_ids)
+    if any(type(job_id) is not str or not job_id for job_id in raw_job_ids):
+        raise HpcAcceptanceError(f"owned SLURM job IDs are invalid: {raw_job_ids!r}")
+    owned_ids = tuple(sorted(set(raw_job_ids)))
     query = {
         "job_name": job_name,
         "user": user,
@@ -583,68 +586,13 @@ def partition_is_exclusive(
 
 
 def validate_rendered_job_script(script: str, profile: ExecutionProfile) -> None:
-    """Fail closed unless dask-jobqueue rendered the approved one-job contract."""
-    spec = profile.slurm
-    if profile.executor != "slurm" or spec is None:
-        raise HpcAcceptanceError("rendered job script requires a SLURM profile")
-    if spec.processes_per_worker != 1:
-        raise HpcAcceptanceError("rendered job script requires one worker process")
-    if type(script) is not str or not script.strip():
-        raise HpcAcceptanceError("rendered job script must be nonempty")
-    exact_lines = {
-        f"#SBATCH -J {spec.job_name}",
-        f"#SBATCH -p {spec.queue}",
-        "#SBATCH -n 1",
-        f"#SBATCH --cpus-per-task={spec.cores_per_worker}",
-        f"#SBATCH --mem={spec.memory}",
-        f"#SBATCH -t {spec.walltime}",
-        *(f"#SBATCH {directive}" for directive in spec.job_extra_directives),
-    }
-    observed_lines = [line.strip() for line in script.splitlines()]
-    missing_lines = sorted(
-        line for line in exact_lines if observed_lines.count(line) != 1
-    )
-    managed_headers = {
-        "#SBATCH -J ": f"#SBATCH -J {spec.job_name}",
-        "#SBATCH -p ": f"#SBATCH -p {spec.queue}",
-        "#SBATCH -n ": "#SBATCH -n 1",
-        "#SBATCH --cpus-per-task=": (
-            f"#SBATCH --cpus-per-task={spec.cores_per_worker}"
-        ),
-        "#SBATCH --mem=": f"#SBATCH --mem={spec.memory}",
-        "#SBATCH -t ": f"#SBATCH -t {spec.walltime}",
-    }
-    conflicting_headers = {
-        prefix: matching
-        for prefix, expected in managed_headers.items()
-        if (matching := [line for line in observed_lines if line.startswith(prefix)])
-        != [expected]
-    }
-    normalized = " ".join(script.replace("\\\n", " ").split())
-    required_fragments = (
-        " -m distributed.cli.dask_worker ",
-        f"--nthreads {spec.cores_per_worker}",
-        f"--local-directory {profile.paths.worker_local_directory}",
-        "--resources round_slot=1",
-        f"--interface {spec.interface}",
-        "--memory-limit ",
-    )
-    missing_fragments = [
-        fragment for fragment in required_fragments if fragment not in normalized
-    ]
-    if (
-        missing_lines
-        or conflicting_headers
-        or missing_fragments
-        or "--nworkers" in normalized
-    ):
+    """Expose the production pre-scale template check as acceptance policy."""
+    try:
+        validate_slurm_job_script(script, profile)
+    except (TypeError, ValueError) as error:
         raise HpcAcceptanceError(
-            "rendered job script does not prove the exact approved SLURM/Dask "
-            f"contract; missing lines={missing_lines!r}, missing command facts="
-            f"{missing_fragments!r}, conflicting headers={conflicting_headers!r}, "
-            "unexpected_nworkers="
-            f"{'--nworkers' in normalized}"
-        )
+            f"rendered job script validation failed: {error}"
+        ) from error
 
 
 def validate_scheduler_interface(

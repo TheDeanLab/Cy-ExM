@@ -347,7 +347,7 @@ class _FakeSlurmModules:
         self.order: tuple[int, ...] = ()
         self.interrupt_after: int | None = None
         self.pending_rounds: set[int] = set()
-        self.connected_workers = (
+        self.connected_workers: tuple[str, ...] = (
             "tcp://node-a:1234",
             "tcp://node-b:1234",
             "tcp://node-c:1234",
@@ -356,6 +356,8 @@ class _FakeSlurmModules:
         self.probe_results: Mapping[str, Mapping[str, object]] | None = None
         self.scheduler_address = "tcp://scheduler:8786"
         self.job_script_text = "#!/bin/bash\n#SBATCH --partition=512GB\n"
+        self.rendered_header_injections: tuple[str, ...] = ()
+        self.rendered_worker_injections: tuple[str, ...] = ()
         self.disappear_after_probe = False
         self.cluster_error: BaseException | None = None
         self.job_script_error: BaseException | None = None
@@ -407,14 +409,28 @@ class _FakeSlurmModules:
         worker_command = str(
             kwargs.get("worker_command", "distributed.cli.dask_worker")
         )
+        worker_extra_args = " ".join(
+            cast(list[str], kwargs.get("worker_extra_args", []))
+        )
+        rendered_headers = "\n".join(self.rendered_header_injections)
+        rendered_worker = " ".join(self.rendered_worker_injections)
         self.job_script_text = (
             f"{kwargs.get('shebang', '#!/bin/bash')}\n"
+            f"#SBATCH -J {kwargs['job_name']}\n"
             f"#SBATCH -p {kwargs['queue']}\n"
+            "#SBATCH -n 1\n"
             f"#SBATCH --cpus-per-task={kwargs['job_cpu']}\n"
             f"#SBATCH --mem={kwargs['job_mem']}\n"
             f"#SBATCH -t {kwargs['walltime']}\n"
             f"{directives}\n"
-            f"{prologue}\n{python} -m {worker_command} tcp://scheduler:8786\n"
+            f"{rendered_headers}\n"
+            f"{prologue}\n{python} -m {worker_command} tcp://scheduler:8786 "
+            f"--name fake --nthreads {kwargs['cores']} "
+            f"--memory-limit {kwargs['memory']} --nanny "
+            f"--death-timeout {kwargs['death_timeout']} "
+            f"--local-directory {kwargs['local_directory']} "
+            f"--resources {worker_extra_args.removeprefix('--resources ')} "
+            f"--interface {kwargs['interface']} {rendered_worker}\n"
         )
         return _FakeCluster(self)
 
@@ -617,6 +633,79 @@ def test_slurm_executor_supplies_isolated_jobqueue_launch_configuration(
     ):
         assert managed in rendered
     assert ("#SBATCH --qos=lab" in rendered) is bool(directives)
+
+
+@pytest.mark.parametrize(
+    "directive",
+    (
+        "--nodes=2",
+        "-N2",
+        "--ntasks-per-node=2",
+        "--mem-per-gpu=20GB",
+        "--job-name=unauthorized",
+        "-Junauthorized",
+        "--chdir=/tmp",
+        "-D/tmp",
+        "--resources=round_slot=2",
+        "--nthreads=1",
+    ),
+)
+def test_slurm_executor_revalidates_direct_profile_before_loading_scheduler(
+    tmp_path: Path,
+    directive: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    executor = SlurmExecutor(
+        _profile(tmp_path, directives=(directive,)),
+        _modules=lambda: modules,
+        _version=lambda _name: "test-version",
+    )
+
+    with pytest.raises(ExecutorStartupError, match="execution profile"):
+        executor.execute((_task(tmp_path, 2),))
+
+    assert modules.cluster_kwargs is None
+    assert modules.scale_calls == []
+    assert modules.submit_calls == []
+
+
+@pytest.mark.parametrize(
+    ("header", "worker"),
+    (
+        ("#SBATCH --nodes=2", ""),
+        ("#SBATCH -N2", ""),
+        ("#SBATCH --ntasks-per-node=2", ""),
+        ("#SBATCH --mem-per-gpu=20GB", ""),
+        ("#SBATCH --partition=unauthorized", ""),
+        ("#SBATCH -punauthorized", ""),
+        ("#SBATCH --job-name=unauthorized", ""),
+        ("#SBATCH -Junauthorized", ""),
+        ("#SBATCH --output=/tmp/job.out", ""),
+        ("#SBATCH --chdir=/tmp", ""),
+        ("", "--resources round_slot=2"),
+        ("", "--nthreads 1"),
+        ("", "--nworkers 2"),
+        ("", "--memory-limit 1GB"),
+        ("", "--interface eth0"),
+        ("", "--local-directory /tmp"),
+    ),
+)
+def test_slurm_executor_rejects_rendered_resource_collision_before_scale(
+    tmp_path: Path,
+    header: str,
+    worker: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:1]
+    modules.rendered_header_injections = (header,) if header else ()
+    modules.rendered_worker_injections = (worker,) if worker else ()
+
+    with pytest.raises(ExecutorStartupError, match="rendered SLURM job script"):
+        _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+
+    assert modules.scale_calls == []
+    assert modules.submit_calls == []
+    assert modules.events == ["cluster.close"]
 
 
 def test_slurm_executor_bounds_jobs_by_configured_workers(tmp_path: Path) -> None:

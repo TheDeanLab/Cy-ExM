@@ -31,11 +31,12 @@
   `round_slot` per job, and preserve exact job IDs, hostnames, partition facts,
   worker probes, and rendered job-script evidence.
 - Own every job created by the harness. Close the Dask client before its cluster on
-  success or failure, query the current user, exact name, and recorded job IDs after
-  cleanup, and fail if any owned job remains. Persist every bounded poll attempt and
-  its query error or timeout, plus executor evidence, before re-raising. Do not
-  cancel, inspect in depth, or otherwise mutate jobs outside the harness's recorded
-  ownership.
+  success or failure, and query only the current user plus exact name after cleanup;
+  never pass recorded job IDs to squeue. Sort and deduplicate the recorded IDs,
+  classify recorded job IDs locally, preserve unrelated same-name rows, and fail if
+  any owned job remains. Persist every bounded poll attempt and its query error or
+  timeout, plus executor evidence, before re-raising. Do not cancel, inspect in
+  depth, or otherwise mutate jobs outside the harness's recorded ownership.
 - Fail closed unless the rendered job script exactly records the approved partition,
   exclusivity, single task/process, cores, memory, worker and scheduler interfaces,
   job name, and `round_slot`. Verify the allocated job partition, scheduler address,

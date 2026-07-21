@@ -13,8 +13,13 @@ from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from typing import Any, cast
 
+from cyexm.config.execution import _validate_execution_profile
 from cyexm.config.models import ExecutionProfile, SlurmSpec
-from cyexm.errors import ExecutorStartupError, WorkerPreflightError
+from cyexm.errors import (
+    ConfigurationValidationError,
+    ExecutorStartupError,
+    WorkerPreflightError,
+)
 from cyexm.execution._dask_common import (
     collect_distributed_results,
     future_is_unfinished,
@@ -77,6 +82,7 @@ _STARTUP_PHASES = (
     "configuration",
     "cluster_construction",
     "template_rendering",
+    "template_validation",
     "scaling",
     "client_creation",
     "worker_wait",
@@ -772,6 +778,128 @@ def _jobqueue_config_overlay() -> dict[str, object]:
     return {f"jobqueue.{_CONFIG_NAME}.{name}": value for name, value in values.items()}
 
 
+def _rendered_script_error(detail: str) -> ValueError:
+    return ValueError(f"rendered SLURM job script is unsafe: {detail}")
+
+
+def _worker_option_values(
+    tokens: list[str],
+) -> tuple[dict[str, list[str]], list[str]]:
+    valued = {
+        "--name",
+        "--nthreads",
+        "--memory-limit",
+        "--death-timeout",
+        "--local-directory",
+        "--resources",
+        "--interface",
+    }
+    flags = {"--nanny"}
+    values = {name: [] for name in valued}
+    observed_flags: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in flags:
+            observed_flags.append(token)
+            index += 1
+            continue
+        option, separator, attached = token.partition("=")
+        if option not in valued:
+            raise _rendered_script_error(f"unexpected worker option {token!r}")
+        if separator:
+            if not attached:
+                raise _rendered_script_error(f"worker option {option!r} is empty")
+            values[option].append(attached)
+            index += 1
+            continue
+        if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+            raise _rendered_script_error(f"worker option {option!r} has no value")
+        values[option].append(tokens[index + 1])
+        index += 2
+    return values, observed_flags
+
+
+def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> None:
+    """Validate the fully rendered owned job template before any scale call."""
+    if type(script) is not str or not script.strip():
+        raise _rendered_script_error("template must be a nonempty built-in string")
+    spec = profile.slurm
+    scratch = profile.paths.worker_local_directory
+    if (
+        profile.executor != "slurm"
+        or not isinstance(spec, SlurmSpec)
+        or scratch is None
+    ):
+        raise _rendered_script_error("validation requires a complete SLURM profile")
+    lines = [line.strip() for line in script.splitlines() if line.strip()]
+    if not lines or lines[0] != _SHEBANG:
+        raise _rendered_script_error(f"expected shebang {_SHEBANG!r}")
+    expected_headers = [
+        f"#SBATCH -J {spec.job_name}",
+        f"#SBATCH -p {spec.queue}",
+        "#SBATCH -n 1",
+        f"#SBATCH --cpus-per-task={spec.cores_per_worker}",
+        f"#SBATCH --mem={spec.memory}",
+        f"#SBATCH -t {spec.walltime}",
+        *(f"#SBATCH {directive}" for directive in spec.job_extra_directives),
+    ]
+    observed_headers = [line for line in lines if line.startswith("#SBATCH")]
+    if observed_headers != expected_headers:
+        raise _rendered_script_error(
+            f"headers must be exactly {expected_headers!r}; got {observed_headers!r}"
+        )
+
+    normalized = script.replace("\\\n", " ")
+    worker_lines = [
+        line.strip()
+        for line in normalized.splitlines()
+        if " -m distributed.cli.dask_worker " in f" {line.strip()} "
+    ]
+    if len(worker_lines) != 1:
+        raise _rendered_script_error(
+            f"expected exactly one Dask worker command; got {len(worker_lines)}"
+        )
+    try:
+        command = shlex.split(worker_lines[0])
+    except ValueError as error:
+        raise _rendered_script_error(
+            f"worker command cannot be parsed: {error}"
+        ) from error
+    module_indexes = [
+        index
+        for index, token in enumerate(command[:-1])
+        if token == "-m" and command[index + 1] == _WORKER_COMMAND
+    ]
+    if len(module_indexes) != 1:
+        raise _rendered_script_error("worker command must launch the managed module")
+    module_index = module_indexes[0]
+    if module_index + 2 >= len(command):
+        raise _rendered_script_error("worker command has no scheduler address")
+    worker_arguments = command[module_index + 3 :]
+    values, flags = _worker_option_values(worker_arguments)
+    expected_values: dict[str, list[str] | None] = {
+        "--name": None,
+        "--nthreads": [str(spec.cores_per_worker)],
+        "--memory-limit": None,
+        "--death-timeout": [str(_DEATH_TIMEOUT_SECONDS)],
+        "--local-directory": [str(scratch)],
+        "--resources": ["round_slot=1"],
+        "--interface": [spec.interface],
+    }
+    for option, expected in expected_values.items():
+        observed = values[option]
+        if len(observed) != 1 or (expected is not None and observed != expected):
+            raise _rendered_script_error(
+                f"worker option {option!r} must occur once with {expected!r}; "
+                f"got {observed!r}"
+            )
+    if flags != ["--nanny"]:
+        raise _rendered_script_error(
+            f"worker flags must be exactly ['--nanny']; got {flags!r}"
+        )
+
+
 def _scheduler_snapshot(
     client: Any,
     *,
@@ -880,6 +1008,12 @@ class SlurmExecutor:
             raise ExecutorStartupError(
                 "SlurmExecutor requires a worker_local_directory"
             )
+        try:
+            _validate_execution_profile(self.profile)
+        except ConfigurationValidationError as error:
+            raise ExecutorStartupError(
+                f"SlurmExecutor execution profile is invalid: {error}"
+            ) from error
         return self.profile.slurm
 
     def _coordinator_versions(self) -> dict[str, str]:
@@ -1061,6 +1195,8 @@ class SlurmExecutor:
                         "string"
                     )
                 rendered["rendered_job_script_template"] = script
+                startup["phase"] = "template_validation"
+                validate_slurm_job_script(script, self.profile)
                 startup["phase"] = "scaling"
                 startup["scale_attempted"] = True
                 try:
@@ -1205,4 +1341,4 @@ class SlurmExecutor:
             cast(dict[str, str], evidence["timestamps"])["ended_at"] = utc_now()
 
 
-__all__ = ["SlurmExecutor"]
+__all__ = ["SlurmExecutor", "validate_slurm_job_script"]

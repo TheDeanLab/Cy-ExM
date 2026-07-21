@@ -588,6 +588,111 @@ def test_slurm_extra_directives_reject_managed_options(
         _load_profile(tmp_path, data)
 
 
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "--nodes=2",
+        "--node=2",
+        "-N 2",
+        "-N2",
+        "--ntasks-per-node=2",
+        "--ntasks-per-core=2",
+        "--ntasks-per-gpu=2",
+        "--ntasks-per-socket=2",
+        "--cpus-per-gpu=2",
+        "--mem-per-gpu=20GB",
+        "--gpus=2",
+        "--gpus-per-node=2",
+        "--gpus-per-socket=2",
+        "--gpus-per-task=2",
+        "--gres=gpu:2",
+        "--tres-bind=gres/gpu:single:1",
+        "--tres-per-task=gres/gpu:1",
+        "-G 2",
+        "-G2",
+        "--sockets-per-node=2",
+        "--cores-per-socket=2",
+        "--threads-per-core=2",
+        "--extra-node-info=2:18:2",
+        "-B2:18:2",
+        "--distribution=block:block",
+        "-mblock:block",
+        "--hint=nomultithread",
+        "--mincpus=72",
+        "--tmp=20GB",
+        "--threads=2",
+        "--gpu-bind=closest",
+        "--gpu-freq=high",
+        "--cpu-bind=cores",
+        "--core-spec=2",
+        "--specialized-cores=2",
+        "--specialized-threads=2",
+        "--gres-flags=enforce-binding",
+        "--job-name=unauthorized",
+        "-J unauthorized",
+        "-Junauthorized",
+        "--chdir=/tmp",
+        "-D /tmp",
+        "-D/tmp",
+        "--time=00:01:00",
+        "-t 00:01:00",
+        "-t00:01:00",
+        "--exclusive=user",
+        "--overcommit",
+        "-O",
+        "--oversubscribe",
+        "-s",
+        "--resources=round_slot=2",
+        "--nthreads=1",
+        "--nworkers=2",
+        "--memory-limit=1GB",
+        "--interface=eth0",
+        "--local-directory=/tmp",
+        "--worker-extra-args=--nthreads=1",
+        "--worker-command=unauthorized.worker",
+    ],
+)
+def test_slurm_extra_directives_reject_all_resource_shaping_aliases(
+    tmp_path: Path,
+    directive: str,
+) -> None:
+    data = _valid_data("slurm")
+    _mapping_at(data, "slurm")["job_extra_directives"] = [directive]
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match="conflicts with managed SLURM option",
+    ):
+        _load_profile(tmp_path, data)
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "--exclusive",
+        "--account=lab",
+        "-Alab",
+        "--qos=normal",
+        "--constraint=ib",
+        "-Cib",
+        "--mail-type=FAIL",
+        "--mail-user=operator@example.org",
+        "--reservation=approved",
+    ],
+)
+def test_slurm_extra_directives_preserve_safe_site_policy(
+    tmp_path: Path,
+    directive: str,
+) -> None:
+    data = _valid_data("slurm")
+    _mapping_at(data, "slurm")["job_extra_directives"] = [directive]
+
+    profile = _load_profile(tmp_path, data)
+
+    assert profile.slurm is not None
+    assert profile.slurm.job_extra_directives == (directive,)
+
+
 def test_slurm_extra_directives_reject_managed_option_later_in_directive(
     tmp_path: Path,
 ) -> None:

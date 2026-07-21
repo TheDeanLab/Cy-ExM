@@ -84,6 +84,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "must not import ants, numpy, scipy, dask, distributed, or dask-jobqueue",
         "must not mutate the filesystem or environment",
         "initialize a scheduler",
+        "resource-shaping slurm aliases",
     ),
     "src/cyexm/execution/AGENTS.md": (
         "phase 2d implements sequential, bounded local-dask, and slurm execution",
@@ -106,6 +107,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "success, failure, and cancellation",
         "operational evidence",
         "never authorizes artifact reuse",
+        "before the first scale call",
         "real slurm submission and hpc acceptance remain unaccepted until phase 2e",
     ),
     "src/cyexm/workflow/AGENTS.md": (
@@ -564,6 +566,8 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             "clearex",
             "canonically disjoint",
             "recorded job ids",
+            "classify recorded job ids locally",
+            "never pass recorded job ids to squeue",
             "query error or timeout",
             "device and mount",
             "rendered job script",

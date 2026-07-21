@@ -63,18 +63,66 @@ _BLAS_THREAD_ENV_VARS = (
 )
 
 _MANAGED_SLURM_OPTIONS = (
+    "--nodes",
+    "-N",
     "--partition",
     "-p",
     "--mem",
     "--mem-per-cpu",
+    "--mem-per-gpu",
     "--cpus-per-task",
     "-c",
+    "--cpus-per-gpu",
     "--ntasks",
     "-n",
+    "--ntasks-per-node",
+    "--ntasks-per-core",
+    "--ntasks-per-gpu",
+    "--ntasks-per-socket",
+    "--gpus",
+    "--gpus-per-node",
+    "--gpus-per-socket",
+    "--gpus-per-task",
+    "--gres",
+    "--tres-bind",
+    "--tres-per-task",
+    "-G",
+    "--sockets-per-node",
+    "--cores-per-socket",
+    "--threads-per-core",
+    "--extra-node-info",
+    "-B",
+    "--distribution",
+    "-m",
+    "--hint",
+    "--mincpus",
+    "--tmp",
+    "--threads",
+    "--gpu-bind",
+    "--gpu-freq",
+    "--job-name",
+    "-J",
     "--output",
     "-o",
     "--error",
     "-e",
+    "--chdir",
+    "-D",
+    "--time",
+    "-t",
+    "--exclusive",
+    "--overcommit",
+    "-O",
+    "--oversubscribe",
+    "-s",
+    "--resources",
+    "--nthreads",
+    "--nworkers",
+    "--memory-limit",
+    "--interface",
+    "--local-directory",
+    "--worker-extra-args",
+    "--worker-command",
 )
 _MANAGED_SLURM_LONG_OPTIONS = frozenset(
     option for option in _MANAGED_SLURM_OPTIONS if option.startswith("--")
@@ -82,6 +130,22 @@ _MANAGED_SLURM_LONG_OPTIONS = frozenset(
 _MANAGED_SLURM_SHORT_OPTIONS = frozenset(
     option for option in _MANAGED_SLURM_OPTIONS if not option.startswith("--")
 )
+_MANAGED_SLURM_RESOURCE_PREFIXES = (
+    "--node",
+    "--ntask",
+    "--cpu",
+    "--gpu",
+    "--mem",
+    "--tres",
+    "--gres",
+    "--socket",
+    "--core",
+    "--thread",
+    "--specialized",
+    "--resource",
+    "--worker-",
+)
+_ALLOWED_SLURM_RESOURCE_NEIGHBORS = frozenset({"--mem-bind"})
 _SLURM_SHORT_OPTIONS_WITH_ARGUMENTS = frozenset(
     {
         "-a",
@@ -304,13 +368,21 @@ def _managed_slurm_option(directive: str, yaml_path: str) -> str | None:
 
 
 def _managed_slurm_long_option(token: str) -> str | None:
+    if token == "--exclusive":
+        return None
     option = token.partition("=")[0]
+    if option in _ALLOWED_SLURM_RESOURCE_NEIGHBORS:
+        return None
     if option in _MANAGED_SLURM_LONG_OPTIONS:
         return option
     matches = tuple(
         managed for managed in _MANAGED_SLURM_LONG_OPTIONS if managed.startswith(option)
     )
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0]
+    if option.startswith(_MANAGED_SLURM_RESOURCE_PREFIXES):
+        return option
+    return None
 
 
 def _managed_slurm_short_option(token: str) -> str | None:

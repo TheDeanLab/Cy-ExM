@@ -412,7 +412,7 @@ def test_queue_snapshot_is_scoped_to_user_name_and_owned_job_ids() -> None:
         )
 
     snapshot = collect_queue_snapshot(
-        "cyexm-smoke", user="dean", job_ids=("913", "914"), _run=run
+        "cyexm-smoke", user="dean", job_ids=("914", "913", "914"), _run=run
     )
 
     assert calls == [
@@ -423,8 +423,6 @@ def test_queue_snapshot_is_scoped_to_user_name_and_owned_job_ids() -> None:
             "dean",
             "--name",
             "cyexm-smoke",
-            "--jobs",
-            "913,914",
             "--format=%i|%j|%T|%N",
         )
     ]
@@ -476,6 +474,75 @@ def test_cleanup_wait_is_bounded_and_records_the_empty_observation() -> None:
     assert observed["elapsed_seconds"] == 1.0
 
 
+def test_cleanup_wait_treats_a_departed_owned_id_as_empty() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def run(arguments: list[str], **_kwargs: Any) -> _Completed:
+        calls.append(tuple(arguments))
+        return _Completed("")
+
+    observed = wait_for_queue_empty(
+        "cyexm-smoke",
+        user="dean",
+        job_ids=("913",),
+        _run=run,
+        _monotonic=lambda: 10.0,
+    )
+
+    assert calls == [
+        (
+            "squeue",
+            "--noheader",
+            "--user",
+            "dean",
+            "--name",
+            "cyexm-smoke",
+            "--format=%i|%j|%T|%N",
+        )
+    ]
+    assert observed["outcome"] == "empty"
+    assert observed["jobs"] == []
+    assert observed["query"] == {
+        "job_name": "cyexm-smoke",
+        "user": "dean",
+        "job_ids": ["913"],
+    }
+
+
+def test_cleanup_wait_preserves_unrelated_same_name_job_without_blocking() -> None:
+    outputs = iter(
+        (
+            "913|cyexm-smoke|COMPLETING|node-a\n999|cyexm-smoke|RUNNING|node-z\n",
+            "999|cyexm-smoke|RUNNING|node-z\n",
+        )
+    )
+    clock = iter((10.0, 10.0, 10.5))
+
+    observed = wait_for_queue_empty(
+        "cyexm-smoke",
+        user="dean",
+        job_ids=("913",),
+        timeout_seconds=5.0,
+        poll_seconds=0.0,
+        _run=lambda _arguments, **_kwargs: _Completed(next(outputs)),
+        _monotonic=lambda: next(clock),
+        _sleep=lambda _seconds: None,
+    )
+
+    attempts = cast(list[dict[str, object]], observed["attempts"])
+    final_snapshot = cast(dict[str, object], attempts[-1]["snapshot"])
+    assert observed["outcome"] == "empty"
+    assert observed["jobs"] == []
+    assert final_snapshot["unrelated_jobs"] == [
+        {
+            "job_id": "999",
+            "job_name": "cyexm-smoke",
+            "state": "RUNNING",
+            "nodes": "node-z",
+        }
+    ]
+
+
 def test_cleanup_wait_returns_durable_squeue_error_evidence(tmp_path: Path) -> None:
     def run(_arguments: list[str], **_kwargs: Any) -> _Completed:
         raise OSError("controller unavailable")
@@ -504,7 +571,7 @@ def test_cleanup_wait_returns_durable_squeue_error_evidence(tmp_path: Path) -> N
                 "type": "HpcAcceptanceError",
                 "message": (
                     "read-only command failed to start: ['squeue', '--noheader', "
-                    "'--user', 'dean', '--name', 'cyexm-smoke', '--jobs', '913', "
+                    "'--user', 'dean', '--name', 'cyexm-smoke', "
                     """'--format=%i|%j|%T|%N']: OSError: controller unavailable"""
                 ),
             },
@@ -523,7 +590,7 @@ def test_cleanup_wait_returns_durable_timeout_evidence(tmp_path: Path) -> None:
         timeout_seconds=1.0,
         poll_seconds=1.0,
         _run=lambda _arguments, **_kwargs: _Completed(
-            "913|cyexm-smoke|COMPLETING|node-a\n"
+            "913|cyexm-smoke|COMPLETING|node-a\n999|cyexm-smoke|RUNNING|node-z\n"
         ),
         _monotonic=lambda: next(clock),
         _sleep=lambda _seconds: None,
@@ -541,6 +608,15 @@ def test_cleanup_wait_returns_durable_timeout_evidence(tmp_path: Path) -> None:
     ]
     attempts = cast(list[dict[str, object]], observed["attempts"])
     assert attempts[-1]["outcome"] == "jobs_remain"
+    timeout_snapshot = cast(dict[str, object], attempts[-1]["snapshot"])
+    assert timeout_snapshot["unrelated_jobs"] == [
+        {
+            "job_id": "999",
+            "job_name": "cyexm-smoke",
+            "state": "RUNNING",
+            "nodes": "node-z",
+        }
+    ]
     assert json.loads((tmp_path / "queue-after.json").read_text()) == observed
 
 

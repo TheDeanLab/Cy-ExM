@@ -12,6 +12,9 @@
   consumes one.
 - SLURM scales to `min(pending rounds, configured workers)` with one worker process
   and one advertised `round_slot` per job; every submitted round requests that slot.
+  Revalidate directly constructed SLURM profiles before scheduler module loading,
+  and validate the production-rendered header and worker command before the first
+  scale call. Reject unexpected or duplicate resource and worker options.
   Require that all connected workers pass preflight before any registration task is
   submitted. Construction, worker probes, and job-script templates are portable
   evidence only, not proof that a scheduler accepted or ran a job.

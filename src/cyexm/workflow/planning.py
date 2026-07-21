@@ -372,18 +372,6 @@ def _inspect_headers(
             continue
         headers[path] = header
 
-    reference_path = paths[0]
-    reference_header = headers.get(reference_path)
-    if reference_header is not None:
-        for path in paths[1:]:
-            header = headers.get(path)
-            if header is not None and header.shape_zyx != reference_header.shape_zyx:
-                labels = ", ".join(yaml_paths_by_resolved[path])
-                errors.append(
-                    f"{labels}: {path}: shape {header.shape_zyx!r} must match "
-                    f"reference shape {reference_header.shape_zyx!r} at "
-                    f"{reference_path}"
-                )
     if errors:
         details = "\n".join(f"- {message}" for message in errors)
         raise WorkflowPlanError(f"Workflow TIFF header validation failed:\n{details}")

@@ -690,7 +690,35 @@ def test_plan_rejects_channel_aliases_to_registration_final_artifacts(
     assert str(registration / registration_filename) in message
 
 
-def test_plan_aggregates_header_failures_and_shape_incompatibility(
+def test_plan_accepts_and_records_independent_source_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+
+    shapes = {
+        "round_1_488.tif": (4, 8, 8),
+        "round_2_488.tif": (5, 9, 7),
+        "round_2_mask.tif": (6, 10, 9),
+    }
+
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path, shape_zyx=shapes[path.name]),
+    )
+
+    plan = build_workflow_plan(manifest, execution)
+    scientific = json.loads(plan.scientific_json)
+
+    assert {
+        Path(source["path"]).name: tuple(source["shape_zyx"])
+        for source in scientific["sources"]
+    } == shapes
+
+
+def test_plan_aggregates_malformed_scalar_header_failures(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -699,8 +727,6 @@ def test_plan_aggregates_header_failures_and_shape_incompatibility(
     _create_manifest_inputs(execution.paths.dataset_root, manifest)
 
     def inspect_header(path: Path) -> ImageHeader:
-        if path.name == "round_2_488.tif":
-            return _header(path, shape_zyx=(4, 8, 9))
         if path.name == "round_2_mask.tif":
             return _header(path, axes="ZCYX")
         return _header(path)
@@ -711,8 +737,6 @@ def test_plan_aggregates_header_failures_and_shape_incompatibility(
         build_workflow_plan(manifest, execution)
 
     message = str(captured.value)
-    assert "round_2_488.tif" in message
-    assert "shape" in message
     assert "round_2_mask.tif" in message
     assert "scalar three-dimensional" in message
 

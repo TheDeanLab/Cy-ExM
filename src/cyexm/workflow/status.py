@@ -680,16 +680,6 @@ def _parse_scientific_snapshot(
         raise WorkflowPlanError(
             f"scientific plan declares unused sources: {unused_sources!r}"
         )
-    incompatible_shapes = tuple(
-        (source.path, source.shape_zyx)
-        for source in sources
-        if source.shape_zyx != fixed_source.shape_zyx
-    )
-    if incompatible_shapes:
-        raise WorkflowPlanError(
-            "scientific plan source shape must match the reference shape "
-            f"{fixed_source.shape_zyx!r}; got {incompatible_shapes!r}"
-        )
     artifact_paths = tuple(
         expectation.path.resolve(strict=False)
         for round_contract in rounds

@@ -832,20 +832,48 @@ def test_status_rejects_unused_declared_sources(tmp_path: Path) -> None:
         inspect_workflow_status(output_root, "dataset-1")
 
 
-def test_status_rejects_source_shape_incompatible_with_reference(
+def test_status_accepts_independently_valid_source_shapes(
     tmp_path: Path,
 ) -> None:
     output_root = tmp_path / "output"
     scientific = _scientific_mapping(output_root)
+    fixed_path = str((output_root.parent / "dataset" / "fixed.tif").resolve())
     moving_path = str((output_root.parent / "dataset" / "round_2_488.tif").resolve())
     sources = cast(list[dict[str, object]], scientific["sources"])
+    fixed = next(source for source in sources if source["path"] == fixed_path)
     moving = next(source for source in sources if source["path"] == moving_path)
-    moving["shape_zyx"] = [5, 8, 8]
+    fixed["shape_zyx"] = [4, 8, 7]
+    moving["shape_zyx"] = [5, 9, 8]
     plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
     plan_path.parent.mkdir(parents=True)
     plan_path.write_text(canonical_json(scientific), encoding="utf-8")
 
-    with pytest.raises(WorkflowPlanError, match=r"shape.*reference"):
+    status = inspect_workflow_status(output_root, "dataset-1")
+
+    assert status.rounds[0].status == "pending"
+
+
+@pytest.mark.parametrize(
+    "invalid_shape",
+    [
+        pytest.param([0, 8, 8], id="zero-dimension"),
+        pytest.param([True, 8, 8], id="boolean-dimension"),
+        pytest.param([4, 8], id="not-three-dimensional"),
+    ],
+)
+def test_status_rejects_malformed_source_shapes(
+    tmp_path: Path,
+    invalid_shape: list[object],
+) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    sources = cast(list[dict[str, object]], scientific["sources"])
+    sources[0]["shape_zyx"] = invalid_shape
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match="shape_zyx"):
         inspect_workflow_status(output_root, "dataset-1")
 
 

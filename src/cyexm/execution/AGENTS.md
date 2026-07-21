@@ -10,6 +10,10 @@
   `min(pending rounds, configured workers)`. Schedule one coarse task per round. Each
   worker advertises one `round_slot`, and every submitted round task requests and
   consumes one.
+- Every executor runs the reference-preparation task as a hard prerequisite in the
+  same owned worker pool. Moving-round futures may be submitted only after the
+  reference result is successful; a failed reference result ends the execution
+  without submitting descendants.
 - SLURM scales to `min(pending rounds, configured workers)` with one worker process
   and one advertised `round_slot` per job; every submitted round requests that slot.
   Round semantic profile memory upward to whole binary GiB, pass the `G` spelling to

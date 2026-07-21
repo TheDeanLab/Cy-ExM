@@ -18,9 +18,9 @@ from cyexm.execution._dask_common import (
     future_is_unfinished,
     validate_distributed_tasks,
 )
-from cyexm.execution.base import RoundTaskRunner
-from cyexm.workflow.models import RoundResult, RoundTask
-from cyexm.workflow.round_task import run_round_task
+from cyexm.execution.base import WorkflowTaskRunner
+from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask
+from cyexm.workflow.task import run_workflow_task
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ class LocalDaskExecutor:
         self,
         profile: ExecutionProfile,
         *,
-        _runner: RoundTaskRunner = run_round_task,
+        _runner: WorkflowTaskRunner = run_workflow_task,
         _modules: Callable[[], Any] = _distributed_modules,
     ) -> None:
         self.profile = profile
@@ -97,13 +97,16 @@ class LocalDaskExecutor:
             )
         return self.profile.local_dask
 
-    def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
-        if not tasks:
-            return ()
-
+    def execute(
+        self,
+        reference_task: ReferenceTask,
+        round_tasks: tuple[RoundTask, ...],
+    ) -> tuple[RoundResult, ...]:
         spec = self._spec()
-        validate_distributed_tasks(tasks, executor_name="LocalDaskExecutor")
-        worker_count = min(len(tasks), spec.workers)
+        validate_distributed_tasks(
+            (reference_task, *round_tasks), executor_name="LocalDaskExecutor"
+        )
+        worker_count = min(max(1, len(round_tasks)), spec.workers)
         cluster: Any | None = None
         client: Any | None = None
         configuration: AbstractContextManager[Any] | None = None
@@ -139,15 +142,27 @@ class LocalDaskExecutor:
 
             execution_client = client
             assert execution_client is not None
-            results, _attempts = collect_distributed_results(
-                tasks,
+            reference_results, _attempts = collect_distributed_results(
+                (reference_task,),
                 runner=self._runner,
                 client=execution_client,
                 as_completed=modules.as_completed,
                 task_retries=spec.task_retries,
                 active=active,
             )
-            return results
+            if reference_results[0].status not in {"completed", "reused"}:
+                return reference_results
+            if not round_tasks:
+                return reference_results
+            moving_results, _attempts = collect_distributed_results(
+                round_tasks,
+                runner=self._runner,
+                client=execution_client,
+                as_completed=modules.as_completed,
+                task_retries=spec.task_retries,
+                active=active,
+            )
+            return (*reference_results, *moving_results)
         except KeyboardInterrupt:
             if client is not None and active:
                 unfinished = tuple(

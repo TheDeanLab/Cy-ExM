@@ -22,3 +22,6 @@
 - Reference preparation tests must prove one shared crop is applied identically to
   every declared channel, exact-grid mismatches fail before writes, independently
   valid commits survive later failures, and restart/force behavior is evidence-based.
+- Executor tests must make the reference barrier observable: reference submission
+  precedes moving submissions, failure prevents descendant submission, and one owned
+  client/cluster lifecycle spans both stages.

@@ -13,8 +13,16 @@ from cyexm.config.models import (
     RegistrationSpec,
     RegistrationStageSpec,
 )
-from cyexm.execution import RoundTaskRunner, SequentialExecutor, WorkflowExecutor
-from cyexm.workflow.models import ChannelTask, RoundResult, RoundTask
+from cyexm.execution import SequentialExecutor, WorkflowExecutor, WorkflowTaskRunner
+from cyexm.workflow.models import (
+    ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
+    RoundResult,
+    RoundTask,
+    WorkflowTask,
+)
+from cyexm.workflow.task import run_workflow_task
 
 pytestmark = pytest.mark.unit
 
@@ -34,15 +42,16 @@ def test_execution_namespace_imports_in_a_fresh_process() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
-def test_round_task_runner_alias_resolves_at_runtime() -> None:
-    assert "Callable" in str(RoundTaskRunner.__value__)
+def test_workflow_task_runner_alias_resolves_at_runtime() -> None:
+    assert "Callable" in str(WorkflowTaskRunner.__value__)
 
 
 def test_executor_annotations_resolve_at_runtime() -> None:
     protocol_hints = get_type_hints(WorkflowExecutor.execute)
     sequential_hints = get_type_hints(SequentialExecutor.execute)
 
-    assert protocol_hints["tasks"] == tuple[RoundTask, ...]
+    assert protocol_hints["reference_task"] is ReferenceTask
+    assert protocol_hints["round_tasks"] == tuple[RoundTask, ...]
     assert protocol_hints["return"] == tuple[RoundResult, ...]
     assert sequential_hints == protocol_hints
 
@@ -76,7 +85,25 @@ def _task(tmp_path: Path, round_number: int) -> RoundTask:
     )
 
 
-def _successful_result(task: RoundTask) -> RoundResult:
+def _reference_task(tmp_path: Path) -> ReferenceTask:
+    source = tmp_path / "fixed-source.tif"
+    output = tmp_path / "round-001/channels/fixed.tif"
+    return ReferenceTask(
+        dataset_id="dataset-1",
+        round=1,
+        registration_channel_source=source,
+        registration_channel_output=output,
+        registration_directory=tmp_path / "round-001/registration",
+        crop_bounds_path=None,
+        log_path=tmp_path / "round-001/logs/round-001.log",
+        voxel_spacing_xyz=(1.0, 1.0, 1.0),
+        crop=False,
+        native_threads=NativeThreadSpec(itk=2, blas=3),
+        channels=(ReferenceChannelTask(source, output),),
+    )
+
+
+def _successful_result(task: WorkflowTask) -> RoundResult:
     return RoundResult(
         dataset_id=task.dataset_id,
         round=task.round,
@@ -88,7 +115,9 @@ def _successful_result(task: RoundTask) -> RoundResult:
         pid=123,
         dask_task_key=None,
         slurm_job_id=None,
-        strategy=task.strategy,
+        strategy=(
+            "reference-preparation" if type(task) is ReferenceTask else task.strategy
+        ),
         native_threads=(("itk", 2), ("blas", 3)),
         artifact_paths=tuple(str(channel.output) for channel in task.channels),
         reused_artifacts=(),
@@ -100,30 +129,35 @@ def _successful_result(task: RoundTask) -> RoundResult:
 def test_sequential_executor_runs_every_task_in_order(tmp_path: Path) -> None:
     calls: list[int] = []
 
-    def runner(task: RoundTask) -> RoundResult:
+    def runner(task: WorkflowTask) -> RoundResult:
         calls.append(task.round)
         return _successful_result(task)
 
     tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
-    results = SequentialExecutor(runner=runner).execute(tasks)
+    results = SequentialExecutor(runner=runner).execute(
+        _reference_task(tmp_path), tasks
+    )
 
-    assert calls == [2, 3]
-    assert tuple(result.round for result in results) == (2, 3)
+    assert calls == [1, 2, 3]
+    assert tuple(result.round for result in results) == (1, 2, 3)
 
 
 def test_sequential_executor_records_failure_and_continues(tmp_path: Path) -> None:
     calls: list[int] = []
 
-    def runner(task: RoundTask) -> RoundResult:
+    def runner(task: WorkflowTask) -> RoundResult:
         calls.append(task.round)
         if task.round == 2:
             raise RuntimeError("injected round failure")
         return _successful_result(task)
 
     tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
-    failed, completed = SequentialExecutor(runner=runner).execute(tasks)
+    reference, failed, completed = SequentialExecutor(runner=runner).execute(
+        _reference_task(tmp_path), tasks
+    )
 
-    assert calls == [2, 3]
+    assert calls == [1, 2, 3]
+    assert reference.status == "completed"
     assert failed.status == "failed"
     assert failed.round == 2
     assert failed.failure is not None
@@ -138,16 +172,16 @@ def test_sequential_executor_records_failure_and_continues(tmp_path: Path) -> No
 def test_sequential_executor_propagates_keyboard_interrupt(tmp_path: Path) -> None:
     calls: list[int] = []
 
-    def runner(task: RoundTask) -> RoundResult:
+    def runner(task: WorkflowTask) -> RoundResult:
         calls.append(task.round)
         raise KeyboardInterrupt
 
     with pytest.raises(KeyboardInterrupt):
         SequentialExecutor(runner=runner).execute(
-            (_task(tmp_path, 2), _task(tmp_path, 3))
+            _reference_task(tmp_path), (_task(tmp_path, 2), _task(tmp_path, 3))
         )
 
-    assert calls == [2]
+    assert calls == [1]
 
 
 def test_sequential_executor_attaches_results_completed_before_interrupt(
@@ -155,15 +189,15 @@ def test_sequential_executor_attaches_results_completed_before_interrupt(
 ) -> None:
     tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
 
-    def runner(task: RoundTask) -> RoundResult:
+    def runner(task: WorkflowTask) -> RoundResult:
         if task.round == 3:
             raise KeyboardInterrupt("injected")
         return _successful_result(task)
 
     with pytest.raises(KeyboardInterrupt) as captured:
-        SequentialExecutor(runner=runner).execute(tasks)
+        SequentialExecutor(runner=runner).execute(_reference_task(tmp_path), tasks)
 
-    assert tuple(result.round for result in captured.value.completed_results) == (2,)  # type: ignore[attr-defined]
+    assert tuple(result.round for result in captured.value.completed_results) == (1, 2)  # type: ignore[attr-defined]
     assert captured.value.original.args == ("injected",)  # type: ignore[attr-defined]
 
 
@@ -171,8 +205,33 @@ def test_sequential_executor_does_not_mutate_tasks(tmp_path: Path) -> None:
     original = _task(tmp_path, 2)
     forced = replace(original, force=True)
 
-    result = SequentialExecutor(runner=_successful_result).execute((forced,))
+    result = SequentialExecutor(runner=_successful_result).execute(
+        _reference_task(tmp_path), (forced,)
+    )
 
     assert original.force is False
     assert forced.force is True
-    assert result[0].round == forced.round
+    assert result[1].round == forced.round
+
+
+def test_sequential_executor_stops_after_failed_reference(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    def runner(task: WorkflowTask) -> RoundResult:
+        calls.append(task.round)
+        result = _successful_result(task)
+        if type(task) is ReferenceTask:
+            return replace(result, status="failed")
+        return result
+
+    results = SequentialExecutor(runner=runner).execute(
+        _reference_task(tmp_path), (_task(tmp_path, 2), _task(tmp_path, 3))
+    )
+
+    assert calls == [1]
+    assert tuple(result.round for result in results) == (1,)
+
+
+def test_workflow_dispatcher_rejects_task_subclasses() -> None:
+    with pytest.raises(TypeError, match="exact ReferenceTask or RoundTask"):
+        run_workflow_task(object())  # type: ignore[arg-type]

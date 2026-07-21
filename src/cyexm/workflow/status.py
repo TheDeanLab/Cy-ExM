@@ -23,6 +23,7 @@ from cyexm.registration._request_policy import (
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, spacing_compatible
+from cyexm.workflow._reference_provenance import reference_completion_evidence
 from cyexm.workflow._round_provenance import (
     ArtifactSnapshot,
     RegistrationArtifactPaths,
@@ -33,9 +34,12 @@ from cyexm.workflow._round_provenance import (
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
     RoundStatus,
     RoundTask,
     WorkflowStatus,
+    WorkflowTask,
     canonical_json,
     sha256_fingerprint,
 )
@@ -1060,11 +1064,86 @@ def _round_status(
     )
 
 
+def _reference_status(
+    snapshot: _ScientificSnapshot,
+    *,
+    layout: WorkflowLayout,
+    task: ReferenceTask | None = None,
+) -> RoundStatus:
+    if task is None:
+        task = ReferenceTask(
+            dataset_id=snapshot.dataset_id,
+            round=snapshot.reference_round,
+            registration_channel_source=snapshot.fixed_source.path,
+            registration_channel_output=snapshot.fixed_output,
+            registration_directory=layout.round(snapshot.reference_round).registration,
+            crop_bounds_path=snapshot.reference_crop_output,
+            log_path=layout.round(snapshot.reference_round).log,
+            voxel_spacing_xyz=snapshot.voxel_spacing_xyz,
+            crop=snapshot.registration.crop,
+            native_threads=NativeThreadSpec(itk=1, blas=1),
+            channels=tuple(
+                ReferenceChannelTask(channel.source.path, channel.output)
+                for channel in snapshot.reference_channels
+            ),
+        )
+
+    def snapshot_reader(path: Path) -> ArtifactSnapshot | None:
+        return _safe_completion_snapshot(path, layout=layout)
+
+    def geometry_reader(
+        path: Path, _spacing: tuple[float, float, float]
+    ) -> ImageGeometry:
+        return _read_uint16_tiff_geometry_without_runtime(path)
+
+    expected = (
+        *(() if task.crop_bounds_path is None else (task.crop_bounds_path,)),
+        *(channel.output for channel in task.channels),
+    )
+    authoritative = reference_completion_evidence(
+        task,
+        tuple(channel.source.geometry for channel in snapshot.reference_channels),
+        snapshot_reader=snapshot_reader,
+        geometry_reader=geometry_reader,
+    )
+    accepted = frozenset(authoritative.artifacts)
+    complete: list[str] = []
+    incomplete: list[str] = []
+    invalid: list[str] = []
+    for path in expected:
+        artifact_state = _filesystem_entry_state(path)
+        record_state = _filesystem_entry_state(
+            path.with_name(f"{path.name}.complete.json")
+        )
+        if artifact_state == "missing" and record_state == "missing":
+            incomplete.append(str(path))
+        elif path in accepted:
+            complete.append(str(path))
+        else:
+            invalid.append(str(path))
+    status: Literal["pending", "partial", "complete", "invalid"]
+    if invalid:
+        status = "invalid"
+    elif len(complete) == len(expected):
+        status = "complete"
+    elif complete:
+        status = "partial"
+    else:
+        status = "pending"
+    return RoundStatus(
+        round=task.round,
+        status=status,
+        complete_artifacts=tuple(complete),
+        incomplete_artifacts=tuple(incomplete),
+        invalid_artifacts=tuple(invalid),
+    )
+
+
 def _inspect_workflow_status(
     output_root: str | Path,
     dataset_id: str,
     *,
-    _tasks: tuple[RoundTask, ...] | None = None,
+    _tasks: tuple[WorkflowTask, ...] | None = None,
 ) -> WorkflowStatus:
     """Inspect authoritative completion provenance without changing workflow state."""
     layout = _safe_workflow_layout(output_root, dataset_id)
@@ -1074,10 +1153,13 @@ def _inspect_workflow_status(
     snapshot = _read_scientific_snapshot(layout.plan_path, dataset_id)
     if snapshot is None:
         return WorkflowStatus(dataset_id, None, (), False)
-    tasks_by_round: dict[int, RoundTask] = {}
+    tasks_by_round: dict[int, WorkflowTask] = {}
     if _tasks is not None:
         tasks_by_round = {task.round: task for task in _tasks}
-        expected_rounds = tuple(item.round for item in snapshot.rounds)
+        expected_rounds = (
+            snapshot.reference_round,
+            *(item.round for item in snapshot.rounds),
+        )
         if len(tasks_by_round) != len(_tasks) or set(tasks_by_round) != set(
             expected_rounds
         ):
@@ -1086,14 +1168,31 @@ def _inspect_workflow_status(
                 "Status task rounds must match the persisted scientific plan; "
                 f"expected={expected_rounds!r}, got={actual_rounds!r}"
             )
-    rounds = tuple(
-        _round_status(
-            snapshot,
-            round_contract,
-            layout=layout,
-            task=tasks_by_round.get(round_contract.round),
+    reference_task = tasks_by_round.get(snapshot.reference_round)
+    if reference_task is not None and type(reference_task) is not ReferenceTask:
+        raise WorkflowPlanError("Status reference task must be an exact ReferenceTask")
+    accepted_reference_task = (
+        reference_task if isinstance(reference_task, ReferenceTask) else None
+    )
+    moving_statuses: list[RoundStatus] = []
+    for round_contract in snapshot.rounds:
+        candidate = tasks_by_round.get(round_contract.round)
+        moving_task = candidate if isinstance(candidate, RoundTask) else None
+        moving_statuses.append(
+            _round_status(
+                snapshot,
+                round_contract,
+                layout=layout,
+                task=moving_task,
+            )
         )
-        for round_contract in snapshot.rounds
+    rounds = (
+        _reference_status(
+            snapshot,
+            layout=layout,
+            task=accepted_reference_task,
+        ),
+        *moving_statuses,
     )
     return WorkflowStatus(
         dataset_id=dataset_id,

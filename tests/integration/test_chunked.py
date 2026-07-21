@@ -14,6 +14,7 @@ from cyexm.registration.backend import AntsRegistrationBackend
 from cyexm.registration.chunked import ChunkedImageRegistration, compute_chunk_grid
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
 from cyexm.runtime import NativeThreadConfig
+from cyexm.spatial import geometry_compatible
 
 pytestmark = pytest.mark.integration
 
@@ -218,4 +219,97 @@ def test_one_chunk_and_whole_apply_the_same_real_estimated_transform_pair(
         whole_output,
         rtol=1e-4,
         atol=1e-5,
+    )
+
+
+def test_unequal_native_shapes_are_affine_resampled_before_chunking(
+    tmp_path: Path,
+    native_threads: NativeThreadConfig,
+) -> None:
+    import numpy as np
+    import tifffile
+
+    fixed_shape = (12, 16, 18)
+    moving_shape = (10, 14, 15)
+    fixed_path = tmp_path / "fixed.tif"
+    moving_path = tmp_path / "moving.tif"
+
+    def centered_blob(shape: tuple[int, int, int]) -> object:
+        coordinates = np.indices(shape, dtype=np.float32)
+        center = np.asarray([(size - 1) / 2.0 for size in shape], dtype=np.float32)
+        squared_distance = sum(
+            (coordinates[axis] - center[axis]) ** 2 for axis in range(3)
+        )
+        return np.exp(-squared_distance / 12.0).astype(np.float32) * 50_000.0
+
+    tifffile.imwrite(
+        fixed_path,
+        centered_blob(fixed_shape),
+        metadata={"axes": "ZYX"},
+        photometric="minisblack",
+    )
+    tifffile.imwrite(
+        moving_path,
+        centered_blob(moving_shape),
+        metadata={"axes": "ZYX"},
+        photometric="minisblack",
+    )
+
+    class RecordingIdentityNonlinearBackend(AntsRegistrationBackend):
+        def __init__(self) -> None:
+            super().__init__(native_threads)
+            self.nonlinear_geometries: list[tuple[object, object]] = []
+
+        def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
+            fixed = kwargs["fixed_image"]
+            moving = kwargs["moving_image"]
+            self.nonlinear_geometries.append(
+                (self.geometry(fixed), self.geometry(moving))
+            )
+            with tempfile.NamedTemporaryFile(
+                dir=tmp_path,
+                prefix=".identity-local-warp-",
+                suffix=".nii.gz",
+                delete=False,
+            ) as temporary:
+                candidate = Path(temporary.name)
+            self.write_identity_warp(fixed, candidate)
+            return moving, candidate
+
+    backend = RecordingIdentityNonlinearBackend()
+    output = tmp_path / "chunked-unequal"
+    registration = ChunkedImageRegistration(
+        fixed_path,
+        moving_path,
+        output,
+        imaging_round=2,
+        pixel_size=_PIXEL_SIZE,
+        enable_logging=False,
+        chunk_size=fixed_shape,
+        overlap_fraction=0.25,
+        native_threads=native_threads,
+        linear_accuracy="dry run",
+        nonlinear_accuracy="dry run",
+        _backend=backend,
+    )
+
+    registration.register()
+
+    fixed_geometry = backend.geometry(backend.load_image(fixed_path, _PIXEL_SIZE))
+    assert backend.geometry(backend.load_image(moving_path, _PIXEL_SIZE)).shape == (
+        moving_shape
+    )
+    assert backend.nonlinear_geometries
+    assert all(
+        fixed_chunk_geometry == moving_chunk_geometry
+        for fixed_chunk_geometry, moving_chunk_geometry in backend.nonlinear_geometries
+    )
+    paths = RegistrationPaths.for_round(output, 2)
+    assert backend.geometry(backend.load_image(paths.registered, _PIXEL_SIZE)) == (
+        fixed_geometry
+    )
+    # NIfTI serializes spacing as float32; the scientific geometry contract uses
+    # the repository's explicit serialization tolerance for this representation.
+    assert geometry_compatible(
+        backend.geometry(backend.read_warp(paths.warp)), fixed_geometry
     )

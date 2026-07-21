@@ -16,6 +16,10 @@
   chunk geometry exactly. Numerical registration comparisons use only the documented
   `rtol=1e-4`, `atol=1e-5` migration tolerance; explain any different tolerance next
   to its assertion.
+- Changes to affine, nonlinear, chunking, or dependent-channel grid behavior require
+  a real-library regression whose native fixed and moving shapes differ along Z, Y,
+  and X. Assert exact fixed-reference geometry immediately after affine resampling
+  and for every persisted scalar, mask, warp, and transformed-channel output.
 - Failure injection may replace only the expensive stage boundary under test. Keep
   artifact persistence, reconstruction, and the remaining ANTs operations real, and
   prove restart from the committed upstream record.

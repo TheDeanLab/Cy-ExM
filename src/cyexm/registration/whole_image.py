@@ -726,6 +726,12 @@ class ImageRegistration:
                         "cached affine reconstruction failed "
                         f"for round {self.imaging_round}"
                     ) from error
+                self._validate_affine_result_geometry(
+                    backend,
+                    fixed,
+                    moving_linear,
+                    moving_linear_mask,
+                )
                 return transform, moving_linear, moving_linear_mask
 
         try:
@@ -747,6 +753,12 @@ class ImageRegistration:
                         interpolation="nearestNeighbor",
                     )
                 )
+            self._validate_affine_result_geometry(
+                backend,
+                fixed,
+                moving_linear,
+                moving_linear_mask,
+            )
 
             def validator(path: Path) -> bool:
                 try:
@@ -776,6 +788,24 @@ class ImageRegistration:
                 f"affine registration failed for round {self.imaging_round}"
             ) from error
         return transform, moving_linear, moving_linear_mask
+
+    def _validate_affine_result_geometry(
+        self,
+        backend: RegistrationBackend,
+        fixed: object,
+        moving_linear: object,
+        moving_linear_mask: object,
+    ) -> None:
+        fixed_geometry = backend.geometry(fixed)
+        for role, image in (
+            ("scalar", moving_linear),
+            ("mask", moving_linear_mask),
+        ):
+            if not geometry_compatible(backend.geometry(image), fixed_geometry):
+                raise RegistrationStageError(
+                    f"affine result geometry for {role} does not match the fixed "
+                    f"reference for round {self.imaging_round}"
+                )
 
     def _load_or_estimate_nonlinear(
         self,

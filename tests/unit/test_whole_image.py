@@ -923,6 +923,49 @@ def test_cached_affine_reconstruction_failure_is_contextualized(
     assert store.record_path(paths.affine).read_bytes() == record_before
 
 
+def test_estimated_affine_result_geometry_must_match_fixed_reference(
+    tmp_path: Path,
+) -> None:
+    class WrongEstimatedGeometryBackend(FakeBackend):
+        def linear(self, **kwargs: object) -> tuple[object, object | None, object]:
+            scalar, mask, transform = super().linear(**kwargs)
+            assert isinstance(scalar, FakeImage)
+            assert isinstance(mask, FakeImage)
+            scalar.origin = (10.0, 20.0, 30.0)
+            mask.origin = scalar.origin
+            return scalar, mask, transform
+
+    backend = WrongEstimatedGeometryBackend()
+
+    with pytest.raises(RegistrationStageError, match="affine result geometry"):
+        make_registration(tmp_path, backend=backend).register()
+
+    paths = round_paths(tmp_path)
+    assert backend.nonlinear_calls == 0
+    assert not paths.warp.exists()
+    assert not paths.registered.exists()
+
+
+def test_cached_affine_result_geometry_must_match_fixed_reference(
+    tmp_path: Path,
+) -> None:
+    make_registration(tmp_path, backend=FakeBackend()).register()
+
+    class WrongCachedGeometryBackend(FakeBackend):
+        def apply_affine(self, **kwargs: object) -> object:
+            result = super().apply_affine(**kwargs)  # type: ignore[arg-type]
+            assert isinstance(result, FakeImage)
+            result.origin = (10.0, 20.0, 30.0)
+            return result
+
+    backend = WrongCachedGeometryBackend()
+
+    with pytest.raises(RegistrationStageError, match="affine result geometry"):
+        make_registration(tmp_path, backend=backend).register()
+
+    assert backend.nonlinear_calls == 0
+
+
 def test_crop_application_failure_is_contextualized_after_bounds_commit(
     tmp_path: Path,
 ) -> None:

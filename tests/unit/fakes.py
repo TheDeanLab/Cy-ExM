@@ -386,13 +386,20 @@ class FakeBackend:
         if self.fail_linear:
             raise RuntimeError("injected linear failure")
         moving = kwargs["moving_image"]
+        fixed = kwargs["fixed_image"]
         moving_mask = kwargs.get("moving_mask")
-        if not isinstance(moving, FakeImage):
-            raise TypeError("moving_image must be a FakeImage")
+        if not isinstance(moving, FakeImage) or not isinstance(fixed, FakeImage):
+            raise TypeError("fixed_image and moving_image must be FakeImages")
         transformed_mask = (
-            None if moving_mask is None else moving_mask.clone()  # type: ignore[union-attr]
+            None
+            if moving_mask is None
+            else self._resample_to_reference(moving_mask, fixed)  # type: ignore[arg-type]
         )
-        return moving.clone(), transformed_mask, self.affine_bytes
+        return (
+            self._resample_to_reference(moving, fixed),
+            transformed_mask,
+            self.affine_bytes,
+        )
 
     def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
         self.events.append("nonlinear")
@@ -427,14 +434,28 @@ class FakeBackend:
         transform: object,
         interpolation: str,
     ) -> object:
-        del fixed, transform
-        if not isinstance(moving, FakeImage):
-            raise TypeError("moving must be a FakeImage")
+        del transform
+        if not isinstance(fixed, FakeImage) or not isinstance(moving, FakeImage):
+            raise TypeError("fixed and moving must be FakeImages")
         self.events.append(f"apply-affine:{interpolation}")
         self.affine_interpolations.append(interpolation)
         if self.fail_affine_interpolation == interpolation:
             raise RuntimeError(f"injected {interpolation} affine application failure")
-        return moving.clone()
+        return self._resample_to_reference(moving, fixed)
+
+    @staticmethod
+    def _resample_to_reference(moving: FakeImage, fixed: FakeImage) -> FakeImage:
+        data = np.zeros(fixed.shape, dtype=moving.data.dtype)
+        overlap = tuple(
+            slice(0, min(moving.shape[axis], fixed.shape[axis])) for axis in range(3)
+        )
+        data[overlap] = moving.data[overlap]
+        return fake_image(
+            data=data,
+            origin=fixed.origin,
+            spacing=fixed.spacing,
+            direction=fixed.direction,
+        )
 
     def apply_warp(
         self,

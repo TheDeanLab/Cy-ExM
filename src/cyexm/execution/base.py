@@ -6,7 +6,6 @@ from typing import Protocol
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask, WorkflowTask
 
 type WorkflowTaskRunner = Callable[[WorkflowTask], RoundResult]
-type RoundTaskRunner = Callable[[RoundTask], RoundResult]
 
 
 class WorkflowExecutor(Protocol):
@@ -20,4 +19,4 @@ class WorkflowExecutor(Protocol):
         raise NotImplementedError
 
 
-__all__ = ["RoundTaskRunner", "WorkflowExecutor", "WorkflowTaskRunner"]
+__all__ = ["WorkflowExecutor", "WorkflowTaskRunner"]

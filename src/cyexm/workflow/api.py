@@ -743,7 +743,7 @@ def _write_run_record(
 def _executor_execution_evidence_json(
     profile: ExecutionProfile,
     executor: object | None,
-    expected_tasks: tuple[RoundTask, ...],
+    expected_tasks: tuple[WorkflowTask, ...],
 ) -> str:
     if profile.executor != "slurm" or executor is None:
         return "{}"
@@ -867,7 +867,7 @@ def run_workflow(
         execution_evidence_json = _executor_execution_evidence_json(
             plan.execution,
             executor,
-            submitted,
+            (reference_task, *submitted),
         )
         rounds = tuple(sorted((*reused, *executed), key=lambda result: result.round))
         preserved_results = rounds
@@ -909,7 +909,7 @@ def run_workflow(
                 execution_evidence_json = _executor_execution_evidence_json(
                     plan.execution,
                     executor,
-                    submitted,
+                    (reference_task, *submitted),
                 )
             except _ExecutorEvidenceError as contract_error:
                 evidence_error = contract_error
@@ -963,7 +963,7 @@ def run_workflow(
             execution_evidence_json = _executor_execution_evidence_json(
                 plan.execution,
                 executor,
-                submitted,
+                (reference_task, *submitted),
             )
         except BaseException as evidence_access_error:
             evidence_error = (

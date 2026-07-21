@@ -27,7 +27,15 @@ from cyexm.execution import slurm as slurm_module
 from cyexm.execution.preflight import WorkerProbe
 from cyexm.execution.slurm import SlurmExecutor
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.workflow.models import ChannelTask, RoundFailure, RoundResult, RoundTask
+from cyexm.workflow.models import (
+    ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
+    RoundFailure,
+    RoundResult,
+    RoundTask,
+    WorkflowTask,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -116,6 +124,25 @@ def _task(
     )
 
 
+def _reference_task(tmp_path: Path) -> ReferenceTask:
+    round_root = tmp_path / "round-001"
+    source = tmp_path / "reference-source.tif"
+    output = round_root / "channels" / "reference.tif"
+    return ReferenceTask(
+        dataset_id="dataset-1",
+        round=1,
+        registration_channel_source=source,
+        registration_channel_output=output,
+        registration_directory=round_root / "registration",
+        crop_bounds_path=None,
+        log_path=round_root / "logs" / "round-001.log",
+        voxel_spacing_xyz=(1.0, 1.0, 1.0),
+        crop=False,
+        native_threads=NativeThreadSpec(itk=2, blas=3),
+        channels=(ReferenceChannelTask(source=source, output=output),),
+    )
+
+
 def _result(task: RoundTask, *, status: str = "completed") -> RoundResult:
     failure = (
         RoundFailure("round", "RuntimeError", "injected failed result")
@@ -147,6 +174,36 @@ def _result(task: RoundTask, *, status: str = "completed") -> RoundResult:
     )
 
 
+def _reference_result(task: ReferenceTask, *, status: str = "completed") -> RoundResult:
+    failure = (
+        RoundFailure("reference", "RuntimeError", "injected failed result")
+        if status == "failed"
+        else None
+    )
+    return RoundResult(
+        dataset_id=task.dataset_id,
+        round=task.round,
+        status=cast(Any, status),
+        started_at="2026-07-20T10:00:00Z",
+        ended_at="2026-07-20T10:00:01Z",
+        duration_seconds=1.0,
+        hostname="worker-01",
+        pid=123,
+        dask_task_key=None,
+        slurm_job_id="12345",
+        strategy="reference-preparation",
+        native_threads=(("itk", 2), ("blas", 3)),
+        artifact_paths=(str(task.registration_channel_output),),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=failure,
+    )
+
+
+def _workflow_result(task: WorkflowTask) -> RoundResult:
+    return _reference_result(task) if isinstance(task, ReferenceTask) else _result(task)
+
+
 def _probe(address: str, *, ok: bool = True) -> dict[str, object]:
     errors = () if ok else ("injected preflight failure",)
     return WorkerProbe(
@@ -173,8 +230,8 @@ def _probe(address: str, *, ok: bool = True) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class _SubmitCall:
-    runner: Callable[[RoundTask], RoundResult]
-    task: RoundTask
+    runner: Callable[[WorkflowTask], RoundResult]
+    task: WorkflowTask
     key: str
     pure: bool
     retries: int
@@ -184,7 +241,7 @@ class _SubmitCall:
 class _FakeFuture:
     def __init__(
         self,
-        task: RoundTask,
+        task: WorkflowTask,
         key: str,
         outcome: object,
         *,
@@ -294,8 +351,8 @@ class _FakeClient:
 
     def submit(
         self,
-        runner: Callable[[RoundTask], RoundResult],
-        task: RoundTask,
+        runner: Callable[[WorkflowTask], RoundResult],
+        task: WorkflowTask,
         *,
         key: str,
         pure: bool,
@@ -313,7 +370,7 @@ class _FakeClient:
             _SubmitCall(runner, task, key, pure, retries, resources)
         )
         configured = self._modules.outcomes.setdefault(task.round, [])
-        outcome = configured.pop(0) if configured else _result(task)
+        outcome = configured.pop(0) if configured else _workflow_result(task)
         return _FakeFuture(
             task,
             key,
@@ -512,7 +569,7 @@ def test_slurm_executor_builds_one_process_jobs_with_round_resource(
     modules.connected_workers = modules.connected_workers[:3]
     tasks = tuple(_task(tmp_path, number) for number in (2, 3, 4))
 
-    _executor(tmp_path, modules).execute(tasks)
+    _executor(tmp_path, modules).execute(_reference_task(tmp_path), tasks)
 
     assert modules.cluster_kwargs == {
         "config_name": "cyexm-slurm",
@@ -567,7 +624,7 @@ def test_slurm_executor_exports_resolved_threads_before_worker_launch(
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
 
-    executor.execute((_task(tmp_path, 2),))
+    executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert modules.cluster_kwargs is not None
     prologue = cast(list[str], modules.cluster_kwargs["job_script_prologue"])
@@ -615,7 +672,7 @@ def test_slurm_executor_supplies_isolated_jobqueue_launch_configuration(
         _version=lambda _name: "test-version",
     )
 
-    executor.execute((_task(tmp_path, 2),))
+    executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert len(modules.config_overlays) == 1
     overlay = modules.config_overlays[0]
@@ -679,7 +736,7 @@ def test_slurm_executor_revalidates_direct_profile_before_loading_scheduler(
     )
 
     with pytest.raises(ExecutorStartupError, match="execution profile"):
-        executor.execute((_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert modules.cluster_kwargs is None
     assert modules.scale_calls == []
@@ -718,7 +775,9 @@ def test_slurm_executor_rejects_rendered_resource_collision_before_scale(
     modules.rendered_worker_injections = (worker,) if worker else ()
 
     with pytest.raises(ExecutorStartupError, match="rendered SLURM job script"):
-        _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+        _executor(tmp_path, modules).execute(
+            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        )
 
     assert modules.scale_calls == []
     assert modules.submit_calls == []
@@ -735,7 +794,9 @@ def test_slurm_executor_rejects_inexact_rendered_worker_memory_before_scale(
     modules.rendered_worker_memory = worker_memory
 
     with pytest.raises(ExecutorStartupError, match="worker memory limit"):
-        _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+        _executor(tmp_path, modules).execute(
+            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        )
 
     assert modules.scale_calls == []
     assert modules.submit_calls == []
@@ -747,13 +808,13 @@ def test_slurm_executor_bounds_jobs_by_configured_workers(tmp_path: Path) -> Non
     tasks = tuple(_task(tmp_path, number) for number in (2, 3, 4))
     modules.connected_workers = modules.connected_workers[:2]
 
-    _executor(tmp_path, modules, workers=2).execute(tasks)
+    _executor(tmp_path, modules, workers=2).execute(_reference_task(tmp_path), tasks)
 
     assert modules.scale_calls == [{"jobs": 2}]
     assert modules.wait_for_workers_calls == [(2, 900.0)]
 
 
-def test_slurm_executor_returns_empty_without_loading_scheduler_modules(
+def test_slurm_executor_runs_reference_when_no_moving_rounds_are_pending(
     tmp_path: Path,
 ) -> None:
     loaded = False
@@ -761,23 +822,22 @@ def test_slurm_executor_returns_empty_without_loading_scheduler_modules(
     def modules() -> _FakeSlurmModules:
         nonlocal loaded
         loaded = True
-        return _FakeSlurmModules()
+        value = _FakeSlurmModules()
+        value.connected_workers = value.connected_workers[:1]
+        return value
 
     executor = SlurmExecutor(_profile(tmp_path), _modules=modules)
 
-    assert executor.execute(()) == ()
-    assert loaded is False
+    results = executor.execute(_reference_task(tmp_path), ())
+
+    assert tuple(result.round for result in results) == (1,)
+    assert loaded is True
     evidence = executor.execution_evidence
-    assert evidence["requested"] == {"workers": 0}
-    assert evidence["rendered"] == {}
-    assert evidence["observed"] == {}
-    assert evidence["startup"] == {
-        "phase": "not_started",
-        "outcome": "not_started",
-        "scale_attempted": False,
-        "scale_succeeded": None,
-    }
-    assert evidence["attempt_counts"] == []
+    assert cast(dict[str, object], evidence["requested"])["workers"] == 1
+    assert cast(dict[str, object], evidence["startup"])["outcome"] == "succeeded"
+    assert evidence["attempt_counts"] == [
+        {"dataset_id": "dataset-1", "round": 1, "attempts": 1}
+    ]
 
 
 def test_slurm_executor_captures_exact_script_versions_scheduler_and_probes(
@@ -787,7 +847,7 @@ def test_slurm_executor_captures_exact_script_versions_scheduler_and_probes(
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
 
-    executor.execute((_task(tmp_path, 2),))
+    executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     evidence = executor.execution_evidence
     assert evidence["executor"] == "slurm"
@@ -819,7 +879,8 @@ def test_slurm_executor_captures_exact_script_versions_scheduler_and_probes(
         == "tcp://node-a:1234"
     )
     assert evidence["attempt_counts"] == [
-        {"dataset_id": "dataset-1", "round": 2, "attempts": 1}
+        {"dataset_id": "dataset-1", "round": 1, "attempts": 1},
+        {"dataset_id": "dataset-1", "round": 2, "attempts": 1},
     ]
     timestamps = cast(dict[str, str], evidence["timestamps"])
     assert timestamps["started_at"].endswith("Z")
@@ -845,7 +906,7 @@ def test_slurm_execution_evidence_is_detached_canonical_json(
     modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
-    executor.execute((_task(tmp_path, 2),))
+    executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     first = cast(dict[str, object], executor.execution_evidence)
     encoded = json.dumps(first, allow_nan=False, sort_keys=True, separators=(",", ":"))
@@ -1027,12 +1088,12 @@ def test_slurm_evidence_schema_returns_a_detached_canonical_snapshot(
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
     task = _task(tmp_path, 2)
-    executor.execute((task,))
+    executor.execute(_reference_task(tmp_path), (task,))
     evidence = cast(dict[str, object], executor.execution_evidence)
 
     encoded = slurm_module._canonical_execution_evidence(
         evidence,
-        expected_tasks=(task,),
+        expected_tasks=(_reference_task(tmp_path), task),
         task_retries=0,
     )
 
@@ -1055,7 +1116,7 @@ def test_slurm_evidence_schema_preserves_truthful_failed_probe_mismatch(
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
     task = _task(tmp_path, 2)
-    executor.execute((task,))
+    executor.execute(_reference_task(tmp_path), (task,))
     evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
     startup = cast(dict[str, object], evidence["startup"])
     startup.update(
@@ -1108,7 +1169,7 @@ def test_slurm_evidence_schema_preserves_failed_probe_identity_diagnostics(
     executor = _executor(tmp_path, modules, workers=2)
 
     with pytest.raises(WorkerPreflightError, match="reported worker address"):
-        executor.execute(tasks)
+        executor.execute(_reference_task(tmp_path), tasks)
 
     evidence = cast(dict[str, object], executor.execution_evidence)
     observed = cast(dict[str, object], evidence["observed"])
@@ -1118,7 +1179,7 @@ def test_slurm_evidence_schema_preserves_failed_probe_identity_diagnostics(
 
     encoded = slurm_module._canonical_execution_evidence(
         evidence,
-        expected_tasks=tasks,
+        expected_tasks=(_reference_task(tmp_path), *tasks),
         task_retries=0,
     )
 
@@ -1191,7 +1252,7 @@ def test_slurm_evidence_schema_fails_closed_on_malformed_or_inconsistent_values(
     modules.connected_workers = modules.connected_workers[:1]
     executor = _executor(tmp_path, modules)
     task = _task(tmp_path, 2)
-    executor.execute((task,))
+    executor.execute(_reference_task(tmp_path), (task,))
     evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
     _invalid_execution_evidence(evidence, case)
 
@@ -1212,7 +1273,7 @@ def test_slurm_evidence_schema_requires_every_submitted_task_in_canonical_order(
     modules.connected_workers = modules.connected_workers[:1]
     tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
     executor = _executor(tmp_path, modules, workers=1)
-    executor.execute(tasks)
+    executor.execute(_reference_task(tmp_path), tasks)
     evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
     attempts = cast(list[dict[str, object]], evidence["attempt_counts"])
     if case == "missing":
@@ -1235,7 +1296,7 @@ def test_slurm_evidence_schema_accepts_canonical_submitted_subset_on_cancel(
     modules.connected_workers = modules.connected_workers[:1]
     tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
     executor = _executor(tmp_path, modules, workers=1)
-    executor.execute(tasks)
+    executor.execute(_reference_task(tmp_path), tasks)
     evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
     observed = cast(dict[str, object], evidence["observed"])
     observed["cancellation"] = {
@@ -1249,7 +1310,7 @@ def test_slurm_evidence_schema_accepts_canonical_submitted_subset_on_cancel(
 
     encoded = slurm_module._canonical_execution_evidence(
         evidence,
-        expected_tasks=tasks,
+        expected_tasks=(_reference_task(tmp_path), *tasks),
         task_retries=0,
     )
 
@@ -1275,7 +1336,7 @@ def test_slurm_evidence_schema_rejects_impossible_cancellation_cardinality(
     modules.connected_workers = modules.connected_workers[:1]
     task = _task(tmp_path, 2)
     executor = _executor(tmp_path, modules, workers=1)
-    executor.execute((task,))
+    executor.execute(_reference_task(tmp_path), (task,))
     evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
     observed = cast(dict[str, object], evidence["observed"])
     observed["cancellation"] = {
@@ -1313,7 +1374,9 @@ def test_slurm_executor_preflight_uses_exact_versions_threads_and_roots(
     modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:1]
 
-    _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+    _executor(tmp_path, modules).execute(
+        _reference_task(tmp_path), (_task(tmp_path, 2),)
+    )
 
     assert len(modules.run_calls) == 1
     function, kwargs = modules.run_calls[0]
@@ -1352,7 +1415,7 @@ def test_slurm_executor_preserves_coordinator_version_failure_as_startup_cause(
         ExecutorStartupError,
         match=r"coordinator package 'numpy'",
     ) as caught:
-        executor.execute((_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert modules.submit_calls == []
@@ -1372,7 +1435,9 @@ def test_slurm_executor_wraps_startup_failures_and_cleans_partial_ownership(
     setattr(modules, f"{failure_point}_error", RuntimeError(f"{failure_point} failed"))
 
     with pytest.raises(ExecutorStartupError) as captured:
-        _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+        _executor(tmp_path, modules).execute(
+            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        )
 
     assert isinstance(captured.value.__cause__, RuntimeError)
     expected = {
@@ -1411,7 +1476,7 @@ def test_slurm_executor_records_exact_failed_startup_phase_and_scale_outcome(
     executor = _executor(tmp_path, modules)
 
     with pytest.raises(ExecutorStartupError):
-        executor.execute((_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     startup = cast(dict[str, object], executor.execution_evidence["startup"])
     assert startup == {
@@ -1433,7 +1498,7 @@ def test_slurm_executor_does_not_count_a_task_rejected_during_submission(
     executor = _executor(tmp_path, modules)
 
     with pytest.raises(RuntimeError, match="scheduler rejected submission"):
-        executor.execute((_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert executor.execution_evidence["attempt_counts"] == []
 
@@ -1443,7 +1508,7 @@ def test_slurm_executor_does_not_count_a_task_rejected_during_submission(
     [
         (
             2,
-            [],
+            [{"dataset_id": "dataset-1", "round": 1, "attempts": 1}],
             {
                 "attempted": False,
                 "unfinished_futures": 0,
@@ -1452,7 +1517,10 @@ def test_slurm_executor_does_not_count_a_task_rejected_during_submission(
         ),
         (
             3,
-            [{"dataset_id": "dataset-1", "round": 2, "attempts": 1}],
+            [
+                {"dataset_id": "dataset-1", "round": 1, "attempts": 1},
+                {"dataset_id": "dataset-1", "round": 2, "attempts": 1},
+            ],
             {
                 "attempted": True,
                 "unfinished_futures": 1,
@@ -1479,7 +1547,7 @@ def test_slurm_executor_cancellation_counts_only_scheduler_accepted_tasks(
     executor = _executor(tmp_path, modules, workers=2)
 
     with pytest.raises(KeyboardInterrupt, match="submission interruption"):
-        executor.execute(tasks)
+        executor.execute(_reference_task(tmp_path), tasks)
 
     evidence = cast(dict[str, object], executor.execution_evidence)
     assert evidence["attempt_counts"] == expected_attempts
@@ -1487,7 +1555,7 @@ def test_slurm_executor_cancellation_counts_only_scheduler_accepted_tasks(
     assert observed["cancellation"] == expected_cancellation
     encoded = slurm_module._canonical_execution_evidence(
         evidence,
-        expected_tasks=tasks,
+        expected_tasks=(_reference_task(tmp_path), *tasks),
         task_retries=0,
     )
     assert json.loads(encoded) == evidence
@@ -1502,7 +1570,7 @@ def test_slurm_executor_records_preflight_interrupt_without_fake_cancellation(
     executor = _executor(tmp_path, modules)
 
     with pytest.raises(KeyboardInterrupt, match="preflight interruption"):
-        executor.execute((_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert executor.execution_evidence["startup"] == {
         "phase": "worker_probe",
@@ -1534,7 +1602,7 @@ def test_slurm_executor_aborts_before_submit_on_reported_probe_failure(
 
     executor = _executor(tmp_path, modules)
     with pytest.raises(WorkerPreflightError, match="injected preflight failure"):
-        executor.execute((_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert modules.submit_calls == []
     assert modules.events[-2:] == ["client.close", "cluster.close"]
@@ -1571,7 +1639,9 @@ def test_slurm_executor_requires_exact_requested_connected_and_probed_worker_set
     modules.probe_results = returned
 
     with pytest.raises(WorkerPreflightError, match=message):
-        _executor(tmp_path, modules, workers=1).execute((_task(tmp_path, 2),))
+        _executor(tmp_path, modules, workers=1).execute(
+            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        )
 
     assert modules.submit_calls == []
 
@@ -1585,7 +1655,7 @@ def test_slurm_executor_detects_worker_disappearance_after_probe(
 
     with pytest.raises(WorkerPreflightError, match="worker set changed"):
         _executor(tmp_path, modules, workers=2).execute(
-            (_task(tmp_path, 2), _task(tmp_path, 3))
+            _reference_task(tmp_path), (_task(tmp_path, 2), _task(tmp_path, 3))
         )
 
     assert modules.submit_calls == []
@@ -1600,7 +1670,9 @@ def test_slurm_executor_rejects_probe_identity_mismatch_for_scheduler_address(
     modules.probe_results = {address: _probe("tcp://different-node:1234")}
 
     with pytest.raises(WorkerPreflightError, match="reported worker address"):
-        _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+        _executor(tmp_path, modules).execute(
+            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        )
 
     assert modules.submit_calls == []
 
@@ -1613,7 +1685,7 @@ def test_slurm_executor_submits_zero_retry_one_slot_unique_keys_and_returns_orde
     modules.order = (3, 2)
 
     results = _executor(tmp_path, modules).execute(
-        (_task(tmp_path, 2), _task(tmp_path, 3))
+        _reference_task(tmp_path), (_task(tmp_path, 2), _task(tmp_path, 3))
     )
 
     assert modules.as_completed_call == (True, False)
@@ -1622,10 +1694,33 @@ def test_slurm_executor_submits_zero_retry_one_slot_unique_keys_and_returns_orde
         for call in modules.submit_calls
     ]
     assert submitted == [
+        ("cyexm-dataset-1-reference-round-001", False, 0, {"round_slot": 1}),
         ("cyexm-dataset-1-round-002", False, 0, {"round_slot": 1}),
         ("cyexm-dataset-1-round-003", False, 0, {"round_slot": 1}),
     ]
-    assert tuple(result.round for result in results) == (2, 3)
+    assert tuple(result.round for result in results) == (1, 2, 3)
+
+
+def test_slurm_executor_does_not_submit_moving_rounds_after_reference_failure(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.connected_workers = modules.connected_workers[:2]
+    reference = _reference_task(tmp_path)
+    modules.outcomes[1] = [_reference_result(reference, status="failed")]
+    executor = _executor(tmp_path, modules, workers=2)
+
+    results = executor.execute(
+        reference,
+        (_task(tmp_path, 2), _task(tmp_path, 3)),
+    )
+
+    assert tuple(result.round for result in results) == (1,)
+    assert results[0].status == "failed"
+    assert [call.task.round for call in modules.submit_calls] == [1]
+    assert executor.execution_evidence["attempt_counts"] == [
+        {"dataset_id": "dataset-1", "round": 1, "attempts": 1}
+    ]
 
 
 def test_slurm_executor_submission_deserializes_without_worker_importing_hpc(
@@ -1657,7 +1752,7 @@ def test_slurm_executor_submission_deserializes_without_worker_importing_hpc(
     )
 
     with smoke_module_by_value():
-        executor.execute((_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
         call = modules.submit_calls[0]
         payload = distributed_pickle.dumps(DaskTask(call.key, call.runner, call.task))
     payload_path = tmp_path / "submission.pickle"
@@ -1704,16 +1799,18 @@ def test_slurm_executor_resubmits_with_bounded_unique_attempts(
     ]
     executor = _executor(tmp_path, modules, retries=1)
 
-    result = executor.execute((task,))[0]
+    result = executor.execute(_reference_task(tmp_path), (task,))[1]
 
     assert result.status == "completed"
     assert [call.key for call in modules.submit_calls] == [
+        "cyexm-dataset-1-reference-round-001",
         "cyexm-dataset-1-round-002",
         "cyexm-dataset-1-round-002-attempt-002",
     ]
     assert all(call.retries == 0 for call in modules.submit_calls)
     assert executor.execution_evidence["attempt_counts"] == [
-        {"dataset_id": "dataset-1", "round": 2, "attempts": 2}
+        {"dataset_id": "dataset-1", "round": 1, "attempts": 1},
+        {"dataset_id": "dataset-1", "round": 2, "attempts": 2},
     ]
 
 
@@ -1725,10 +1822,11 @@ def test_slurm_executor_preserves_independent_result_after_exhausted_failure(
     failed_task = _task(tmp_path, 2)
     modules.outcomes[2] = [(RuntimeError, RuntimeError("exhausted"), None)]
 
-    failed, completed = _executor(tmp_path, modules).execute(
-        (failed_task, _task(tmp_path, 3))
+    reference, failed, completed = _executor(tmp_path, modules).execute(
+        _reference_task(tmp_path), (failed_task, _task(tmp_path, 3))
     )
 
+    assert reference.status == "completed"
     assert failed.status == "failed"
     assert failed.failure == RoundFailure("round", "RuntimeError", "exhausted")
     assert completed.status == "completed"
@@ -1746,9 +1844,9 @@ def test_slurm_executor_validates_tasks_and_results_like_local_dask(
         return _FakeSlurmModules()
 
     malformed_task = replace(_task(tmp_path, 2), round=True)
-    with pytest.raises(RoundExecutionError, match=r"tasks\[0\].*round"):
+    with pytest.raises(RoundExecutionError, match=r"tasks\[1\].*round"):
         SlurmExecutor(_profile(tmp_path), _modules=modules_factory).execute(
-            (malformed_task,)
+            _reference_task(tmp_path), (malformed_task,)
         )
     assert loaded is False
 
@@ -1756,7 +1854,7 @@ def test_slurm_executor_validates_tasks_and_results_like_local_dask(
     modules.connected_workers = modules.connected_workers[:1]
     task = _task(tmp_path, 2)
     modules.outcomes[2] = [replace(_result(task), dataset_id="wrong")]
-    result = _executor(tmp_path, modules).execute((task,))[0]
+    result = _executor(tmp_path, modules).execute(_reference_task(tmp_path), (task,))[1]
     assert result.status == "failed"
     assert result.failure is not None
     assert result.failure.exception_type == "RoundExecutionError"
@@ -1775,7 +1873,7 @@ def test_slurm_executor_rejects_duplicate_task_identity_before_cluster_mutation(
     task = _task(tmp_path, 2)
     with pytest.raises(RoundExecutionError, match="duplicate task identity"):
         SlurmExecutor(_profile(tmp_path), _modules=modules_factory).execute(
-            (task, task)
+            _reference_task(tmp_path), (task, task)
         )
     assert loaded is False
 
@@ -1786,12 +1884,15 @@ def test_slurm_executor_cancels_only_actual_unfinished_on_keyboard_interrupt(
     modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:3]
     modules.order = (2, 3, 4)
-    modules.interrupt_after = 1
+    modules.interrupt_after = 2
     modules.pending_rounds = {4}
     executor = _executor(tmp_path, modules)
 
     with pytest.raises(KeyboardInterrupt, match="collection interruption"):
-        executor.execute(tuple(_task(tmp_path, number) for number in (2, 3, 4)))
+        executor.execute(
+            _reference_task(tmp_path),
+            tuple(_task(tmp_path, number) for number in (2, 3, 4)),
+        )
 
     assert modules.cancel_call is not None
     cancelled, force = modules.cancel_call
@@ -1814,7 +1915,7 @@ def test_slurm_executor_preserves_primary_baseexception_when_cleanup_fails(
     modules = _FakeSlurmModules()
     modules.connected_workers = modules.connected_workers[:1]
     modules.interrupt_after = 0
-    modules.pending_rounds = {2}
+    modules.pending_rounds = {1}
     modules.cancel_error = SystemExit("cancel failed")
     modules.client_close_error = KeyboardInterrupt("client close failed")
     modules.cluster_close_error = SystemExit("cluster close failed")
@@ -1825,7 +1926,7 @@ def test_slurm_executor_preserves_primary_baseexception_when_cleanup_fails(
         caplog.at_level(logging.WARNING, logger="cyexm.execution.slurm"),
         pytest.raises(KeyboardInterrupt, match="collection interruption"),
     ):
-        executor.execute((_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert "cancel failed" in caplog.text
     assert "client close failed" in caplog.text
@@ -1856,7 +1957,9 @@ def test_slurm_executor_does_not_invoke_sequential_fallback_on_startup_failure(
     )
 
     with pytest.raises(ExecutorStartupError):
-        _executor(tmp_path, modules).execute((_task(tmp_path, 2),))
+        _executor(tmp_path, modules).execute(
+            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        )
 
     assert fallback_called is False
 
@@ -1876,6 +1979,10 @@ def test_slurm_executor_rejects_non_slurm_or_missing_slurm_profiles(
     missing_spec = replace(profile, slurm=None)
 
     with pytest.raises(ExecutorStartupError, match="requires a slurm profile"):
-        SlurmExecutor(non_slurm).execute((_task(tmp_path, 2),))
+        SlurmExecutor(non_slurm).execute(
+            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        )
     with pytest.raises(ExecutorStartupError, match="requires SlurmSpec"):
-        SlurmExecutor(missing_spec).execute((_task(tmp_path, 2),))
+        SlurmExecutor(missing_spec).execute(
+            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        )

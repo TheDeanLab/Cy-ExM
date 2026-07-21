@@ -546,7 +546,10 @@ def _slurm_evidence(*, outcome: str = "succeeded") -> dict[str, object]:
             "scale_attempted": True,
             "scale_succeeded": True,
         },
-        "attempt_counts": [{"dataset_id": "dataset-1", "round": 2, "attempts": 1}],
+        "attempt_counts": [
+            {"dataset_id": "dataset-1", "round": 1, "attempts": 1},
+            {"dataset_id": "dataset-1", "round": 2, "attempts": 1},
+        ],
         "timestamps": {
             "started_at": "2026-07-20T10:00:00Z",
             "ended_at": "2026-07-20T10:00:01Z",
@@ -1323,17 +1326,24 @@ def test_run_workflow_lazily_selects_slurm_without_falling_back_to_sequential(
         def execution_evidence(self) -> object:
             return evidence
 
-        def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
             slurm_calls.append(
                 (self.profile.executor, tuple(task.round for task in tasks))
             )
-            return tuple(_result(task) for task in tasks)
+            return (
+                _reference_result(reference_task),
+                *(_result(task) for task in tasks),
+            )
 
     monkeypatch.setattr(slurm_execution, "SlurmExecutor", FakeSlurmExecutor)
     monkeypatch.setattr(
         SequentialExecutor,
         "execute",
-        lambda _self, tasks: (
+        lambda _self, _reference_task, tasks: (
             sequential_calls.append(tuple(task.round for task in tasks))
             or tuple(_result(task) for task in tasks)
         ),
@@ -1663,7 +1673,8 @@ def test_slurm_invalid_evidence_fails_closed_with_a_durable_operational_summary(
     }
     assert run_record["operational_failure"]["phase"] == "execution_evidence"
     assert [item["status"] for item in run_record["rounds"]] == [
-        "failed" if round_failed else "completed"
+        "completed",
+        "failed" if round_failed else "completed",
     ]
 
 
@@ -1761,7 +1772,11 @@ def test_slurm_evidence_property_baseexception_cannot_replace_primary_cancel(
         def execution_evidence(self) -> object:
             raise SystemExit("injected evidence property defect")
 
-        def execute(self, _tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
+        def execute(
+            self,
+            _reference_task: ReferenceTask,
+            _tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
             raise interruption
 
     with (
@@ -1804,8 +1819,15 @@ def test_slurm_evidence_property_system_exit_is_a_mapped_contract_failure(
         def execution_evidence(self) -> object:
             raise SystemExit("injected evidence property defect")
 
-        def execute(self, tasks: tuple[RoundTask, ...]) -> tuple[RoundResult, ...]:
-            return tuple(_result(task) for task in tasks)
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            return (
+                _reference_result(reference_task),
+                *(_result(task) for task in tasks),
+            )
 
     with pytest.raises(
         ExecutorStartupError,
@@ -1873,7 +1895,7 @@ def test_local_dask_does_not_claim_injected_slurm_evidence(tmp_path: Path) -> No
     assert run_record["execution"] == {}
 
 
-def test_all_reused_slurm_workflow_does_not_construct_an_executor_or_evidence(
+def test_all_reused_slurm_workflow_still_runs_reference_barrier(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1885,17 +1907,27 @@ def test_all_reused_slurm_workflow_does_not_construct_an_executor_or_evidence(
     for artifact in _artifacts(plan.tasks[0]):
         _commit_artifact(artifact, plan)
 
-    def unexpected_factory(_profile: ExecutionProfile) -> WorkflowExecutor:
-        raise AssertionError("all-reused SLURM workflow constructed an executor")
+    evidence = _slurm_evidence()
+    attempts = evidence["attempt_counts"]
+    assert isinstance(attempts, list)
+    attempts.pop()
+    fake = _FakeExecutor(lambda tasks: (), execution_evidence=evidence)
 
-    monkeypatch.setattr(workflow_api, "_default_executor_factory", unexpected_factory)
+    def tracking_factory(_profile: ExecutionProfile) -> WorkflowExecutor:
+        return fake
+
+    monkeypatch.setattr(workflow_api, "_default_executor_factory", tracking_factory)
 
     result = run_workflow(plan)
 
-    assert tuple(round_result.status for round_result in result.rounds) == ("reused",)
-    assert result.execution_evidence_json == "{}"
+    assert fake.calls == [()]
+    assert tuple(round_result.status for round_result in result.rounds) == (
+        "completed",
+        "reused",
+    )
+    assert result.execution_evidence_json == canonical_json(evidence)
     run_record = json.loads(Path(result.run_record).read_text(encoding="utf-8"))
-    assert run_record["execution"] == {}
+    assert run_record["execution"] == evidence
 
 
 def test_run_workflow_skips_a_complete_round_without_opening_execution(

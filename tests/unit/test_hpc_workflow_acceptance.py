@@ -36,6 +36,7 @@ from cyexm.config.models import (
     ExecutionPaths,
     ExecutionProfile,
     NativeThreadSpec,
+    ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
@@ -52,7 +53,11 @@ def _manifest(*rounds: RoundSpec) -> DatasetManifest:
         schema_version=1,
         dataset_id="bounded",
         voxel_spacing_um=(0.2, 0.2, 0.5),
-        reference=ReferenceSpec(round=1, channel=PurePosixPath("reference.tif")),
+        reference=ReferenceSpec(
+            round=1,
+            registration_channel=PurePosixPath("reference.tif"),
+            channels=(ReferenceChannelSpec(PurePosixPath("reference.tif")),),
+        ),
         registration=RegistrationSpec(
             crop=False,
             linear=RegistrationStageSpec(type="TRSAA", accuracy="low"),

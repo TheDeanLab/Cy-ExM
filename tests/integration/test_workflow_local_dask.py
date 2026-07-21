@@ -14,6 +14,7 @@ from cyexm.config.models import (
     ExecutorName,
     LocalDaskSpec,
     NativeThreadSpec,
+    ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
@@ -66,7 +67,8 @@ def _manifest() -> DatasetManifest:
         voxel_spacing_um=_PIXEL_SIZE,
         reference=ReferenceSpec(
             round=1,
-            channel=PurePosixPath("round-1-reference.tif"),
+            registration_channel=PurePosixPath("round-1-reference.tif"),
+            channels=(ReferenceChannelSpec(PurePosixPath("round-1-reference.tif")),),
         ),
         registration=RegistrationSpec(
             crop=False,

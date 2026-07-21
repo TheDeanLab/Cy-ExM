@@ -58,7 +58,10 @@ def _write_approved_inputs(archive_root: Path, project_root: Path) -> tuple[Path
 schema_version: 1
 dataset_id: zenodo-smoke
 voxel_spacing_um: {x: 1.0, y: 1.0, z: 1.0}
-reference: {round: 1, channel: fixed.tif}
+reference:
+  round: 1
+  registration_channel: fixed.tif
+  channels: [{file: fixed.tif}]
 registration:
   crop: false
   linear: {type: TRSAA, accuracy: high}

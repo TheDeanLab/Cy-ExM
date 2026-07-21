@@ -15,6 +15,7 @@ from cyexm.config.models import (
     ExecutionPaths,
     ExecutionProfile,
     NativeThreadSpec,
+    ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
@@ -80,7 +81,8 @@ def _manifest(round_order: tuple[int, ...] = (3, 2)) -> DatasetManifest:
         voxel_spacing_um=(0.324, 0.324, 0.9),
         reference=ReferenceSpec(
             round=1,
-            channel=PurePosixPath("round_1_488.tif"),
+            registration_channel=PurePosixPath("round_1_488.tif"),
+            channels=(ReferenceChannelSpec(PurePosixPath("round_1_488.tif")),),
         ),
         registration=_registration(),
         rounds=tuple(_round(round_number) for round_number in round_order),
@@ -504,7 +506,11 @@ def test_plan_inspects_each_unique_resolved_file_once(
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(1.0, 1.0, 1.0),
-        reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+        reference=ReferenceSpec(
+            1,
+            PurePosixPath("fixed.tif"),
+            (ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
         registration=_registration(),
         rounds=(
             RoundSpec(2, "whole_image", shared, (ChannelSpec(shared, "linear"),)),
@@ -539,7 +545,11 @@ def test_plan_rejects_channel_output_name_collisions_after_resolution(
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(1.0, 1.0, 1.0),
-        reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+        reference=ReferenceSpec(
+            1,
+            PurePosixPath("fixed.tif"),
+            (ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
         registration=_registration(),
         rounds=(
             RoundSpec(
@@ -655,7 +665,11 @@ def test_plan_rejects_channel_aliases_to_registration_final_artifacts(
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(1.0, 1.0, 1.0),
-        reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+        reference=ReferenceSpec(
+            1,
+            PurePosixPath("fixed.tif"),
+            (ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
         registration=_registration(),
         rounds=(
             RoundSpec(
@@ -835,7 +849,11 @@ def test_manifest_alias_and_relative_channel_output_are_scientific_identity(
             schema_version=1,
             dataset_id="dataset-1",
             voxel_spacing_um=(1.0, 1.0, 1.0),
-            reference=ReferenceSpec(1, PurePosixPath("fixed.tif")),
+            reference=ReferenceSpec(
+                1,
+                PurePosixPath("fixed.tif"),
+                (ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+            ),
             registration=_registration(),
             rounds=(
                 RoundSpec(
@@ -995,7 +1013,11 @@ def test_existing_plan_signed_zero_mismatch_has_a_dotted_value_difference(
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(0.324, 0.324, 0.9),
-        reference=ReferenceSpec(1, PurePosixPath("round_1_488.tif")),
+        reference=ReferenceSpec(
+            1,
+            PurePosixPath("round_1_488.tif"),
+            (ReferenceChannelSpec(PurePosixPath("round_1_488.tif")),),
+        ),
         registration=_registration(),
         rounds=(
             RoundSpec(

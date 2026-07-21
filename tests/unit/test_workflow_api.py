@@ -22,6 +22,7 @@ from cyexm.config.models import (
     ExecutionProfile,
     LocalDaskSpec,
     NativeThreadSpec,
+    ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
@@ -135,7 +136,11 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
         schema_version=1,
         dataset_id="dataset-1",
         voxel_spacing_um=(1.0, 1.0, 1.0),
-        reference=ReferenceSpec(round=1, channel=PurePosixPath("fixed.tif")),
+        reference=ReferenceSpec(
+            round=1,
+            registration_channel=PurePosixPath("fixed.tif"),
+            channels=(ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
         registration=_registration(),
         rounds=tuple(
             RoundSpec(

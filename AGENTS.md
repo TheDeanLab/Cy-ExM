@@ -53,6 +53,11 @@
 
 - Fixed and moving roles do not change. Public pixel sizes are micrometers in
   `(x, y, z)` order; NumPy volumes use `(z, y, x)` order.
+- Native reference, registration-channel, and dependent-channel shapes may differ
+  independently along Z, Y, and X. The affine application is the first fixed-grid
+  boundary: its scalar and mask outputs, every nonlinear input and output, the full
+  warp, and every transformed dependent channel must match the fixed-reference
+  geometry.
 - Preserve masks based on values greater than zero, affine-before-nonlinear transform
   order, TRSAA linear registration, SyNOnly nonlinear registration, scalar linear
   interpolation, mask nearest-neighbor interpolation, and ANTs origin, spacing, and

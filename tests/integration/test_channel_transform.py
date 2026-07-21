@@ -87,8 +87,7 @@ def test_transform_channel_resamples_unequal_native_shape_to_fixed_geometry(
     assert written.shape == fixed_shape
     assert read_tiff_geometry(output_path, written.shape) == fixed_geometry
     assert (
-        backend.geometry(backend.load_image(output_path, _PIXEL_SIZE))
-        == fixed_geometry
+        backend.geometry(backend.load_image(output_path, _PIXEL_SIZE)) == fixed_geometry
     )
 
 

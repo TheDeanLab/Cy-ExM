@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import cast
 
+from cyexm._nonlinear_metric import NonlinearMetricName, resolve_nonlinear_metric
 from cyexm.config._validation import (
     built_in_int,
     finite_positive_float,
@@ -17,6 +18,7 @@ from cyexm.config.models import (
     ChannelSpec,
     ChunkSizeZYX,
     DatasetManifest,
+    NonlinearRegistrationStageSpec,
     PixelSpacingXYZ,
     ReferenceChannelSpec,
     ReferenceSpec,
@@ -47,7 +49,9 @@ _VOXEL_SPACING_KEYS = frozenset({"x", "y", "z"})
 _REFERENCE_KEYS = frozenset({"round", "registration_channel", "channels"})
 _REFERENCE_CHANNEL_KEYS = frozenset({"file"})
 _REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
-_STAGE_KEYS = frozenset({"type", "accuracy"})
+_LINEAR_STAGE_KEYS = frozenset({"type", "accuracy"})
+_NONLINEAR_STAGE_KEYS = frozenset({"type", "accuracy", "metric"})
+_NONLINEAR_CC_STAGE_KEYS = _NONLINEAR_STAGE_KEYS | frozenset({"radius"})
 _WHOLE_IMAGE_ROUND_KEYS = frozenset(
     {"round", "strategy", "registration_channel", "channels"}
 )
@@ -140,10 +144,34 @@ def _reference(value: object) -> ReferenceSpec:
 def _stage(
     value: object, yaml_path: str, accepted_types: frozenset[str]
 ) -> RegistrationStageSpec:
-    mapping = require_exact_keys(value, _STAGE_KEYS, yaml_path)
+    mapping = require_exact_keys(value, _LINEAR_STAGE_KEYS, yaml_path)
     return RegistrationStageSpec(
         type=_choice(mapping["type"], accepted_types, f"{yaml_path}.type"),
         accuracy=_choice(mapping["accuracy"], _ACCURACIES, f"{yaml_path}.accuracy"),
+    )
+
+
+def _nonlinear_stage(value: object) -> NonlinearRegistrationStageSpec:
+    yaml_path = "registration.nonlinear"
+    has_radius = isinstance(value, Mapping) and "radius" in value
+    expected_keys = _NONLINEAR_CC_STAGE_KEYS if has_radius else _NONLINEAR_STAGE_KEYS
+    mapping = require_exact_keys(value, expected_keys, yaml_path)
+    metric = cast(
+        NonlinearMetricName,
+        _choice(mapping["metric"], frozenset({"CC", "mattes"}), f"{yaml_path}.metric"),
+    )
+    radius: int | None = None
+    if has_radius:
+        radius = built_in_int(mapping["radius"], f"{yaml_path}.radius", minimum=1)
+    try:
+        resolved = resolve_nonlinear_metric(metric, radius)
+    except (TypeError, ValueError) as error:
+        raise ConfigurationValidationError(f"{yaml_path}.radius: {error}") from error
+    return NonlinearRegistrationStageSpec(
+        type=_choice(mapping["type"], _NONLINEAR_TYPES, f"{yaml_path}.type"),
+        accuracy=_choice(mapping["accuracy"], _ACCURACIES, f"{yaml_path}.accuracy"),
+        metric=resolved.metric,
+        radius=resolved.radius,
     )
 
 
@@ -157,9 +185,7 @@ def _registration(value: object) -> RegistrationSpec:
     return RegistrationSpec(
         crop=crop,
         linear=_stage(mapping["linear"], "registration.linear", _LINEAR_TYPES),
-        nonlinear=_stage(
-            mapping["nonlinear"], "registration.nonlinear", _NONLINEAR_TYPES
-        ),
+        nonlinear=_nonlinear_stage(mapping["nonlinear"]),
     )
 
 
@@ -343,24 +369,42 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
             "registration.crop must be a built-in boolean; "
             f"got {manifest.registration.crop!r}"
         )
-    for stage_name, stage in (
-        ("linear", manifest.registration.linear),
-        ("nonlinear", manifest.registration.nonlinear),
+    linear_stage = manifest.registration.linear
+    if type(linear_stage) is not RegistrationStageSpec:
+        raise ConfigurationValidationError(
+            f"registration.linear must be a RegistrationStageSpec; got {linear_stage!r}"
+        )
+    nonlinear_stage = manifest.registration.nonlinear
+    if type(nonlinear_stage) is not NonlinearRegistrationStageSpec:
+        raise ConfigurationValidationError(
+            "registration.nonlinear must be a NonlinearRegistrationStageSpec; "
+            f"got {nonlinear_stage!r}"
+        )
+    for stage_name, values in (
+        (
+            "linear",
+            (("type", linear_stage.type), ("accuracy", linear_stage.accuracy)),
+        ),
+        (
+            "nonlinear",
+            (
+                ("type", nonlinear_stage.type),
+                ("accuracy", nonlinear_stage.accuracy),
+                ("metric", nonlinear_stage.metric),
+            ),
+        ),
     ):
-        stage_path = f"registration.{stage_name}"
-        if type(stage) is not RegistrationStageSpec:
-            raise ConfigurationValidationError(
-                f"{stage_path} must be a RegistrationStageSpec; got {stage!r}"
-            )
-        for field_name, value in (
-            ("type", stage.type),
-            ("accuracy", stage.accuracy),
-        ):
+        for field_name, value in values:
             if type(value) is not str:
                 raise ConfigurationValidationError(
-                    f"{stage_path}.{field_name} must be a built-in string; "
-                    f"got {value!r}"
+                    f"registration.{stage_name}.{field_name} must be a built-in "
+                    f"string; got {value!r}"
                 )
+    if nonlinear_stage.radius is not None and type(nonlinear_stage.radius) is not int:
+        raise ConfigurationValidationError(
+            "registration.nonlinear.radius must be a positive built-in integer "
+            f"or null; got {nonlinear_stage.radius!r}"
+        )
     spacing = manifest.voxel_spacing_um
     if type(spacing) is not tuple or len(spacing) != 3:
         raise ConfigurationValidationError(
@@ -382,17 +426,21 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
             "channels": reference_channels,
         }
     )
+    nonlinear_mapping: dict[str, object] = {
+        "type": nonlinear_stage.type,
+        "accuracy": nonlinear_stage.accuracy,
+        "metric": nonlinear_stage.metric,
+    }
+    if nonlinear_stage.metric == "CC":
+        nonlinear_mapping["radius"] = nonlinear_stage.radius
     parsed_registration = _registration(
         {
             "crop": manifest.registration.crop,
             "linear": {
-                "type": manifest.registration.linear.type,
-                "accuracy": manifest.registration.linear.accuracy,
+                "type": linear_stage.type,
+                "accuracy": linear_stage.accuracy,
             },
-            "nonlinear": {
-                "type": manifest.registration.nonlinear.type,
-                "accuracy": manifest.registration.nonlinear.accuracy,
-            },
+            "nonlinear": nonlinear_mapping,
         }
     )
     round_mappings: list[dict[str, object]] = []

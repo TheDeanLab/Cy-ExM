@@ -8,6 +8,7 @@ import yaml
 from cyexm.config import (
     ChannelSpec,
     DatasetManifest,
+    NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
@@ -41,6 +42,7 @@ registration:
   nonlinear:
     type: SyNOnly
     accuracy: high
+    metric: mattes
 rounds:
   - round: 2
     strategy: whole_image
@@ -112,6 +114,7 @@ def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
         "ExecutionProfile",
         "LocalDaskSpec",
         "NativeThreadSpec",
+        "NonlinearRegistrationStageSpec",
         "ReferenceChannelSpec",
         "ReferenceSpec",
         "RegistrationSpec",
@@ -145,7 +148,9 @@ def test_load_dataset_manifest_normalizes_xyz_and_zyx_fields(tmp_path: Path) -> 
     assert manifest.registration == RegistrationSpec(
         crop=True,
         linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
-        nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
+        nonlinear=NonlinearRegistrationStageSpec(
+            type="SyNOnly", accuracy="high", metric="mattes", radius=None
+        ),
     )
     assert manifest.rounds[0] == RoundSpec(
         round=2,
@@ -193,6 +198,7 @@ def test_load_dataset_manifest_preserves_round_and_channel_order(
         (("registration",), "crop"),
         (("registration", "linear"), "accuracy"),
         (("registration", "nonlinear"), "type"),
+        (("registration", "nonlinear"), "metric"),
         (("rounds", 0), "registration_channel"),
         (("rounds", 1), "chunk_size_zyx"),
         (("rounds", 0, "channels", 0), "interpolation"),
@@ -537,6 +543,69 @@ def test_load_dataset_manifest_accepts_exact_phase_one_nonlinear_types(
     manifest = _load_data(tmp_path, data)
 
     assert manifest.registration.nonlinear.type == nonlinear_type
+
+
+def test_load_dataset_manifest_normalizes_omitted_cc_radius_to_four(
+    tmp_path: Path,
+) -> None:
+    data = _valid_data()
+    _set_at(data, ("registration", "nonlinear", "metric"), "CC")
+
+    manifest = _load_data(tmp_path, data)
+
+    assert manifest.registration.nonlinear.metric == "CC"
+    assert manifest.registration.nonlinear.radius == 4
+
+
+def test_load_dataset_manifest_preserves_explicit_cc_radius(tmp_path: Path) -> None:
+    data = _valid_data()
+    _set_at(data, ("registration", "nonlinear", "metric"), "CC")
+    nonlinear = _mapping_at(data, ("registration", "nonlinear"))
+    nonlinear["radius"] = 2
+
+    manifest = _load_data(tmp_path, data)
+
+    assert manifest.registration.nonlinear.radius == 2
+
+
+def test_load_dataset_manifest_normalizes_mattes_without_radius(tmp_path: Path) -> None:
+    manifest = _load_data(tmp_path, _valid_data())
+
+    assert manifest.registration.nonlinear.metric == "mattes"
+    assert manifest.registration.nonlinear.radius is None
+
+
+@pytest.mark.parametrize("value", [None, True, 0, -1, 1.0, "4", [1, 2, 4]])
+def test_load_dataset_manifest_rejects_invalid_explicit_cc_radius(
+    tmp_path: Path, value: object
+) -> None:
+    data = _valid_data()
+    _set_at(data, ("registration", "nonlinear", "metric"), "CC")
+    nonlinear = _mapping_at(data, ("registration", "nonlinear"))
+    nonlinear["radius"] = value
+
+    with pytest.raises(ConfigurationValidationError, match="radius"):
+        _load_data(tmp_path, data)
+
+
+def test_load_dataset_manifest_rejects_radius_for_mattes(tmp_path: Path) -> None:
+    data = _valid_data()
+    nonlinear = _mapping_at(data, ("registration", "nonlinear"))
+    nonlinear["radius"] = 4
+
+    with pytest.raises(ConfigurationValidationError, match="radius"):
+        _load_data(tmp_path, data)
+
+
+@pytest.mark.parametrize("metric", ["cc", "Mattes", "MI", 1])
+def test_load_dataset_manifest_rejects_unsupported_nonlinear_metric(
+    tmp_path: Path, metric: object
+) -> None:
+    data = _valid_data()
+    _set_at(data, ("registration", "nonlinear", "metric"), metric)
+
+    with pytest.raises(ConfigurationValidationError, match="metric"):
+        _load_data(tmp_path, data)
 
 
 @pytest.mark.parametrize("accuracy", ["high", "medium", "low", "dry run"])

@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from cyexm._nonlinear_metric import NonlinearMetricName
+
 type PixelSpacingXYZ = tuple[float, float, float]
 type ChunkSizeZYX = tuple[int, int, int]
 type RegistrationStrategy = Literal["whole_image", "serial_chunked"]
@@ -44,10 +46,18 @@ class RegistrationStageSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class NonlinearRegistrationStageSpec:
+    type: str
+    accuracy: str
+    metric: NonlinearMetricName
+    radius: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class RegistrationSpec:
     crop: bool
     linear: RegistrationStageSpec
-    nonlinear: RegistrationStageSpec
+    nonlinear: NonlinearRegistrationStageSpec
 
 
 @dataclass(frozen=True, slots=True)

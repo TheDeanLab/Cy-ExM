@@ -75,8 +75,8 @@ causes Jupyter Book 2.1.6 to treat that directory as an input file.
 
 **Interfaces:**
 - Consumes: `uv.lock`, repository Python constraint, and the existing `dev` group.
-- Produces: `uv run --group docs jupyter book build docs --html`, which later tasks
-  use to render `docs/_build/html`.
+- Produces: `(cd docs && uv run --group docs jupyter book build --html)`, which
+  later tasks use to render `docs/_build/html`.
 
 - [ ] **Step 1: Add the isolated documentation dependency group**
 
@@ -147,7 +147,7 @@ causes Jupyter Book 2.1.6 to treat that directory as an input file.
   ```bash
   export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
   export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
-  uv run --group docs jupyter book build docs --html
+  (cd docs && uv run --group docs jupyter book build --html)
   ```
 
   Expected: FAIL because `docs/myst.yml` does not exist and there is no MyST site.
@@ -420,7 +420,7 @@ causes Jupyter Book 2.1.6 to treat that directory as an input file.
         - name: Build documentation
           env:
             BASE_URL: /Cy-ExM
-          run: uv run --group docs jupyter book build docs --html
+          run: cd docs && uv run --group docs jupyter book build --html
         - name: Upload Pages artifact
           uses: actions/upload-pages-artifact@v4
           with:

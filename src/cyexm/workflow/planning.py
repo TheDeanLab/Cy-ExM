@@ -8,12 +8,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
+from cyexm._nonlinear_metric import MATTES_BINS
 from cyexm.config.dataset import _validate_dataset_manifest
 from cyexm.config.execution import _validate_execution_profile
 from cyexm.config.models import (
     DatasetManifest,
     ExecutionPaths,
     ExecutionProfile,
+    NonlinearRegistrationStageSpec,
     RoundSpec,
 )
 from cyexm.errors import (
@@ -54,6 +56,24 @@ class _InputReference:
 class _FinalArtifact:
     path: Path
     role: str
+
+
+def _nonlinear_mapping(
+    stage: NonlinearRegistrationStageSpec,
+) -> dict[str, object]:
+    if stage.metric == "CC":
+        return {
+            "type": stage.type,
+            "accuracy": stage.accuracy,
+            "metric": "CC",
+            "radius": stage.radius,
+        }
+    return {
+        "type": stage.type,
+        "accuracy": stage.accuracy,
+        "metric": "mattes",
+        "bins": MATTES_BINS,
+    }
 
 
 def _input_references(manifest: DatasetManifest) -> tuple[_InputReference, ...]:
@@ -671,10 +691,7 @@ def _scientific_mapping(
                 "type": manifest.registration.linear.type,
                 "accuracy": manifest.registration.linear.accuracy,
             },
-            "nonlinear": {
-                "type": manifest.registration.nonlinear.type,
-                "accuracy": manifest.registration.nonlinear.accuracy,
-            },
+            "nonlinear": _nonlinear_mapping(manifest.registration.nonlinear),
         },
         "sources": [
             _header_mapping(headers[path]) for path in sorted(headers, key=str)

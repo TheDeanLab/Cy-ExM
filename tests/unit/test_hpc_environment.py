@@ -35,6 +35,7 @@ from hpc.environment import (
 
 from cyexm.config.models import (
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
@@ -86,7 +87,7 @@ reference:
 registration:
   crop: false
   linear: {type: TRSAA, accuracy: high}
-  nonlinear: {type: SyNOnly, accuracy: high}
+  nonlinear: {type: SyNOnly, accuracy: high, metric: mattes}
 rounds:
   - round: 2
     strategy: whole_image
@@ -838,7 +839,9 @@ def _smoke_task(tmp_path: Path) -> RoundTask:
         registration=RegistrationSpec(
             crop=False,
             linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
-            nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
+            nonlinear=NonlinearRegistrationStageSpec(
+                type="SyNOnly", accuracy="high", metric="mattes", radius=None
+            ),
         ),
         native_threads=NativeThreadSpec(itk=1, blas=1),
         channels=(

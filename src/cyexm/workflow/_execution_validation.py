@@ -8,6 +8,7 @@ from pathlib import Path
 
 from cyexm.config.models import (
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
@@ -105,13 +106,13 @@ def _validate_round_task_value(
         raise error_type(f"{location}.registration must be a RegistrationSpec")
     if type(registration.crop) is not bool:
         raise error_type(f"{location}.registration.crop must be a built-in boolean")
-    for stage_name, stage in (
-        ("linear", registration.linear),
-        ("nonlinear", registration.nonlinear),
+    for stage_name, stage, expected_type in (
+        ("linear", registration.linear, RegistrationStageSpec),
+        ("nonlinear", registration.nonlinear, NonlinearRegistrationStageSpec),
     ):
         stage_location = f"{location}.registration.{stage_name}"
-        if type(stage) is not RegistrationStageSpec:
-            raise error_type(f"{stage_location} must be a RegistrationStageSpec")
+        if type(stage) is not expected_type:
+            raise error_type(f"{stage_location} must be a {expected_type.__name__}")
         if type(stage.type) is not str or not stage.type:
             raise error_type(
                 f"{stage_location}.type must be a nonempty built-in string"
@@ -120,6 +121,21 @@ def _validate_round_task_value(
             raise error_type(
                 f"{stage_location}.accuracy must be a nonempty built-in string"
             )
+    nonlinear = registration.nonlinear
+    if type(nonlinear.metric) is not str or nonlinear.metric not in {"CC", "mattes"}:
+        raise error_type(
+            f"{location}.registration.nonlinear.metric must be exactly CC or mattes"
+        )
+    if nonlinear.metric == "CC":
+        if type(nonlinear.radius) is not int or nonlinear.radius < 1:
+            raise error_type(
+                f"{location}.registration.nonlinear.radius must be a positive "
+                "built-in integer for CC"
+            )
+    elif nonlinear.radius is not None:
+        raise error_type(
+            f"{location}.registration.nonlinear.radius must be null for mattes"
+        )
 
     native_threads = task.native_threads
     if type(native_threads) is not NativeThreadSpec:

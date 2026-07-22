@@ -15,6 +15,7 @@ from cyexm.config.models import (
     ExecutionProfile,
     LocalDaskSpec,
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
@@ -47,7 +48,9 @@ def _registration() -> RegistrationSpec:
     return RegistrationSpec(
         crop=True,
         linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
-        nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
+        nonlinear=NonlinearRegistrationStageSpec(
+            type="SyNOnly", accuracy="high", metric="mattes", radius=None
+        ),
     )
 
 
@@ -195,7 +198,12 @@ def _scientific_mapping(tmp_path: Path) -> dict[str, object]:
         "registration": {
             "crop": True,
             "linear": {"type": "TRSAA", "accuracy": "high"},
-            "nonlinear": {"type": "SyNOnly", "accuracy": "high"},
+            "nonlinear": {
+                "type": "SyNOnly",
+                "accuracy": "high",
+                "metric": "mattes",
+                "bins": 32,
+            },
         },
         "sources": [
             {

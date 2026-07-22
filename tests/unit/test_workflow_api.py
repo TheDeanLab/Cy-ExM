@@ -22,6 +22,7 @@ from cyexm.config.models import (
     ExecutionProfile,
     LocalDaskSpec,
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
@@ -88,7 +89,9 @@ def _registration() -> RegistrationSpec:
     return RegistrationSpec(
         crop=False,
         linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
-        nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
+        nonlinear=NonlinearRegistrationStageSpec(
+            type="SyNOnly", accuracy="high", metric="mattes", radius=None
+        ),
     )
 
 
@@ -231,7 +234,12 @@ def _plan(tmp_path: Path, rounds: tuple[int, ...] = (2, 3)) -> WorkflowPlan:
             "registration": {
                 "crop": False,
                 "linear": {"type": "TRSAA", "accuracy": "high"},
-                "nonlinear": {"type": "SyNOnly", "accuracy": "high"},
+                "nonlinear": {
+                    "type": "SyNOnly",
+                    "accuracy": "high",
+                    "metric": "mattes",
+                    "bins": 32,
+                },
             },
             "sources": [source_mapping(path) for path in sorted(sources)],
             "rounds": [
@@ -368,6 +376,32 @@ def _invalid_task(
                 linear=replace(
                     registration.linear,
                     type=_StringAlias(registration.linear.type),
+                ),
+            ),
+        )
+    if case == "nonlinear_model":
+        nonlinear = task.registration.nonlinear
+        return plan, replace(
+            task,
+            registration=replace(  # type: ignore[arg-type]
+                task.registration,
+                nonlinear=SimpleNamespace(
+                    type=nonlinear.type,
+                    accuracy=nonlinear.accuracy,
+                    metric=nonlinear.metric,
+                    radius=nonlinear.radius,
+                ),
+            ),
+        )
+    if case == "nonlinear_radius":
+        return plan, replace(
+            task,
+            registration=replace(
+                task.registration,
+                nonlinear=replace(
+                    task.registration.nonlinear,
+                    metric="CC",
+                    radius=True,  # type: ignore[arg-type]
                 ),
             ),
         )
@@ -2358,6 +2392,8 @@ def test_run_workflow_wraps_overflowing_task_spacing_before_mutation(
         ("spacing_scalar", "voxel_spacing_xyz"),
         ("registration_model", "registration"),
         ("registration_scalar", "registration.linear.type"),
+        ("nonlinear_model", "registration.nonlinear"),
+        ("nonlinear_radius", "registration.nonlinear.radius"),
         ("native_model", "native_threads"),
         ("native_itk", "native_threads.itk"),
         ("native_blas", "native_threads.blas"),

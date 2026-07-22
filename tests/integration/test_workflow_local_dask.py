@@ -14,6 +14,7 @@ from cyexm.config.models import (
     ExecutorName,
     LocalDaskSpec,
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
@@ -73,7 +74,9 @@ def _manifest() -> DatasetManifest:
         registration=RegistrationSpec(
             crop=False,
             linear=RegistrationStageSpec(type="TRSAA", accuracy="dry run"),
-            nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="dry run"),
+            nonlinear=NonlinearRegistrationStageSpec(
+                type="SyNOnly", accuracy="dry run", metric="mattes", radius=None
+            ),
         ),
         rounds=(
             RoundSpec(

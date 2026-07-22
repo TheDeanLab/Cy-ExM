@@ -41,7 +41,7 @@ reference:
 registration:
   crop: false
   linear: {type: TRSAA, accuracy: high}
-  nonlinear: {type: SyNOnly, accuracy: high}
+  nonlinear: {type: SyNOnly, accuracy: high, metric: mattes}
 rounds:
   - round: 2
     strategy: whole_image

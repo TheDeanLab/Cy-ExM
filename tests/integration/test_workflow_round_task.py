@@ -10,6 +10,7 @@ import pytest
 
 from cyexm.config.models import (
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
@@ -133,7 +134,9 @@ def _task(
         registration=RegistrationSpec(
             crop=False,
             linear=RegistrationStageSpec(type="TRSAA", accuracy="dry run"),
-            nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="dry run"),
+            nonlinear=NonlinearRegistrationStageSpec(
+                type="SyNOnly", accuracy="dry run", metric="mattes", radius=None
+            ),
         ),
         native_threads=NativeThreadSpec(itk=1, blas=1),
         channels=channels,

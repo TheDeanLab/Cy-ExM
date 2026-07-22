@@ -12,6 +12,7 @@ from cyexm.config.models import (
     ExecutionProfile,
     LocalDaskSpec,
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
@@ -80,7 +81,9 @@ def _task(tmp_path: Path, round_number: int) -> RoundTask:
         registration=RegistrationSpec(
             crop=False,
             linear=RegistrationStageSpec(type="TRSAA", accuracy="dry run"),
-            nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="dry run"),
+            nonlinear=NonlinearRegistrationStageSpec(
+                type="SyNOnly", accuracy="dry run", metric="mattes", radius=None
+            ),
         ),
         native_threads=NativeThreadSpec(itk=1, blas=1),
         channels=(

@@ -231,6 +231,8 @@ def _registration_matches_snapshot(
             and registration.nonlinear.type == snapshot.registration.nonlinear_type
             and registration.nonlinear.accuracy
             == snapshot.registration.nonlinear_accuracy
+            and registration.nonlinear.metric == snapshot.registration.nonlinear_metric
+            and registration.nonlinear.radius == snapshot.registration.nonlinear_radius
         )
     except AttributeError:
         return False

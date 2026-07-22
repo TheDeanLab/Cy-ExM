@@ -9,12 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from cyexm._nonlinear_metric import NonlinearMetricName
 from cyexm.config.models import (
     ChannelSpec,
     DatasetManifest,
     ExecutionPaths,
     ExecutionProfile,
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
@@ -42,11 +44,15 @@ class _StringAlias(str):
     pass
 
 
-def _registration() -> RegistrationSpec:
+def _registration(
+    metric: NonlinearMetricName = "mattes", radius: int | None = None
+) -> RegistrationSpec:
     return RegistrationSpec(
         crop=False,
         linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
-        nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
+        nonlinear=NonlinearRegistrationStageSpec(
+            type="SyNOnly", accuracy="high", metric=metric, radius=radius
+        ),
     )
 
 
@@ -173,6 +179,43 @@ def _invalid_manifest(manifest: DatasetManifest, case: str) -> DatasetManifest:
                 nonlinear=replace(
                     registration.nonlinear,
                     accuracy=_StringAlias(registration.nonlinear.accuracy),
+                ),
+            ),
+        )
+    if case == "nonlinear_stage_model":
+        stage = manifest.registration.nonlinear
+        return replace(
+            manifest,
+            registration=replace(  # type: ignore[arg-type]
+                manifest.registration,
+                nonlinear=SimpleNamespace(
+                    type=stage.type,
+                    accuracy=stage.accuracy,
+                    metric=stage.metric,
+                    radius=stage.radius,
+                ),
+            ),
+        )
+    if case == "nonlinear_metric":
+        return replace(
+            manifest,
+            registration=replace(
+                manifest.registration,
+                nonlinear=replace(
+                    manifest.registration.nonlinear,
+                    metric=_StringAlias("mattes"),
+                ),
+            ),
+        )
+    if case == "nonlinear_radius":
+        return replace(
+            manifest,
+            registration=replace(
+                manifest.registration,
+                nonlinear=replace(
+                    manifest.registration.nonlinear,
+                    metric="CC",
+                    radius=True,  # type: ignore[arg-type]
                 ),
             ),
         )
@@ -476,6 +519,9 @@ def test_plan_revalidates_directly_constructed_manifest_before_inspection(
         ("registration_stage_model", "registration.linear"),
         ("registration_type", "registration.linear.type"),
         ("registration_accuracy", "registration.nonlinear.accuracy"),
+        ("nonlinear_stage_model", "registration.nonlinear"),
+        ("nonlinear_metric", "registration.nonlinear.metric"),
+        ("nonlinear_radius", "registration.nonlinear.radius"),
         ("rounds_container", "rounds"),
         ("round_model", "rounds[0]"),
         ("round_number", "round"),
@@ -894,6 +940,13 @@ def test_scientific_fingerprint_contains_complete_policy_but_not_execution_choic
     plan = build_workflow_plan(manifest, execution)
     scientific = json.loads(plan.scientific_json)
 
+    assert scientific["registration"]["nonlinear"] == {
+        "type": "SyNOnly",
+        "accuracy": "high",
+        "metric": "mattes",
+        "bins": 32,
+    }
+
     assert scientific["reference"] == {
         "round": 1,
         "registration_channel": str(plan.reference_task.registration_channel_source),
@@ -935,6 +988,74 @@ def test_scientific_fingerprint_contains_complete_policy_but_not_execution_choic
             )
         ),
     )
+
+
+def test_cc_default_radius_has_one_canonical_plan_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = replace(_manifest(), registration=_registration("CC", 4))
+    dataset_root = tmp_path / "dataset"
+    execution_a = _execution(
+        tmp_path, dataset_root=dataset_root, output_root=tmp_path / "output-a"
+    )
+    execution_b = _execution(
+        tmp_path, dataset_root=dataset_root, output_root=tmp_path / "output-b"
+    )
+    _create_manifest_inputs(dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    omitted_normalized = build_workflow_plan(manifest, execution_a)
+    explicit_default = build_workflow_plan(
+        replace(manifest, registration=_registration("CC", 4)), execution_b
+    )
+
+    assert omitted_normalized.scientific_json == explicit_default.scientific_json
+    assert (
+        omitted_normalized.scientific_fingerprint
+        == explicit_default.scientific_fingerprint
+    )
+    assert json.loads(omitted_normalized.scientific_json)["registration"][
+        "nonlinear"
+    ] == {
+        "type": "SyNOnly",
+        "accuracy": "high",
+        "metric": "CC",
+        "radius": 4,
+    }
+
+
+def test_changing_cc_radius_changes_plan_and_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    default_manifest = replace(_manifest(), registration=_registration("CC", 4))
+    radius_two_manifest = replace(default_manifest, registration=_registration("CC", 2))
+    dataset_root = tmp_path / "dataset"
+    _create_manifest_inputs(dataset_root, default_manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    default_plan = build_workflow_plan(
+        default_manifest,
+        _execution(
+            tmp_path, dataset_root=dataset_root, output_root=tmp_path / "output-a"
+        ),
+    )
+    radius_two_plan = build_workflow_plan(
+        radius_two_manifest,
+        _execution(
+            tmp_path, dataset_root=dataset_root, output_root=tmp_path / "output-b"
+        ),
+    )
+
+    assert default_plan.scientific_json != radius_two_plan.scientific_json
+    assert default_plan.scientific_fingerprint != radius_two_plan.scientific_fingerprint
 
 
 def test_manifest_alias_and_relative_channel_output_are_scientific_identity(

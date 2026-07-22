@@ -94,7 +94,12 @@ def _scientific_mapping(
         "registration": {
             "crop": False,
             "linear": {"type": "TRSAA", "accuracy": "high"},
-            "nonlinear": {"type": "SyNOnly", "accuracy": "high"},
+            "nonlinear": {
+                "type": "SyNOnly",
+                "accuracy": "high",
+                "metric": "mattes",
+                "bins": 32,
+            },
         },
         "sources": [source_mapping(path) for path in sorted(sources)],
         "rounds": [
@@ -750,6 +755,41 @@ def test_status_rejects_boolean_scientific_schema_version(tmp_path: Path) -> Non
     plan_path.write_text(canonical_json(scientific), encoding="utf-8")
 
     with pytest.raises(WorkflowPlanError, match="schema_version"):
+        inspect_workflow_status(output_root, "dataset-1")
+
+
+@pytest.mark.parametrize(
+    "nonlinear",
+    [
+        {"type": "SyNOnly", "accuracy": "high"},
+        {"type": "SyNOnly", "accuracy": "high", "metric": "CC"},
+        {"type": "SyNOnly", "accuracy": "high", "metric": "CC", "radius": True},
+        {"type": "SyNOnly", "accuracy": "high", "metric": "CC", "radius": 0},
+        {
+            "type": "SyNOnly",
+            "accuracy": "high",
+            "metric": "mattes",
+            "radius": 4,
+        },
+        {
+            "type": "SyNOnly",
+            "accuracy": "high",
+            "metric": "mattes",
+            "bins": 31,
+        },
+    ],
+)
+def test_status_rejects_noncanonical_nonlinear_plan_evidence(
+    tmp_path: Path, nonlinear: dict[str, object]
+) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    scientific["registration"]["nonlinear"] = nonlinear  # type: ignore[index]
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match="nonlinear"):
         inspect_workflow_status(output_root, "dataset-1")
 
 

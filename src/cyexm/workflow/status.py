@@ -7,10 +7,12 @@ import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, cast
 
+from cyexm._nonlinear_metric import MATTES_BINS, NonlinearMetricName
 from cyexm.config.models import (
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
@@ -69,7 +71,9 @@ _REFERENCE_KEYS = frozenset(
 )
 _REFERENCE_CHANNEL_KEYS = frozenset({"file", "manifest_file", "output"})
 _REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
-_STAGE_KEYS = frozenset({"type", "accuracy"})
+_LINEAR_STAGE_KEYS = frozenset({"type", "accuracy"})
+_NONLINEAR_CC_STAGE_KEYS = frozenset({"type", "accuracy", "metric", "radius"})
+_NONLINEAR_MATTES_STAGE_KEYS = frozenset({"type", "accuracy", "metric", "bins"})
 _SOURCE_KEYS = frozenset(
     {
         "path",
@@ -151,6 +155,8 @@ class _RegistrationContract:
     linear_accuracy: str
     nonlinear_type: str
     nonlinear_accuracy: str
+    nonlinear_metric: NonlinearMetricName
+    nonlinear_radius: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,11 +429,32 @@ def _parse_registration(value: object) -> _RegistrationContract:
             f"scientific plan registration.crop must be boolean; got {crop!r}"
         )
     linear = _exact_mapping(
-        mapping["linear"], _STAGE_KEYS, "scientific plan registration.linear"
+        mapping["linear"], _LINEAR_STAGE_KEYS, "scientific plan registration.linear"
+    )
+    nonlinear_location = "scientific plan registration.nonlinear"
+    nonlinear_preliminary = _mapping(mapping["nonlinear"], nonlinear_location)
+    metric = _choice(
+        nonlinear_preliminary.get("metric"),
+        frozenset({"CC", "mattes"}),
+        f"{nonlinear_location}.metric",
     )
     nonlinear = _exact_mapping(
-        mapping["nonlinear"], _STAGE_KEYS, "scientific plan registration.nonlinear"
+        nonlinear_preliminary,
+        (_NONLINEAR_CC_STAGE_KEYS if metric == "CC" else _NONLINEAR_MATTES_STAGE_KEYS),
+        nonlinear_location,
     )
+    nonlinear_radius: int | None
+    if metric == "CC":
+        nonlinear_radius = _integer(
+            nonlinear["radius"], f"{nonlinear_location}.radius", minimum=1
+        )
+    else:
+        bins = _integer(nonlinear["bins"], f"{nonlinear_location}.bins", minimum=1)
+        if bins != MATTES_BINS:
+            raise WorkflowPlanError(
+                f"{nonlinear_location}.bins must be exactly {MATTES_BINS}; got {bins!r}"
+            )
+        nonlinear_radius = None
     return _RegistrationContract(
         crop=crop,
         linear_type=_choice(
@@ -448,6 +475,8 @@ def _parse_registration(value: object) -> _RegistrationContract:
             _ACCURACIES,
             "scientific plan registration.nonlinear.accuracy",
         ),
+        nonlinear_metric=cast(NonlinearMetricName, metric),
+        nonlinear_radius=nonlinear_radius,
     )
 
 
@@ -950,9 +979,11 @@ def _task_from_snapshot(
                 type=snapshot.registration.linear_type,
                 accuracy=snapshot.registration.linear_accuracy,
             ),
-            nonlinear=RegistrationStageSpec(
+            nonlinear=NonlinearRegistrationStageSpec(
                 type=snapshot.registration.nonlinear_type,
                 accuracy=snapshot.registration.nonlinear_accuracy,
+                metric=snapshot.registration.nonlinear_metric,
+                radius=snapshot.registration.nonlinear_radius,
             ),
         ),
         native_threads=native_threads,

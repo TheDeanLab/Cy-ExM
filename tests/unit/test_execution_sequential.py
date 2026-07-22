@@ -10,6 +10,7 @@ import pytest
 
 from cyexm.config.models import (
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
@@ -70,7 +71,9 @@ def _task(tmp_path: Path, round_number: int) -> RoundTask:
         registration=RegistrationSpec(
             crop=False,
             linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
-            nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
+            nonlinear=NonlinearRegistrationStageSpec(
+                type="SyNOnly", accuracy="high", metric="mattes", radius=None
+            ),
         ),
         native_threads=NativeThreadSpec(itk=2, blas=3),
         channels=(

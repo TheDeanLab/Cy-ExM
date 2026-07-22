@@ -1,0 +1,30 @@
+version: 1
+project:
+  title: Cy-ExM
+  description: Reusable cyclic expansion microscopy registration workflows.
+  github: TheDeanLab/Cy-ExM
+  toc:
+    - file: index.md
+    - title: Getting started
+      children:
+        - file: getting-started.md
+    - title: Scientific and technical foundations
+      children:
+        - file: registration-foundations.md
+        - file: registration-artifacts.md
+        - file: workflow-guide.md
+    - title: Characterization and evidence
+      children:
+        - file: brightness-dependence-investigation.md
+        - file: cc-syn-radius-characterization.md
+        - file: phase-1-acceptance.md
+        - file: legacy-parity-report.md
+  exclude:
+    - AGENTS.md
+    - migration-from-clearex.md
+    - superpowers/**
+site:
+  template: book-theme
+  title: Cy-ExM documentation
+  options:
+    logo_text: Cy-ExM

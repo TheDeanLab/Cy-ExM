@@ -1,5 +1,11 @@
 # Reducing brightness dependence in nonlinear registration
 
+:::{note}
+The measured observations below are specific to the investigated spheroid data.
+Proposed acceptance thresholds and the CC-radius comparison remain characterization
+work; they are not production-default claims.
+:::
+
 ## Conclusion
 
 The observed brightness dependence can likely be reduced substantially in software,
@@ -135,7 +141,7 @@ would reduce chromatic and photometric differences.
 - **Arbitrary dependent-channel fusion:** scientifically unsafe because those
   channels label different biology in different rounds.
 
-## Proposed characterization experiment
+## Ongoing CC-radius characterization
 
 Before changing chunk geometry or deformation regularization, compare the following
 on the approved cropped data:

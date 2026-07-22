@@ -40,8 +40,8 @@ resolver and lock behavior reproducible locally and in CI.
 
 ## Portable validation results
 
-All commands below ran on 2026-07-19 with uv's cache and managed-Python locations on
-`/project` as required by repository policy.
+All commands below ran on 2026-07-19 using the project's configured cache and
+managed-Python locations, as required by repository policy.
 
 | Command | Fresh result |
 | --- | --- |
@@ -76,8 +76,8 @@ and 7 integration modules.
 
 ## Acceptance evidence
 
-- **Legacy parity:** the [legacy parity report](legacy-parity-report.md) records the
-  ClearEx comparison, tolerances, source pin, and characterized corrections.
+- **Legacy parity:** historical extraction evidence records the ClearEx comparison,
+  tolerances, source pin, and characterized corrections.
 - **Import side effects:** all four tests in `test_import_contract.py` passed. They
   confirmed lightweight package/runtime/registration imports, unchanged environment
   and root logging state, no filesystem work during construction, and no eager ANTs,

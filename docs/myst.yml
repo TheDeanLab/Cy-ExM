@@ -18,9 +18,9 @@ project:
         - file: brightness-dependence-investigation.md
         - file: cc-syn-radius-characterization.md
         - file: phase-1-acceptance.md
-        - file: legacy-parity-report.md
   exclude:
     - AGENTS.md
+    - legacy-*-report.md
     - migration-from-clearex.md
     - superpowers/**
 site:

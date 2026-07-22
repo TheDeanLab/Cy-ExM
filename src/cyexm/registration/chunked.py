@@ -279,6 +279,8 @@ class ChunkedImageRegistration(ImageRegistration):
         linear_accuracy: str = "low",
         nonlinear_type: str = "SyNOnly",
         nonlinear_accuracy: str = "high",
+        nonlinear_metric: object = "mattes",
+        nonlinear_radius: object = None,
         _backend: RegistrationBackend | None = None,
         _artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -297,6 +299,8 @@ class ChunkedImageRegistration(ImageRegistration):
             linear_accuracy=linear_accuracy,
             nonlinear_type=nonlinear_type,
             nonlinear_accuracy=nonlinear_accuracy,
+            nonlinear_metric=nonlinear_metric,
+            nonlinear_radius=nonlinear_radius,
             _backend=_backend,
             _artifact_store=_artifact_store,
         )
@@ -479,6 +483,8 @@ class ChunkedImageRegistration(ImageRegistration):
             ),
             overlap_fraction=self.overlap_fraction,
             nonlinear_accuracy=self.nonlinear_accuracy,
+            nonlinear_metric=self.nonlinear_metric,
+            nonlinear_radius=self.nonlinear_radius,
             scalar_postprocessing_policy=self._scalar_postprocessing_policy,
         )
         return StageRequest.for_identities(
@@ -538,6 +544,8 @@ class ChunkedImageRegistration(ImageRegistration):
                     moving_mask=moving_mask_chunk,
                     registration_type=self.nonlinear_type,
                     accuracy=self.nonlinear_accuracy,
+                    metric=self.nonlinear_metric,
+                    radius=self.nonlinear_radius,
                     verbose=True,
                 )
                 reader(temporary_warp)
@@ -653,6 +661,8 @@ class ChunkedImageRegistration(ImageRegistration):
                 image_shape_zyx=image_shape,
                 local_warps=[identity.to_dict() for identity in warp_identities],
                 nonlinear_accuracy=self.nonlinear_accuracy,
+                nonlinear_metric=self.nonlinear_metric,
+                nonlinear_radius=self.nonlinear_radius,
                 nonlinear_type=self.nonlinear_type,
                 overlap_fraction=self.overlap_fraction,
             ),

@@ -14,6 +14,7 @@ from fakes import FakeBackend, FakeImage, fake_image
 
 import cyexm.registration.whole_image as whole_image
 from cyexm.errors import CacheValidationError, RegistrationStageError
+from cyexm.registration._request_policy import nonlinear_parameters
 from cyexm.registration.artifacts import (
     ArtifactStore,
     CompletionRecord,
@@ -88,6 +89,34 @@ def round_paths(tmp_path: Path) -> RegistrationPaths:
 def completion_request(path: Path) -> object:
     store = ArtifactStore()
     return CompletionRecord.read(store.record_path(path)).request
+
+
+def test_nonlinear_request_policy_resolves_metric_sampling() -> None:
+    assert nonlinear_parameters("high", "CC", None)["syn_sampling"] == 4
+    assert nonlinear_parameters("high", "CC", 2)["syn_sampling"] == 2
+    assert nonlinear_parameters("high", "mattes", None)["syn_sampling"] == 32
+
+
+def test_whole_image_cc_policy_is_normalized_forwarded_and_recorded(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    registration = make_registration(
+        tmp_path,
+        backend=backend,
+        nonlinear_metric="CC",
+    )
+
+    assert registration.nonlinear_metric == "CC"
+    assert registration.nonlinear_radius == 4
+
+    registration.register()
+
+    assert backend.nonlinear_kwargs[0]["metric"] == "CC"
+    assert backend.nonlinear_kwargs[0]["radius"] == 4
+    request = completion_request(round_paths(tmp_path).warp)
+    assert request.parameters["registration_parameters"]["syn_metric"] == "CC"
+    assert request.parameters["registration_parameters"]["syn_sampling"] == 4
 
 
 class RejectingValidatorStore(ArtifactStore):
@@ -341,6 +370,8 @@ def test_constructor_stores_custom_scalar_configuration(tmp_path: Path) -> None:
         linear_accuracy="high",
         nonlinear_type="SyN",
         nonlinear_accuracy="low",
+        nonlinear_metric="CC",
+        nonlinear_radius=2,
     )
 
     assert registration.imaging_round == 7
@@ -472,6 +503,8 @@ def test_register_round_forwards_every_option_and_registers_once(
         linear_accuracy="medium",
         nonlinear_type="SyN",
         nonlinear_accuracy="low",
+        nonlinear_metric="CC",
+        nonlinear_radius=2,
     )
 
     assert received["args"] == (
@@ -490,6 +523,8 @@ def test_register_round_forwards_every_option_and_registers_once(
         "linear_accuracy": "medium",
         "nonlinear_type": "SyN",
         "nonlinear_accuracy": "low",
+        "nonlinear_metric": "CC",
+        "nonlinear_radius": 2,
     }
     assert register_calls == 1
 

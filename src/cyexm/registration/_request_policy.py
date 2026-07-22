@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from numbers import Integral, Real
 from typing import Literal
 
+from cyexm._nonlinear_metric import resolve_nonlinear_metric
 from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, PixelSize
 
 WHOLE_SCALAR_POLICY = "whole-global-histogram-match-v1"
@@ -39,12 +40,13 @@ def common_parameters(
     *, crop: bool, imaging_round: int, pixel_size_xyz: PixelSize
 ) -> dict[str, object]:
     """Return evidence common to every Phase 1 registration stage."""
-    return {
+    parameters: dict[str, object] = {
         "axis_convention_version": AXIS_CONVENTION_VERSION,
         "crop": crop,
         "imaging_round": imaging_round,
         "pixel_size_xyz": list(pixel_size_xyz),
     }
+    return parameters
 
 
 def crop_parameters(role: Literal["fixed", "moving"]) -> dict[str, object]:
@@ -116,8 +118,13 @@ def affine_parameters(
     }
 
 
-def nonlinear_parameters(accuracy: str) -> dict[str, object]:
+def nonlinear_parameters(
+    accuracy: str,
+    metric: object = "mattes",
+    radius: object = None,
+) -> dict[str, object]:
     """Return the canonical Phase 1 nonlinear registration parameter evidence."""
+    resolved = resolve_nonlinear_metric(metric, radius)
     return {
         "aff_random_sampling_rate": 1.0,
         "flow_sigma": 3.0,
@@ -125,8 +132,8 @@ def nonlinear_parameters(accuracy: str) -> dict[str, object]:
         "mask_all_stages": True,
         "reg_iterations": _NONLINEAR_ITERATIONS[accuracy],
         "singleprecision": False,
-        "syn_metric": "mattes",
-        "syn_sampling": 32,
+        "syn_metric": resolved.metric,
+        "syn_sampling": resolved.syn_sampling,
         "total_sigma": 0.5,
         "verbose": True,
     }
@@ -137,6 +144,8 @@ def nonlinear_stage_parameters(
     moving_geometry: ImageGeometry,
     registration_mode: Literal["whole-image", "serial-chunked"],
     nonlinear_accuracy: str,
+    nonlinear_metric: object = "mattes",
+    nonlinear_radius: object = None,
     scalar_postprocessing_policy: str,
     evidence: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -146,7 +155,9 @@ def nonlinear_stage_parameters(
         "mask_interpolation": "nearestNeighbor",
         "moving_geometry": moving_geometry.to_dict(),
         "registration_mode": registration_mode,
-        "registration_parameters": nonlinear_parameters(nonlinear_accuracy),
+        "registration_parameters": nonlinear_parameters(
+            nonlinear_accuracy, nonlinear_metric, nonlinear_radius
+        ),
         "scalar_postprocessing_policy": scalar_postprocessing_policy,
     }
     if evidence is not None:
@@ -335,10 +346,12 @@ def local_chunk_parameters(
     moving_mask_geometry: ImageGeometry | None,
     overlap_fraction: float,
     nonlinear_accuracy: str,
+    nonlinear_metric: object = "mattes",
+    nonlinear_radius: object = None,
     scalar_postprocessing_policy: str,
 ) -> dict[str, object]:
     """Return canonical local-warp parameters."""
-    return {
+    parameters: dict[str, object] = {
         "axis_convention_version": AXIS_CONVENTION_VERSION,
         "chunk": dict(chunk),
         "chunk_grid": [dict(item) for item in chunks],
@@ -355,9 +368,12 @@ def local_chunk_parameters(
             None if moving_mask_geometry is None else moving_mask_geometry.to_dict()
         ),
         "overlap_fraction": overlap_fraction,
-        "registration_parameters": nonlinear_parameters(nonlinear_accuracy),
+        "registration_parameters": nonlinear_parameters(
+            nonlinear_accuracy, nonlinear_metric, nonlinear_radius
+        ),
         "scalar_postprocessing_policy": scalar_postprocessing_policy,
     }
+    return parameters
 
 
 def chunk_manifest_payload(
@@ -391,10 +407,13 @@ def chunk_manifest_parameters(
     local_warps: Sequence[Mapping[str, object]],
     nonlinear_accuracy: str,
     nonlinear_type: str,
+    nonlinear_metric: object = "mattes",
+    nonlinear_radius: object = None,
     overlap_fraction: float,
 ) -> dict[str, object]:
     """Return canonical chunk-manifest completion parameters."""
-    return {
+    resolved = resolve_nonlinear_metric(nonlinear_metric, nonlinear_radius)
+    parameters: dict[str, object] = {
         "axis_convention_version": AXIS_CONVENTION_VERSION,
         "chunk_size_zyx": list(chunk_size_zyx),
         "image_shape_zyx": list(image_shape_zyx),
@@ -403,6 +422,12 @@ def chunk_manifest_parameters(
         "nonlinear_type": nonlinear_type,
         "overlap_fraction": overlap_fraction,
     }
+    if resolved.metric == "CC":
+        parameters.update(
+            nonlinear_metric=resolved.metric,
+            nonlinear_sampling=resolved.syn_sampling,
+        )
+    return parameters
 
 
 __all__ = [

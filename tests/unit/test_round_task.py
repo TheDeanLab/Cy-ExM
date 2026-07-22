@@ -39,6 +39,11 @@ from cyexm.runtime import (
     ResolvedNativeThreads,
 )
 from cyexm.spatial import TIFF_GEOMETRY_ATOL, ImageGeometry
+from cyexm.workflow._round_provenance import (
+    RegistrationArtifactPaths,
+    SourceGeometries,
+    completion_evidence,
+)
 from cyexm.workflow.models import ChannelTask, RoundTask
 from cyexm.workflow.round_task import run_round_task
 
@@ -257,6 +262,8 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
                     moving_mask_geometry=local_geometry,
                     overlap_fraction=task.overlap_fraction,
                     nonlinear_accuracy=task.registration.nonlinear.accuracy,
+                    nonlinear_metric=task.registration.nonlinear.metric,
+                    nonlinear_radius=task.registration.nonlinear.radius,
                     scalar_postprocessing_policy=selected_scalar_policy,
                 ),
             )
@@ -286,6 +293,8 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
                 image_shape_zyx=fixed_geometry.shape,
                 local_warps=local_dicts,
                 nonlinear_accuracy=task.registration.nonlinear.accuracy,
+                nonlinear_metric=task.registration.nonlinear.metric,
+                nonlinear_radius=task.registration.nonlinear.radius,
                 nonlinear_type=task.registration.nonlinear.type,
                 overlap_fraction=task.overlap_fraction,
             ),
@@ -320,6 +329,8 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
                     else "serial-chunked"
                 ),
                 nonlinear_accuracy=task.registration.nonlinear.accuracy,
+                nonlinear_metric=task.registration.nonlinear.metric,
+                nonlinear_radius=task.registration.nonlinear.radius,
                 scalar_postprocessing_policy=selected_scalar_policy,
                 evidence=nonlinear_evidence,
             ),
@@ -755,6 +766,8 @@ def test_round_task_passes_exact_strategy_constructor_arguments(
         "linear_accuracy": task.registration.linear.accuracy,
         "nonlinear_type": task.registration.nonlinear.type,
         "nonlinear_accuracy": task.registration.nonlinear.accuracy,
+        "nonlinear_metric": task.registration.nonlinear.metric,
+        "nonlinear_radius": task.registration.nonlinear.radius,
     }
     if strategy == "serial_chunked":
         expected["chunk_size"] = task.chunk_size_zyx
@@ -1033,6 +1046,47 @@ def test_round_task_reports_artifacts_reused_from_before_invocation(
 
     assert result.status == "completed"
     assert result.reused_artifacts == result.artifact_paths
+
+
+@pytest.mark.parametrize("strategy", ["whole_image", "serial_chunked"])
+def test_radius_change_preserves_affine_but_invalidates_nonlinear_descendants(
+    tmp_path: Path, strategy: str
+) -> None:
+    original = _task(tmp_path, strategy=strategy, channel_names=("a.tif",))
+    original = replace(
+        original,
+        registration=replace(
+            original.registration,
+            nonlinear=replace(
+                original.registration.nonlinear,
+                metric="CC",
+                radius=4,
+            ),
+        ),
+    )
+    _commit_registration_chain(original)
+    _commit_channel(original, original.channels[0])
+    changed = replace(
+        original,
+        registration=replace(
+            original.registration,
+            nonlinear=replace(original.registration.nonlinear, radius=2),
+        ),
+    )
+    paths = RegistrationArtifactPaths.for_round(
+        changed.registration_directory, changed.round
+    )
+
+    evidence = completion_evidence(
+        changed,
+        paths,
+        SourceGeometries(fixed=_FULL_FIXED_GEOMETRY, moving=_FULL_MOVING_GEOMETRY),
+        geometry_reader=lambda _path, _spacing: _FULL_FIXED_GEOMETRY,
+    )
+
+    assert evidence.artifacts == (paths.affine,)
+    assert evidence.affine is not None
+    assert evidence.warp is None
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt("stop"), SystemExit(7)])

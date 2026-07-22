@@ -286,6 +286,30 @@ def test_resume_reuses_completed_chunk(tmp_path: Path) -> None:
     assert 1 in resumed.registered_chunk_ids
 
 
+def test_chunked_cc_policy_is_forwarded_to_every_local_registration(
+    tmp_path: Path,
+) -> None:
+    backend = FakeChunkBackend()
+    registration = make_chunked_registration(
+        tmp_path,
+        backend=backend,
+        nonlinear_metric="CC",
+        nonlinear_radius=2,
+    )
+
+    registration.register()
+
+    assert backend.nonlinear_kwargs
+    assert all(call["metric"] == "CC" for call in backend.nonlinear_kwargs)
+    assert all(call["radius"] == 2 for call in backend.nonlinear_kwargs)
+    request = CompletionRecord.read(
+        registration.chunk_paths(0).completion_record
+    ).request
+    parameters = request.parameters["registration_parameters"]
+    assert parameters["syn_metric"] == "CC"
+    assert parameters["syn_sampling"] == 2
+
+
 def test_local_registration_uses_extended_physical_image_geometry(
     tmp_path: Path,
 ) -> None:

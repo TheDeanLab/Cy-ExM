@@ -291,6 +291,8 @@ def run_round_task(task: RoundTask) -> RoundResult:
             "linear_accuracy": task.registration.linear.accuracy,
             "nonlinear_type": task.registration.nonlinear.type,
             "nonlinear_accuracy": task.registration.nonlinear.accuracy,
+            "nonlinear_metric": task.registration.nonlinear.metric,
+            "nonlinear_radius": task.registration.nonlinear.radius,
         }
         stage = "registration"
         if task.strategy == "whole_image":

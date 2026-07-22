@@ -10,6 +10,7 @@ from numbers import Real
 from pathlib import Path
 from typing import Any, Literal
 
+from cyexm._nonlinear_metric import resolve_nonlinear_metric
 from cyexm.errors import (
     CacheValidationError,
     ChunkRegistrationError,
@@ -135,6 +136,8 @@ class ImageRegistration:
         linear_accuracy: str = "low",
         nonlinear_type: str = "SyNOnly",
         nonlinear_accuracy: str = "high",
+        nonlinear_metric: object = "mattes",
+        nonlinear_radius: object = None,
         _backend: RegistrationBackend | None = None,
         _artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -162,6 +165,9 @@ class ImageRegistration:
         self.nonlinear_accuracy = _validated_choice(
             nonlinear_accuracy, "nonlinear_accuracy", _ACCURACIES
         )
+        resolved_metric = resolve_nonlinear_metric(nonlinear_metric, nonlinear_radius)
+        self.nonlinear_metric = resolved_metric.metric
+        self.nonlinear_radius = resolved_metric.radius
         self._backend = _backend
         self._artifact_store = _artifact_store
         self._log = logger
@@ -502,7 +508,11 @@ class ImageRegistration:
         return linear_parameters(self.linear_type, self.linear_accuracy)
 
     def _nonlinear_parameters(self) -> dict[str, object]:
-        return nonlinear_parameters(self.nonlinear_accuracy)
+        return nonlinear_parameters(
+            self.nonlinear_accuracy,
+            self.nonlinear_metric,
+            self.nonlinear_radius,
+        )
 
     def _commit_fixed_reference(
         self,
@@ -834,6 +844,8 @@ class ImageRegistration:
                     moving_geometry=backend.geometry(moving_linear),
                     registration_mode=self._nonlinear_mode,
                     nonlinear_accuracy=self.nonlinear_accuracy,
+                    nonlinear_metric=self.nonlinear_metric,
+                    nonlinear_radius=self.nonlinear_radius,
                     scalar_postprocessing_policy=self._scalar_postprocessing_policy,
                     evidence=self._nonlinear_request_evidence,
                 )
@@ -992,6 +1004,8 @@ class ImageRegistration:
             moving_mask=moving_linear_mask,
             registration_type=self.nonlinear_type,
             accuracy=self.nonlinear_accuracy,
+            metric=self.nonlinear_metric,
+            radius=self.nonlinear_radius,
             verbose=True,
         )
 
@@ -1082,6 +1096,8 @@ def register_round(
     linear_accuracy: str = "low",
     nonlinear_type: str = "SyNOnly",
     nonlinear_accuracy: str = "high",
+    nonlinear_metric: object = "mattes",
+    nonlinear_radius: object = None,
 ) -> None:
     ImageRegistration(
         fixed_image_path,
@@ -1097,6 +1113,8 @@ def register_round(
         linear_accuracy=linear_accuracy,
         nonlinear_type=nonlinear_type,
         nonlinear_accuracy=nonlinear_accuracy,
+        nonlinear_metric=nonlinear_metric,
+        nonlinear_radius=nonlinear_radius,
     ).register()
 
 

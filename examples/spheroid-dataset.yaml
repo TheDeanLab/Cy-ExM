@@ -21,6 +21,8 @@ registration:
   nonlinear:
     type: SyNOnly
     accuracy: high
+    metric: CC
+    # Optional scalar voxel radius. Omission uses the provisional default of 4.
 
 rounds:
   - round: 2

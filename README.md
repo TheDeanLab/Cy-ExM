@@ -6,7 +6,8 @@ and a restartable **serial** chunked nonlinear workflow. Its Phase 2 workflow ad
 strict YAML configuration, immutable round planning, sequential and local-Dask
 execution, and a SLURM adapter whose real-cluster acceptance is still pending. Both
 registration strategies use affine registration before nonlinear registration and
-preserve physical image geometry.
+preserve physical image geometry. Nonlinear SyN supports either legacy Mattes mutual
+information or local cross-correlation (CC) with a configurable scalar voxel radius.
 
 Cy-ExM requires Python 3.12 and retains the academic-research-use terms in
 [LICENSE.md](LICENSE.md).
@@ -138,8 +139,14 @@ register_round(
     native_threads=NativeThreadConfig(itk_threads=1, blas_threads=1),
     linear_accuracy="low",
     nonlinear_accuracy="high",
+    nonlinear_metric="CC",
+    # nonlinear_radius=4,  # Optional for CC; omission normalizes to 4.
 )
 ```
+
+The standalone Phase 1 Python API retains its legacy omitted-argument behavior:
+`nonlinear_metric="mattes"` with 32 bins. CC accepts one positive built-in integer
+`nonlinear_radius`; an omitted CC radius normalizes to the provisional value 4.
 
 The equivalent command-line example is:
 
@@ -170,6 +177,7 @@ registration = ChunkedImageRegistration(
     chunk_size=(512, 512, 512),
     overlap_fraction=0.15,
     native_threads=NativeThreadConfig(itk_threads=1, blas_threads=1),
+    nonlinear_metric="CC",
 )
 registration.register()
 ```
@@ -261,8 +269,9 @@ resources before use. In particular, do not run the SLURM placeholders unchanged
 
 ### Scientific dataset manifest
 
-Every mapping has exact keys; there are no implicit scientific defaults in the YAML.
-The fields are:
+Every mapping has exact keys. Required scientific selections are explicit; the only
+nonlinear metric normalization is CC's documented optional radius default. The fields
+are:
 
 | Location | Type and accepted values | Meaning |
 | --- | --- | --- |
@@ -278,6 +287,8 @@ The fields are:
 | `registration` / `linear` / `accuracy` | `high`, `medium`, `low`, or `dry run` | Phase 1 linear schedule. |
 | `registration` / `nonlinear` / `type` | `Elastic`, `SyNOnly`, or `SyN` | Phase 1 nonlinear method. |
 | `registration` / `nonlinear` / `accuracy` | `high`, `medium`, `low`, or `dry run` | Phase 1 nonlinear schedule. |
+| `registration` / `nonlinear` / `metric` | exact `CC` or `mattes` | Required nonlinear similarity metric. Affine registration remains Mattes/32 independently. |
+| `registration` / `nonlinear` / `radius` | positive built-in integer | Optional only for `CC`; omission normalizes to the provisional default 4. Rejected for `mattes`, which uses 32 bins. |
 | `rounds` | non-empty list | Moving-round objects; moving rounds are unique and cannot equal the reference round. |
 | moving `round` | nonnegative built-in integer | Round identifier used in task and output names. |
 | `strategy` | `whole_image` or `serial_chunked` | Selects the accepted Phase 1 registration implementation. |
@@ -304,6 +315,12 @@ chunking and before final channel export. Planning requires every input to be a 
 Schema version 1 intentionally uses only `reference.registration_channel` and
 `reference.channels`. The retired singular `reference.channel` form is rejected;
 there is no dual parser or compatibility schema to maintain.
+
+ANTs exposes CC radius as one scalar voxel count, not independent per-axis radii.
+Radius 4 therefore means a 9-by-9-by-9 voxel neighborhood. With anisotropic voxel
+spacing that neighborhood is physically anisotropic even though its voxel radius is
+equal along X, Y, and Z. The default of 4 is provisional pending dataset-specific
+characterization; it is not a claim of optimality.
 
 The loader uses safe YAML decoding and rejects unknown keys, missing keys, duplicate
 mapping keys, YAML aliases, custom tags, non-scalar keys, specialized collection
@@ -469,6 +486,12 @@ fingerprint fails with field-level differences: force cannot bypass a scientific
 fingerprint mismatch, and a scientifically incompatible plan requires a new output
 root. `--force-round` and `--force-all` only request recomputation within a compatible
 plan.
+
+Schema version 1 now requires nonlinear `metric` evidence, and persisted plans record
+either effective CC `radius` or fixed Mattes `bins: 32`. Plans written before this
+contract fail exact validation and should be rerun under a new output root. Omitting a
+CC radius and explicitly selecting radius 4 produce the same canonical plan,
+fingerprint, and cache identity; changing the radius changes all three.
 
 For reference round 1 and moving round 2, the workflow uses the following layout.
 Reference sources are copied, never moved or modified. The current export boundary is

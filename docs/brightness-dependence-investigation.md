@@ -19,11 +19,10 @@ All tested representations recover essentially the same residual displacement in
 the dim region of interest. This confirms that the offset is real and that usable
 structural information remains there.
 
-| Round | Approximate correction `(dy, dx)` | Raw NCC improvement at correction | Gradient NCC improvement |
+| Round | Approximate correction `(dy, dx)` | Raw NCC current -> corrected | Gradient NCC current -> corrected |
 | --- | ---: | ---: | ---: |
-| 2 | `(+7, -8)` px | +0.100 | +0.240 |
-| 3 | `(+16, -9)` px | +0.227 | +0.314 |
-| 4 | `(+10, -14)` px | +0.173 | +0.275 |
+| 2 | `(+7, -8)` px | 0.807 -> 0.907 | 0.557 -> 0.797 |
+| 3 | `(+16, -9)` px | 0.656 -> 0.883 | 0.433 -> 0.747 |
 
 The gradient representation made the correct match approximately 1.4--2.4 times
 more distinguishable than raw intensity. Log compression, contrast-limited adaptive
@@ -38,8 +37,8 @@ volume.
 
 ### 1. Mattes affine followed by CC SyN
 
-Keep the current TRSAA/Mattes affine stage. Make the nonlinear metric configurable
-and test neighborhood cross-correlation (CC) with radii 2 and 4.
+Keep the current TRSAA/Mattes affine stage and use the now-configurable nonlinear
+metric to test neighborhood cross-correlation (CC) across several radii.
 
 CC computes correlation over local neighborhoods and normalizes local mean and
 contrast. That directly reduces sensitivity to local brightness scaling. ANTs
@@ -55,11 +54,12 @@ This dataset is well suited to CC because tubulin is the common marker in every
 round. Radius selection needs testing because Z is anisotropic: a voxel-radius
 neighborhood covers a larger physical distance in Z than in XY.
 
-Estimated implementation difficulty is moderate, approximately one or two focused
-development days. ANTSpyX already supports `syn_metric="CC"` and
-`syn_sampling=<radius>`. Cy-ExM would need corresponding schema, planner, cache
-identity, provenance, validation, tests, documentation, and example-YAML changes.
-See the [ANTsPy registration API](https://antspy.readthedocs.io/en/stable/registration.html).
+Cy-ExM now carries `metric: CC` and its effective scalar radius through schema-v1
+validation, canonical planning, cache identity, provenance, status reconstruction,
+and ANTs execution. Omission uses the provisional radius 4. ANTs does not expose an
+anisotropic per-axis CC radius: a scalar radius 4 spans 9 voxels per axis, so an
+anisotropic voxel grid produces a physically anisotropic neighborhood. See the
+[ANTsPy registration API](https://antspy.readthedocs.io/en/stable/registration.html).
 
 ### 2. Add a structure-aware secondary metric
 
@@ -143,7 +143,8 @@ on the approved cropped data:
 1. The current Mattes SyN baseline.
 2. CC SyN with radius 2.
 3. CC SyN with radius 4.
-4. The best CC configuration plus a low-weight gradient or LoG metric.
+4. CC SyN with radius 6 or 8 to bound the useful neighborhood scale.
+5. The best CC configuration plus a low-weight gradient or LoG metric.
 
 Only promote a configuration that improves spatially resolved low-signal residuals,
 preserves bright-region alignment and global similarity, produces a physically

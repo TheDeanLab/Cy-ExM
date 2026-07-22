@@ -15,6 +15,9 @@
   volumes whose shapes differ along all three spatial axes. Prove the affine result
   enters nonlinear work on the fixed grid and assert fixed-reference geometry for
   persisted scalar, mask, warp, and dependent-channel products.
+- Nonlinear metric changes require pure policy tests, request/provenance invalidation
+  tests, and a bounded real-ANTs integration test. Dataset-specific radius selection
+  remains explicitly selected HPC/scientific acceptance.
 - Portable unit and integration tests must not access lab storage or silently skip by
   hostname. HPC tests require a documented, explicitly selected command.
 - The portable scheduler firewall covers semantic command positions for subprocess,

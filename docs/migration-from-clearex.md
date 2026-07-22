@@ -76,6 +76,14 @@ The extraction preserves fixed/moving roles, TRSAA and SyNOnly policy, masks,
 interpolation, and transform order. It intentionally does not reproduce defects that
 could create incomplete or scientifically misleading results:
 
+Legacy ClearEx nonlinear registration used Mattes mutual information with 32 bins.
+The standalone Cy-ExM Phase 1 API preserves that omitted-argument default. Workflow
+schema version 1 now requires the choice explicitly: use `metric: mattes` for legacy
+behavior, or `metric: CC` for local cross-correlation. CC accepts one optional scalar
+voxel `radius`; omission normalizes to the provisional default 4. Mattes rejects a
+radius. Scientific plans created before the required metric field do not satisfy the
+revised exact schema and must use a new output root.
+
 1. Linear registration defines the optional transformed-mask return even when no
    moving mask is supplied.
 2. Whole-image orchestration consumes the nonlinear scalar-and-warp tuple rather

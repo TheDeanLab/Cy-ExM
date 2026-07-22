@@ -29,3 +29,6 @@
 - Scientific-manifest examples declare `reference.registration_channel` and every
   intended `reference.channels[].file`; do not use the retired singular
   `reference.channel` field. Reference declaration order is preserved in outputs.
+- Scientific-manifest examples must declare nonlinear `metric`; demonstrate CC's
+  optional radius by omitting it only when the normalized provisional default 4 is
+  the intended example behavior.

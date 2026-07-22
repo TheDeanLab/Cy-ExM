@@ -69,12 +69,16 @@
   order, TRSAA linear registration, SyNOnly nonlinear registration, scalar linear
   interpolation, mask nearest-neighbor interpolation, and ANTs origin, spacing, and
   direction.
+- Affine registration remains Mattes/32. Nonlinear registration supports exact `CC`
+  and `mattes`; CC uses one positive scalar voxel radius with omitted radius normalized
+  to the provisional default 4, while Mattes uses 32 bins and rejects a radius.
 - Preserve the legacy class defaults: the `low` linear preset and the `high`
   nonlinear preset.
 - Default each ITK and BLAS-family native runtime to one thread unless an inherited
   environment value or explicit configuration overrides that variable.
-- Treat transform, axis, interpolation, schedule, and tolerance changes as scientific
-  changes that require explicit rationale and focused characterization tests.
+- Treat transform, axis, interpolation, metric, radius, schedule, and tolerance
+  changes as scientific changes that require explicit rationale and focused
+  characterization tests.
 
 ## HPC storage and source safety
 

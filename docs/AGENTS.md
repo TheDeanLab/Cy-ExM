@@ -18,6 +18,9 @@
 - Treat transform order, interpolation, axes, masks, schedules, and tolerance values
   as scientific statements. Link evidence or explain the characterization behind
   them instead of simplifying them into ambiguous prose.
+- Describe CC radius as one scalar voxel radius and identify radius 4 as provisional.
+  Do not imply ANTs accepts per-axis radii or that repository defaults are optimized
+  for a representative dataset without explicit scientific acceptance evidence.
 - Historical ClearEx names and lab consumer paths belong only in migration or parity
   documents. General guides and examples must remain portable and use Cy-ExM names.
 - Do not include credentials, private GitHub URLs with tokens, generated evidence,

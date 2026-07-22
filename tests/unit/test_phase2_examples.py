@@ -9,6 +9,7 @@ from cyexm.config import (
     ExecutionPaths,
     LocalDaskSpec,
     NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
     RegistrationSpec,
     RegistrationStageSpec,
     SlurmMemoryQuantity,
@@ -50,7 +51,9 @@ def test_spheroid_manifest_records_approved_scientific_inputs() -> None:
     assert manifest.registration == RegistrationSpec(
         crop=False,
         linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
-        nonlinear=RegistrationStageSpec(type="SyNOnly", accuracy="high"),
+        nonlinear=NonlinearRegistrationStageSpec(
+            type="SyNOnly", accuracy="high", metric="CC", radius=4
+        ),
     )
     assert tuple(item.round for item in manifest.rounds) == (2, 3, 4)
     assert tuple(item.strategy for item in manifest.rounds) == (

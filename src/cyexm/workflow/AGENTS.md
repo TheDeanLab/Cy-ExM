@@ -17,6 +17,9 @@
   for both reference and moving rounds; use the one-thread default only when no valid
   evidence exists.
 - Scientific fingerprints exclude executor, resource, and logging settings.
+- Scientific fingerprints and strict persisted plans include effective nonlinear
+  metric evidence: CC radius or fixed Mattes bins. Omitted CC radius and explicit 4
+  share identity; a different radius invalidates nonlinear descendants, not affine.
 - Validate each source TIFF shape independently as positive scalar ZYX evidence.
   Native reference, registration-channel, and dependent-channel shapes may differ
   along every spatial axis; fixed-grid equality is a post-resampling output contract,

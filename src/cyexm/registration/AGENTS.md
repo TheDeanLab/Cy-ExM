@@ -9,6 +9,9 @@
 - Validate registration method and accuracy before requesting ANTs. Preserve
   the characterized TRSAA and SyNOnly schedules, metrics, sampling settings,
   masks, interpolation modes, histogram matching, and single-precision policy.
+- Resolve nonlinear metric policy before loading scientific runtimes. Preserve
+  standalone Mattes/32 defaults; forward exact `CC` plus its positive scalar radius
+  through whole-image and every serial-chunk call and authoritative request record.
 - Apply forward transforms in warp-then-affine list order with both inversion
   flags false. Scalars use linear interpolation; labels and masks use
   `nearestNeighbor`, with transformed masks cast to float and thresholded at 0.5 so

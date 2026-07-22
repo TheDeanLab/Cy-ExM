@@ -8,6 +8,9 @@
   `reference.channels` list. Require the registration channel exactly once, require
   unique source paths and output basenames, and do not maintain legacy
   `reference.channel` dual parsing.
+- Schema version 1 also requires nonlinear `metric` exactly `CC` or `mattes`. Normalize
+  omitted CC radius to built-in integer 4, reject anisotropic or invalid radii, reject
+  radius for Mattes, and keep the normalized nonlinear model free of runtime imports.
 - Scientific and execution roots are disjoint, neither containing the other.
 - Parse `slurm.memory` centrally as positive whole decimal memory with exact `KB`,
   `MB`, `GB`, or `TB` suffixes. Reject invalid, fractional, zero, unsupported, or

@@ -27,6 +27,9 @@
   cannot accidentally satisfy prepared-grid provenance.
 - Status tests must cover non-default native thread evidence on the reference round;
   the scientific plan intentionally excludes execution-profile thread settings.
+- Metric-policy unit tests must compare complete normalized plans and request
+  dictionaries, prove strict scalar-radius typing, and prove radius changes preserve
+  affine evidence while invalidating nonlinear descendants.
 - Executor tests must make the reference barrier observable: reference submission
   precedes moving submissions, failure prevents descendant submission, and one owned
   client/cluster lifecycle spans both stages.

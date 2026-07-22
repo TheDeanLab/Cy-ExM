@@ -37,8 +37,9 @@
   reference barrier in the same owned execution lifecycle; reference failure prevents
   moving submission. Forcing the reference round propagates to every moving descendant.
   Worker-backed executors expose one `round_slot` per worker and every submitted round
-  consumes one slot. SLURM uses one process per SLURM job and one node per round; do not
-  weaken that resource contract without explicit scientific and operational acceptance.
+  consumes one slot. SLURM uses one process per SLURM job and one node per round; do
+  not weaken that resource contract without explicit scientific and operational
+  acceptance.
 - `clearex.registration.pipeline` and `clearex.registration.tre` remain out of scope;
   do not recreate unrelated ClearEx surfaces in this repository.
 - Child `AGENTS.md` files add scope-specific guidance and inherit, rather than repeat,
@@ -113,3 +114,23 @@ Run bare `uv lock` only when an approved dependency change intentionally regener
 
 Tests marked `hpc` require an explicit lab-storage or cluster allocation and are not
 part of portable CI.
+
+## API reuse and documentation policy
+
+Before adding or changing a user-callable API, search source, tests, documentation,
+examples, exports, the proposed name, and plausible synonyms. Identify the closest
+existing symbols; prefer composition, extension, parameterization, or repair over a
+parallel abstraction. Do not add a wrapper that merely renames an operation or
+duplicates its lifecycle, validation, persistence, state management, or cleanup.
+
+A user-callable API is a relatively high-level entry point, resource owner, data
+model, executor, or explicitly supported extension interface. It requires full
+Numpydoc. Simple pure value objects and helpers may use concise Numpydoc. Treat
+documented units, shapes, coordinate systems, state transitions, side effects,
+ownership, and errors as contracts.
+
+For multi-step or user-callable API work, record a `Reuse analysis` in the
+implementation plan and in the body of the API-changing commit. A PR description
+links to both records and notes deviations; preserve the analysis in squash commits.
+Read [the agentic API documentation guide](docs/agentic-api-documentation.md) before
+designing or documenting such an API.

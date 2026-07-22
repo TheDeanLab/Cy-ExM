@@ -19,6 +19,7 @@ from hpc.deterministic_parity import (
 from hpc.deterministic_parity import (
     main as deterministic_parity_main,
 )
+from hpc.test_slurm_workflow import _assert_resume
 from hpc.workflow_acceptance import (
     HpcWorkflowAcceptanceError,
     _validated_deterministic_parity_evidence,
@@ -148,6 +149,46 @@ def test_bounded_manifest_selects_one_round_per_strategy_in_round_order() -> Non
     )
     assert selected == replace(
         manifest, rounds=(manifest.rounds[1], manifest.rounds[0])
+    )
+
+
+def test_resume_assertion_counts_reference_dispatch_but_proves_artifact_reuse() -> None:
+    reference = SimpleNamespace(
+        round=1,
+        status="completed",
+        artifact_paths=("reference.tif",),
+        reused_artifacts=("reference.tif",),
+    )
+    reused = SimpleNamespace(
+        round=2,
+        status="reused",
+        artifact_paths=("round-2.tif",),
+        reused_artifacts=("round-2.tif",),
+    )
+    recomputed = SimpleNamespace(
+        round=3,
+        status="completed",
+        artifact_paths=("round-3.tif",),
+        reused_artifacts=(),
+    )
+    result = SimpleNamespace(
+        succeeded=True,
+        dataset_id="bounded",
+        rounds=(reference, reused, recomputed),
+        execution_evidence_json=json.dumps(
+            {
+                "attempt_counts": [
+                    {"dataset_id": "bounded", "round": 1, "attempts": 1},
+                    {"dataset_id": "bounded", "round": 3, "attempts": 1},
+                ]
+            }
+        ),
+    )
+
+    _assert_resume(
+        result,  # type: ignore[arg-type]
+        reused_round=2,
+        recomputed_round=3,
     )
 
 

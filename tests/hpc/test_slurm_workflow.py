@@ -111,6 +111,15 @@ def _assert_resume(
     assert result.succeeded
     reused = _result_by_round(result, reused_round)
     recomputed = _result_by_round(result, recomputed_round)
+    reference_results = tuple(
+        item
+        for item in result.rounds
+        if item.round not in {reused_round, recomputed_round}
+    )
+    assert len(reference_results) == 1
+    reference = reference_results[0]
+    assert reference.status == "completed"
+    assert reference.reused_artifacts == reference.artifact_paths
     assert reused.status == "reused"
     assert reused.reused_artifacts == reused.artifact_paths
     assert recomputed.status == "completed"
@@ -119,9 +128,14 @@ def _assert_resume(
     assert execution["attempt_counts"] == [
         {
             "dataset_id": result.dataset_id,
+            "round": reference.round,
+            "attempts": 1,
+        },
+        {
+            "dataset_id": result.dataset_id,
             "round": recomputed_round,
             "attempts": 1,
-        }
+        },
     ]
 
 

@@ -21,6 +21,7 @@ from hpc.deterministic_parity import (
 )
 from hpc.workflow_acceptance import (
     HpcWorkflowAcceptanceError,
+    _validated_deterministic_parity_evidence,
     bounded_acceptance_manifest,
     bounded_slurm_profile,
     coordination_timeout_seconds,
@@ -213,6 +214,82 @@ def test_task5_profiles_are_bounded_and_confined_to_named_owned_roots(
     assert deterministic_sequential.paths.worker_local_directory is None
 
 
+def _exact_numeric_payload() -> dict[str, object]:
+    return {
+        "array_equal": True,
+        "close_required": True,
+        "maximum_absolute_difference": 0.0,
+        "rtol": 0.0,
+        "atol": 0.0,
+    }
+
+
+def _strict_parity_payload() -> dict[str, object]:
+    metric = {
+        "absolute_tolerance": 0.0,
+        "absolute_differences": {
+            "Correlation": 0.0,
+            "MattesMutualInformation": 0.0,
+        },
+    }
+    return {
+        "schema_version": 1,
+        "scientific_fingerprint": "abc",
+        "rtol": 0.0,
+        "atol": 0.0,
+        "comparison_policy": "strict-deterministic-numeric-parity",
+        "metric_absolute_tolerance": 0.0,
+        "voxel_differences_are_characterization": False,
+        "rounds": [
+            {
+                "affine": {"parameters": _exact_numeric_payload()},
+                "warp": {"numeric": _exact_numeric_payload()},
+                "registered": {"numeric": _exact_numeric_payload()},
+                "metrics": {
+                    "pre-registration": metric,
+                    "linearly-registered": metric,
+                    "nonlinear-registered": metric,
+                },
+                "channels": [{"comparison": {"numeric": _exact_numeric_payload()}}],
+            }
+        ],
+    }
+
+
+def test_deterministic_parity_evidence_rejects_nonexact_artifact_claim() -> None:
+    strict = _strict_parity_payload()
+    rounds = strict["rounds"]
+    assert isinstance(rounds, list)
+    round_evidence = rounds[0]
+    assert isinstance(round_evidence, dict)
+    affine = round_evidence["affine"]
+    assert isinstance(affine, dict)
+    parameters = affine["parameters"]
+    assert isinstance(parameters, dict)
+    parameters["array_equal"] = False
+    payload = {
+        "schema_version": 1,
+        "status": "completed",
+        "seed": "20260722",
+        "native_threads": {
+            "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1,
+            "OMP_NUM_THREADS": 1,
+            "OPENBLAS_NUM_THREADS": 1,
+            "MKL_NUM_THREADS": 1,
+            "NUMEXPR_NUM_THREADS": 1,
+            "VECLIB_MAXIMUM_THREADS": 1,
+        },
+        "inputs": {},
+        "parallel": {"status": "completed"},
+        "sequential": {"status": "completed"},
+        "strict_parity": strict,
+        "final_queue": {"jobs": []},
+    }
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="affine is not exactly"):
+        _validated_deterministic_parity_evidence(payload)
+
+
 def test_deterministic_parity_subprocess_is_fresh_one_thread_and_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -245,9 +322,9 @@ def test_deterministic_parity_subprocess_is_fresh_one_thread_and_fail_closed(
                         "VECLIB_MAXIMUM_THREADS": 1,
                     },
                     "inputs": {},
-                    "parallel": {},
-                    "sequential": {},
-                    "strict_parity": {},
+                    "parallel": {"status": "completed"},
+                    "sequential": {"status": "completed"},
+                    "strict_parity": _strict_parity_payload(),
                     "final_queue": {"jobs": []},
                 }
             )
@@ -930,6 +1007,24 @@ def test_strict_numeric_evidence_rejects_the_same_difference() -> None:
             location="registered image",
             require_close=True,
         )
+
+
+def test_strict_numeric_evidence_requires_bitwise_equal_values() -> None:
+    import numpy as np
+
+    evidence = numeric_comparison_evidence(
+        np.array([1.0, 2.0], dtype=np.float32),
+        np.array([1.0, 2.0], dtype=np.float32),
+        location="strict artifact",
+        require_close=True,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    assert evidence["array_equal"] is True
+    assert evidence["maximum_absolute_difference"] == 0.0
+    assert evidence["rtol"] == 0.0
+    assert evidence["atol"] == 0.0
 
 
 def test_metric_equivalence_accepts_observed_repeat_variation_and_rejects_excess() -> (

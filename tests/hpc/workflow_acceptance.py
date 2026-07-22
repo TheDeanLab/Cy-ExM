@@ -430,8 +430,8 @@ def _scientific_comparison_evidence(
     from cyexm.registration.transforms import import_affine_transform
     from cyexm.registration.whole_image import RegistrationPaths
 
-    relative_tolerance = 1e-4
-    absolute_tolerance = 1e-5
+    relative_tolerance = 0.0 if require_close else 1e-4
+    absolute_tolerance = 0.0 if require_close else 1e-5
     if reference.scientific_fingerprint != candidate.scientific_fingerprint:
         raise HpcWorkflowAcceptanceError(
             "sequential and SLURM plans have different scientific fingerprints"
@@ -939,21 +939,116 @@ def _validated_deterministic_parity_evidence(value: object) -> dict[str, object]
         **{name: 1 for name in BLAS_THREAD_ENV_VARS},
     }
     final_queue = value.get("final_queue")
+    parallel = value.get("parallel")
+    sequential = value.get("sequential")
+    strict_parity = value.get("strict_parity")
     if (
         value.get("schema_version") != 1
         or value.get("status") != "completed"
         or value.get("seed") != "20260722"
         or value.get("native_threads") != expected_threads
         or not isinstance(value.get("inputs"), dict)
-        or not isinstance(value.get("parallel"), dict)
-        or not isinstance(value.get("sequential"), dict)
-        or not isinstance(value.get("strict_parity"), dict)
+        or not isinstance(parallel, dict)
+        or parallel.get("status") != "completed"
+        or not isinstance(sequential, dict)
+        or sequential.get("status") != "completed"
+        or not isinstance(strict_parity, dict)
         or not isinstance(final_queue, dict)
         or final_queue.get("jobs") != []
     ):
         raise HpcWorkflowAcceptanceError(
             "deterministic parity evidence does not prove strict one-thread parity"
         )
+    if (
+        strict_parity.get("comparison_policy") != "strict-deterministic-numeric-parity"
+        or strict_parity.get("rtol") != 0.0
+        or strict_parity.get("atol") != 0.0
+        or strict_parity.get("metric_absolute_tolerance") != 0.0
+        or strict_parity.get("voxel_differences_are_characterization") is not False
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity evidence does not require exact numerical equality"
+        )
+    rounds = strict_parity.get("rounds")
+    if not isinstance(rounds, list) or not rounds:
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity evidence contains no compared rounds"
+        )
+
+    def require_exact_numeric(node: object, location: str) -> None:
+        if (
+            not isinstance(node, Mapping)
+            or node.get("array_equal") is not True
+            or node.get("close_required") is not True
+            or node.get("maximum_absolute_difference") != 0.0
+            or node.get("rtol") != 0.0
+            or node.get("atol") != 0.0
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"deterministic parity {location} is not exactly equal"
+            )
+
+    for round_index, round_evidence in enumerate(rounds):
+        if not isinstance(round_evidence, Mapping):
+            raise HpcWorkflowAcceptanceError(
+                "deterministic parity round evidence is malformed"
+            )
+        affine = round_evidence.get("affine")
+        warp = round_evidence.get("warp")
+        registered = round_evidence.get("registered")
+        if not all(isinstance(item, Mapping) for item in (affine, warp, registered)):
+            raise HpcWorkflowAcceptanceError(
+                "deterministic parity artifact evidence is malformed"
+            )
+        require_exact_numeric(
+            cast(Mapping[str, object], affine).get("parameters"),
+            f"round {round_index} affine",
+        )
+        require_exact_numeric(
+            cast(Mapping[str, object], warp).get("numeric"),
+            f"round {round_index} warp",
+        )
+        require_exact_numeric(
+            cast(Mapping[str, object], registered).get("numeric"),
+            f"round {round_index} registered image",
+        )
+        metrics = round_evidence.get("metrics")
+        if not isinstance(metrics, Mapping) or not metrics:
+            raise HpcWorkflowAcceptanceError(
+                "deterministic parity metric evidence is malformed"
+            )
+        for stage, metric in metrics.items():
+            differences = (
+                metric.get("absolute_differences")
+                if isinstance(metric, Mapping)
+                else None
+            )
+            if (
+                not isinstance(metric, Mapping)
+                or metric.get("absolute_tolerance") != 0.0
+                or not isinstance(differences, Mapping)
+                or not differences
+                or any(value != 0.0 for value in differences.values())
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    f"deterministic parity {stage} metrics are not exactly equal"
+                )
+        channels = round_evidence.get("channels")
+        if not isinstance(channels, list) or not channels:
+            raise HpcWorkflowAcceptanceError(
+                "deterministic parity channel evidence is malformed"
+            )
+        for channel_index, channel in enumerate(channels):
+            comparison = (
+                channel.get("comparison") if isinstance(channel, Mapping) else None
+            )
+            numeric = (
+                comparison.get("numeric") if isinstance(comparison, Mapping) else None
+            )
+            require_exact_numeric(
+                numeric,
+                f"round {round_index} channel {channel_index}",
+            )
     return cast(dict[str, object], value)
 
 

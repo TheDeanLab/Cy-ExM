@@ -110,6 +110,46 @@ def test_nonlinear_high_synonly_preserves_established_registration_parameters(
     assert "smoothing_sigmas" not in calls.registration
 
 
+@pytest.mark.parametrize(("radius", "expected"), [(None, 4), (2, 2)])
+def test_nonlinear_cc_forwards_effective_radius(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    radius: int | None,
+    expected: int,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.nonlinear", tmp_path)
+    warp_path: Path | None = None
+    try:
+        _, warp_path = register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+            metric="CC",
+            radius=radius,
+        )
+
+        assert calls.registration["syn_metric"] == "CC"
+        assert calls.registration["syn_sampling"] == expected
+    finally:
+        discard_path(warp_path)
+
+
+def test_invalid_metric_policy_fails_before_scientific_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_runtime() -> tuple[object, object]:
+        raise AssertionError("scientific runtime loaded")
+
+    monkeypatch.setattr(nonlinear, "_scientific_runtime", unexpected_runtime)
+
+    with pytest.raises(ValueError, match="radius"):
+        register_image(
+            moving_image=fake_image(),
+            fixed_image=fake_image(),
+            metric="mattes",
+            radius=4,
+        )
+
+
 def test_nonlinear_registration_converts_external_zyx_arrays_to_ants_xyz(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

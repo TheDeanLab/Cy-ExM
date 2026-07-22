@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from cyexm._nonlinear_metric import resolve_nonlinear_metric
 from cyexm.io.images import external_to_ants_array
 from cyexm.registration._native_paths import discard_path
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
@@ -142,10 +143,13 @@ def register_image(
     accuracy: str = "high",
     verbose: bool = False,
     *,
+    metric: object = "mattes",
+    radius: object = None,
     native_threads: NativeThreadConfig | None = None,
 ) -> tuple[object, Path]:
     """Return the histogram-matched scalar and one materialized forward warp."""
     _validate_policy(registration_type, accuracy)
+    resolved_metric = resolve_nonlinear_metric(metric, radius)
     ants, np = _configured_runtime(native_threads)
 
     if isinstance(fixed_image, np.ndarray):
@@ -167,8 +171,8 @@ def register_image(
         "type_of_transform": registration_type,
         "flow_sigma": 3.0,
         "total_sigma": 0.5,
-        "syn_metric": "mattes",
-        "syn_sampling": 32,
+        "syn_metric": resolved_metric.metric,
+        "syn_sampling": resolved_metric.syn_sampling,
         "singleprecision": False,
         "aff_random_sampling_rate": 1.0,
         "verbose": verbose,

@@ -37,6 +37,14 @@ Actions; GitHub Pages.
 - Preserve the existing software CI workflow and its `contents: read` permission.
   The new deployment job alone receives `pages: write` and `id-token: write`.
 
+## Approved execution correction
+
+Tasks 2 and 3 are one buildable site-content unit. The `myst.yml` navigation in
+Task 2 names the narrative files created in Task 3, so a full Book build occurs only
+after both sets of files exist. Run Jupyter Book from the project directory with
+`(cd docs && jupyter book build --html)`; passing `docs` as a positional target
+causes Jupyter Book 2.1.6 to treat that directory as an input file.
+
 ---
 
 ## File structure
@@ -215,18 +223,13 @@ Actions; GitHub Pages.
   ongoing and is not a statement of an optimized default.
   ```
 
-- [ ] **Step 4: Run the focused build and inspect its root artifact**
+- [ ] **Step 4: Defer the full Book build to the combined site-content gate**
 
   Run:
 
-  ```bash
-  export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
-  export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
-  BASE_URL=/Cy-ExM uv run --group docs jupyter book build docs --html
-  test -f docs/_build/html/index.html
-  ```
-
-  Expected: the build exits 0 and `docs/_build/html/index.html` exists.
+  The configuration deliberately references the Task 3 narrative pages. Do not use a
+  partial-site build as a Task 2 acceptance gate. The combined Task 3 gate below
+  renders the complete site from `docs/` and checks `docs/_build/html/index.html`.
 
 - [ ] **Step 5: Commit the navigable site shell**
 
@@ -350,7 +353,7 @@ Actions; GitHub Pages.
     docs/brightness-dependence-investigation.md
   export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
   export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
-  BASE_URL=/Cy-ExM uv run --group docs jupyter book build docs --html
+  (cd docs && BASE_URL=/Cy-ExM uv run --group docs jupyter book build --html)
   ```
 
   Expected: both `rg` commands report one match and the Book build exits 0.
@@ -482,7 +485,7 @@ Actions; GitHub Pages.
   export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
   uv lock --check
   uv sync --locked --group docs
-  BASE_URL=/Cy-ExM uv run --group docs jupyter book build docs --html
+  (cd docs && BASE_URL=/Cy-ExM uv run --group docs jupyter book build --html)
   test -f docs/_build/html/index.html
   ```
 

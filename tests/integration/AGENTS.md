@@ -20,6 +20,9 @@
   a real-library regression whose native fixed and moving shapes differ along Z, Y,
   and X. Assert exact fixed-reference geometry immediately after affine resampling
   and for every persisted scalar, mask, warp, and transformed-channel output.
+- Nonlinear metric changes require a bounded real-ANTs acceptance test proving the
+  selected scalar policy materializes a finite warp on exact fixed geometry. Radius
+  optimization on representative datasets remains separate HPC/scientific acceptance.
 - Reference-task integration tests use real small TIFFs and must prove full and
   identically cropped multi-channel materialization, geometry/dtype/axes preservation,
   evidence reuse, and fail-before-write behavior for mismatched reference grids.

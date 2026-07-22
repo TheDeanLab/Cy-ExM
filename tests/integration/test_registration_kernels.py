@@ -80,3 +80,71 @@ def test_dry_run_kernels_preserve_geometry_masks_and_improve_similarity(
         assert nonlinear_mse < pre_mse
     finally:
         discard_path(warp_path)
+
+
+def test_cc_radius_materializes_finite_warp_on_fixed_reference_grid(
+    native_threads: NativeThreadConfig,
+) -> None:
+    import ants
+    import numpy as np
+
+    def asymmetric_volume(shape: tuple[int, int, int], shift: float) -> object:
+        coordinates = np.meshgrid(
+            *(np.linspace(-1.0, 1.0, length) for length in shape),
+            indexing="ij",
+        )
+        first = np.exp(
+            -(
+                (coordinates[0] - 0.25 - shift) ** 2 / 0.10
+                + (coordinates[1] + 0.20) ** 2 / 0.16
+                + (coordinates[2] - 0.10) ** 2 / 0.08
+            )
+        )
+        second = 0.55 * np.exp(
+            -(
+                (coordinates[0] + 0.35) ** 2 / 0.18
+                + (coordinates[1] - 0.30 - shift) ** 2 / 0.09
+                + (coordinates[2] + 0.25) ** 2 / 0.13
+            )
+        )
+        return np.asarray(first + second, dtype=np.float32)
+
+    direction = np.asarray(
+        ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+    geometry = {
+        "origin": (1.0, 2.0, 3.0),
+        "spacing": (0.2, 0.3, 0.6),
+        "direction": direction,
+    }
+    fixed = ants.from_numpy(asymmetric_volume((12, 16, 20), 0.0), **geometry)
+    moving_data = 2.5 * asymmetric_volume((10, 14, 18), 0.08) + 7.0
+    moving = ants.from_numpy(np.asarray(moving_data, dtype=np.float32), **geometry)
+
+    registered, warp_path = nonlinear.register_image(
+        moving_image=moving,
+        fixed_image=fixed,
+        registration_type="SyNOnly",
+        accuracy="dry run",
+        metric="CC",
+        radius=2,
+        native_threads=native_threads,
+    )
+    try:
+        assert registered.shape == fixed.shape
+        assert registered.origin == fixed.origin
+        assert registered.spacing == fixed.spacing
+        np.testing.assert_array_equal(registered.direction, fixed.direction)
+        assert np.isfinite(registered.numpy()).all()
+
+        assert warp_path.is_file()
+        warp = ants.image_read(str(warp_path))
+        assert warp.shape == fixed.shape
+        assert warp.has_components
+        assert warp.origin == fixed.origin
+        np.testing.assert_allclose(warp.spacing, fixed.spacing, rtol=0.0, atol=1e-7)
+        np.testing.assert_array_equal(warp.direction, fixed.direction)
+        assert np.isfinite(warp.numpy()).all()
+    finally:
+        discard_path(warp_path)

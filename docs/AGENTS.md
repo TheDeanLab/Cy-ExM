@@ -18,6 +18,11 @@
 - Treat transform order, interpolation, axes, masks, schedules, and tolerance values
   as scientific statements. Link evidence or explain the characterization behind
   them instead of simplifying them into ambiguous prose.
+- Treat `phase2e-multithreaded-registration-reproducibility.md` as scientific
+  characterization of the observed ANTs behavior, not a production tolerance or
+  seed policy. A final Phase 2E acceptance page may claim both tiers—the
+  multithreaded scientific-equivalence gate and seeded one-thread strict-parity
+  gate—only after complete external evidence passes for one exact commit.
 - Describe CC radius as one scalar voxel radius and identify radius 4 as provisional.
   Do not imply ANTs accepts per-axis radii or that repository defaults are optimized
   for a representative dataset without explicit scientific acceptance evidence.

@@ -17,6 +17,18 @@
 - Before pytest starts, export all six coordinator native-thread variables to the
   exact profile values. Fail before scheduler access when any value is missing or
   mismatched so later sequential parity never attempts a post-import thread change.
+- Treat the approved-dataset 8/8 comparison as stochastic scientific equivalence,
+  not deterministic equality. Exact artifact structure, geometry, dtype, transform
+  metadata, finite metrics, and nonlinear non-degradation remain mandatory; every
+  persisted stage metric must have a metric absolute difference of 0.01 or less.
+  Transform and voxel deltas are characterization only in this tier and must be
+  recorded rather than promoted to universal scientific tolerances.
+- Require strict numerical executor parity in a separate fresh coordinator with
+  `ANTS_RANDOM_SEED=20260722`, one native thread for ITK and every BLAS variable,
+  bounded synthetic whole-image and serial-chunked inputs, and exact named-job
+  cleanup. A fixed seed does not make multithreaded ANTs registration exact. Neither
+  acceptance tier authorizes a production seed, schema, or registration-policy
+  change.
 - Keep datasets, generated registration outputs, submitted scripts, scheduler
   snapshots, and other large evidence on `/archive`. Keep the environment, caches,
   and worker scratch on `/project`; each smoke worker must prove scratch

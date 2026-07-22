@@ -614,6 +614,34 @@ def test_every_maintained_directory_has_local_agent_guidance() -> None:
             assert fragment in guidance, (path, fragment)
 
 
+def test_phase2e_guidance_requires_both_stochastic_and_deterministic_gates() -> None:
+    hpc = _normalized_repository_file("tests/hpc/AGENTS.md")
+    documentation = _normalized_repository_file("docs/AGENTS.md")
+    for required in (
+        "stochastic scientific equivalence",
+        "metric absolute difference of 0.01",
+        "ants_random_seed=20260722",
+        "one native thread",
+        "characterization only",
+    ):
+        assert required in hpc
+    assert "fixed seed makes multithreaded ants registration exact" not in hpc
+    for required in (
+        "phase2e-multithreaded-registration-reproducibility.md",
+        "scientific characterization",
+        "both tiers",
+        "external evidence",
+    ):
+        assert required in documentation
+    assert (
+        REPOSITORY_ROOT / "docs/phase2e-multithreaded-registration-reproducibility.md"
+    ).is_file()
+    assert (
+        REPOSITORY_ROOT
+        / "docs/superpowers/specs/2026-07-22-phase2e-stochastic-parity-design.md"
+    ).is_file()
+
+
 @pytest.mark.parametrize(
     ("path", "required_fragment"),
     tuple(

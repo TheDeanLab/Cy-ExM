@@ -44,6 +44,7 @@ dev = [
   "pytest-cov>=6",
   "ruff>=0.14.8",
 ]
+docs = ["jupyter-book==2.1.6"]
 
 [project.urls]
 Source = "https://github.com/TheDeanLab/Cy-ExM"

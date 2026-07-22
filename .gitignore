@@ -1,3 +1,6 @@
 .worktrees/
 __pycache__/
 *.py[cod]
+
+# Documentation build output
+docs/_build/

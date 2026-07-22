@@ -16,6 +16,7 @@ from cyexm.workflow.models import RoundResult
 from hpc.environment import (
     HpcAcceptanceContext,
     HpcAcceptanceError,
+    build_smoke_reference_task,
     build_smoke_tasks,
     collect_interface_facts,
     collect_partition_snapshot,
@@ -63,6 +64,7 @@ def _assert_worker_records(
     context: HpcAcceptanceContext,
     results: tuple[RoundResult, ...],
     records: list[dict[str, object]],
+    worker_count: int,
     coordinator_paths: dict[str, dict[str, object]],
     expected_worker_memory_bytes: int,
 ) -> None:
@@ -72,8 +74,8 @@ def _assert_worker_records(
     expected_ids = {result.slurm_job_id for result in results}
     expected_hosts = {result.hostname for result in results}
     assert None not in expected_ids
-    assert len(expected_ids) == len(results)
-    assert len(expected_hosts) == len(results)
+    assert len(expected_ids) == worker_count
+    assert len(expected_hosts) == worker_count
     assert len(records) == len(results)
 
     for record in records:
@@ -243,6 +245,7 @@ def test_real_slurm_environment_acceptance(
         f"acceptance name {spec.job_name!r}"
     )
 
+    reference_task = build_smoke_reference_task(context)
     tasks = build_smoke_tasks(context, worker_count=worker_count)
     runner = partial(
         run_environment_smoke,
@@ -258,7 +261,7 @@ def test_real_slurm_environment_acceptance(
     execution_error: BaseException | None = None
     with smoke_module_by_value():
         try:
-            results = executor.execute(tasks)
+            results = executor.execute(reference_task, tasks)
         except BaseException as error:
             execution_error = error
         finally:
@@ -303,7 +306,10 @@ def test_real_slurm_environment_acceptance(
         worker_count,
         scheduler_interface,
     )
-    records = [json.loads(task.log_path.read_text(encoding="utf-8")) for task in tasks]
+    workflow_tasks = (reference_task, *tasks)
+    records = [
+        json.loads(task.log_path.read_text(encoding="utf-8")) for task in workflow_tasks
+    ]
     script = cast(dict[str, str], evidence["rendered"])["rendered_job_script_template"]
     script_hash = hashlib.sha256(script.encode("utf-8")).hexdigest()
     write_evidence_text(context.evidence_dir / "submitted-job-script.sh", script)
@@ -312,7 +318,7 @@ def test_real_slurm_environment_acceptance(
         {
             "schema_version": 1,
             "worker_count": worker_count,
-            "job_ids": sorted(cast(str, result.slurm_job_id) for result in results),
+            "job_ids": sorted({cast(str, result.slurm_job_id) for result in results}),
             "hostnames": sorted(result.hostname for result in results),
             "submitted_job_script_sha256": script_hash,
             "results": [result.to_dict() for result in results],
@@ -325,20 +331,23 @@ def test_real_slurm_environment_acceptance(
         },
     )
 
-    assert len(results) == worker_count
+    assert len(results) == worker_count + 1
+    assert results
+    assert results[0].round == reference_task.round
     assert all(result.status == "completed" for result in results)
     cleanup_query = cast(dict[str, object], after["query"])
     assert cleanup_query["job_ids"] == sorted(
-        cast(str, result.slurm_job_id) for result in results
+        {cast(str, result.slurm_job_id) for result in results}
     )
     _assert_worker_records(
         context,
         results,
         records,
+        worker_count,
         coordinator_paths,
         expected_worker_memory_bytes,
     )
-    for task in tasks:
+    for task in workflow_tasks:
         assert not task.registration_directory.exists(), (
             "environment smoke unexpectedly created registration output"
         )

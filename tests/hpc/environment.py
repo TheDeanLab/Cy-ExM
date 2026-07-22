@@ -31,7 +31,14 @@ from cyexm.config import (
 from cyexm.execution.slurm import validate_slurm_job_script
 from cyexm.io.atomic import atomic_write
 from cyexm.runtime.threads import BLAS_THREAD_ENV_VARS, ITK_THREAD_ENV_VAR
-from cyexm.workflow.models import ChannelTask, RoundResult, RoundTask
+from cyexm.workflow.models import (
+    ChannelTask,
+    ReferenceChannelTask,
+    ReferenceTask,
+    RoundResult,
+    RoundTask,
+    WorkflowTask,
+)
 
 ACCEPTANCE_PACKAGES = (
     "cy-exm",
@@ -932,6 +939,41 @@ def build_smoke_tasks(
     return tuple(tasks)
 
 
+def build_smoke_reference_task(context: HpcAcceptanceContext) -> ReferenceTask:
+    """Build the no-registration reference task required by the real barrier."""
+    dataset_root = context.profile.paths.dataset_root
+    reference = context.manifest.reference
+    no_registration_root = (
+        context.evidence_dir
+        / "no-registration"
+        / f"round-{reference.round:03d}-reference"
+    )
+    channels_root = no_registration_root / "channels"
+    return ReferenceTask(
+        dataset_id=context.manifest.dataset_id,
+        round=reference.round,
+        registration_channel_source=(dataset_root / reference.registration_channel),
+        registration_channel_output=(
+            channels_root / reference.registration_channel.name
+        ),
+        registration_directory=no_registration_root / "registration",
+        crop_bounds_path=None,
+        log_path=(
+            context.evidence_dir / f"worker-reference-round-{reference.round:03d}.json"
+        ),
+        voxel_spacing_xyz=context.manifest.voxel_spacing_um,
+        crop=False,
+        native_threads=context.profile.native_threads,
+        channels=tuple(
+            ReferenceChannelTask(
+                source=dataset_root / channel.file,
+                output=channels_root / channel.file.name,
+            )
+            for channel in reference.channels
+        ),
+    )
+
+
 @contextmanager
 def smoke_module_by_value() -> Iterator[None]:
     """Temporarily serialize this module by value and restore exact prior state."""
@@ -1093,7 +1135,9 @@ def _scratch_probe(root: Path) -> dict[str, bool]:
     return {"created": created, "deleted": not probe.exists()}
 
 
-def _planned_artifacts(task: RoundTask) -> tuple[str, ...]:
+def _planned_artifacts(task: WorkflowTask) -> tuple[str, ...]:
+    if isinstance(task, ReferenceTask):
+        return tuple(str(channel.output) for channel in task.channels)
     return (
         str(task.registration_directory / f"linear_transform_{task.round}.mat"),
         str(task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz"),
@@ -1103,7 +1147,7 @@ def _planned_artifacts(task: RoundTask) -> tuple[str, ...]:
 
 
 def run_environment_smoke(
-    task: RoundTask,
+    task: WorkflowTask,
     *,
     evidence_dir: str,
     dataset_root: str,
@@ -1154,6 +1198,14 @@ def run_environment_smoke(
         ["scontrol", "--oneliner", "show", "node", slurm_node_name], run=_run
     )
     scratch = _scratch_probe(Path(worker_local_directory))
+    if isinstance(task, ReferenceTask):
+        fixed_image = task.registration_channel_source
+        moving_image = task.registration_channel_source
+        strategy = "reference-preparation"
+    else:
+        fixed_image = task.fixed_image
+        moving_image = task.moving_image
+        strategy = task.strategy
     record = {
         "schema_version": 1,
         "dataset_id": task.dataset_id,
@@ -1172,8 +1224,8 @@ def run_environment_smoke(
             "output_root": collect_path_fact(Path(output_root)),
             "worker_local_directory": collect_path_fact(Path(worker_local_directory)),
             "evidence_dir": collect_path_fact(Path(evidence_dir)),
-            "fixed_image": collect_path_fact(task.fixed_image),
-            "moving_image": collect_path_fact(task.moving_image),
+            "fixed_image": collect_path_fact(fixed_image),
+            "moving_image": collect_path_fact(moving_image),
         },
         "scratch_probe": scratch,
         "job": parse_scontrol_record(cast(str, job_command["stdout"])),
@@ -1199,7 +1251,7 @@ def run_environment_smoke(
         pid=os.getpid(),
         dask_task_key=task_key,
         slurm_job_id=job_id,
-        strategy=task.strategy,
+        strategy=strategy,
         native_threads=(
             ("itk", task.native_threads.itk),
             ("blas", task.native_threads.blas),
@@ -1394,6 +1446,7 @@ __all__ = [
     "ACCEPTANCE_PACKAGES",
     "HpcAcceptanceContext",
     "HpcAcceptanceError",
+    "build_smoke_reference_task",
     "build_smoke_tasks",
     "collect_interface_facts",
     "collect_partition_snapshot",

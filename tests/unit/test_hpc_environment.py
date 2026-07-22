@@ -12,6 +12,7 @@ import pytest
 from hpc.environment import (
     ACCEPTANCE_PACKAGES,
     HpcAcceptanceError,
+    build_smoke_reference_task,
     build_smoke_tasks,
     collect_partition_snapshot,
     collect_path_fact,
@@ -968,6 +969,42 @@ def test_build_smoke_tasks_bounds_workers_and_uses_manifest_inputs(
     assert tasks[0].moving_image == context.profile.paths.dataset_root / "moving.tif"
     assert tasks[0].log_path == evidence / "worker-round-002.json"
     assert not tasks[0].registration_directory.exists()
+
+
+def test_build_smoke_reference_task_preserves_real_executor_barrier(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    project_root = tmp_path / "project"
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    dataset, execution = _write_approved_inputs(archive_root, project_root)
+    evidence = archive_root / "approved" / "evidence"
+    evidence.mkdir()
+    context = prepare_acceptance_context(
+        dataset,
+        execution,
+        evidence,
+        repository_root=repository_root,
+        archive_root=archive_root,
+        project_root=project_root,
+        protected_roots=(),
+        argv=("pytest",),
+        _git_commit=lambda _root: "a" * 40,
+        _version=lambda name: name,
+    )
+
+    task = build_smoke_reference_task(context)
+
+    assert task.round == context.manifest.reference.round
+    assert task.registration_channel_source == (
+        context.profile.paths.dataset_root
+        / context.manifest.reference.registration_channel
+    )
+    assert task.log_path == evidence / "worker-reference-round-001.json"
+    assert task.crop is False
+    assert task.channels
+    assert not task.registration_directory.exists()
 
 
 def test_exclusive_policy_requires_partition_policy_or_explicit_directive() -> None:

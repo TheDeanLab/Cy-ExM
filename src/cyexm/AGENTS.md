@@ -18,3 +18,15 @@
   not belong in `cyexm.registration`; keep the stable Phase 1 registration API and
   the Phase 2B channel primitive usable without Dask, distributed, dask-jobqueue, or
   YAML workflow dependencies.
+
+## User-callable API documentation
+
+For a user-callable entry point, resource owner, data model, executor, or explicit
+extension interface, follow `docs/agentic-api-documentation.md` and provide full
+Numpydoc. Simple pure value objects and helpers may use concise Numpydoc.
+
+An internal symbol is reusable only when it is explicitly designated as an extension
+interface and documented as such; do not turn implementation details into public
+contracts merely to share code. Before adding a user-callable symbol, record the
+closest existing symbols and why they cannot be safely reused in the required `Reuse
+analysis` record.

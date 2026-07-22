@@ -40,13 +40,12 @@ def common_parameters(
     *, crop: bool, imaging_round: int, pixel_size_xyz: PixelSize
 ) -> dict[str, object]:
     """Return evidence common to every Phase 1 registration stage."""
-    parameters: dict[str, object] = {
+    return {
         "axis_convention_version": AXIS_CONVENTION_VERSION,
         "crop": crop,
         "imaging_round": imaging_round,
         "pixel_size_xyz": list(pixel_size_xyz),
     }
-    return parameters
 
 
 def crop_parameters(role: Literal["fixed", "moving"]) -> dict[str, object]:

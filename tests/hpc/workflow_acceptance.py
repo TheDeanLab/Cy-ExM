@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -30,6 +31,7 @@ from cyexm.config.models import (
 from cyexm.execution.slurm import SlurmExecutor
 from cyexm.io.atomic import atomic_write
 from cyexm.registration.artifacts import FileIdentity
+from cyexm.runtime.threads import BLAS_THREAD_ENV_VARS, ITK_THREAD_ENV_VAR
 from cyexm.workflow.api import run_workflow
 from cyexm.workflow.models import (
     ReferenceTask,
@@ -903,6 +905,153 @@ def write_deterministic_inputs(input_root: Path) -> dict[str, object]:
     }
 
 
+def _write_text_evidence(path: Path, value: str) -> None:
+    def writer(temporary: Path) -> None:
+        temporary.write_text(value, encoding="utf-8")
+
+    def validator(temporary: Path) -> bool:
+        try:
+            return temporary.read_text(encoding="utf-8") == value
+        except (OSError, UnicodeError):
+            return False
+
+    atomic_write(path, writer, validator)
+
+
+def _validated_deterministic_parity_evidence(value: object) -> dict[str, object]:
+    expected_keys = {
+        "schema_version",
+        "status",
+        "seed",
+        "native_threads",
+        "inputs",
+        "parallel",
+        "sequential",
+        "strict_parity",
+        "final_queue",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity evidence has an invalid exact schema"
+        )
+    expected_threads = {
+        ITK_THREAD_ENV_VAR: 1,
+        **{name: 1 for name in BLAS_THREAD_ENV_VARS},
+    }
+    final_queue = value.get("final_queue")
+    if (
+        value.get("schema_version") != 1
+        or value.get("status") != "completed"
+        or value.get("seed") != "20260722"
+        or value.get("native_threads") != expected_threads
+        or not isinstance(value.get("inputs"), dict)
+        or not isinstance(value.get("parallel"), dict)
+        or not isinstance(value.get("sequential"), dict)
+        or not isinstance(value.get("strict_parity"), dict)
+        or not isinstance(final_queue, dict)
+        or final_queue.get("jobs") != []
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity evidence does not prove strict one-thread parity"
+        )
+    return cast(dict[str, object], value)
+
+
+def execute_deterministic_parity_subprocess(
+    *,
+    execution_path: Path,
+    owned_root: Path,
+    evidence_dir: Path,
+    timeout_seconds: float,
+    _run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    _environ: Mapping[str, str] = os.environ,
+) -> dict[str, object]:
+    """Run strict parity in a fresh process before scientific imports occur."""
+    if timeout_seconds <= 0.0:
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity subprocess timeout must be positive"
+        )
+    if not execution_path.is_file():
+        raise HpcWorkflowAcceptanceError(
+            f"deterministic parity execution profile is not a file: {execution_path}"
+        )
+    if owned_root.is_symlink() or not owned_root.is_dir():
+        raise HpcWorkflowAcceptanceError(
+            f"deterministic parity owned root is not a real directory: {owned_root}"
+        )
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity evidence directory is not a real directory: "
+            f"{evidence_dir}"
+        )
+
+    repository_root = Path(__file__).resolve().parents[2]
+    tests_root = repository_root / "tests"
+    evidence_path = evidence_dir / "deterministic-executor-parity.json"
+    command = (
+        sys.executable,
+        "-m",
+        "hpc.deterministic_parity",
+        "--execution",
+        str(execution_path),
+        "--owned-root",
+        str(owned_root),
+        "--evidence",
+        str(evidence_path),
+    )
+    environment = dict(_environ)
+    environment[ITK_THREAD_ENV_VAR] = "1"
+    environment.update({name: "1" for name in BLAS_THREAD_ENV_VARS})
+    environment["ANTS_RANDOM_SEED"] = "20260722"
+    inherited_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(tests_root), inherited_pythonpath)
+        if inherited_pythonpath
+        else (str(tests_root),)
+    )
+    try:
+        completed = _run(
+            command,
+            cwd=repository_root,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        stdout = error.stdout if isinstance(error.stdout, str) else ""
+        stderr = error.stderr if isinstance(error.stderr, str) else ""
+        _write_text_evidence(
+            evidence_dir / "deterministic-coordinator.stdout.txt", stdout
+        )
+        _write_text_evidence(
+            evidence_dir / "deterministic-coordinator.stderr.txt", stderr
+        )
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity subprocess exceeded its bounded timeout"
+        ) from error
+
+    _write_text_evidence(
+        evidence_dir / "deterministic-coordinator.stdout.txt", completed.stdout
+    )
+    _write_text_evidence(
+        evidence_dir / "deterministic-coordinator.stderr.txt", completed.stderr
+    )
+    if completed.returncode != 0:
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity subprocess failed with exit code "
+            f"{completed.returncode}; inspect captured coordinator output"
+        )
+    try:
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity subprocess did not write valid evidence"
+        ) from error
+    return _validated_deterministic_parity_evidence(evidence)
+
+
 @contextmanager
 def workflow_module_by_value() -> Iterator[None]:
     """Serialize only this helper by value and restore its exact prior state."""
@@ -1493,6 +1642,7 @@ __all__ = [
     "deterministic_sequential_profile",
     "deterministic_slurm_profile",
     "execute_cancellation_acceptance",
+    "execute_deterministic_parity_subprocess",
     "execute_owned_slurm_workflow",
     "metric_comparison_evidence",
     "numeric_comparison_evidence",

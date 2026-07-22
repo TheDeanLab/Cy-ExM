@@ -29,12 +29,13 @@ from hpc.workflow_acceptance import (
     bounded_slurm_profile,
     coordination_timeout_seconds,
     execute_cancellation_acceptance,
+    execute_deterministic_parity_subprocess,
     execute_owned_slurm_workflow,
     parallel_placement_evidence,
     prepare_task5_output_roots,
     run_cancellation_task,
     run_failure_task,
-    scientific_parity_evidence,
+    scientific_equivalence_evidence,
     sequential_reference_profile,
     task5_output_roots,
     validate_injected_failure_record,
@@ -172,8 +173,16 @@ def _run_task5_acceptance(
         context.evidence_dir / "sequential-reference.json",
         sequential.to_dict(),
     )
-    parity = scientific_parity_evidence(sequential_plan, parallel_plan)
-    write_evidence_json(context.evidence_dir / "scientific-parity.json", parity)
+    equivalence = scientific_equivalence_evidence(sequential_plan, parallel_plan)
+    write_evidence_json(
+        context.evidence_dir / "scientific-equivalence.json", equivalence
+    )
+    deterministic_parity = execute_deterministic_parity_subprocess(
+        execution_path=context.execution_path,
+        owned_root=roots.base,
+        evidence_dir=context.evidence_dir,
+        timeout_seconds=coordination_timeout + 600.0,
+    )
 
     failure_success = _round_by_strategy(failure_plan.tasks, "whole_image")
     failure_target = _round_by_strategy(failure_plan.tasks, "serial_chunked")
@@ -324,7 +333,8 @@ def _run_task5_acceptance(
         "status": "completed",
         "selected_rounds": [task.round for task in parallel_plan.tasks],
         "placement": placement,
-        "scientific_parity": parity,
+        "scientific_equivalence": equivalence,
+        "deterministic_executor_parity": deterministic_parity,
         "coordination_timeout_seconds": coordination_timeout,
         "failure_resume": {
             "reused_round": failure_success.round,

@@ -12,6 +12,13 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
+from hpc.deterministic_parity import (
+    _require_one_thread_results,
+    _require_owned_root,
+)
+from hpc.deterministic_parity import (
+    main as deterministic_parity_main,
+)
 from hpc.workflow_acceptance import (
     HpcWorkflowAcceptanceError,
     bounded_acceptance_manifest,
@@ -21,6 +28,7 @@ from hpc.workflow_acceptance import (
     deterministic_sequential_profile,
     deterministic_slurm_profile,
     execute_cancellation_acceptance,
+    execute_deterministic_parity_subprocess,
     execute_owned_slurm_workflow,
     metric_comparison_evidence,
     numeric_comparison_evidence,
@@ -203,6 +211,190 @@ def test_task5_profiles_are_bounded_and_confined_to_named_owned_roots(
     assert deterministic_sequential.executor == "sequential"
     assert deterministic_sequential.slurm is None
     assert deterministic_sequential.paths.worker_local_directory is None
+
+
+def test_deterministic_parity_subprocess_is_fresh_one_thread_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    execution = tmp_path / "execution.yaml"
+    execution.write_text("schema_version: 1\n", encoding="utf-8")
+    owned_root = tmp_path / "owned"
+    owned_root.mkdir()
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    observed: dict[str, object] = {}
+
+    def complete(
+        command: tuple[str, ...], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        observed["command"] = command
+        observed.update(kwargs)
+        evidence_path = evidence_dir / "deterministic-executor-parity.json"
+        evidence_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "completed",
+                    "seed": "20260722",
+                    "native_threads": {
+                        "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1,
+                        "OMP_NUM_THREADS": 1,
+                        "OPENBLAS_NUM_THREADS": 1,
+                        "MKL_NUM_THREADS": 1,
+                        "NUMEXPR_NUM_THREADS": 1,
+                        "VECLIB_MAXIMUM_THREADS": 1,
+                    },
+                    "inputs": {},
+                    "parallel": {},
+                    "sequential": {},
+                    "strict_parity": {},
+                    "final_queue": {"jobs": []},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "child-out", "child-err")
+
+    result = execute_deterministic_parity_subprocess(
+        execution_path=execution,
+        owned_root=owned_root,
+        evidence_dir=evidence_dir,
+        timeout_seconds=90.0,
+        _run=complete,
+        _environ={"PYTHONPATH": "/existing"},
+    )
+
+    command = observed["command"]
+    assert isinstance(command, tuple)
+    assert command[:3] == (sys.executable, "-m", "hpc.deterministic_parity")
+    environment = observed["env"]
+    assert isinstance(environment, dict)
+    assert environment["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] == "1"
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        assert environment[name] == "1"
+    assert environment["ANTS_RANDOM_SEED"] == "20260722"
+    assert Path(environment["PYTHONPATH"].split(os.pathsep)[0]).name == "tests"
+    assert observed["check"] is False
+    assert observed["capture_output"] is True
+    assert observed["text"] is True
+    assert observed["timeout"] == 90.0
+    assert result["status"] == "completed"
+    assert (evidence_dir / "deterministic-coordinator.stdout.txt").read_text(
+        encoding="utf-8"
+    ) == "child-out"
+    assert (evidence_dir / "deterministic-coordinator.stderr.txt").read_text(
+        encoding="utf-8"
+    ) == "child-err"
+
+
+@pytest.mark.parametrize("failure", ["exit", "missing", "malformed"])
+def test_deterministic_parity_subprocess_rejects_child_failure(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    execution = tmp_path / "execution.yaml"
+    execution.write_text("schema_version: 1\n", encoding="utf-8")
+    owned_root = tmp_path / "owned"
+    owned_root.mkdir()
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+
+    def fail(
+        command: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        evidence = evidence_dir / "deterministic-executor-parity.json"
+        if failure == "malformed":
+            evidence.write_text("{}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            command,
+            7 if failure == "exit" else 0,
+            "stdout",
+            "stderr",
+        )
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="deterministic"):
+        execute_deterministic_parity_subprocess(
+            execution_path=execution,
+            owned_root=owned_root,
+            evidence_dir=evidence_dir,
+            timeout_seconds=90.0,
+            _run=fail,
+        )
+    assert (evidence_dir / "deterministic-coordinator.stdout.txt").is_file()
+    assert (evidence_dir / "deterministic-coordinator.stderr.txt").is_file()
+
+
+def test_deterministic_parity_child_rejects_thread_environment_before_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = tmp_path / "child.json"
+    monkeypatch.setenv("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", "8")
+    monkeypatch.setenv("ANTS_RANDOM_SEED", "20260722")
+    for name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        monkeypatch.setenv(name, "1")
+
+    exit_code = deterministic_parity_main(
+        [
+            "--execution",
+            str(tmp_path / "execution.yaml"),
+            "--owned-root",
+            str(tmp_path / "owned"),
+            "--evidence",
+            str(evidence),
+        ]
+    )
+
+    assert exit_code == 1
+    failure = json.loads(evidence.read_text(encoding="utf-8"))
+    assert failure["status"] == "failed"
+    assert "environment mismatch" in failure["error"]["message"]
+
+
+def test_deterministic_parity_child_requires_exact_empty_owned_roots(
+    tmp_path: Path,
+) -> None:
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    for name in (
+        "deterministic-inputs",
+        "deterministic-parallel",
+        "deterministic-sequential",
+    ):
+        (owned / name).mkdir()
+
+    roots = _require_owned_root(owned)
+
+    assert roots == {
+        "inputs": owned / "deterministic-inputs",
+        "parallel": owned / "deterministic-parallel",
+        "sequential": owned / "deterministic-sequential",
+    }
+    (roots["inputs"] / "unexpected").write_text("no", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="existing empty real directory"):
+        _require_owned_root(owned)
+
+
+def test_deterministic_parity_child_rejects_non_one_thread_result() -> None:
+    result = SimpleNamespace(
+        rounds=(SimpleNamespace(native_threads=(("OMP_NUM_THREADS", 2),)),)
+    )
+
+    with pytest.raises(RuntimeError, match="did not use one native thread"):
+        _require_one_thread_results(result, "sequential")
 
 
 def test_bounded_slurm_profile_requires_two_single_process_workers(

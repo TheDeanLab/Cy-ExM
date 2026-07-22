@@ -17,6 +17,9 @@ from hpc.workflow_acceptance import (
     bounded_acceptance_manifest,
     bounded_slurm_profile,
     coordination_timeout_seconds,
+    deterministic_acceptance_manifest,
+    deterministic_sequential_profile,
+    deterministic_slurm_profile,
     execute_cancellation_acceptance,
     execute_owned_slurm_workflow,
     metric_comparison_evidence,
@@ -25,11 +28,13 @@ from hpc.workflow_acceptance import (
     prepare_task5_output_roots,
     run_cancellation_task,
     run_failure_task,
+    run_seeded_workflow_task,
     sequential_reference_profile,
     task5_output_roots,
     validate_injected_failure_record,
     validate_task5_output_ownership,
     workflow_module_by_value,
+    write_deterministic_inputs,
 )
 
 from cyexm.config.models import (
@@ -167,6 +172,9 @@ def test_task5_profiles_are_bounded_and_confined_to_named_owned_roots(
         roots.sequential,
         roots.failure,
         roots.cancellation,
+        roots.deterministic_inputs,
+        roots.deterministic_parallel,
+        roots.deterministic_sequential,
     )
     assert all(path.is_relative_to(roots.base) for path in roots.scenario_roots)
     assert not roots.base.exists()
@@ -179,6 +187,22 @@ def test_task5_profiles_are_bounded_and_confined_to_named_owned_roots(
     assert sequential.executor == "sequential"
     assert sequential.slurm is None
     assert sequential.local_dask is None
+
+    deterministic_slurm = deterministic_slurm_profile(
+        approved, roots.deterministic_parallel
+    )
+    deterministic_sequential = deterministic_sequential_profile(
+        approved, roots.deterministic_sequential
+    )
+    assert deterministic_slurm.native_threads == NativeThreadSpec(itk=1, blas=1)
+    assert deterministic_slurm.slurm is not None
+    assert deterministic_slurm.slurm.workers == 2
+    assert deterministic_slurm.slurm.task_retries == 0
+    assert deterministic_slurm.slurm.job_name == "cyexm-task5-det"
+    assert deterministic_sequential.native_threads == NativeThreadSpec(itk=1, blas=1)
+    assert deterministic_sequential.executor == "sequential"
+    assert deterministic_sequential.slurm is None
+    assert deterministic_sequential.paths.worker_local_directory is None
 
 
 def test_bounded_slurm_profile_requires_two_single_process_workers(
@@ -538,6 +562,82 @@ def test_task5_root_ownership_preserves_general_results_siblings(
     with pytest.raises(HpcWorkflowAcceptanceError, match="must not exist"):
         prepare_task5_output_roots(roots)
     assert unrelated.read_text(encoding="utf-8") == "preserve"
+
+
+def test_deterministic_acceptance_inputs_and_manifest_are_bounded(
+    tmp_path: Path,
+) -> None:
+    import numpy as np
+    import tifffile
+
+    input_root = tmp_path / "inputs"
+    input_root.mkdir()
+    evidence = write_deterministic_inputs(input_root)
+    manifest = deterministic_acceptance_manifest(input_root)
+
+    assert manifest.dataset_id == "phase2e-deterministic-parity"
+    assert manifest.registration.linear == RegistrationStageSpec(
+        type="TRSAA", accuracy="dry run"
+    )
+    assert manifest.registration.nonlinear == NonlinearRegistrationStageSpec(
+        type="SyNOnly", accuracy="dry run", metric="mattes", radius=None
+    )
+    assert tuple(item.strategy for item in manifest.rounds) == (
+        "whole_image",
+        "serial_chunked",
+    )
+    assert manifest.rounds[1].chunk_size_zyx == (8, 16, 16)
+    assert manifest.rounds[1].overlap_fraction == 0.25
+    expected = {
+        input_root / "fixed.tif",
+        input_root / "moving-whole.tif",
+        input_root / "moving-chunked.tif",
+    }
+    assert set(input_root.glob("*.tif")) == expected
+    arrays = [tifffile.imread(path) for path in sorted(expected)]
+    assert all(array.shape == (16, 32, 32) for array in arrays)
+    assert all(array.dtype == np.dtype(np.float32) for array in arrays)
+    assert all(np.all(np.isfinite(array)) for array in arrays)
+    assert not np.array_equal(arrays[0], arrays[1])
+    assert not np.array_equal(arrays[1], arrays[2])
+    assert evidence["shape_zyx"] == [16, 32, 32]
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="empty"):
+        write_deterministic_inputs(input_root)
+
+
+def test_seeded_runner_sets_and_restores_acceptance_seed() -> None:
+    task = SimpleNamespace(round=2)
+    environment: dict[str, str] = {}
+
+    def observe(observed: object) -> str:
+        assert observed is task
+        assert environment["ANTS_RANDOM_SEED"] == "20260722"
+        return "completed"
+
+    assert (
+        run_seeded_workflow_task(
+            task,  # type: ignore[arg-type]
+            _run_workflow_task=observe,  # type: ignore[arg-type]
+            _environ=environment,
+        )
+        == "completed"
+    )
+    assert "ANTS_RANDOM_SEED" not in environment
+
+    environment["ANTS_RANDOM_SEED"] = "caller-seed"
+
+    def fail(_observed: object) -> RoundResult:
+        assert environment["ANTS_RANDOM_SEED"] == "20260722"
+        raise RuntimeError("injected seeded failure")
+
+    with pytest.raises(RuntimeError, match="injected seeded failure"):
+        run_seeded_workflow_task(
+            task,  # type: ignore[arg-type]
+            _run_workflow_task=fail,  # type: ignore[arg-type]
+            _environ=environment,
+        )
+    assert environment["ANTS_RANDOM_SEED"] == "caller-seed"
 
 
 def _round_result(

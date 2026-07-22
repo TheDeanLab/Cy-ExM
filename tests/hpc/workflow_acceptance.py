@@ -8,16 +8,28 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
-from cyexm.config.models import DatasetManifest, ExecutionProfile
+from cyexm.config.models import (
+    ChannelSpec,
+    DatasetManifest,
+    ExecutionProfile,
+    NativeThreadSpec,
+    NonlinearRegistrationStageSpec,
+    ReferenceChannelSpec,
+    ReferenceSpec,
+    RegistrationSpec,
+    RegistrationStageSpec,
+    RoundSpec,
+)
 from cyexm.execution.slurm import SlurmExecutor
 from cyexm.io.atomic import atomic_write
+from cyexm.registration.artifacts import FileIdentity
 from cyexm.workflow.api import run_workflow
 from cyexm.workflow.models import (
     ReferenceTask,
@@ -50,6 +62,9 @@ class Task5OutputRoots:
     sequential: Path
     failure: Path
     cancellation: Path
+    deterministic_inputs: Path
+    deterministic_parallel: Path
+    deterministic_sequential: Path
 
     @property
     def scenario_roots(self) -> tuple[Path, ...]:
@@ -58,6 +73,9 @@ class Task5OutputRoots:
             self.sequential,
             self.failure,
             self.cancellation,
+            self.deterministic_inputs,
+            self.deterministic_parallel,
+            self.deterministic_sequential,
         )
 
 
@@ -88,6 +106,9 @@ def task5_output_roots(profile: ExecutionProfile) -> Task5OutputRoots:
         sequential=base / "sequential-reference",
         failure=base / "failure-resume",
         cancellation=base / "cancellation-resume",
+        deterministic_inputs=base / "deterministic-inputs",
+        deterministic_parallel=base / "deterministic-parallel",
+        deterministic_sequential=base / "deterministic-sequential",
     )
 
 
@@ -181,6 +202,9 @@ def prepare_task5_output_roots(roots: Task5OutputRoots) -> dict[str, object]:
         roots.base / "sequential-reference",
         roots.base / "failure-resume",
         roots.base / "cancellation-resume",
+        roots.base / "deterministic-inputs",
+        roots.base / "deterministic-parallel",
+        roots.base / "deterministic-sequential",
     }
     if set(roots.scenario_roots) != expected_scenarios:
         raise HpcWorkflowAcceptanceError("Task 5 scenario roots are not canonical")
@@ -701,6 +725,184 @@ def sequential_reference_profile(
     )
 
 
+def deterministic_slurm_profile(
+    profile: ExecutionProfile,
+    output_root: Path,
+) -> ExecutionProfile:
+    """Derive the bounded one-thread SLURM profile for strict parity."""
+    spec = profile.slurm
+    if profile.executor != "slurm" or spec is None:
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity requires an approved SLURM profile"
+        )
+    if spec.workers < 2 or spec.processes_per_worker != 1:
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity requires two single-process workers"
+        )
+    job_name = f"{spec.job_name}-det"
+    if "\n" in job_name or "\r" in job_name or len(job_name) > 128:
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity job name must be one line and at most 128 characters"
+        )
+    return replace(
+        profile,
+        paths=replace(profile.paths, output_root=output_root),
+        native_threads=NativeThreadSpec(itk=1, blas=1),
+        slurm=replace(
+            spec,
+            workers=2,
+            task_retries=0,
+            job_name=job_name,
+        ),
+    )
+
+
+def deterministic_sequential_profile(
+    profile: ExecutionProfile,
+    output_root: Path,
+) -> ExecutionProfile:
+    """Derive the one-thread sequential profile for strict parity."""
+    return replace(
+        profile,
+        executor="sequential",
+        paths=replace(
+            profile.paths,
+            output_root=output_root,
+            worker_local_directory=None,
+        ),
+        native_threads=NativeThreadSpec(itk=1, blas=1),
+        local_dask=None,
+        slurm=None,
+    )
+
+
+def deterministic_acceptance_manifest(input_root: Path) -> DatasetManifest:
+    """Build the bounded synthetic manifest used only by strict parity."""
+    if not input_root.is_dir() or input_root.is_symlink():
+        raise HpcWorkflowAcceptanceError(
+            "deterministic input root must be an existing real directory"
+        )
+    return DatasetManifest(
+        schema_version=1,
+        dataset_id="phase2e-deterministic-parity",
+        voxel_spacing_um=(0.4, 0.4, 1.0),
+        reference=ReferenceSpec(
+            round=1,
+            registration_channel=PurePosixPath("fixed.tif"),
+            channels=(ReferenceChannelSpec(PurePosixPath("fixed.tif")),),
+        ),
+        registration=RegistrationSpec(
+            crop=False,
+            linear=RegistrationStageSpec(type="TRSAA", accuracy="dry run"),
+            nonlinear=NonlinearRegistrationStageSpec(
+                type="SyNOnly",
+                accuracy="dry run",
+                metric="mattes",
+                radius=None,
+            ),
+        ),
+        rounds=(
+            RoundSpec(
+                round=2,
+                strategy="whole_image",
+                registration_channel=PurePosixPath("moving-whole.tif"),
+                channels=(ChannelSpec(PurePosixPath("moving-whole.tif"), "linear"),),
+            ),
+            RoundSpec(
+                round=3,
+                strategy="serial_chunked",
+                registration_channel=PurePosixPath("moving-chunked.tif"),
+                channels=(ChannelSpec(PurePosixPath("moving-chunked.tif"), "linear"),),
+                chunk_size_zyx=(8, 16, 16),
+                overlap_fraction=0.25,
+            ),
+        ),
+    )
+
+
+def write_deterministic_inputs(input_root: Path) -> dict[str, object]:
+    """Write three small deterministic scalar TIFFs into one owned root."""
+    if input_root.is_symlink() or not input_root.is_dir():
+        raise HpcWorkflowAcceptanceError(
+            "deterministic input root must be an existing empty real directory"
+        )
+    if any(input_root.iterdir()):
+        raise HpcWorkflowAcceptanceError(
+            "deterministic input root must be an existing empty real directory"
+        )
+
+    import numpy as np
+    import tifffile
+
+    z, y, x = np.mgrid[:16, :32, :32]
+    fixed = (
+        45_000.0
+        * np.exp(
+            -(
+                ((z - 7.0) / 2.8) ** 2
+                + ((y - 15.0) / 5.5) ** 2
+                + ((x - 17.0) / 6.0) ** 2
+            )
+        )
+    ).astype(np.float32)
+    fixed += (
+        18_000.0
+        * np.exp(
+            -(
+                ((z - 10.0) / 2.0) ** 2
+                + ((y - 22.0) / 3.5) ** 2
+                + ((x - 9.0) / 4.0) ** 2
+            )
+        )
+    ).astype(np.float32)
+    texture = (
+        np.random.default_rng(20260722)
+        .normal(
+            loc=0.0,
+            scale=25.0,
+            size=fixed.shape,
+        )
+        .astype(np.float32)
+    )
+    fixed = np.maximum(fixed + texture, 0.0).astype(np.float32)
+    arrays = {
+        "fixed.tif": fixed,
+        "moving-whole.tif": np.roll(fixed, shift=(0, 1, -1), axis=(0, 1, 2)),
+        "moving-chunked.tif": np.roll(fixed, shift=(1, -1, 1), axis=(0, 1, 2)),
+    }
+    identities: dict[str, object] = {}
+    for name, array in arrays.items():
+        destination = input_root / name
+
+        def writer(temporary: Path, *, value: Any = array) -> None:
+            tifffile.imwrite(
+                temporary,
+                value,
+                metadata={"axes": "ZYX"},
+                photometric="minisblack",
+            )
+
+        def validator(temporary: Path, *, value: Any = array) -> bool:
+            try:
+                observed = tifffile.imread(temporary)
+            except Exception:
+                return False
+            return bool(
+                observed.dtype == np.dtype(np.float32)
+                and observed.shape == (16, 32, 32)
+                and np.array_equal(observed, value)
+            )
+
+        atomic_write(destination, writer, validator)
+        identities[name] = FileIdentity.from_path(destination).to_dict()
+    return {
+        "schema_version": 1,
+        "shape_zyx": [16, 32, 32],
+        "dtype": "float32",
+        "files": identities,
+    }
+
+
 @contextmanager
 def workflow_module_by_value() -> Iterator[None]:
     """Serialize only this helper by value and restore its exact prior state."""
@@ -856,6 +1058,31 @@ def _production_workflow_task(task: WorkflowTask) -> RoundResult:
     return run_workflow_task(task)
 
 
+def run_seeded_workflow_task(
+    task: WorkflowTask,
+    *,
+    seed: str = "20260722",
+    _run_workflow_task: Callable[[WorkflowTask], RoundResult] = (
+        _production_workflow_task
+    ),
+    _environ: MutableMapping[str, str] = os.environ,
+) -> RoundResult:
+    """Run one acceptance task under a worker-local fixed ANTs seed."""
+    if type(seed) is not str or not seed.isdecimal():
+        raise HpcWorkflowAcceptanceError(
+            "deterministic parity ANTs seed must contain decimal digits"
+        )
+    previous = _environ.get("ANTS_RANDOM_SEED")
+    _environ["ANTS_RANDOM_SEED"] = seed
+    try:
+        return _run_workflow_task(task)
+    finally:
+        if previous is None:
+            _environ.pop("ANTS_RANDOM_SEED", None)
+        else:
+            _environ["ANTS_RANDOM_SEED"] = previous
+
+
 def _commit_round_marker(
     path: Path,
     result: RoundResult,
@@ -964,6 +1191,7 @@ def run_failure_task(
     """Commit one real round before deterministically failing its independent peer."""
     if type(task) is ReferenceTask:
         return _run_workflow_task(task)
+    task = cast(RoundTask, task)
     if task.round == successful_round:
         result = _run_round_task(task)
         _commit_round_marker(
@@ -1009,6 +1237,7 @@ def run_cancellation_task(
     """Commit one real round while its peer stays cancellably unfinished."""
     if type(task) is ReferenceTask:
         return _run_workflow_task(task)
+    task = cast(RoundTask, task)
     if task.round == successful_round:
         result = _run_round_task(task)
         _commit_round_marker(
@@ -1260,6 +1489,9 @@ __all__ = [
     "bounded_acceptance_manifest",
     "bounded_slurm_profile",
     "coordination_timeout_seconds",
+    "deterministic_acceptance_manifest",
+    "deterministic_sequential_profile",
+    "deterministic_slurm_profile",
     "execute_cancellation_acceptance",
     "execute_owned_slurm_workflow",
     "metric_comparison_evidence",
@@ -1268,6 +1500,7 @@ __all__ = [
     "prepare_task5_output_roots",
     "run_cancellation_task",
     "run_failure_task",
+    "run_seeded_workflow_task",
     "scientific_equivalence_evidence",
     "scientific_parity_evidence",
     "sequential_reference_profile",
@@ -1275,4 +1508,5 @@ __all__ = [
     "validate_injected_failure_record",
     "validate_task5_output_ownership",
     "workflow_module_by_value",
+    "write_deterministic_inputs",
 ]

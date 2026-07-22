@@ -19,6 +19,8 @@ from hpc.workflow_acceptance import (
     coordination_timeout_seconds,
     execute_cancellation_acceptance,
     execute_owned_slurm_workflow,
+    metric_comparison_evidence,
+    numeric_comparison_evidence,
     parallel_placement_evidence,
     prepare_task5_output_roots,
     run_cancellation_task,
@@ -607,6 +609,55 @@ def test_parallel_placement_requires_two_overlapping_unique_jobs_and_hosts() -> 
     with pytest.raises(HpcWorkflowAcceptanceError, match="unique hostname"):
         parallel_placement_evidence(
             (reference, moving[0], replace(moving[1], hostname="node-a"))
+        )
+
+
+def test_stochastic_numeric_evidence_records_nonrepeatable_difference() -> None:
+    import numpy as np
+
+    evidence = numeric_comparison_evidence(
+        np.array([0, 100, 200], dtype=np.uint16),
+        np.array([0, 102, 197], dtype=np.uint16),
+        location="registered image",
+        require_close=False,
+    )
+
+    assert evidence["array_equal"] is False
+    assert evidence["maximum_absolute_difference"] == 3.0
+    assert evidence["mean_absolute_difference"] == pytest.approx(5.0 / 3.0)
+    assert evidence["close_required"] is False
+
+
+def test_strict_numeric_evidence_rejects_the_same_difference() -> None:
+    import numpy as np
+
+    with pytest.raises(AssertionError):
+        numeric_comparison_evidence(
+            np.array([0, 100, 200], dtype=np.uint16),
+            np.array([0, 102, 197], dtype=np.uint16),
+            location="registered image",
+            require_close=True,
+        )
+
+
+def test_metric_equivalence_accepts_observed_repeat_variation_and_rejects_excess() -> (
+    None
+):
+    accepted = metric_comparison_evidence(
+        {"Correlation": 0.8622, "MattesMutualInformation": 0.3864},
+        {"Correlation": 0.8661, "MattesMutualInformation": 0.3882},
+        location="round 2 nonlinear metrics",
+    )
+    assert accepted["absolute_tolerance"] == 0.01
+    assert accepted["absolute_differences"] == pytest.approx(
+        {"Correlation": 0.0039, "MattesMutualInformation": 0.0018}
+    )
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="Correlation"):
+        metric_comparison_evidence(
+            {"Correlation": 0.86, "MattesMutualInformation": 0.38},
+            {"Correlation": 0.84, "MattesMutualInformation": 0.38},
+            location="round 2 nonlinear metrics",
         )
 
 

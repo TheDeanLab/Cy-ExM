@@ -302,15 +302,105 @@ def parallel_placement_evidence(
     }
 
 
-def scientific_parity_evidence(
+def numeric_comparison_evidence(
+    expected: object,
+    observed: object,
+    *,
+    location: str,
+    require_close: bool,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> dict[str, object]:
+    """Record numeric differences, optionally enforcing strict closeness."""
+    import numpy as np
+
+    expected_array = np.asarray(expected)
+    observed_array = np.asarray(observed)
+    if expected_array.shape != observed_array.shape:
+        raise HpcWorkflowAcceptanceError(
+            f"{location} shape changed: "
+            f"{expected_array.shape!r} != {observed_array.shape!r}"
+        )
+    if expected_array.dtype != observed_array.dtype:
+        raise HpcWorkflowAcceptanceError(
+            f"{location} dtype changed: "
+            f"{expected_array.dtype!r} != {observed_array.dtype!r}"
+        )
+    if not np.all(np.isfinite(expected_array)) or not np.all(
+        np.isfinite(observed_array)
+    ):
+        raise HpcWorkflowAcceptanceError(f"{location} contains non-finite values")
+    if require_close:
+        np.testing.assert_allclose(
+            observed_array,
+            expected_array,
+            rtol=rtol,
+            atol=atol,
+        )
+    difference = np.abs(
+        observed_array.astype(np.float64) - expected_array.astype(np.float64)
+    )
+    return {
+        "shape": list(expected_array.shape),
+        "reference_dtype": str(expected_array.dtype),
+        "candidate_dtype": str(observed_array.dtype),
+        "array_equal": bool(np.array_equal(observed_array, expected_array)),
+        "close_required": require_close,
+        "maximum_absolute_difference": float(difference.max(initial=0.0)),
+        "mean_absolute_difference": float(difference.mean()),
+        "p99_9_absolute_difference": float(np.percentile(difference, 99.9)),
+        "rtol": rtol,
+        "atol": atol,
+    }
+
+
+def metric_comparison_evidence(
+    reference: Mapping[str, float],
+    candidate: Mapping[str, float],
+    *,
+    location: str,
+    absolute_tolerance: float = 0.01,
+) -> dict[str, object]:
+    """Require finite canonical stage metrics within one absolute bound."""
+    import math
+
+    expected_names = {"Correlation", "MattesMutualInformation"}
+    if set(reference) != expected_names or set(candidate) != expected_names:
+        raise HpcWorkflowAcceptanceError(f"{location} metric schema changed")
+    differences: dict[str, float] = {}
+    for name in sorted(expected_names):
+        reference_value = reference[name]
+        candidate_value = candidate[name]
+        if not math.isfinite(reference_value) or not math.isfinite(candidate_value):
+            raise HpcWorkflowAcceptanceError(f"{location} {name} is non-finite")
+        difference = abs(candidate_value - reference_value)
+        if difference > absolute_tolerance:
+            raise HpcWorkflowAcceptanceError(
+                f"{location} {name} difference {difference} exceeds "
+                f"{absolute_tolerance}"
+            )
+        differences[name] = difference
+    return {
+        "reference": dict(reference),
+        "candidate": dict(candidate),
+        "absolute_differences": differences,
+        "absolute_tolerance": absolute_tolerance,
+    }
+
+
+def _scientific_comparison_evidence(
     reference: WorkflowPlan,
     candidate: WorkflowPlan,
+    *,
+    require_close: bool,
+    metric_absolute_tolerance: float,
 ) -> dict[str, object]:
-    """Compare sequential and SLURM artifacts at established scientific bounds."""
+    """Compare exact structure plus strict or stochastic numerical evidence."""
     import numpy as np
     import tifffile
 
     from cyexm.io.tiff import read_tiff_geometry
+    from cyexm.metrics import read_metrics
     from cyexm.registration.transforms import import_affine_transform
     from cyexm.registration.whole_image import RegistrationPaths
 
@@ -324,43 +414,6 @@ def scientific_parity_evidence(
         raise HpcWorkflowAcceptanceError(
             "sequential and SLURM plans contain different round counts"
         )
-
-    def numeric_evidence(
-        expected: object,
-        observed: object,
-        *,
-        location: str,
-    ) -> dict[str, object]:
-        expected_array = np.asarray(expected)
-        observed_array = np.asarray(observed)
-        if expected_array.shape != observed_array.shape:
-            raise HpcWorkflowAcceptanceError(
-                f"{location} shape changed: "
-                f"{expected_array.shape!r} != {observed_array.shape!r}"
-            )
-        if expected_array.dtype != observed_array.dtype:
-            raise HpcWorkflowAcceptanceError(
-                f"{location} dtype changed: "
-                f"{expected_array.dtype!r} != {observed_array.dtype!r}"
-            )
-        np.testing.assert_allclose(
-            observed_array,
-            expected_array,
-            rtol=relative_tolerance,
-            atol=absolute_tolerance,
-        )
-        difference = np.abs(
-            observed_array.astype(np.float64) - expected_array.astype(np.float64)
-        )
-        return {
-            "shape": list(expected_array.shape),
-            "reference_dtype": str(expected_array.dtype),
-            "candidate_dtype": str(observed_array.dtype),
-            "array_equal": bool(np.array_equal(observed_array, expected_array)),
-            "maximum_absolute_difference": float(difference.max(initial=0.0)),
-            "rtol": relative_tolerance,
-            "atol": absolute_tolerance,
-        }
 
     def tiff_evidence(
         expected_path: Path,
@@ -392,7 +445,14 @@ def scientific_parity_evidence(
             "dtype": str(expected.dtype),
             "shape": list(expected.shape),
             "geometry": expected_geometry.to_dict(),
-            "numeric": numeric_evidence(expected, observed, location=location),
+            "numeric": numeric_comparison_evidence(
+                expected,
+                observed,
+                location=location,
+                require_close=require_close,
+                rtol=relative_tolerance,
+                atol=absolute_tolerance,
+            ),
         }
 
     rounds: list[dict[str, object]] = []
@@ -454,6 +514,51 @@ def scientific_parity_evidence(
                 f"round {round_number} warp geometry changed"
             )
 
+        stage_metrics: dict[str, dict[str, object]] = {}
+        metric_paths = (
+            (
+                "pre-registration",
+                expected_paths.pre_metrics,
+                observed_paths.pre_metrics,
+            ),
+            (
+                "linearly-registered",
+                expected_paths.linear_metrics,
+                observed_paths.linear_metrics,
+            ),
+            (
+                "nonlinear-registered",
+                expected_paths.nonlinear_metrics,
+                observed_paths.nonlinear_metrics,
+            ),
+        )
+        reference_metrics: dict[str, dict[str, float]] = {}
+        candidate_metrics: dict[str, dict[str, float]] = {}
+        for stage, reference_path, candidate_path in metric_paths:
+            reference_stage = read_metrics(reference_path)
+            candidate_stage = read_metrics(candidate_path)
+            reference_metrics[stage] = reference_stage
+            candidate_metrics[stage] = candidate_stage
+            stage_metrics[stage] = metric_comparison_evidence(
+                reference_stage,
+                candidate_stage,
+                location=f"round {round_number} {stage} metrics",
+                absolute_tolerance=metric_absolute_tolerance,
+            )
+        for execution_name, values in (
+            ("reference", reference_metrics),
+            ("candidate", candidate_metrics),
+        ):
+            for metric_name in ("Correlation", "MattesMutualInformation"):
+                if (
+                    values["nonlinear-registered"][metric_name]
+                    < values["pre-registration"][metric_name]
+                ):
+                    raise HpcWorkflowAcceptanceError(
+                        f"round {round_number} {execution_name} nonlinear "
+                        f"{metric_name} degraded below pre-registration"
+                    )
+
         channels: list[dict[str, object]] = []
         for index, (expected_channel, observed_channel) in enumerate(
             zip(expected_task.channels, observed_task.channels, strict=True)
@@ -484,18 +589,24 @@ def scientific_parity_evidence(
                     "transform_type": expected_affine.transform_type,
                     "dimension": expected_affine.dimension,
                     "fixed_parameters_exact": True,
-                    "parameters": numeric_evidence(
+                    "parameters": numeric_comparison_evidence(
                         expected_affine.parameters,
                         observed_affine.parameters,
                         location=f"round {round_number} affine parameters",
+                        require_close=require_close,
+                        rtol=relative_tolerance,
+                        atol=absolute_tolerance,
                     ),
                 },
                 "warp": {
                     "geometry": warp_geometry,
-                    "numeric": numeric_evidence(
+                    "numeric": numeric_comparison_evidence(
                         expected_warp.numpy(),
                         observed_warp.numpy(),
                         location=f"round {round_number} nonlinear warp",
+                        require_close=require_close,
+                        rtol=relative_tolerance,
+                        atol=absolute_tolerance,
                     ),
                 },
                 "registered": tiff_evidence(
@@ -503,6 +614,7 @@ def scientific_parity_evidence(
                     observed_paths.registered,
                     location=f"round {round_number} registered image",
                 ),
+                "metrics": stage_metrics,
                 "channels": channels,
             }
         )
@@ -511,11 +623,41 @@ def scientific_parity_evidence(
         "scientific_fingerprint": reference.scientific_fingerprint,
         "rtol": relative_tolerance,
         "atol": absolute_tolerance,
-        "tolerance_rationale": (
-            "established ANTSpyX independent-registration floating-point tolerance"
+        "comparison_policy": (
+            "strict-deterministic-numeric-parity"
+            if require_close
+            else "stochastic-scientific-equivalence"
         ),
+        "metric_absolute_tolerance": metric_absolute_tolerance,
+        "voxel_differences_are_characterization": not require_close,
         "rounds": rounds,
     }
+
+
+def scientific_equivalence_evidence(
+    reference: WorkflowPlan,
+    candidate: WorkflowPlan,
+) -> dict[str, object]:
+    """Compare independent multithreaded estimates by structure and quality."""
+    return _scientific_comparison_evidence(
+        reference,
+        candidate,
+        require_close=False,
+        metric_absolute_tolerance=0.01,
+    )
+
+
+def scientific_parity_evidence(
+    reference: WorkflowPlan,
+    candidate: WorkflowPlan,
+) -> dict[str, object]:
+    """Require strict numerical parity under deterministic conditions."""
+    return _scientific_comparison_evidence(
+        reference,
+        candidate,
+        require_close=True,
+        metric_absolute_tolerance=0.0,
+    )
 
 
 def bounded_slurm_profile(
@@ -1120,10 +1262,13 @@ __all__ = [
     "coordination_timeout_seconds",
     "execute_cancellation_acceptance",
     "execute_owned_slurm_workflow",
+    "metric_comparison_evidence",
+    "numeric_comparison_evidence",
     "parallel_placement_evidence",
     "prepare_task5_output_roots",
     "run_cancellation_task",
     "run_failure_task",
+    "scientific_equivalence_evidence",
     "scientific_parity_evidence",
     "sequential_reference_profile",
     "task5_output_roots",

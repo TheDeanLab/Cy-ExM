@@ -241,4 +241,3 @@ def run_workflow(...):
     use the Phase 1 artifact store as the only restart authority.
     """
 ```
-

@@ -224,12 +224,47 @@ class _SerializedWorkflowTaskRunner:
         return result
 
 
+@dataclass(frozen=True, slots=True)
+class _SerializedFineWorkflowTaskRunner:
+    payload: bytes
+
+    def __call__(self, task: FineWorkflowTask) -> FineTaskResult:
+        import cloudpickle
+
+        if type(task) not in {
+            RoundPreparationTask,
+            NonlinearChunkTask,
+            ChunkAssemblyTask,
+            WholeImageRegistrationTask,
+            ChannelTransformTask,
+            RoundValidationTask,
+        }:
+            raise TypeError("serialized fine task must use an exact task type")
+        runner = cloudpickle.loads(self.payload)
+        if not callable(runner):
+            raise TypeError("serialized fine runner payload must be callable")
+        result = runner(task)
+        if type(result) is not FineTaskResult:
+            raise TypeError(
+                "serialized fine runner must return an exact FineTaskResult"
+            )
+        return result
+
+
 def _serialize_workflow_task_runner(
     runner: WorkflowTaskRunner,
 ) -> _SerializedWorkflowTaskRunner:
     import cloudpickle
 
     return _SerializedWorkflowTaskRunner(cloudpickle.dumps(runner))
+
+
+def _serialize_fine_workflow_task_runner(
+    runner: FineWorkflowTaskRunner,
+) -> _SerializedFineWorkflowTaskRunner:
+    import cloudpickle
+
+    return _SerializedFineWorkflowTaskRunner(cloudpickle.dumps(runner))
 
 
 def _evidence_object(
@@ -2505,6 +2540,9 @@ class SlurmExecutor:
                     from cyexm.workflow.fine_task import run_fine_task
 
                     fine_runner = run_fine_task
+                fine_submission_runner = _serialize_fine_workflow_task_runner(
+                    fine_runner
+                )
                 controller = FineGraphController(round_tasks)
 
                 def probe_was_active_for_attempt(
@@ -2646,7 +2684,7 @@ class SlurmExecutor:
                 moving_results, task_results, attempts = (
                     collect_distributed_fine_results(
                         controller,
-                        runner=fine_runner,
+                        runner=fine_submission_runner,
                         client=execution_client,
                         as_completed=modules.as_completed,
                         task_retries=spec.task_retries,

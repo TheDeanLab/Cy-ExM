@@ -83,6 +83,10 @@
   never as accepted placement evidence. Retain one exact ordered evidence record
   for every scheduler-settled attempt, including attempts later retried; counts,
   attempt keys, claimed placement, acceptance, and rejection reason must agree.
+- Serialize both coarse and fine task runners into the importable byte-carrying
+  submission wrapper before Dask receives them. Compute nodes must not need the
+  coordinator's test modules or a test-only `PYTHONPATH`; this also applies to
+  acceptance-only instrumentation and injected-failure runners.
 - Keep fine SLURM lifecycle evidence versioned, strict, and operational. The
   scheduler-neutral controller owns immutable canonical task/dependency evidence;
   `_slurm_evidence` owns typed scale-event construction and decoding; `slurm`

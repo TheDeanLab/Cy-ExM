@@ -3876,6 +3876,73 @@ def test_slurm_executor_submission_deserializes_without_worker_importing_hpc(
     assert completed.returncode == 0, completed.stderr
 
 
+def test_fine_slurm_submission_deserializes_without_worker_importing_hpc(
+    tmp_path: Path,
+) -> None:
+    import os
+    import subprocess
+    from functools import partial
+
+    from dask._task_spec import Task as DaskTask
+    from distributed.protocol import pickle as distributed_pickle
+    from hpc.workflow_acceptance import (
+        run_profiled_fine_task,
+        workflow_module_by_value,
+    )
+
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    executor = SlurmExecutor(
+        _profile(tmp_path, workers=1, mode="fine_grained"),
+        _fine_runner=partial(
+            run_profiled_fine_task,
+            timing_root=tmp_path / "timings",
+        ),
+        _modules=lambda: modules,
+        _version=lambda name: "test-version" if name in _PACKAGES else "unexpected",
+    )
+
+    with workflow_module_by_value():
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+        call = next(
+            item
+            for item in modules.submit_calls
+            if type(item.task) not in {ReferenceTask, RoundTask}
+        )
+        payload = distributed_pickle.dumps(DaskTask(call.key, call.runner, call.task))
+    payload_path = tmp_path / "fine-submission.pickle"
+    payload_path.write_bytes(payload)
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(source_root)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib, sys\n"
+            "from distributed.protocol import pickle as distributed_pickle\n"
+            "submission = distributed_pickle.loads(\n"
+            "    pathlib.Path(sys.argv[1]).read_bytes()\n"
+            ")\n"
+            "assert callable(submission.func)\n"
+            "from cyexm.workflow.fine_models import FineTaskResult\n"
+            "result = submission.func(*submission.args, **submission.kwargs)\n"
+            "assert type(result) is FineTaskResult\n"
+            "assert 'hpc' not in sys.modules\n"
+            "assert 'hpc.workflow_acceptance' not in sys.modules",
+            str(payload_path),
+        ],
+        cwd="/tmp",
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_slurm_executor_resubmits_with_bounded_unique_attempts(
     tmp_path: Path,
 ) -> None:

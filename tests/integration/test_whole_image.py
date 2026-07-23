@@ -46,6 +46,7 @@ def _registration(
     *,
     backend: AntsRegistrationBackend | None = None,
     crop: bool = False,
+    force_override: bool = False,
 ) -> ImageRegistration:
     return ImageRegistration(
         fixed_path,
@@ -55,11 +56,93 @@ def _registration(
         pixel_size=_PIXEL_SIZE,
         crop=crop,
         enable_logging=False,
+        force_override=force_override,
         native_threads=native_threads,
         linear_accuracy="dry run",
         nonlinear_accuracy="dry run",
         _backend=backend,
     )
+
+
+def test_preparation_boundary_forced_rerun_preserves_public_artifacts_and_requests(
+    synthetic_tiffs: tuple[Path, Path],
+    tmp_path: Path,
+    native_threads: NativeThreadConfig,
+) -> None:
+    import ants
+
+    fixed_path, moving_path = synthetic_tiffs
+    output = tmp_path / "preparation-boundary"
+    paths = RegistrationPaths.for_round(output, 1)
+    artifacts = (
+        paths.fixed_reference,
+        paths.pre_metrics,
+        paths.affine,
+        paths.linear_metrics,
+        paths.warp,
+        paths.nonlinear_metrics,
+        paths.registered,
+    )
+    store = ArtifactStore()
+
+    def snapshot() -> tuple[
+        set[str],
+        dict[str, object],
+        dict[str, str],
+        dict[str, str | None],
+    ]:
+        records = {
+            artifact.name: CompletionRecord.read(store.record_path(artifact))
+            for artifact in artifacts
+        }
+        expected_upstream = {
+            paths.fixed_reference.name: None,
+            paths.pre_metrics.name: None,
+            paths.affine.name: None,
+            paths.linear_metrics.name: paths.affine.name,
+            paths.warp.name: paths.affine.name,
+            paths.nonlinear_metrics.name: paths.warp.name,
+            paths.registered.name: paths.warp.name,
+        }
+        for artifact_name, upstream_name in expected_upstream.items():
+            request_upstream = records[artifact_name].request.upstream
+            if upstream_name is None:
+                assert request_upstream is None
+            else:
+                assert request_upstream == records[upstream_name].artifact
+
+        backend = AntsRegistrationBackend(native_threads)
+        geometries = {
+            paths.fixed_reference.name: backend.geometry(
+                backend.load_image(paths.fixed_reference, _PIXEL_SIZE)
+            ),
+            paths.warp.name: backend.geometry(ants.image_read(str(paths.warp))),
+            paths.registered.name: backend.geometry(
+                backend.load_image(paths.registered, _PIXEL_SIZE)
+            ),
+        }
+        return (
+            {path.name for path in output.iterdir()},
+            geometries,
+            {
+                artifact_name: record.request.stage
+                for artifact_name, record in records.items()
+            },
+            expected_upstream,
+        )
+
+    _registration(fixed_path, moving_path, output, native_threads).register()
+    before = snapshot()
+
+    _registration(
+        fixed_path,
+        moving_path,
+        output,
+        native_threads,
+        force_override=True,
+    ).register()
+
+    assert snapshot() == before
 
 
 def test_whole_image_writes_spatially_consistent_output_and_completion_records(

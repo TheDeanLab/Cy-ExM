@@ -118,6 +118,18 @@ class RegistrationPaths:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _LinearPreparation:
+    backend: RegistrationBackend
+    paths: RegistrationPaths
+    resolved: ResolvedNativeThreads
+    fixed: object
+    moving_linear: object
+    fixed_mask: object
+    moving_linear_mask: object
+    affine: object
+
+
 class ImageRegistration:
     def __init__(
         self,
@@ -178,7 +190,7 @@ class ImageRegistration:
         self._source_paths: tuple[Path, Path] | None = None
         self._source_identities: tuple[FileIdentity, FileIdentity] | None = None
 
-    def register(self) -> None:
+    def _prepare_linear_state(self) -> _LinearPreparation:
         resolved = configure_native_threads(self.native_threads)
         backend = self._backend or AntsRegistrationBackend(self.native_threads)
         paths = RegistrationPaths.for_round(
@@ -245,30 +257,47 @@ class ImageRegistration:
             resolved,
         )
 
+        return _LinearPreparation(
+            backend=backend,
+            paths=paths,
+            resolved=resolved,
+            fixed=fixed,
+            moving_linear=moving_linear,
+            fixed_mask=fixed_mask,
+            moving_linear_mask=moving_linear_mask,
+            affine=affine,
+        )
+
+    def register(self) -> None:
+        state = self._prepare_linear_state()
         warp_path, moving_nonlinear, moving_nonlinear_mask = (
             self._load_or_estimate_nonlinear(
-                backend,
-                fixed,
-                moving_linear,
-                fixed_mask,
-                moving_linear_mask,
-                affine,
-                paths,
-                resolved,
+                state.backend,
+                state.fixed,
+                state.moving_linear,
+                state.fixed_mask,
+                state.moving_linear_mask,
+                state.affine,
+                state.paths,
+                state.resolved,
             )
         )
         self._commit_metrics(
             "nonlinear-registered",
-            backend,
-            fixed,
+            state.backend,
+            state.fixed,
             moving_nonlinear,
-            fixed_mask,
+            state.fixed_mask,
             moving_nonlinear_mask,
-            paths,
-            resolved,
+            state.paths,
+            state.resolved,
         )
         self._commit_registered_image(
-            backend, moving_nonlinear, paths, resolved, warp_path
+            state.backend,
+            moving_nonlinear,
+            state.paths,
+            state.resolved,
+            warp_path,
         )
 
     def _store(self) -> ArtifactStore:

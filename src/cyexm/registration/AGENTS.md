@@ -36,6 +36,11 @@
 - Linear registration accepts native fixed and moving grids, but affine resampling
   must produce the exact fixed-reference scalar and mask geometry before whole-image
   or serial-chunked nonlinear work. Keep chunk geometry strict on that fixed grid.
+- Keep `_prepare_linear_state` as the shared private boundary for source snapshots,
+  image loading, crop, masks, fixed-reference persistence, pre-registration metrics,
+  affine preparation, and linear metrics. Consumers must preserve that stage order
+  and use its accepted fixed-grid scalar, mask, affine, paths, backend, and resolved
+  native-thread state without repeating preparation.
 - Pre-registration metrics resample unequal moving scalar and mask grids to the fixed
   grid for diagnosis only; this must not replace or pre-resample the native moving
   inputs supplied to affine estimation.

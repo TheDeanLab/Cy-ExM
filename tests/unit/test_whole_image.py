@@ -614,6 +614,168 @@ def test_successful_registration_commits_every_artifact_in_stage_order(
     assert nonlinear < third_metrics
 
 
+def test_linear_preparation_boundary_preserves_stage_order(
+    tmp_path: Path,
+) -> None:
+    assert hasattr(ImageRegistration, "_prepare_linear_state")
+    events: list[str] = []
+    mask_calls = 0
+    preparation_calls = 0
+
+    class StageOrderBackend(FakeBackend):
+        def load_image(
+            self,
+            path: Path,
+            pixel_size_xyz: tuple[float, float, float],
+        ) -> object:
+            if path.name == "fixed.tif":
+                events.append("load-fixed")
+            elif path.name == "moving.tif":
+                events.append("load-moving")
+            return super().load_image(path, pixel_size_xyz)
+
+        def zero_mask(self, image: object) -> object:
+            nonlocal mask_calls
+            events.append("fixed-mask" if mask_calls == 0 else "moving-mask")
+            mask_calls += 1
+            return super().zero_mask(image)
+
+    class StageOrderRegistration(ImageRegistration):
+        def _prepare_linear_state(self) -> object:
+            nonlocal preparation_calls
+            preparation_calls += 1
+            return super()._prepare_linear_state()
+
+        def _crop_if_requested(
+            self,
+            backend: object,
+            fixed: object,
+            moving: object,
+            paths: RegistrationPaths,
+            resolved: ResolvedNativeThreads,
+        ) -> tuple[object, object]:
+            events.append("crop")
+            return super()._crop_if_requested(backend, fixed, moving, paths, resolved)
+
+        def _commit_metrics(
+            self,
+            stage: str,
+            backend: object,
+            fixed: object,
+            moving: object,
+            fixed_mask: object,
+            moving_mask: object,
+            paths: RegistrationPaths,
+            resolved: ResolvedNativeThreads,
+        ) -> None:
+            events.append(
+                {
+                    "pre-registration": "pre-metrics",
+                    "linearly-registered": "linear-metrics",
+                    "nonlinear-registered": "nonlinear-metrics",
+                }[stage]
+            )
+            super()._commit_metrics(
+                stage,
+                backend,
+                fixed,
+                moving,
+                fixed_mask,
+                moving_mask,
+                paths,
+                resolved,
+            )
+
+        def _load_or_estimate_affine(
+            self,
+            backend: object,
+            fixed: object,
+            moving: object,
+            fixed_mask: object,
+            moving_mask: object,
+            paths: RegistrationPaths,
+            resolved: ResolvedNativeThreads,
+        ) -> tuple[object, object, object]:
+            events.append("affine")
+            return super()._load_or_estimate_affine(
+                backend,
+                fixed,
+                moving,
+                fixed_mask,
+                moving_mask,
+                paths,
+                resolved,
+            )
+
+        def _load_or_estimate_nonlinear(
+            self,
+            backend: object,
+            fixed: object,
+            moving_linear: object,
+            fixed_mask: object,
+            moving_linear_mask: object,
+            affine: object,
+            paths: RegistrationPaths,
+            resolved: ResolvedNativeThreads,
+        ) -> tuple[Path, object, object]:
+            events.append("nonlinear")
+            return super()._load_or_estimate_nonlinear(
+                backend,
+                fixed,
+                moving_linear,
+                fixed_mask,
+                moving_linear_mask,
+                affine,
+                paths,
+                resolved,
+            )
+
+        def _commit_registered_image(
+            self,
+            backend: object,
+            moving_nonlinear: object,
+            paths: RegistrationPaths,
+            resolved: ResolvedNativeThreads,
+            warp_path: Path,
+        ) -> None:
+            events.append("registered-image")
+            super()._commit_registered_image(
+                backend,
+                moving_nonlinear,
+                paths,
+                resolved,
+                warp_path,
+            )
+
+    fixed = write_stub(tmp_path / "fixed.tif", b"fixed-input")
+    moving = write_stub(tmp_path / "moving.tif", b"moving-input")
+    registration = StageOrderRegistration(
+        fixed,
+        moving,
+        tmp_path / "output",
+        2,
+        _backend=StageOrderBackend(),
+        _artifact_store=ArtifactStore(),
+    )
+
+    registration.register()
+
+    assert preparation_calls == 1
+    assert events == [
+        "load-fixed",
+        "load-moving",
+        "crop",
+        "fixed-mask",
+        "moving-mask",
+        "pre-metrics",
+        "affine",
+        "linear-metrics",
+        "nonlinear",
+        "nonlinear-metrics",
+        "registered-image",
+    ]
+
+
 def test_stage_records_capture_inputs_geometry_threads_policy_and_upstream(
     tmp_path: Path,
     resolved_native_threads: ResolvedNativeThreads,

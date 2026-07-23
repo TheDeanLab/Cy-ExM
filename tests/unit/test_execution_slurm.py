@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -536,6 +537,28 @@ class _FakeClient:
                 else self._modules.connected_workers
             )
         )
+        if function.__name__ == "_activate_round_slot":
+            for address in addresses:
+                self._modules.events.append(f"activate:{address}")
+                activation_count = sum(
+                    event.startswith("activate:") for event in self._modules.events
+                )
+                if self._modules.hang_activation_call == activation_count:
+                    time.sleep(self._modules.hang_seconds)
+                if self._modules.activation_error is not None and (
+                    self._modules.activation_error_call is None
+                    or activation_count == self._modules.activation_error_call
+                ):
+                    raise self._modules.activation_error
+                self._modules.scheduler_resource_calls.append(
+                    (address, {"round_slot": 1})
+                )
+                self._modules.scheduler_resources[address] = {"round_slot": 1}
+                if self._modules.hang_post_activation_call == activation_count:
+                    self._modules.hang_next_scheduler_info_seconds = (
+                        self._modules.hang_seconds
+                    )
+            return {address: {} for address in addresses}
         if self._modules.probe_results is not None:
             return {
                 address: self._modules.probe_results[address]
@@ -988,6 +1011,21 @@ def test_fine_slurm_starts_candidates_without_slots_then_activates_after_preflig
     assert tuple(result.round for result in results) == (1, 2)
 
 
+def test_fine_worker_activation_updates_worker_and_scheduler_resource_state() -> None:
+    class Worker:
+        def __init__(self) -> None:
+            self.resources: dict[str, int] = {}
+
+        async def set_resources(self, **resources: int) -> None:
+            self.resources = resources
+
+    worker = Worker()
+
+    asyncio.run(slurm_module._activate_round_slot(dask_worker=worker))
+
+    assert worker.resources == {"round_slot": 1}
+
+
 def test_fine_slurm_scales_up_from_ready_width_without_scaling_down(
     tmp_path: Path,
 ) -> None:
@@ -1001,7 +1039,10 @@ def test_fine_slurm_scales_up_from_ready_width_without_scaling_down(
 
     assert modules.scale_calls == [{"jobs": 1}, {"jobs": 2}]
     assert modules.wait_for_workers_calls == [(1, 900.0), (2, 900.0)]
-    assert [call[1]["workers"] for call in modules.run_calls] == [
+    probe_calls = [
+        call for call in modules.run_calls if call[0].__name__ == "probe_worker"
+    ]
+    assert [call[1]["workers"] for call in probe_calls] == [
         ["tcp://node-a:1234"],
         ["tcp://node-b:1234"],
     ]
@@ -1376,7 +1417,7 @@ def test_fine_slurm_connected_replacement_gate_has_one_bounded_deadline(
     modules.pending_rounds = {2}
     modules.parsed_timeout_seconds = 0.03
     if hung_stage == "probe":
-        modules.hang_run_call = 2
+        modules.hang_run_call = 3
     elif hung_stage == "activation":
         modules.hang_activation_call = 2
     else:
@@ -1431,7 +1472,7 @@ def test_fine_slurm_replacement_stages_share_one_deadline(
     modules.pending_rounds = {2}
     modules.parsed_timeout_seconds = 0.03
     modules.hang_seconds = 0.02
-    modules.hang_run_call = 2
+    modules.hang_run_call = 3
     modules.hang_activation_call = 2
 
     def replace(

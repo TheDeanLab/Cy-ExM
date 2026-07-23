@@ -74,9 +74,10 @@
   demand-driven scale-up only to `min(configured workers, running + ready)`. Candidate
   workers advertise no `round_slot`; the coordinator must run the complete
   worker preflight on each exact new address, validate one dedicated SLURM
-  job/worker identity, add exactly one scheduler-side `round_slot`, and verify
-  the exact scheduler identity, worker set, and resources in the post-activation
-  snapshot before scientific submission. Before recording any fine result or
+  job/worker identity, add exactly one `round_slot` through the worker API so both
+  worker-local and scheduler resource state agree, and verify the exact scheduler
+  identity, worker set, and resources in the post-activation snapshot before
+  scientific submission. Before recording any fine result or
   releasing descendants, match its SLURM job, worker address, hostname, and PID to
   one activated probe. Record rejected/no-placement outcomes explicitly as failed,
   never as accepted placement evidence. Retain one exact ordered evidence record

@@ -1400,16 +1400,9 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> int:
     return worker_memory_bytes
 
 
-def _activate_round_slot(
-    *,
-    worker_address: str,
-    dask_scheduler: Any,
-) -> None:
-    """Make one preflighted worker eligible for scientific work."""
-    dask_scheduler.add_resources(
-        worker_address,
-        resources=dict(ROUND_RESOURCE),
-    )
+async def _activate_round_slot(*, dask_worker: Any) -> None:
+    """Make one preflighted worker eligible in both worker and scheduler state."""
+    await dask_worker.set_resources(**ROUND_RESOURCE)
 
 
 def _scheduler_snapshot(
@@ -1995,10 +1988,7 @@ class SlurmExecutor:
                     assert fine_state is not None
                     validated_probes.update(batch)
                     for address in connected:
-                        opened_client.run_on_scheduler(
-                            _activate_round_slot,
-                            worker_address=address,
-                        )
+                        opened_client.run(_activate_round_slot, workers=[address])
                         initial_scale_event.activated.append(address)
                         initial_scale_event.activated_probes.append(batch[address])
                         activated_probe_history.append(batch[address])
@@ -2158,9 +2148,9 @@ class SlurmExecutor:
                         )
                         validated_probes.update(new_batch)
                         for address in newcomers:
-                            execution_client.run_on_scheduler(
+                            execution_client.run(
                                 _activate_round_slot,
-                                worker_address=address,
+                                workers=[address],
                             )
                             event.activated.append(address)
                             event.activated_probes.append(new_batch[address])
@@ -2450,11 +2440,9 @@ class SlurmExecutor:
                         for address in newcomers:
                             before_deadline(
                                 f"replacement activation {address}",
-                                lambda address=address: (
-                                    execution_client.run_on_scheduler(
-                                        _activate_round_slot,
-                                        worker_address=address,
-                                    )
+                                lambda address=address: execution_client.run(
+                                    _activate_round_slot,
+                                    workers=[address],
                                 ),
                             )
                             event.activated.append(address)

@@ -16,6 +16,7 @@ from cyexm.config.models import (
     LocalDaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
+    ParallelismSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
@@ -24,6 +25,7 @@ from cyexm.config.models import (
     SlurmSpec,
 )
 from cyexm.spatial import ImageGeometry
+from cyexm.workflow.api import _execution_profile_mapping
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
@@ -538,3 +540,55 @@ def test_scientific_identity_excludes_all_execution_profile_choices(
     }
     assert {plan.scientific_json for plan in plans} == {scientific_json}
     assert {plan.scientific_fingerprint for plan in plans} == {fingerprint}
+
+
+def test_scientific_identity_excludes_parallelism_mode(tmp_path: Path) -> None:
+    scientific_values = _scientific_mapping(tmp_path)
+    scientific_json = canonical_json(scientific_values)
+    fingerprint = sha256_fingerprint(scientific_json)
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    profiles = tuple(
+        ExecutionProfile(
+            schema_version=profile.schema_version,
+            executor=profile.executor,
+            paths=profile.paths,
+            native_threads=profile.native_threads,
+            local_dask=profile.local_dask,
+            slurm=profile.slurm,
+            source_path=profile.source_path,
+            parallelism=ParallelismSpec(mode=mode),
+        )
+        for profile in (_execution_profile(tmp_path, "sequential"),)
+        for mode in ("coarse", "fine_grained")
+    )
+
+    plans = tuple(
+        WorkflowPlan(
+            schema_version=1,
+            dataset_id="dataset-1",
+            manifest=_manifest(),
+            execution=profile,
+            reference_task=_reference_task(tmp_path),
+            fixed_image=tmp_path / "round_1_488.tif",
+            tasks=tasks,
+            expected_artifacts=tuple(task.registration_directory for task in tasks),
+            scientific_json=scientific_json,
+            scientific_fingerprint=fingerprint,
+        )
+        for profile in profiles
+    )
+
+    assert {plan.execution.parallelism.mode for plan in plans} == {
+        "coarse",
+        "fine_grained",
+    }
+    assert {plan.scientific_json for plan in plans} == {scientific_json}
+    assert {plan.scientific_fingerprint for plan in plans} == {fingerprint}
+
+
+def test_canonical_execution_mapping_includes_parallelism_mode(
+    tmp_path: Path,
+) -> None:
+    profile = _execution_profile(tmp_path, "sequential")
+
+    assert _execution_profile_mapping(profile)["parallelism"] == {"mode": "coarse"}

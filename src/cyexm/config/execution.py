@@ -19,6 +19,8 @@ from cyexm.config.models import (
     ExecutorName,
     LocalDaskSpec,
     NativeThreadSpec,
+    ParallelismMode,
+    ParallelismSpec,
     SlurmSpec,
 )
 from cyexm.errors import ConfigurationValidationError
@@ -27,6 +29,8 @@ _EXECUTORS = frozenset({"sequential", "local_dask", "slurm"})
 _BASE_EXECUTION_KEYS = frozenset({"schema_version", "executor", "paths"})
 _PATH_KEYS = frozenset({"dataset_root", "output_root", "worker_local_directory"})
 _NATIVE_THREAD_KEYS = frozenset({"itk", "blas"})
+_PARALLELISM_KEYS = frozenset({"mode"})
+_PARALLELISM_MODES = frozenset({"coarse", "fine_grained"})
 _LOCAL_DASK_KEYS = frozenset(
     {
         "workers",
@@ -301,6 +305,20 @@ def _native_threads(value: object) -> NativeThreadSpec:
     )
 
 
+def _parallelism(value: object) -> ParallelismSpec:
+    mapping = require_exact_keys(value, _PARALLELISM_KEYS, "parallelism")
+    return ParallelismSpec(
+        mode=cast(
+            ParallelismMode,
+            _choice(
+                mapping["mode"],
+                _PARALLELISM_MODES,
+                "parallelism.mode",
+            ),
+        )
+    )
+
+
 def _local_dask(value: object) -> LocalDaskSpec:
     mapping = require_exact_keys(value, _LOCAL_DASK_KEYS, "local_dask")
     processes = mapping["processes"]
@@ -487,6 +505,13 @@ def _validate_execution_profile(profile: ExecutionProfile) -> None:
     )
     if native_threads != profile.native_threads:
         raise ConfigurationValidationError("native_threads are invalid")
+    if not isinstance(profile.parallelism, ParallelismSpec):
+        raise ConfigurationValidationError(
+            f"parallelism must be a ParallelismSpec; got {profile.parallelism!r}"
+        )
+    parallelism = _parallelism({"mode": profile.parallelism.mode})
+    if parallelism != profile.parallelism:
+        raise ConfigurationValidationError("parallelism settings are invalid")
 
     if executor == "sequential":
         if profile.local_dask is not None or profile.slurm is not None:
@@ -556,6 +581,8 @@ def load_execution_profile(path: str | Path) -> ExecutionProfile:
     expected_keys = _BASE_EXECUTION_KEYS
     if "native_threads" in raw_mapping:
         expected_keys |= frozenset({"native_threads"})
+    if "parallelism" in raw_mapping:
+        expected_keys |= frozenset({"parallelism"})
     if executor != "sequential":
         expected_keys |= frozenset({executor})
     mapping = require_exact_keys(raw_mapping, expected_keys, "execution")
@@ -584,6 +611,11 @@ def load_execution_profile(path: str | Path) -> ExecutionProfile:
         ),
         slurm=_slurm(mapping["slurm"]) if executor == "slurm" else None,
         source_path=source_path,
+        parallelism=(
+            _parallelism(mapping["parallelism"])
+            if "parallelism" in mapping
+            else ParallelismSpec()
+        ),
     )
     _validate_execution_profile(profile)
     return profile

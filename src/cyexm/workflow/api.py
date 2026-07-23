@@ -581,6 +581,7 @@ def _execution_profile_mapping(profile: ExecutionProfile) -> dict[str, object]:
             "itk": profile.native_threads.itk,
             "blas": profile.native_threads.blas,
         },
+        "parallelism": {"mode": profile.parallelism.mode},
         "local_dask": (
             None
             if local_dask is None

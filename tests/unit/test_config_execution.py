@@ -14,6 +14,7 @@ from cyexm.config import (
     ExecutionProfile,
     LocalDaskSpec,
     NativeThreadSpec,
+    ParallelismSpec,
     SlurmSpec,
     load_execution_profile,
 )
@@ -113,6 +114,37 @@ def _mapping_at(data: dict[str, object], key: str) -> dict[str, object]:
     value = data[key]
     assert isinstance(value, dict)
     return value
+
+
+def test_execution_parallelism_defaults_to_coarse(tmp_path: Path) -> None:
+    profile = _load_profile(tmp_path, _valid_data("sequential"))
+
+    assert profile.parallelism == ParallelismSpec(mode="coarse")
+
+
+@pytest.mark.parametrize("mode", ["coarse", "fine_grained"])
+def test_execution_accepts_exact_parallelism_modes(tmp_path: Path, mode: str) -> None:
+    data = _valid_data("sequential")
+    data["parallelism"] = {"mode": mode}
+
+    assert _load_profile(tmp_path, data).parallelism.mode == mode
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {},
+        {"mode": "fine"},
+        {"mode": "fine_grained", "workers": 2},
+        "fine_grained",
+    ],
+)
+def test_execution_rejects_invalid_parallelism(tmp_path: Path, value: object) -> None:
+    data = _valid_data("sequential")
+    data["parallelism"] = value
+
+    with pytest.raises(ConfigurationValidationError, match="parallelism"):
+        _load_profile(tmp_path, data)
 
 
 def test_execution_paths_resolve_relative_to_profile(tmp_path: Path) -> None:

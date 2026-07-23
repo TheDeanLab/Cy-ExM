@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Literal
 
@@ -56,6 +57,97 @@ _SUCCESS = frozenset({"completed", "reused"})
 def _canonical_key(key: FineTaskKey) -> tuple[int, int, int]:
     item = int(key.item) if key.stage in {"chunk", "channel"} else -1
     return (key.round, _STAGE_ORDER[key.stage], item)
+
+
+def canonical_fine_task_key(value: str) -> tuple[int, int, int]:
+    """Return scheduler-neutral canonical ordering for an encoded fine key."""
+    return _canonical_key(FineTaskKey.from_encoded(value))
+
+
+def validate_fine_graph_description(
+    description: Sequence[tuple[str, tuple[str, ...]]],
+    round_tasks: tuple[RoundTask, ...],
+    *,
+    allow_partial: bool,
+    terminal_statuses: Mapping[str, str],
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
+    """Validate scheduler-neutral materialized graph shape and canonical order."""
+    task_keys = tuple(key for key, _dependencies in description)
+    dependencies = dict(description)
+    if len(dependencies) != len(task_keys):
+        raise ValueError("fine graph task keys must be unique")
+    decoded = {key: FineTaskKey.from_encoded(key) for key in task_keys}
+    if task_keys != tuple(sorted(task_keys, key=canonical_fine_task_key)):
+        raise ValueError("fine graph tasks must use canonical ordering")
+    if any(
+        dependency not in dependencies
+        for values in dependencies.values()
+        for dependency in values
+    ):
+        raise ValueError("fine graph dependencies must name graph task keys")
+    if tuple(sorted({key.round for key in decoded.values()})) != tuple(
+        sorted(task.round for task in round_tasks)
+    ):
+        raise ValueError("fine graph rounds must match submitted moving rounds")
+
+    stopped = {"failed", "cancelled"}
+    for round_task in round_tasks:
+        round_keys = tuple(
+            key for key in task_keys if decoded[key].round == round_task.round
+        )
+        stages = {
+            stage: tuple(key for key in round_keys if decoded[key].stage == stage)
+            for stage in _STAGE_ORDER
+        }
+        prefix = f"round-{round_task.round:03d}:"
+        channels = tuple(
+            f"{prefix}channel:{index:04d}" for index in range(len(round_task.channels))
+        )
+        validation = f"{prefix}validation:main"
+        if round_task.strategy == "whole_image":
+            producer = f"{prefix}whole-image:main"
+            if stages["whole-image"] != (producer,) or any(
+                stages[stage] for stage in ("preparation", "chunk", "assembly")
+            ):
+                raise ValueError("whole-image fine graph has incompatible stages")
+            if dependencies[producer]:
+                raise ValueError("whole-image task must have no dependencies")
+            producer_stopped = terminal_statuses.get(producer) in stopped
+        else:
+            preparation = f"{prefix}preparation:main"
+            producer = f"{prefix}assembly:main"
+            chunks = stages["chunk"]
+            if stages["preparation"] != (preparation,) or stages["whole-image"]:
+                raise ValueError("chunked fine graph has incompatible stages")
+            preparation_stopped = terminal_statuses.get(preparation) in stopped
+            if not chunks and (allow_partial or preparation_stopped):
+                if stages["assembly"] or stages["channel"] or stages["validation"]:
+                    raise ValueError("partial chunk graph contains downstream stages")
+                continue
+            if not chunks or stages["assembly"] != (producer,):
+                raise ValueError("chunked fine graph has incompatible stages")
+            if dependencies[preparation] or any(
+                dependencies[key] != (preparation,) for key in chunks
+            ):
+                raise ValueError("fine chunks must depend only on preparation")
+            if dependencies[producer] != chunks:
+                raise ValueError("fine assembly must depend on every chunk")
+            producer_stopped = terminal_statuses.get(producer) in stopped or any(
+                terminal_statuses.get(key) in stopped for key in chunks
+            )
+        if (
+            (allow_partial or producer_stopped)
+            and not stages["channel"]
+            and not stages["validation"]
+        ):
+            continue
+        if stages["channel"] != channels or stages["validation"] != (validation,):
+            raise ValueError("fine graph channels/validation must match the round")
+        if dependencies[validation] != channels:
+            raise ValueError("fine validation must depend on every channel task")
+        if any(dependencies[key] != (producer,) for key in channels):
+            raise ValueError("fine channels must depend only on registration producer")
+    return task_keys, dependencies
 
 
 def _parsed_timestamp(value: str, role: str) -> datetime:

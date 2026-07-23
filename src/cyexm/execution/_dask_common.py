@@ -124,6 +124,7 @@ def fine_exception_result(
     key: str,
     started_at: str,
     started: float,
+    placement: FineTaskResult | None = None,
 ) -> FineTaskResult:
     return FineTaskResult(
         task=task,
@@ -131,10 +132,10 @@ def fine_exception_result(
         started_at=started_at,
         ended_at=utc_now(),
         duration_seconds=max(0.0, time.monotonic() - started),
-        hostname="unknown",
-        pid=os.getpid(),
+        hostname="unknown" if placement is None else placement.hostname,
+        pid=os.getpid() if placement is None else placement.pid,
         dask_task_key=key,
-        slurm_job_id=None,
+        slurm_job_id=None if placement is None else placement.slurm_job_id,
         native_threads=tuple(
             (
                 name,
@@ -306,6 +307,9 @@ def collect_distributed_fine_results(
     capacity: int,
     active: set[Any],
     capacity_provider: Callable[[FineGraphController, int], int] | None = None,
+    result_validator: (
+        Callable[[FineWorkflowTask, FineTaskResult], FineTaskResult] | None
+    ) = None,
 ) -> tuple[
     tuple[RoundResult, ...],
     tuple[FineTaskResult, ...],
@@ -387,6 +391,8 @@ def collect_distributed_fine_results(
                             "Dask fine task result key does not match the current "
                             "submitted attempt"
                         )
+                    if result_validator is not None:
+                        result = result_validator(task, result)
                 except RoundExecutionError as error:
                     result = fine_exception_result(
                         task,
@@ -394,6 +400,7 @@ def collect_distributed_fine_results(
                         key=submission.key,
                         started_at=submission.started_at,
                         started=submission.started,
+                        placement=outcome,
                     )
             else:
                 error = (

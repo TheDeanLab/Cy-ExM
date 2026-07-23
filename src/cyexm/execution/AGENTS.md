@@ -60,7 +60,11 @@
   workers advertise no `round_slot`; the coordinator must run the complete
   worker preflight on each exact new address, validate one dedicated SLURM
   job/worker identity, add exactly one scheduler-side `round_slot`, and verify
-  the post-activation scheduler snapshot before scientific submission.
+  the exact scheduler identity, worker set, and resources in the post-activation
+  snapshot before scientific submission. Before recording any fine result or
+  releasing descendants, match its SLURM job, worker address, hostname, and PID to
+  one activated probe. Record rejected/no-placement outcomes explicitly as failed,
+  never as accepted placement evidence.
 - Keep fine SLURM lifecycle evidence versioned, strict, and operational. The
   scheduler-neutral controller owns immutable canonical task/dependency evidence;
   `_slurm_evidence` owns typed scale-event construction and decoding; `slurm`

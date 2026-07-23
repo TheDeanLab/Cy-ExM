@@ -7,7 +7,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
 
-from cyexm.execution.dispatcher import FineGraphController
+from cyexm.execution.dispatcher import (
+    FineGraphController,
+    canonical_fine_task_key,
+    validate_fine_graph_description,
+)
 from cyexm.execution.preflight import (
     WorkerProbe,
     validate_slurm_worker_identities,
@@ -27,16 +31,9 @@ _GRAPH_KEYS = frozenset(
         "placements",
         "blocked_descendants",
         "cancelled",
+        "pre_controller_terminal",
     }
 )
-_STAGE_ORDER = {
-    "preparation": 0,
-    "whole-image": 0,
-    "chunk": 1,
-    "assembly": 2,
-    "channel": 3,
-    "validation": 4,
-}
 
 
 def _object(
@@ -96,18 +93,6 @@ def _strings(value: object, location: str) -> tuple[str, ...]:
     return result
 
 
-def _key_order(key: str) -> tuple[int, int, str]:
-    try:
-        round_label, stage, item = key.split(":", 2)
-        return (
-            int(round_label.removeprefix("round-")),
-            _STAGE_ORDER[stage],
-            item,
-        )
-    except (ValueError, KeyError) as error:
-        raise ValueError(f"malformed fine task key: {key!r}") from error
-
-
 @dataclass(slots=True)
 class FineScaleEvent:
     """One deterministic upward-scale transition."""
@@ -138,6 +123,24 @@ class FineScaleEvent:
         return result
 
 
+@dataclass(frozen=True, slots=True)
+class PreControllerTerminal:
+    """Exact cause proving why no moving fine controller could run."""
+
+    phase: str
+    status: str
+    exception_type: str
+    message: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "phase": self.phase,
+            "status": self.status,
+            "exception_type": self.exception_type,
+            "message": self.message,
+        }
+
+
 @dataclass(slots=True)
 class FineSlurmEvidence:
     """Mutable coordinator state with detached JSON snapshots."""
@@ -151,6 +154,7 @@ class FineSlurmEvidence:
     results: tuple[FineTaskResult, ...] = ()
     probes: dict[str, WorkerProbe] = field(default_factory=dict)
     cancelled: bool = False
+    pre_controller_terminal: PreControllerTerminal | None = None
 
     def begin_scale(self, requested: int, started_at: str) -> FineScaleEvent:
         event = FineScaleEvent(requested=requested, started_at=started_at)
@@ -186,6 +190,17 @@ class FineSlurmEvidence:
                 return ""
             return worker_by_job.get(result.slurm_job_id, "")
 
+        def placement_accepted(result: FineTaskResult) -> bool:
+            address = worker_address(result)
+            probe = self.probes.get(address)
+            return (
+                address in self.validated
+                and probe is not None
+                and result.hostname == probe.hostname
+                and result.pid == probe.pid
+                and result.slurm_job_id == probe.slurm_job_id
+            )
+
         return {
             "mode": "fine_grained",
             "worker_cap": self.worker_cap,
@@ -208,22 +223,23 @@ class FineSlurmEvidence:
                     "hostname": result.hostname,
                     "pid": result.pid,
                     "slurm_job_id": result.slurm_job_id,
+                    "placement_accepted": placement_accepted(result),
                 }
                 for result in self.results
             ],
-            "blocked_descendants": sorted(blocked, key=_key_order),
+            "blocked_descendants": sorted(blocked, key=canonical_fine_task_key),
             "cancelled": self.cancelled,
+            "pre_controller_terminal": (
+                None
+                if self.pre_controller_terminal is None
+                else self.pre_controller_terminal.to_dict()
+            ),
         }
 
 
-def _validate_task_graph(
-    raw_graph: object,
-    round_tasks: tuple[RoundTask, ...],
-    *,
-    allow_partial: bool,
-) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
-    task_keys: list[str] = []
-    dependencies: dict[str, tuple[str, ...]] = {}
+def _decode_task_graph(raw_graph: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    description: list[tuple[str, tuple[str, ...]]] = []
+    seen: set[str] = set()
     for index, raw in enumerate(_array(raw_graph, "fine_graph.task_graph")):
         task = _object(
             raw,
@@ -231,7 +247,7 @@ def _validate_task_graph(
             frozenset({"key", "dependencies"}),
         )
         key = _string(task["key"], f"fine_graph.task_graph[{index}].key")
-        if key in dependencies:
+        if key in seen:
             raise ValueError(f"duplicate fine graph task key: {key!r}")
         values = tuple(
             _string(item, f"fine_graph.task_graph[{index}].dependencies[{item_index}]")
@@ -244,70 +260,9 @@ def _validate_task_graph(
         )
         if len(values) != len(set(values)):
             raise ValueError("fine graph task dependencies must be unique")
-        task_keys.append(key)
-        dependencies[key] = values
-    if task_keys != sorted(task_keys, key=_key_order):
-        raise ValueError("fine graph tasks must use canonical ordering")
-    if any(
-        dependency not in dependencies
-        for values in dependencies.values()
-        for dependency in values
-    ):
-        raise ValueError("fine graph dependencies must name graph task keys")
-    if tuple(sorted({_key_order(key)[0] for key in task_keys})) != tuple(
-        sorted(task.round for task in round_tasks)
-    ):
-        raise ValueError("fine graph rounds must match submitted moving rounds")
-
-    for round_task in round_tasks:
-        prefix = f"round-{round_task.round:03d}:"
-        stages = {
-            stage: tuple(
-                key
-                for key in task_keys
-                if key.startswith(prefix) and key.split(":", 2)[1] == stage
-            )
-            for stage in _STAGE_ORDER
-        }
-        channels = tuple(
-            f"{prefix}channel:{index:04d}" for index in range(len(round_task.channels))
-        )
-        validation = f"{prefix}validation:main"
-        if round_task.strategy == "whole_image":
-            producer = f"{prefix}whole-image:main"
-            if stages["whole-image"] != (producer,) or any(
-                stages[stage] for stage in ("preparation", "chunk", "assembly")
-            ):
-                raise ValueError("whole-image fine graph has incompatible stages")
-            if dependencies[producer]:
-                raise ValueError("whole-image task must have no dependencies")
-        else:
-            preparation = f"{prefix}preparation:main"
-            producer = f"{prefix}assembly:main"
-            chunks = stages["chunk"]
-            if stages["preparation"] != (preparation,) or stages["whole-image"]:
-                raise ValueError("chunked fine graph has incompatible stages")
-            if not chunks and allow_partial:
-                if stages["assembly"] or stages["channel"] or stages["validation"]:
-                    raise ValueError("partial chunk graph contains downstream stages")
-                continue
-            if not chunks or stages["assembly"] != (producer,):
-                raise ValueError("chunked fine graph has incompatible stages")
-            if dependencies[preparation] or any(
-                dependencies[key] != (preparation,) for key in chunks
-            ):
-                raise ValueError("fine chunks must depend only on preparation")
-            if dependencies[producer] != chunks:
-                raise ValueError("fine assembly must depend on every chunk")
-        if allow_partial and not stages["channel"] and not stages["validation"]:
-            continue
-        if stages["channel"] != channels or stages["validation"] != (validation,):
-            raise ValueError("fine graph channels/validation must match the round")
-        if dependencies[validation] != channels:
-            raise ValueError("fine validation must depend on every channel task")
-        if any(dependencies[key] != (producer,) for key in channels):
-            raise ValueError("fine channels must depend only on registration producer")
-    return tuple(task_keys), dependencies
+        seen.add(key)
+        description.append((key, values))
+    return tuple(description)
 
 
 def validate_fine_slurm_evidence(
@@ -316,6 +271,8 @@ def validate_fine_slurm_evidence(
     configured_workers: int,
     task_retries: int,
     cancellation_present: bool,
+    startup_outcome: str,
+    reference_attempted: bool,
     round_tasks: tuple[RoundTask, ...],
     observed_probes: Sequence[WorkerProbe],
 ) -> None:
@@ -331,6 +288,7 @@ def validate_fine_slurm_evidence(
         raise ValueError("validated workers must be candidate workers")
 
     activated: list[str] = []
+    probed_workers: set[str] = set()
     connected: set[str] = set()
     previous_request = 0
     scale_failed = False
@@ -361,6 +319,7 @@ def validate_fine_slurm_evidence(
         if not set(event_activated) <= set(probed) <= set(event_connected):
             raise ValueError("fine scale activation must be a subset of probed workers")
         connected.update(event_connected)
+        probed_workers.update(probed)
         activated.extend(event_activated)
         for failure_index, failure in enumerate(
             _array(event["failed"], f"{location}.failed")
@@ -383,11 +342,57 @@ def validate_fine_slurm_evidence(
     if tuple(sorted(activated)) != validated:
         raise ValueError("scale-event activations must match validated_workers")
 
-    task_keys, dependencies = _validate_task_graph(
-        graph["task_graph"],
-        round_tasks,
-        allow_partial=cancellation_present or scale_failed,
-    )
+    terminal_raw = graph["pre_controller_terminal"]
+    terminal: dict[str, object] | None = None
+    if terminal_raw is not None:
+        terminal = _object(
+            terminal_raw,
+            "fine_graph.pre_controller_terminal",
+            frozenset({"phase", "status", "exception_type", "message"}),
+        )
+        phase = _string(terminal["phase"], "pre_controller_terminal.phase")
+        status = _string(terminal["status"], "pre_controller_terminal.status")
+        _string(
+            terminal["exception_type"],
+            "pre_controller_terminal.exception_type",
+        )
+        if type(terminal["message"]) is not str:
+            raise TypeError("pre_controller_terminal.message must be a string")
+        if phase not in {"startup", "reference"}:
+            raise ValueError("pre_controller_terminal phase is unsupported")
+        if status not in {"failed", "cancelled"}:
+            raise ValueError("pre_controller_terminal status is unsupported")
+        if phase == "startup" and startup_outcome not in {"failed", "interrupted"}:
+            raise ValueError("startup terminal cause contradicts startup outcome")
+        if phase == "reference" and (
+            startup_outcome != "succeeded" or not reference_attempted
+        ):
+            raise ValueError(
+                "reference terminal cause lacks successful startup/attempt"
+            )
+    raw_task_graph = _array(graph["task_graph"], "fine_graph.task_graph")
+    if not raw_task_graph:
+        if terminal is None:
+            raise ValueError("empty fine graph requires an exact pre-controller cause")
+        task_keys: tuple[str, ...] = ()
+        dependencies: dict[str, tuple[str, ...]] = {}
+    else:
+        if terminal is not None:
+            raise ValueError(
+                "materialized fine graph cannot claim pre-controller cause"
+            )
+        task_keys, dependencies = validate_fine_graph_description(
+            _decode_task_graph(raw_task_graph),
+            round_tasks,
+            allow_partial=cancellation_present or scale_failed,
+            terminal_statuses={
+                cast(str, item["task_key"]): cast(str, item["status"])
+                for raw in _array(graph["placements"], "fine_graph.placements")
+                if isinstance(raw, Mapping)
+                for item in [raw]
+                if type(item.get("task_key")) is str and type(item.get("status")) is str
+            },
+        )
     attempts: dict[str, int] = {}
     for index, raw in enumerate(
         _array(graph["attempt_counts"], "fine_graph.attempt_counts")
@@ -410,8 +415,8 @@ def validate_fine_slurm_evidence(
     probes = tuple(observed_probes)
     validate_slurm_worker_identities(probes)
     probe_by_address = {probe.worker_address: probe for probe in probes}
-    if tuple(sorted(probe_by_address)) != validated:
-        raise ValueError("worker probes must exactly match validated_workers")
+    if tuple(sorted(probe_by_address)) != tuple(sorted(probed_workers)):
+        raise ValueError("worker probes must exactly match successfully probed workers")
     statuses: dict[str, str] = {}
     placement_keys: list[str] = []
     for index, raw in enumerate(_array(graph["placements"], "fine_graph.placements")):
@@ -428,6 +433,7 @@ def validate_fine_slurm_evidence(
                     "hostname",
                     "pid",
                     "slurm_job_id",
+                    "placement_accepted",
                 }
             ),
         )
@@ -446,16 +452,27 @@ def validate_fine_slurm_evidence(
         observed_dask = _string(placement["dask_task_key"], f"{location}.dask_task_key")
         if observed_dask != expected_dask:
             raise ValueError("fine placement Dask key must match terminal attempt")
-        worker = _string(placement["worker_address"], f"{location}.worker_address")
-        if worker not in probe_by_address:
-            raise ValueError("fine placement must use a validated worker")
-        probe = probe_by_address[worker]
-        if (
-            placement["hostname"] != probe.hostname
-            or placement["slurm_job_id"] != probe.slurm_job_id
-        ):
-            raise ValueError("fine placement does not match worker probe identity")
+        worker = placement["worker_address"]
+        if type(worker) is not str:
+            raise TypeError(f"{location}.worker_address must be an exact string")
         _integer(placement["pid"], f"{location}.pid", 1)
+        accepted = placement["placement_accepted"]
+        if type(accepted) is not bool:
+            raise TypeError(f"{location}.placement_accepted must be an exact boolean")
+        probe = probe_by_address.get(worker)
+        exact_identity = (
+            worker in validated
+            and probe is not None
+            and placement["hostname"] == probe.hostname
+            and placement["pid"] == probe.pid
+            and placement["slurm_job_id"] == probe.slurm_job_id
+        )
+        if accepted and not exact_identity:
+            raise ValueError("fine placement does not match worker probe identity")
+        if not accepted and (status != "failed" or exact_identity):
+            raise ValueError(
+                "rejected fine placement must be a failed nonmatching identity"
+            )
     if set(placement_keys) != set(attempts):
         raise ValueError("fine placements must match attempted terminal tasks")
 
@@ -485,5 +502,6 @@ def validate_fine_slurm_evidence(
 __all__ = [
     "FineScaleEvent",
     "FineSlurmEvidence",
+    "PreControllerTerminal",
     "validate_fine_slurm_evidence",
 ]

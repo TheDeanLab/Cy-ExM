@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Literal, Self, cast
 
 from cyexm.chunking import ChunkInfo
 
@@ -109,6 +109,23 @@ class FineTaskKey:
     @property
     def encoded(self) -> str:
         return f"round-{self.round:03d}:{self.stage}:{self.item}"
+
+    @classmethod
+    def from_encoded(cls, value: str) -> Self:
+        """Decode one exact canonical task identity."""
+        if type(value) is not str:
+            raise TypeError("encoded fine task key must be an exact string")
+        try:
+            round_label, stage, item = value.split(":", 2)
+            if not round_label.startswith("round-"):
+                raise ValueError
+            round_number = int(round_label.removeprefix("round-"))
+            key = cls(round_number, cast(FineTaskStage, stage), item)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"malformed fine task key: {value!r}") from error
+        if key.encoded != value:
+            raise ValueError(f"fine task key is not canonically encoded: {value!r}")
+        return key
 
     @property
     def log_name(self) -> str:

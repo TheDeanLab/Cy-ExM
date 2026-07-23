@@ -11,8 +11,9 @@ from cyexm.config.models import (
     RegistrationSpec,
     RegistrationStageSpec,
 )
-from cyexm.execution.dispatcher import FineGraphController
+from cyexm.execution.dispatcher import FineGraphController, canonical_fine_task_key
 from cyexm.workflow.fine_models import (
+    FineTaskKey,
     FineTaskResult,
     FineWorkflowTask,
     RoundPreparationTask,
@@ -21,6 +22,18 @@ from cyexm.workflow.fine_models import (
 from cyexm.workflow.models import ChannelTask, RoundFailure, RoundTask
 
 pytestmark = pytest.mark.unit
+
+
+def test_canonical_fine_task_key_orders_indices_numerically_above_9999() -> None:
+    keys = (
+        FineTaskKey(2, "chunk", "10000").encoded,
+        FineTaskKey(2, "chunk", "9999").encoded,
+    )
+
+    assert sorted(keys, key=canonical_fine_task_key) == [
+        "round-002:chunk:9999",
+        "round-002:chunk:10000",
+    ]
 
 
 def _round_task(tmp_path: Path, round_number: int) -> RoundTask:

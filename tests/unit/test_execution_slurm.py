@@ -33,7 +33,11 @@ from cyexm.execution._slurm_evidence import (
 from cyexm.execution.preflight import WorkerProbe
 from cyexm.execution.slurm import SlurmExecutor
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
+from cyexm.workflow.fine_models import (
+    FineTaskResult,
+    FineWorkflowTask,
+    RoundPreparationTask,
+)
 from cyexm.workflow.models import (
     ChannelTask,
     ReferenceChannelTask,
@@ -135,6 +139,45 @@ def _task(
     )
 
 
+def _chunked_task(tmp_path: Path, round_number: int) -> RoundTask:
+    return replace(
+        _task(tmp_path, round_number),
+        strategy="serial_chunked",
+        chunk_size_zyx=(2, 8, 8),
+        overlap_fraction=0.25,
+    )
+
+
+def _prepared_descriptor() -> dict[str, object]:
+    identity = {"path": "/tmp/item", "st_size": 1, "st_mtime_ns": 2}
+    return {
+        "format_version": 1,
+        "fixed_scalar": identity,
+        "moving_linear_scalar": identity,
+        "fixed_mask": identity,
+        "moving_linear_mask": identity,
+        "native_fixed": identity,
+        "native_moving": identity,
+        "moving_crop": None,
+        "affine": identity,
+        "geometry": {
+            "shape": [4, 8, 8],
+            "origin": [0.0, 0.0, 0.0],
+            "spacing": [1.0, 1.0, 1.0],
+            "direction": [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        },
+        "scalar_policy": "float32-preserve-registration-values-v1",
+        "mask_policy": (
+            "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
+        ),
+        "native_threads": {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 2},
+    }
+
+
 def _reference_task(tmp_path: Path) -> ReferenceTask:
     round_root = tmp_path / "round-001"
     source = tmp_path / "reference-source.tif"
@@ -212,7 +255,11 @@ def _reference_result(task: ReferenceTask, *, status: str = "completed") -> Roun
 
 
 def _workflow_result(task: WorkflowTask) -> RoundResult:
-    return _reference_result(task) if isinstance(task, ReferenceTask) else _result(task)
+    if type(task) is ReferenceTask:
+        return _reference_result(task)
+    if type(task) is RoundTask:
+        return _result(task)
+    raise TypeError("workflow result requires a coarse workflow task")
 
 
 def _fine_result(
@@ -220,6 +267,9 @@ def _fine_result(
     *,
     status: str = "completed",
     dask_task_key: str | None = "AUTO",
+    hostname: str = "node-a",
+    pid: int = 123,
+    slurm_job_id: str | None = "9001",
 ) -> FineTaskResult:
     failure = (
         RoundFailure(task.key.stage, "RuntimeError", "injected failed result")
@@ -232,10 +282,10 @@ def _fine_result(
         started_at="2026-07-20T10:00:00Z",
         ended_at="2026-07-20T10:00:01Z",
         duration_seconds=1.0,
-        hostname="node-a",
-        pid=123,
+        hostname=hostname,
+        pid=pid,
         dask_task_key=dask_task_key,
-        slurm_job_id="9001",
+        slurm_job_id=slurm_job_id,
         native_threads=tuple(
             (
                 name,
@@ -253,7 +303,11 @@ def _fine_result(
         reused_artifacts=(),
         log_path=str(task.log_path),
         failure=failure,
-        prepared_descriptor=None,
+        prepared_descriptor=(
+            _prepared_descriptor()
+            if type(task) is RoundPreparationTask and status in {"completed", "reused"}
+            else None
+        ),
     )
 
 
@@ -408,7 +462,13 @@ class _FakeClient:
         ):
             addresses = addresses[:-1]
         return {
-            "address": self._modules.scheduler_address,
+            "address": (
+                "tcp://impostor-scheduler:8786"
+                if self._modules.scheduler_flip_after_resource_calls is not None
+                and len(self._modules.scheduler_resource_calls)
+                >= self._modules.scheduler_flip_after_resource_calls
+                else self._modules.scheduler_address
+            ),
             "workers": {
                 address: {
                     "resources": dict(
@@ -480,13 +540,20 @@ class _FakeClient:
         self._modules.submit_calls.append(
             _SubmitCall(runner, task, key, pure, retries, resources)
         )
-        identity = task.key.encoded if hasattr(task, "key") else task.round
+        fine_task = (
+            None
+            if type(task) in {ReferenceTask, RoundTask}
+            else cast(FineWorkflowTask, task)
+        )
+        identity = task.round if fine_task is None else fine_task.key.encoded
         configured = self._modules.outcomes.setdefault(identity, [])
         outcome = (
             configured.pop(0)
             if configured
             else (
-                _fine_result(task) if hasattr(task, "key") else _workflow_result(task)
+                _fine_result(fine_task)
+                if fine_task is not None
+                else _workflow_result(task)
             )
         )
         if type(outcome) is FineTaskResult and outcome.dask_task_key == "AUTO":
@@ -539,6 +606,7 @@ class _FakeSlurmModules:
         self.fake_scheduler = _FakeScheduler(self)
         self.probe_results: Mapping[str, Mapping[str, object]] | None = None
         self.scheduler_address = "tcp://scheduler:8786"
+        self.scheduler_flip_after_resource_calls: int | None = None
         self.job_script_text = "#!/bin/bash\n#SBATCH --partition=512GB\n"
         self.rendered_header_injections: tuple[str, ...] = ()
         self.rendered_worker_injections: tuple[str, ...] = ()
@@ -804,6 +872,23 @@ def test_fine_slurm_scales_up_from_ready_width_without_scaling_down(
     ]
 
 
+def test_fine_slurm_rechecks_scheduler_identity_after_dynamic_activation(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.scheduler_flip_after_resource_calls = 2
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+
+    with pytest.raises(WorkerPreflightError, match="scheduler identity"):
+        _executor(tmp_path, modules, workers=2, mode="fine_grained").execute(
+            _reference_task(tmp_path), tasks
+        )
+
+    assert [call.task.round for call in modules.submit_calls] == [1]
+    assert modules.events[-2:] == ["client.close", "cluster.close"]
+
+
 def test_fine_slurm_retries_exact_task_with_deterministic_attempt_identity(
     tmp_path: Path,
 ) -> None:
@@ -838,6 +923,73 @@ def test_fine_slurm_retries_exact_task_with_deterministic_attempt_identity(
     )
 
 
+@pytest.mark.parametrize(
+    "placement",
+    (
+        {"slurm_job_id": None},
+        {"slurm_job_id": "wrong-job"},
+        {"hostname": "impostor"},
+        {"pid": 999999},
+    ),
+)
+def test_fine_slurm_rejects_bad_placement_before_descendant_release(
+    tmp_path: Path,
+    placement: dict[str, object],
+) -> None:
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    task = _task(tmp_path, 2)
+    initial = initial_fine_tasks((task,))[0]
+    modules.outcomes[initial.key.encoded] = cast(
+        list[object],
+        [_fine_result(initial, **placement)],  # type: ignore[arg-type]
+    )
+
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    results = executor.execute(_reference_task(tmp_path), (task,))
+
+    assert results[1].status == "failed"
+    assert [call.key for call in modules.submit_calls] == [
+        "cyexm-dataset-1-reference-round-001",
+        "cyexm-round-002-whole-image-main",
+    ]
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    placement_evidence = cast(list[dict[str, object]], fine["placements"])
+    assert placement_evidence[0]["placement_accepted"] is False
+
+
+def test_fine_slurm_bad_placement_retries_before_releasing_descendants(
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    task = _task(tmp_path, 2)
+    initial = initial_fine_tasks((task,))[0]
+    modules.outcomes[initial.key.encoded] = [
+        _fine_result(initial, pid=999999),
+        _fine_result(initial),
+    ]
+
+    results = _executor(
+        tmp_path,
+        modules,
+        retries=1,
+        mode="fine_grained",
+    ).execute(_reference_task(tmp_path), (task,))
+
+    assert results[1].status == "completed"
+    assert [call.key for call in modules.submit_calls[1:]] == [
+        "cyexm-round-002-whole-image-main",
+        "cyexm-round-002-whole-image-main-attempt-002",
+        "cyexm-round-002-channel-0000",
+        "cyexm-round-002-validation-main",
+    ]
+
+
 def test_fine_slurm_activation_failure_closes_every_owned_resource(
     tmp_path: Path,
 ) -> None:
@@ -845,11 +997,39 @@ def test_fine_slurm_activation_failure_closes_every_owned_resource(
     modules.dynamic_workers = True
     modules.activation_error = RuntimeError("injected activation failure")
 
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
     with pytest.raises(ExecutorStartupError, match="activation"):
-        _executor(tmp_path, modules, mode="fine_grained").execute(
-            _reference_task(tmp_path), (_task(tmp_path, 2),)
+        executor.execute(reference, (task,))
+
+    assert modules.events[-2:] == ["client.close", "cluster.close"]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
+
+
+def test_fine_slurm_dynamic_probe_address_mismatch_never_activates_candidate(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    first_address, second_address = modules.connected_workers[:2]
+    modules.probe_results = {
+        first_address: _probe(first_address),
+        second_address: _probe("tcp://impostor:1234"),
+    }
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+
+    with pytest.raises(WorkerPreflightError, match="reported worker address"):
+        _executor(tmp_path, modules, workers=2, mode="fine_grained").execute(
+            _reference_task(tmp_path), tasks
         )
 
+    assert modules.scheduler_resource_calls == [(first_address, {"round_slot": 1})]
+    assert [call.task.round for call in modules.submit_calls] == [1]
     assert modules.events[-2:] == ["client.close", "cluster.close"]
 
 
@@ -943,6 +1123,10 @@ def test_fine_slurm_records_versioned_scale_graph_and_placement_evidence(
     assert cast(list[object], fine["task_graph"])
     assert cast(list[object], fine["attempt_counts"])
     assert cast(list[object], fine["placements"])
+    assert all(
+        item["placement_accepted"] is True
+        for item in cast(list[dict[str, object]], fine["placements"])
+    )
     assert fine["cancelled"] is False
     observed = cast(dict[str, object], evidence["observed"])
     validate_fine_slurm_evidence(
@@ -950,6 +1134,8 @@ def test_fine_slurm_records_versioned_scale_graph_and_placement_evidence(
         configured_workers=2,
         task_retries=0,
         cancellation_present=False,
+        startup_outcome="succeeded",
+        reference_attempted=True,
         round_tasks=tasks,
         observed_probes=tuple(
             WorkerProbe.from_dict(item)
@@ -1008,6 +1194,12 @@ def test_fine_slurm_typed_evidence_snapshots_are_detached_and_canonical() -> Non
             "does not match worker probe identity",
         ),
         (
+            lambda fine: cast(list[dict[str, object]], fine["placements"])[0].update(
+                pid=999999
+            ),
+            "does not match worker probe identity",
+        ),
+        (
             lambda fine: cast(list[dict[str, object]], fine["scale_events"])[1].update(
                 probed=[]
             ),
@@ -1041,6 +1233,105 @@ def test_fine_slurm_evidence_rejects_noncanonical_graph_scale_and_placement(
             expected_tasks=(_reference_task(tmp_path), *tasks),
             task_retries=0,
         )
+
+
+def test_fine_slurm_evidence_rejects_unexplained_or_contradictory_empty_graph(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+    executor.execute(reference, (task,))
+    unexplained = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    unexplained_fine = cast(dict[str, object], unexplained["fine_graph"])
+    unexplained_fine["task_graph"] = []
+
+    with pytest.raises(ValueError, match="exact pre-controller cause"):
+        slurm_module._canonical_execution_evidence(
+            unexplained,
+            expected_tasks=(reference, task),
+            task_retries=0,
+        )
+
+    contradictory = deepcopy(unexplained)
+    contradictory_fine = cast(dict[str, object], contradictory["fine_graph"])
+    contradictory_fine["pre_controller_terminal"] = {
+        "phase": "startup",
+        "status": "failed",
+        "exception_type": "RuntimeError",
+        "message": "forged",
+    }
+    with pytest.raises(ValueError, match="contradicts startup outcome"):
+        slurm_module._canonical_execution_evidence(
+            contradictory,
+            expected_tasks=(reference, task),
+            task_retries=0,
+        )
+
+
+def test_fine_slurm_terminal_whole_image_failure_returns_partial_graph_result(
+    tmp_path: Path,
+) -> None:
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    task = _task(tmp_path, 2)
+    initial = initial_fine_tasks((task,))[0]
+    modules.outcomes[initial.key.encoded] = [_fine_result(initial, status="failed")]
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+
+    results = executor.execute(reference, (task,))
+
+    assert tuple(result.status for result in results) == ("completed", "failed")
+    encoded = slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
+    fine = cast(dict[str, object], json.loads(encoded)["fine_graph"])
+    assert [
+        item["key"] for item in cast(list[dict[str, object]], fine["task_graph"])
+    ] == ["round-002:whole-image:main"]
+
+
+@pytest.mark.parametrize(
+    "failed_key",
+    (
+        "round-002:preparation:main",
+        "round-002:chunk:0000",
+        "round-002:assembly:main",
+    ),
+)
+def test_fine_slurm_early_chunk_stage_failure_returns_canonical_partial_graph(
+    tmp_path: Path,
+    failed_key: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    task = _chunked_task(tmp_path, 2)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    initial = initial_fine_tasks((task,))[0]
+    failed_task = initial if failed_key == initial.key.encoded else None
+    if failed_task is not None:
+        modules.outcomes[failed_key] = [_fine_result(failed_task, status="failed")]
+    else:
+        modules.outcomes[failed_key] = [RuntimeError("injected stage failure")]
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+
+    results = executor.execute(reference, (task,))
+
+    assert tuple(result.status for result in results) == ("completed", "failed")
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
 
 
 def test_slurm_executor_exports_resolved_threads_before_worker_launch(
@@ -2153,6 +2444,26 @@ def test_slurm_executor_does_not_submit_moving_rounds_after_reference_failure(
     assert executor.execution_evidence["attempt_counts"] == [
         {"dataset_id": "dataset-1", "round": 1, "attempts": 1}
     ]
+
+
+def test_fine_slurm_reference_failure_has_canonical_pre_controller_evidence(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    modules.outcomes[1] = [_reference_result(reference, status="failed")]
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+
+    results = executor.execute(reference, (task,))
+
+    assert tuple(result.status for result in results) == ("failed",)
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
 
 
 def test_slurm_executor_submission_deserializes_without_worker_importing_hpc(

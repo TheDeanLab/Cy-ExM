@@ -17,6 +17,15 @@
   exactly one immutable stage, and never create clients, workers, or descendant
   tasks. Concurrent stages use deterministic per-task logs rather than the coarse
   round log.
+- `run_workflow` remains the only public execution entry point for coarse and fine
+  modes. Validate the exact mode-appropriate summary log: successful fine rounds use
+  their validation-task log, while failed or cancelled summaries use the canonical
+  representative terminal-task log.
+- Persist a strict scheduler-neutral fine evidence envelope for sequential and local
+  Dask execution, and validate the corresponding fine-graph extension for SLURM.
+  Cross-check public summaries against actual controller task results after
+  scientific work; missing or malformed evidence fails closed and never becomes
+  scientific reuse authority.
 - Validate successful preparation evidence with the authoritative
   `PreparedManifest` parser before graph expansion. Malformed worker descriptors
   must become ordinary current-attempt failures so configured retries and

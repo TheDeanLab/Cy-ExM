@@ -19,6 +19,7 @@ from cyexm.config.models import (
 )
 from cyexm.errors import ConfigurationValidationError
 from cyexm.execution import SequentialExecutor, WorkflowExecutor, WorkflowTaskRunner
+from cyexm.workflow._execution_validation import _FineExecutionEvidence
 from cyexm.workflow.fine_models import (
     FineTaskResult,
     FineWorkflowTask,
@@ -365,6 +366,42 @@ def test_sequential_fine_mode_executes_the_exact_graph_one_at_a_time(
         "round-002:validation:main",
     ]
     assert tuple(result.round for result in results) == (1, 2)
+
+
+def test_sequential_fine_mode_retains_detached_granular_evidence(
+    tmp_path: Path,
+) -> None:
+    chunked = replace(
+        _task(tmp_path, 2),
+        strategy="serial_chunked",
+        chunk_size_zyx=(4, 8, 8),
+        overlap_fraction=0.0,
+    )
+    executor = SequentialExecutor(
+        _profile(tmp_path, "fine_grained"),
+        runner=_successful_result,
+        fine_runner=_fine_result,
+    )
+
+    executor.execute(_reference_task(tmp_path), (chunked,))
+    evidence = executor.execution_evidence
+
+    assert type(evidence) is _FineExecutionEvidence
+    assert evidence.executor == "sequential"
+    assert evidence.worker_cap == 1
+    assert tuple(key for key, _dependencies in evidence.task_graph) == (
+        "round-002:preparation:main",
+        "round-002:chunk:0000",
+        "round-002:assembly:main",
+        "round-002:channel:0000",
+        "round-002:validation:main",
+    )
+    assert tuple(key for key, _attempts in evidence.attempt_counts) == tuple(
+        key for key, _dependencies in evidence.task_graph
+    )
+    assert evidence.blocked_descendants == ()
+    assert not evidence.cancelled
+    assert evidence.cleanup == ()
 
 
 def test_sequential_coarse_mode_never_calls_fine_runner(tmp_path: Path) -> None:

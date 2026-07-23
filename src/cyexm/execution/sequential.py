@@ -9,6 +9,7 @@ from cyexm.config.execution import _validate_execution_profile
 from cyexm.config.models import ExecutionProfile
 from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
 from cyexm.execution.dispatcher import FineGraphController
+from cyexm.workflow._execution_validation import _FineExecutionEvidence
 from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask, WorkflowTask
 
@@ -59,7 +60,10 @@ class SequentialExecutor:
     Notes
     -----
     Reference preparation is always a hard coarse prerequisite. Fine mode never
-    falls back to coarse moving-round execution.
+    falls back to coarse moving-round execution. Independent ready siblings settle
+    after a failure, and interruption retains the actual partial graph, task
+    results, admissions, and blocked descendants for the public run record.
+    Scientific reuse remains authorized only by Phase 1 completion records.
 
     See Also
     --------
@@ -82,6 +86,33 @@ class SequentialExecutor:
         self._profile = profile
         self._runner = runner
         self._fine_runner = fine_runner
+        self._execution_evidence: _FineExecutionEvidence | None = None
+
+    @property
+    def execution_evidence(self) -> _FineExecutionEvidence:
+        """Return detached scheduler-neutral fine graph evidence."""
+        if self._execution_evidence is None:
+            raise RuntimeError("fine execution evidence is not available")
+        return self._execution_evidence
+
+    def _record_fine_evidence(
+        self,
+        controller: FineGraphController,
+        attempts: list[tuple[str, int]],
+        *,
+        cancelled: bool,
+    ) -> None:
+        self._execution_evidence = _FineExecutionEvidence(
+            executor="sequential",
+            worker_cap=1,
+            tasks=controller.tasks,
+            task_graph=controller.graph_description,
+            task_results=controller.task_results,
+            attempt_counts=tuple(attempts),
+            blocked_descendants=tuple(key.encoded for key in controller.blocked_keys),
+            cancelled=cancelled,
+            cleanup=(),
+        )
 
     def _execute_tasks(
         self, tasks: tuple[WorkflowTask, ...]
@@ -155,6 +186,7 @@ class SequentialExecutor:
         self, round_tasks: tuple[RoundTask, ...]
     ) -> tuple[RoundResult, ...]:
         controller = FineGraphController(round_tasks)
+        attempts: list[tuple[str, int]] = []
         while not controller.terminal:
             ready = controller.pop_ready(limit=1)
             if len(ready) != 1:
@@ -162,15 +194,22 @@ class SequentialExecutor:
                     "non-terminal fine graph has no scheduler-ready task"
                 )
             task = ready[0]
+            attempts.append((task.key.encoded, 1))
             try:
                 result = self._run_fine(task)
             except KeyboardInterrupt as error:
+                self._record_fine_evidence(
+                    controller,
+                    attempts,
+                    cancelled=True,
+                )
                 raise _SequentialExecutionInterrupted(
                     error,
                     controller._settled_round_results(),
                     controller.task_results,
                 ) from error
             controller.record(task, result)
+        self._record_fine_evidence(controller, attempts, cancelled=False)
         return controller.round_results()
 
     def execute(
@@ -178,6 +217,7 @@ class SequentialExecutor:
         reference_task: ReferenceTask,
         round_tasks: tuple[RoundTask, ...],
     ) -> tuple[RoundResult, ...]:
+        self._execution_evidence = None
         reference_results = self._execute_tasks((reference_task,))
         if reference_results[0].status not in {"completed", "reused"}:
             return reference_results

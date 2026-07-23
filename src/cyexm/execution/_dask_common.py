@@ -323,6 +323,7 @@ def collect_distributed_fine_results(
         Callable[[FineWorkflowTask, FineTaskResult], FineTaskResult] | None
     ) = None,
     attempt_observer: Callable[[FineAttemptObservation], None] | None = None,
+    submission_observer: Callable[[FineWorkflowTask, int], None] | None = None,
 ) -> tuple[
     tuple[RoundResult, ...],
     tuple[FineTaskResult, ...],
@@ -350,6 +351,8 @@ def collect_distributed_fine_results(
             resources=dict(ROUND_RESOURCE),
         )
         attempts[encoded] = attempt
+        if submission_observer is not None:
+            submission_observer(task, attempt)
         submissions[future] = FineSubmission(
             task=task,
             key=key,

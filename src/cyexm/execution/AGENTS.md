@@ -55,6 +55,11 @@
   the latest actual task end. All actual results for one round must agree on native
   thread evidence. Full multi-host, process, scheduler, and log provenance remains
   per-task evidence; never concatenate it into singular `RoundResult` fields.
+- Sequential and local Dask fine executors retain the actual controller graph,
+  task results, attempt counts, blocked descendants, cancellation, and owned-resource
+  cleanup in one detached scheduler-neutral evidence snapshot. Public workflow
+  validation cross-checks that snapshot after scientific work; never reconstruct it
+  from lossy round summaries or let it authorize artifact reuse.
 - Fine-grained SLURM starts one candidate worker for the reference barrier and
   scales upward only to `min(configured workers, running + ready)`. Candidate
   workers advertise no `round_slot`; the coordinator must run the complete

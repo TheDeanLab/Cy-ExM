@@ -38,6 +38,7 @@ from cyexm.errors import (
     WorkflowPlanError,
 )
 from cyexm.execution.base import WorkflowExecutor
+from cyexm.execution.dispatcher import FineGraphController
 from cyexm.execution.sequential import SequentialExecutor
 from cyexm.registration._request_policy import (
     common_parameters,
@@ -52,6 +53,13 @@ from cyexm.registration.artifacts import (
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.spatial import ImageGeometry
 from cyexm.workflow import run_workflow
+from cyexm.workflow._execution_validation import _FineExecutionEvidence
+from cyexm.workflow.fine_models import (
+    FineTaskKey,
+    FineTaskResult,
+    FineWorkflowTask,
+    RoundValidationTask,
+)
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ChannelTask,
@@ -732,6 +740,64 @@ def _result(task: RoundTask, *, failed: bool = False) -> RoundResult:
     )
 
 
+def _fine_task_result(task: FineWorkflowTask) -> FineTaskResult:
+    return FineTaskResult(
+        task=task,
+        status="completed",
+        started_at="2026-07-20T10:00:00Z",
+        ended_at="2026-07-20T10:00:01Z",
+        duration_seconds=1.0,
+        hostname="worker-01",
+        pid=123,
+        dask_task_key=None,
+        slurm_job_id=None,
+        native_threads=tuple(
+            (
+                name,
+                (
+                    task.native_threads.itk
+                    if name == NATIVE_THREAD_ENV_VARS[0]
+                    else task.native_threads.blas
+                ),
+            )
+            for name in NATIVE_THREAD_ENV_VARS
+        ),
+        artifact_paths=tuple(str(path) for path in task.output_paths),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=None,
+    )
+
+
+def _failed_fine_execution(
+    task: RoundTask,
+) -> tuple[RoundResult, _FineExecutionEvidence]:
+    controller = FineGraphController((task,))
+    fine_task = controller.pop_ready(limit=1)[0]
+    failure = RoundFailure(fine_task.key.stage, "RuntimeError", "injected")
+    failed_result = replace(
+        _fine_task_result(fine_task),
+        status="failed",
+        artifact_paths=(),
+        failure=failure,
+    )
+    controller.record(fine_task, failed_result)
+    return (
+        controller.round_results()[0],
+        _FineExecutionEvidence(
+            executor="sequential",
+            worker_cap=1,
+            tasks=controller.tasks,
+            task_graph=controller.graph_description,
+            task_results=controller.task_results,
+            attempt_counts=((fine_task.key.encoded, 1),),
+            blocked_descendants=tuple(key.encoded for key in controller.blocked_keys),
+            cancelled=False,
+            cleanup=(),
+        ),
+    )
+
+
 def _reference_result(task: ReferenceTask, *, failed: bool = False) -> RoundResult:
     return RoundResult(
         dataset_id=task.dataset_id,
@@ -1099,6 +1165,224 @@ def test_run_workflow_writes_scientific_snapshot_before_execution(
         == "completed"
     )
     assert not tuple(layout.root.rglob(".*.tmp*"))
+
+
+def test_run_workflow_accepts_the_fine_validation_summary_log(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    fine_profile = replace(
+        plan.execution,
+        parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+    )
+    plan = replace(plan, execution=fine_profile)
+
+    def reference_runner(task: WorkflowTask) -> RoundResult:
+        assert type(task) is ReferenceTask
+        return _reference_result(task)
+
+    executor = SequentialExecutor(
+        plan.execution,
+        runner=reference_runner,
+        fine_runner=_fine_task_result,
+    )
+
+    result = run_workflow(
+        plan,
+        _executor_factory=lambda _profile: executor,
+    )
+
+    assert result.status == "completed"
+    assert result.rounds[1].log_path.endswith("round-002-validation-main.log")
+    evidence = json.loads(result.execution_evidence_json)
+    assert evidence["mode"] == "fine_grained"
+    assert [item["key"] for item in evidence["task_graph"]] == [
+        "round-002:whole-image:main",
+        "round-002:channel:0000",
+        "round-002:validation:main",
+    ]
+    assert [item["status"] for item in evidence["task_results"]] == [
+        "completed",
+        "completed",
+        "completed",
+    ]
+    assert json.loads(Path(result.run_record).read_text())["execution"] == evidence
+
+
+def test_parallelism_mode_is_operational_not_scientific_identity(
+    tmp_path: Path,
+) -> None:
+    coarse = _plan(tmp_path, rounds=(2,))
+    fine = replace(
+        coarse,
+        execution=replace(
+            coarse.execution,
+            parallelism=replace(
+                coarse.execution.parallelism,
+                mode="fine_grained",
+            ),
+        ),
+    )
+
+    assert coarse.scientific_json.encode() == fine.scientific_json.encode()
+    assert coarse.scientific_fingerprint == fine.scientific_fingerprint
+    assert coarse.execution.parallelism.mode == "coarse"
+    assert fine.execution.parallelism.mode == "fine_grained"
+
+
+def test_run_workflow_fails_closed_when_fine_evidence_is_missing(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        plan,
+        execution=replace(
+            plan.execution,
+            parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+        ),
+    )
+    validation = RoundValidationTask.create(
+        plan.tasks[0],
+        dependencies=(FineTaskKey(2, "channel", "0000"),),
+    )
+    summary = replace(_result(plan.tasks[0]), log_path=str(validation.log_path))
+
+    class MissingEvidenceExecutor:
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            _round_tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            return (_reference_result(reference_task), summary)
+
+    with pytest.raises(
+        ExecutorStartupError,
+        match="invalid sequential execution evidence",
+    ) as captured:
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: MissingEvidenceExecutor(),
+        )
+
+    record = json.loads(Path(captured.value.run_record).read_text())
+    assert record["execution"] is None
+    assert record["operational_failure"]["phase"] == "execution_evidence"
+
+
+def test_run_workflow_accepts_the_failed_fine_stage_as_authoritative_log(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        plan,
+        execution=replace(
+            plan.execution,
+            parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+        ),
+    )
+    failed_summary, evidence = _failed_fine_execution(plan.tasks[0])
+
+    class FailedFineExecutor:
+        execution_evidence = evidence
+
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            _round_tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            return (_reference_result(reference_task), failed_summary)
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: FailedFineExecutor(),
+        )
+
+    record = json.loads(Path(captured.value.run_record).read_text())
+    assert record["rounds"][1]["failure"]["stage"] == "whole-image"
+    assert record["rounds"][1]["log_path"].endswith("round-002-whole-image-main.log")
+    assert record["execution"]["task_results"][0]["status"] == "failed"
+
+
+def test_run_workflow_rejects_fine_summary_that_disagrees_with_task_evidence(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        plan,
+        execution=replace(
+            plan.execution,
+            parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+        ),
+    )
+    failed_summary, evidence = _failed_fine_execution(plan.tasks[0])
+    validation = RoundValidationTask.create(
+        plan.tasks[0],
+        dependencies=(FineTaskKey(2, "channel", "0000"),),
+    )
+    forged_summary = replace(
+        failed_summary,
+        log_path=str(validation.log_path),
+        failure=RoundFailure("validation", "RuntimeError", "forged"),
+    )
+
+    class ForgedFineExecutor:
+        execution_evidence = evidence
+
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            _round_tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            return (_reference_result(reference_task), forged_summary)
+
+    with pytest.raises(ExecutorStartupError, match="execution evidence"):
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: ForgedFineExecutor(),
+        )
+
+
+def test_run_workflow_rejects_fine_evidence_bound_to_a_forged_round_task(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        plan,
+        execution=replace(
+            plan.execution,
+            parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+        ),
+    )
+    failed_summary, evidence = _failed_fine_execution(plan.tasks[0])
+    original = evidence.task_results[0]
+    forged_round = replace(
+        original.task.round_task,
+        native_threads=NativeThreadSpec(itk=8, blas=8),
+    )
+    forged_task = replace(original.task, round_task=forged_round)
+    forged_result = replace(
+        original,
+        task=forged_task,
+        native_threads=tuple((name, 8) for name in NATIVE_THREAD_ENV_VARS),
+    )
+    forged_evidence = replace(evidence, task_results=(forged_result,))
+
+    class ForgedTaskExecutor:
+        execution_evidence = forged_evidence
+
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            _round_tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            return (_reference_result(reference_task), failed_summary)
+
+    with pytest.raises(ExecutorStartupError, match="execution evidence"):
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: ForgedTaskExecutor(),
+        )
 
 
 def test_run_workflow_lazily_uses_the_production_round_worker(
@@ -2017,6 +2301,82 @@ def test_run_workflow_skips_a_complete_round_without_opening_execution(
     assert tuple(item.status for item in result.rounds) == ("completed", "reused")
 
 
+def test_fine_mode_does_not_submit_syn_for_a_coarse_complete_round(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    for artifact in _artifacts(plan.tasks[0]):
+        _commit_artifact(artifact, plan)
+    plan = replace(
+        plan,
+        execution=replace(
+            plan.execution,
+            parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+        ),
+    )
+
+    class ReferenceOnlyExecutor:
+        execution_evidence = _FineExecutionEvidence(
+            executor="sequential",
+            worker_cap=1,
+            tasks=(),
+            task_graph=(),
+            task_results=(),
+            attempt_counts=(),
+            blocked_descendants=(),
+            cancelled=False,
+            cleanup=(),
+        )
+
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            round_tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            assert round_tasks == ()
+            return (_reference_result(reference_task),)
+
+    result = run_workflow(
+        plan,
+        _executor_factory=lambda _profile: ReferenceOnlyExecutor(),
+    )
+
+    assert tuple((item.round, item.status) for item in result.rounds) == (
+        (1, "completed"),
+        (2, "reused"),
+    )
+    evidence = json.loads(result.execution_evidence_json)
+    assert evidence["task_graph"] == []
+    assert evidence["task_results"] == []
+
+
+def test_coarse_mode_preserves_accepted_fine_local_warp_evidence(
+    tmp_path: Path,
+) -> None:
+    plan = _serial_plan(tmp_path)
+    task = plan.tasks[0]
+    chunk_root = task.registration_directory / f"round_{task.round}_chunks"
+    chunk_root.mkdir(parents=True)
+    local_warp = chunk_root / "chunk_0000_warp.nii.gz"
+    local_warp.write_bytes(b"accepted-local-warp")
+    local_record = ArtifactStore().record_path(local_warp)
+    local_record.write_text('{"accepted":"fine-local-warp"}', encoding="utf-8")
+    before_warp = FileIdentity.from_path(local_warp)
+    before_record = local_record.read_bytes()
+    executor = _FakeExecutor(lambda tasks: tuple(_result(item) for item in tasks))
+
+    result = run_workflow(
+        plan,
+        _executor_factory=_factory(executor),
+    )
+
+    assert result.status == "completed"
+    assert executor.calls == [(task,)]
+    assert not executor.calls[0][0].force
+    assert FileIdentity.from_path(local_warp) == before_warp
+    assert local_record.read_bytes() == before_record
+
+
 def test_run_workflow_executes_when_a_channel_record_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2770,6 +3130,60 @@ def test_run_workflow_writes_cancelled_summary_and_reraises(
     payload = json.loads(records[0].read_text(encoding="utf-8"))
     assert payload["status"] == "cancelled"
     assert payload["rounds"] == []
+
+
+def test_fine_sequential_interruption_persists_partial_graph_and_cancellation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        plan,
+        execution=replace(
+            plan.execution,
+            parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+        ),
+    )
+    calls = 0
+
+    def coarse_runner(task: WorkflowTask) -> RoundResult:
+        assert type(task) is ReferenceTask
+        return _reference_result(task)
+
+    def fine_runner(task: FineWorkflowTask) -> FineTaskResult:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt("injected fine cancellation")
+        return _fine_task_result(task)
+
+    executor = SequentialExecutor(
+        plan.execution,
+        runner=coarse_runner,
+        fine_runner=fine_runner,
+    )
+    layout = WorkflowLayout.for_dataset(
+        plan.execution.paths.output_root,
+        plan.dataset_id,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="injected fine cancellation"):
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: executor,
+        )
+
+    records = tuple(layout.workflow_runs.glob("*.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text())
+    assert record["status"] == "cancelled"
+    assert record["execution"]["cancelled"] is True
+    assert [item["task_key"] for item in record["execution"]["attempt_counts"]] == [
+        "round-002:whole-image:main",
+        "round-002:channel:0000",
+    ]
+    assert [item["key"] for item in record["execution"]["task_results"]] == [
+        "round-002:whole-image:main"
+    ]
 
 
 def test_run_workflow_skips_unhashable_partial_result_during_cancellation(

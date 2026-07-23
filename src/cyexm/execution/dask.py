@@ -21,6 +21,7 @@ from cyexm.execution._dask_common import (
 )
 from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
 from cyexm.execution.dispatcher import FineGraphController
+from cyexm.workflow._execution_validation import _FineExecutionEvidence
 from cyexm.workflow.fine_models import FineTaskResult
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask
 from cyexm.workflow.task import run_workflow_task
@@ -56,27 +57,63 @@ def _close_owned(
     client: Any | None,
     cluster: Any | None,
     configuration: AbstractContextManager[Any] | None,
-) -> None:
+) -> tuple[tuple[str, bool, str | None, str | None], ...]:
     exit_info = sys.exc_info()
+    statuses: list[tuple[str, bool, str | None, str | None]] = []
+
+    def close(name: str, operation: Callable[[], object]) -> None:
+        try:
+            operation()
+        except BaseException as error:
+            statuses.append((name, False, type(error).__name__, str(error)))
+            _LOGGER.warning("Failed to close owned local Dask %s: %s", name, error)
+        else:
+            statuses.append((name, True, None, None))
+
     if client is not None:
-        try:
-            client.close()
-        except BaseException as error:
-            _LOGGER.warning("Failed to close owned Dask client: %s", error)
+        close("client", client.close)
     if cluster is not None:
-        try:
-            cluster.close()
-        except BaseException as error:
-            _LOGGER.warning("Failed to close owned local Dask cluster: %s", error)
+        close("cluster", cluster.close)
     if configuration is not None:
-        try:
-            configuration.__exit__(*exit_info)
-        except BaseException as error:
-            _LOGGER.warning("Failed to close owned local Dask configuration: %s", error)
+        close("configuration", lambda: configuration.__exit__(*exit_info))
+    return tuple(statuses)
 
 
 class LocalDaskExecutor:
-    """Execute independent rounds on an owned, bounded ``LocalCluster``."""
+    """Execute coarse rounds or fine stages on an owned ``LocalCluster``.
+
+    The normalized profile selects the existing round-level runner or the shared
+    scheduler-neutral fine graph. This class owns the local cluster, client,
+    bounded worker pool, cancellation, and cleanup; workers execute one immutable
+    task and never create clients or submit descendants.
+
+    Parameters
+    ----------
+    profile : ExecutionProfile
+        Exact normalized ``local_dask`` profile. ``local_dask.workers`` is the hard
+        global task cap, and ``parallelism.mode`` selects coarse or fine admission.
+
+    Raises
+    ------
+    ExecutorStartupError
+        If the profile is incompatible or the owned scheduler lifecycle cannot
+        start within the configured timeout.
+
+    See Also
+    --------
+    SequentialExecutor :
+        Execute the same normalized coarse or fine work without a worker pool.
+    SlurmExecutor :
+        Execute the same work through preflight-gated SLURM workers.
+
+    Notes
+    -----
+    Reference preparation is a hard barrier in the same client lifecycle. Fine
+    siblings settle independently after a failure, and the coordinator retains the
+    exact graph, attempts, task results, cancellation, and cleanup evidence for
+    strict public run-record validation. Scientific reuse remains authorized only
+    by Phase 1 completion records.
+    """
 
     def __init__(
         self,
@@ -92,6 +129,35 @@ class LocalDaskExecutor:
         self._modules = _modules
         self._fine_task_results: tuple[FineTaskResult, ...] = ()
         self._fine_attempt_counts: tuple[tuple[str, int], ...] = ()
+        self._fine_live_attempts: dict[str, int] = {}
+        self._fine_controller: FineGraphController | None = None
+        self._fine_cancelled = False
+        self._fine_cleanup: tuple[tuple[str, bool, str | None, str | None], ...] = ()
+
+    @property
+    def execution_evidence(self) -> _FineExecutionEvidence:
+        """Return detached scheduler-neutral fine graph evidence."""
+        controller = self._fine_controller
+        if controller is None:
+            raise RuntimeError("fine execution evidence is not available")
+        attempts = self._fine_attempt_counts
+        if self._fine_cancelled and not attempts:
+            attempts = tuple(
+                (key, self._fine_live_attempts[key])
+                for key, _dependencies in controller.graph_description
+                if key in self._fine_live_attempts
+            )
+        return _FineExecutionEvidence(
+            executor="local_dask",
+            worker_cap=self._spec().workers,
+            tasks=controller.tasks,
+            task_graph=controller.graph_description,
+            task_results=controller.task_results,
+            attempt_counts=attempts,
+            blocked_descendants=tuple(key.encoded for key in controller.blocked_keys),
+            cancelled=self._fine_cancelled,
+            cleanup=self._fine_cleanup,
+        )
 
     def _spec(self) -> LocalDaskSpec:
         if self.profile.executor != "local_dask":
@@ -123,6 +189,10 @@ class LocalDaskExecutor:
         active: set[Any] = set()
         self._fine_task_results = ()
         self._fine_attempt_counts = ()
+        self._fine_live_attempts = {}
+        self._fine_controller = None
+        self._fine_cancelled = False
+        self._fine_cleanup = ()
 
         try:
             try:
@@ -172,15 +242,23 @@ class LocalDaskExecutor:
                     from cyexm.workflow.fine_task import run_fine_task
 
                     fine_runner = run_fine_task
+                controller = FineGraphController(round_tasks)
+                self._fine_controller = controller
                 moving_results, task_results, attempts = (
                     collect_distributed_fine_results(
-                        FineGraphController(round_tasks),
+                        controller,
                         runner=fine_runner,
                         client=execution_client,
                         as_completed=modules.as_completed,
                         task_retries=spec.task_retries,
                         capacity=worker_count,
                         active=active,
+                        submission_observer=lambda task, attempt: (
+                            self._fine_live_attempts.__setitem__(
+                                task.key.encoded,
+                                attempt,
+                            )
+                        ),
                     )
                 )
                 self._fine_task_results = task_results
@@ -196,6 +274,7 @@ class LocalDaskExecutor:
                 )
             return (*reference_results, *moving_results)
         except KeyboardInterrupt:
+            self._fine_cancelled = fine_mode
             if client is not None and active:
                 unfinished = tuple(
                     future
@@ -211,7 +290,7 @@ class LocalDaskExecutor:
                     )
             raise
         finally:
-            _close_owned(client, cluster, configuration)
+            self._fine_cleanup = _close_owned(client, cluster, configuration)
 
 
 __all__ = ["LocalDaskExecutor"]

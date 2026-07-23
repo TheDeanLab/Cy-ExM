@@ -1255,7 +1255,42 @@ def _validated_probe_batch(
 
 
 class SlurmExecutor:
-    """Run one coarse or fine graph through an owned ``SLURMCluster``."""
+    """Execute coarse rounds or fine stages through an owned ``SLURMCluster``.
+
+    The normalized profile selects the existing round-level runner or the shared
+    coordinator-owned fine graph. This class owns cluster scaling, worker
+    preflight, resource activation, task placement, cancellation, and cleanup;
+    workers execute one immutable task and never submit descendants.
+
+    Parameters
+    ----------
+    profile : ExecutionProfile
+        Exact normalized ``slurm`` profile. ``slurm.workers`` is the global cap,
+        and fine candidates receive a scheduler task slot only after exact
+        preflight and identity validation.
+
+    Raises
+    ------
+    ExecutorStartupError
+        If the profile, scheduler startup, scaling, or worker lifecycle is invalid.
+    WorkerPreflightError
+        If a candidate worker cannot satisfy the exact placement and environment
+        contract.
+
+    See Also
+    --------
+    SequentialExecutor :
+        Execute the same normalized graph without scheduler resources.
+    LocalDaskExecutor :
+        Execute the same graph in a bounded local process cluster.
+
+    Notes
+    -----
+    The reference barrier and all moving work share one owned scheduler lifecycle.
+    Fine mode records every scale event and settled placement attempt, including
+    rejected or retried attempts, before cleanup. This operational evidence never
+    authorizes scientific artifact reuse.
+    """
 
     def __init__(
         self,

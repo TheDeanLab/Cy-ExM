@@ -27,6 +27,7 @@ from cyexm.execution._dask_common import collect_distributed_fine_results
 from cyexm.execution.dask import LocalDaskExecutor
 from cyexm.execution.dispatcher import FineGraphController
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
+from cyexm.workflow._execution_validation import _FineExecutionEvidence
 from cyexm.workflow.fine_models import (
     FineTaskResult,
     FineWorkflowTask,
@@ -837,6 +838,19 @@ def test_fine_local_executor_retries_malformed_evidence_before_descendants(
         initial.key.encoded,
         2,
     )
+    evidence = executor.execution_evidence
+    assert type(evidence) is _FineExecutionEvidence
+    assert evidence.executor == "local_dask"
+    assert evidence.worker_cap == 4
+    assert evidence.attempt_counts[0] == (initial.key.encoded, 2)
+    assert tuple(result.key.encoded for result in evidence.task_results) == tuple(
+        key for key, _dependencies in evidence.task_graph
+    )
+    assert evidence.cleanup == (
+        ("client", True, None, None),
+        ("cluster", True, None, None),
+        ("configuration", True, None, None),
+    )
 
 
 def test_fine_local_executor_rejects_bad_prep_descriptor_and_settles_sibling(
@@ -1043,12 +1057,13 @@ def test_fine_local_executor_cancels_unfinished_stage_on_interrupt(
     modules.interrupt_after = 0
     modules.interrupt_as_completed_call = 2
     modules.pending_rounds = {2}
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
 
     with pytest.raises(KeyboardInterrupt, match="collection interruption"):
-        LocalDaskExecutor(
-            _profile(tmp_path, workers=2, mode="fine_grained"),
-            _modules=lambda: modules,
-        ).execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert modules.cancel_call is not None
     cancelled, force = modules.cancel_call
@@ -1056,6 +1071,15 @@ def test_fine_local_executor_cancels_unfinished_stage_on_interrupt(
     assert cancelled[0].task.key.stage == "whole-image"  # type: ignore[union-attr]
     assert force is True
     assert modules.events == ["client.close", "cluster.close"]
+    evidence = executor.execution_evidence
+    assert evidence.cancelled
+    assert evidence.attempt_counts == (("round-002:whole-image:main", 1),)
+    assert evidence.task_results == ()
+    assert evidence.cleanup == (
+        ("client", True, None, None),
+        ("cluster", True, None, None),
+        ("configuration", True, None, None),
+    )
 
 
 def test_local_executor_owns_worker_ttl_config_for_cluster_and_execution(
@@ -1372,16 +1396,23 @@ def test_local_executor_logs_cleanup_failures_without_losing_results(
     modules = _FakeDistributedModules()
     modules.client_close_error = RuntimeError("client cleanup failed")
     modules.cluster_close_error = RuntimeError("cluster cleanup failed")
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
 
     with caplog.at_level(logging.WARNING, logger="cyexm.execution.dask"):
-        results = LocalDaskExecutor(
-            _profile(tmp_path), _modules=lambda: modules
-        ).execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+        results = executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert results[0].status == "completed"
     assert modules.events == ["client.close", "cluster.close"]
     assert "client cleanup failed" in caplog.text
     assert "cluster cleanup failed" in caplog.text
+    assert executor.execution_evidence.cleanup == (
+        ("client", False, "RuntimeError", "client cleanup failed"),
+        ("cluster", False, "RuntimeError", "cluster cleanup failed"),
+        ("configuration", True, None, None),
+    )
 
 
 def test_local_executor_cancels_only_unfinished_futures_on_keyboard_interrupt(

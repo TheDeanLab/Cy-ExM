@@ -34,6 +34,7 @@ from cyexm.execution.sequential import (
 from cyexm.io.atomic import atomic_write
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity
 from cyexm.workflow._execution_validation import (
+    _canonical_fine_execution_evidence,
     _canonical_path,
     _validate_round_result,
     _validate_round_result_structure,
@@ -71,10 +72,16 @@ class _ExecutionEvidenceOwner(Protocol):
 
 
 class _ExecutorEvidenceError(ExecutorStartupError):
-    def __init__(self, validation_error: BaseException) -> None:
+    def __init__(
+        self,
+        validation_error: BaseException,
+        *,
+        executor: str = "executor",
+    ) -> None:
         self.validation_error = validation_error
+        label = "SLURM" if executor == "slurm" else executor
         super().__init__(
-            "invalid SLURM execution evidence: "
+            f"invalid {label} execution evidence: "
             f"{type(validation_error).__name__}: {validation_error}"
         )
 
@@ -657,6 +664,8 @@ def _reused_result(
 def _ordered_results(
     submitted: tuple[WorkflowTask, ...],
     results: tuple[RoundResult, ...],
+    *,
+    fine_mode: bool = False,
 ) -> tuple[RoundResult, ...]:
     if type(results) is not tuple:
         raise RoundExecutionError(
@@ -674,13 +683,19 @@ def _ordered_results(
     by_round = {result.round: result for result in results}
     ordered = tuple(by_round[task.round] for task in submitted)
     for task, result in zip(submitted, ordered, strict=True):
-        _validate_round_result(task, result)
+        _validate_round_result(
+            task,
+            result,
+            fine_mode=fine_mode and type(task) is RoundTask,
+        )
     return ordered
 
 
 def _ordered_execution_results(
     submitted: tuple[WorkflowTask, ...],
     results: tuple[RoundResult, ...],
+    *,
+    fine_mode: bool = False,
 ) -> tuple[RoundResult, ...]:
     if (
         len(submitted) > 1
@@ -691,12 +706,14 @@ def _ordered_execution_results(
         and results[0].status == "failed"
     ):
         return _ordered_results((submitted[0],), results)
-    return _ordered_results(submitted, results)
+    return _ordered_results(submitted, results, fine_mode=fine_mode)
 
 
 def _validated_partial_results(
     submitted: tuple[WorkflowTask, ...],
     results: tuple[RoundResult, ...],
+    *,
+    fine_mode: bool = False,
 ) -> tuple[RoundResult, ...]:
     if type(results) is not tuple:
         return ()
@@ -715,7 +732,11 @@ def _validated_partial_results(
         if task is None or result.round in seen:
             continue
         try:
-            _validate_round_result(task, result)
+            _validate_round_result(
+                task,
+                result,
+                fine_mode=fine_mode and type(task) is RoundTask,
+            )
         except RoundExecutionError:
             continue
         seen.add(result.round)
@@ -763,10 +784,35 @@ def _executor_execution_evidence_json(
     profile: ExecutionProfile,
     executor: object | None,
     expected_tasks: tuple[WorkflowTask, ...],
+    expected_results: tuple[RoundResult, ...] = (),
 ) -> str:
-    if profile.executor != "slurm" or executor is None:
+    if executor is None:
         return "{}"
     try:
+        if profile.parallelism.mode == "fine_grained" and profile.executor != "slurm":
+            if profile.executor == "sequential":
+                worker_cap = 1
+                task_retries = 0
+            elif profile.executor == "local_dask" and profile.local_dask is not None:
+                worker_cap = profile.local_dask.workers
+                task_retries = profile.local_dask.task_retries
+            else:
+                raise TypeError(
+                    "fine execution evidence requires a supported normalized profile"
+                )
+            evidence = cast(_ExecutionEvidenceOwner, executor).execution_evidence
+            return _canonical_fine_execution_evidence(
+                evidence,
+                expected_executor=profile.executor,
+                expected_round_tasks=tuple(
+                    task for task in expected_tasks if type(task) is RoundTask
+                ),
+                expected_round_results=expected_results,
+                expected_worker_cap=worker_cap,
+                task_retries=task_retries,
+            )
+        if profile.executor != "slurm":
+            return "{}"
         from cyexm.execution.slurm import _canonical_execution_evidence
 
         if profile.slurm is None:
@@ -780,7 +826,7 @@ def _executor_execution_evidence_json(
     except KeyboardInterrupt:
         raise
     except BaseException as error:
-        raise _ExecutorEvidenceError(error) from error
+        raise _ExecutorEvidenceError(error, executor=profile.executor) from error
 
 
 def _evidence_error_payload(error: BaseException) -> dict[str, str]:
@@ -794,7 +840,63 @@ def run_workflow(
     force_all: bool = False,
     _executor_factory: ExecutorFactory | None = None,
 ) -> WorkflowResult:
-    """Execute pending workflow rounds and persist operational provenance."""
+    """Execute pending workflow rounds and persist operational provenance.
+
+    This is the canonical execution entry point for a validated
+    :class:`WorkflowPlan`. The normalized execution profile selects coarse
+    round-level work or the coordinator-owned fine graph; both modes preserve the
+    same scientific plan and Phase 1 artifact identities.
+
+    Parameters
+    ----------
+    plan : WorkflowPlan
+        Immutable scientific and operational plan. The value is validated again
+        before any workflow output is written.
+    force_rounds : frozenset of int, optional
+        Exact rounds whose accepted artifacts must be recomputed. Forcing the
+        reference round propagates to every moving descendant.
+    force_all : bool, optional
+        Recompute the reference and every moving round. Mutually exclusive with
+        ``force_rounds``.
+
+    Returns
+    -------
+    WorkflowResult
+        Deterministically ordered public round summaries and the path to the
+        durable operational run record.
+
+    Raises
+    ------
+    WorkflowPlanError
+        If the plan, force selection, source identities, or persisted scientific
+        snapshot is invalid.
+    ExecutorStartupError
+        If executor startup, preflight, or strict post-work execution evidence
+        validation fails.
+    WorkflowExecutionError
+        If one or more submitted rounds reaches a failed terminal state.
+    KeyboardInterrupt
+        If the coordinator is interrupted after writing cancellation evidence.
+
+    See Also
+    --------
+    cyexm.workflow.build_workflow_plan :
+        Build deterministic scientific work without executing it.
+    cyexm.workflow.inspect_workflow_status :
+        Inspect authoritative public completion evidence without mutation.
+
+    Notes
+    -----
+    The reference task remains a hard prerequisite. The coordinator alone owns
+    task admission, scheduler clients, cancellation, and cleanup; fine workers run
+    one immutable stage and never submit descendants. Concurrent fine stages use
+    task-specific logs, while their public round summary uses the canonical
+    validation or terminal-failure task log.
+
+    Phase 1 completion records remain the only restart authority. Operational graph,
+    attempt, placement, cancellation, and cleanup evidence is validated after
+    scientific work and excluded from the scientific fingerprint.
+    """
     layout = _safe_workflow_layout(
         plan.execution.paths.output_root,
         plan.dataset_id,
@@ -879,7 +981,11 @@ def run_workflow(
         factory = _executor_factory or _default_executor_factory
         executor = factory(plan.execution)
         raw_results = executor.execute(reference_task, submitted)
-        executed = _ordered_execution_results((reference_task, *submitted), raw_results)
+        executed = _ordered_execution_results(
+            (reference_task, *submitted),
+            raw_results,
+            fine_mode=plan.execution.parallelism.mode == "fine_grained",
+        )
         preserved_results = tuple(
             sorted((*reused, *executed), key=lambda result: result.round)
         )
@@ -887,6 +993,7 @@ def run_workflow(
             plan.execution,
             executor,
             (reference_task, *submitted),
+            executed,
         )
         rounds = tuple(sorted((*reused, *executed), key=lambda result: result.round))
         preserved_results = rounds
@@ -988,10 +1095,15 @@ def run_workflow(
             evidence_error = (
                 evidence_access_error
                 if isinstance(evidence_access_error, _ExecutorEvidenceError)
-                else _ExecutorEvidenceError(evidence_access_error)
+                else _ExecutorEvidenceError(
+                    evidence_access_error,
+                    executor=plan.execution.executor,
+                )
             )
+            evidence_label = "SLURM " if plan.execution.executor == "slurm" else ""
             _LOGGER.error(
-                "invalid SLURM execution evidence during cancellation: %s",
+                "invalid %sexecution evidence during cancellation: %s",
+                evidence_label,
                 evidence_error,
             )
         original_interruption = interruption
@@ -999,6 +1111,7 @@ def run_workflow(
             partial_results = _validated_partial_results(
                 (reference_task, *submitted),
                 interruption.completed_results,
+                fine_mode=plan.execution.parallelism.mode == "fine_grained",
             )
             preserved_results = tuple(
                 sorted(

@@ -43,7 +43,15 @@ Tasks:
   partial-summary validation, SLURM granular/placement binding, YAML-built
   identity, and canonical fine-to-coarse local-warp reuse. Full gates: 2,258 unit,
   58 integration, repository Ruff/BasedPyright/pre-commit clean; final remediation
-  re-review approved; commit pending.
+  re-review approved and committed in `9f816c2`. A final adversarial audit then
+  found authenticate-before-persist ordering and omitted full SLURM preparation
+  descriptor/successor binding gaps. The second remediation keeps new partial
+  summaries provisional until evidence validates, persists canonical complete
+  version-2 task results, decodes them through `FineTaskResult.from_dict` plus the
+  shared validator, binds exact controller tasks, and shares producer-successor
+  expansion validation. Full gates are clean (2,265 unit, 58 integration,
+  repository Ruff/BasedPyright/pre-commit), and final independent re-review
+  approved; the second remediation is committed.
 - Task 10: pending
 - Task 11: pending
 - Task 12: pending

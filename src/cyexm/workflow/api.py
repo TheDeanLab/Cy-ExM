@@ -41,7 +41,7 @@ from cyexm.workflow._execution_validation import (
     _validate_round_result_structure,
     _validate_round_task_structure,
 )
-from cyexm.workflow.fine_models import FineTaskResult
+from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ReferenceChannelTask,
@@ -836,6 +836,11 @@ def _executor_execution_evidence_json(
                 tuple[FineTaskResult, ...],
                 getattr(executor, "fine_task_results", ()),
             ),
+            fine_tasks=cast(
+                tuple[FineWorkflowTask, ...],
+                getattr(executor, "fine_tasks", ()),
+            ),
+            require_runtime_bindings=True,
             expected_interruption=(
                 None
                 if interruption is None
@@ -1005,9 +1010,6 @@ def run_workflow(
             raw_results,
             fine_mode=plan.execution.parallelism.mode == "fine_grained",
         )
-        preserved_results = tuple(
-            sorted((*reused, *executed), key=lambda result: result.round)
-        )
         execution_evidence_json = _executor_execution_evidence_json(
             plan.execution,
             executor,
@@ -1159,13 +1161,6 @@ def run_workflow(
                     evidence_access_error,
                     executor=plan.execution.executor,
                 )
-        preserved_by_round = {
-            result.round: result for result in (*preserved_results, *partial_results)
-        }
-        preserved_results = tuple(
-            preserved_by_round[round_number]
-            for round_number in sorted(preserved_by_round)
-        )
         evidence_error = partial_evidence_error
         if evidence_error is None:
             try:
@@ -1191,6 +1186,15 @@ def run_workflow(
                 "invalid %sexecution evidence during cancellation: %s",
                 evidence_label,
                 evidence_error,
+            )
+        else:
+            preserved_by_round = {
+                result.round: result
+                for result in (*preserved_results, *partial_results)
+            }
+            preserved_results = tuple(
+                preserved_by_round[round_number]
+                for round_number in sorted(preserved_by_round)
             )
         cancelled = WorkflowResult(
             dataset_id=plan.dataset_id,

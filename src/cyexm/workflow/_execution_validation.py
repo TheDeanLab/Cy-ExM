@@ -746,6 +746,36 @@ def _validate_fine_task_result(
     return result
 
 
+def _validate_fine_successor_expansion(
+    task_by_key: Mapping[str, FineWorkflowTask],
+    results: tuple[FineTaskResult, ...],
+    *,
+    location: str,
+) -> None:
+    """Require materialized successors to equal the shared planning policy."""
+    from cyexm.workflow.fine_planning import channel_tasks, chunk_tasks
+
+    for result in results:
+        if result.status not in {"completed", "reused"}:
+            continue
+        if type(result.task) is RoundPreparationTask:
+            successors = chunk_tasks(result)
+        elif type(result.task) in {
+            ChunkAssemblyTask,
+            WholeImageRegistrationTask,
+        }:
+            successors = channel_tasks(result)
+        else:
+            continue
+        actual_successors = tuple(
+            task_by_key.get(task.key.encoded) for task in successors
+        )
+        if actual_successors != successors:
+            raise RoundExecutionError(
+                f"{location} successor tasks must match exact producer expansion"
+            )
+
+
 def _canonical_fine_execution_evidence(
     value: object,
     *,
@@ -763,11 +793,7 @@ def _canonical_fine_execution_evidence(
         canonical_fine_task_key,
         validate_fine_graph_description,
     )
-    from cyexm.workflow.fine_planning import (
-        channel_tasks,
-        chunk_tasks,
-        initial_fine_tasks,
-    )
+    from cyexm.workflow.fine_planning import initial_fine_tasks
     from cyexm.workflow.models import canonical_json
 
     location = "fine execution evidence"
@@ -987,25 +1013,11 @@ def _canonical_fine_execution_evidence(
             raise RoundExecutionError(f"{location} task result keys must be unique")
         results_by_key[key] = validated
         terminal_statuses[key] = validated.status
-    for result in results_by_key.values():
-        if result.status not in {"completed", "reused"}:
-            continue
-        if type(result.task) is RoundPreparationTask:
-            successors = chunk_tasks(result)
-        elif type(result.task) in {
-            ChunkAssemblyTask,
-            WholeImageRegistrationTask,
-        }:
-            successors = channel_tasks(result)
-        else:
-            continue
-        actual_successors = tuple(
-            task_by_key.get(task.key.encoded) for task in successors
-        )
-        if actual_successors != successors:
-            raise RoundExecutionError(
-                f"{location} successor tasks must match exact producer expansion"
-            )
+    _validate_fine_successor_expansion(
+        task_by_key,
+        tuple(results_by_key.values()),
+        location=location,
+    )
 
     summaries = {result.round: result for result in value.round_results}
     if len(summaries) != len(

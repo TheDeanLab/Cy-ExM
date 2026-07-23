@@ -48,7 +48,16 @@ from cyexm.execution.preflight import (
     validate_worker_probes,
 )
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
+from cyexm.workflow.fine_models import (
+    ChannelTransformTask,
+    ChunkAssemblyTask,
+    FineTaskResult,
+    FineWorkflowTask,
+    NonlinearChunkTask,
+    RoundPreparationTask,
+    RoundValidationTask,
+    WholeImageRegistrationTask,
+)
 from cyexm.workflow.models import (
     ReferenceTask,
     RoundResult,
@@ -731,6 +740,8 @@ def _canonical_execution_evidence(
     task_retries: int,
     expected_results: tuple[RoundResult, ...] = (),
     fine_task_results: tuple[FineTaskResult, ...] = (),
+    fine_tasks: tuple[FineWorkflowTask, ...] = (),
+    require_runtime_bindings: bool = False,
     expected_interruption: tuple[str, str] | None = None,
 ) -> str:
     """Validate and detach Task 2 evidence against the submitted work context."""
@@ -813,6 +824,18 @@ def _canonical_execution_evidence(
     if fine_mode:
         if configured is None:
             raise ValueError("fine SLURM evidence requires configured_workers")
+        exact_fine_types = (
+            RoundPreparationTask,
+            NonlinearChunkTask,
+            ChunkAssemblyTask,
+            WholeImageRegistrationTask,
+            ChannelTransformTask,
+            RoundValidationTask,
+        )
+        if type(fine_tasks) is not tuple or any(
+            type(task) not in exact_fine_types for task in fine_tasks
+        ):
+            raise TypeError("fine_tasks must contain exact fine workflow tasks")
         raw_probes = _evidence_array(
             cast(Mapping[str, object], evidence["observed"]).get("worker_probes"),
             "execution_evidence.observed.worker_probes",
@@ -851,6 +874,7 @@ def _canonical_execution_evidence(
                 )
                 for index, raw in enumerate(raw_probes)
             ),
+            fine_tasks=fine_tasks,
         )
         fine_graph = cast(Mapping[str, object], evidence["fine_graph"])
         terminal = fine_graph["pre_controller_terminal"]
@@ -927,9 +951,41 @@ def _canonical_execution_evidence(
             type(result) is not FineTaskResult for result in fine_task_results
         ):
             raise TypeError("fine_task_results must be exact FineTaskResult values")
+        raw_task_graph = cast(list[object], fine_graph["task_graph"])
+        raw_task_results = cast(list[object], fine_graph["task_results"])
+        if require_runtime_bindings and raw_task_graph and not fine_tasks:
+            raise ValueError("fine SLURM evidence requires exact runtime task bindings")
+        if require_runtime_bindings and raw_task_results and not fine_task_results:
+            raise ValueError(
+                "fine SLURM evidence requires exact runtime result bindings"
+            )
+        if fine_tasks:
+            from cyexm.workflow.fine_planning import initial_fine_tasks
+
+            expected_task_graph = [
+                {
+                    "key": task.key.encoded,
+                    "dependencies": [
+                        dependency.encoded for dependency in task.dependencies
+                    ],
+                }
+                for task in fine_tasks
+            ]
+            if raw_task_graph != expected_task_graph:
+                raise ValueError(
+                    "fine SLURM task graph must exactly describe immutable "
+                    "controller tasks"
+                )
+            if tuple(task for task in fine_tasks if not task.dependencies) != (
+                initial_fine_tasks(tuple(expected_rounds.values()))
+            ):
+                raise ValueError(
+                    "fine SLURM initial tasks must match submitted moving rounds"
+                )
         if public_moving or fine_task_results:
             from cyexm.execution.dispatcher import _summarize_fine_round
             from cyexm.workflow._execution_validation import (
+                _validate_fine_successor_expansion,
                 _validate_fine_task_result,
             )
 
@@ -965,6 +1021,11 @@ def _canonical_execution_evidence(
                     "fine SLURM granular results must uniquely and canonically "
                     "cover final placements"
                 )
+            if raw_task_results != [result.to_dict() for result in fine_task_results]:
+                raise ValueError(
+                    "fine SLURM persisted task results must exactly equal runtime "
+                    "granular results"
+                )
             graph_dependencies = {
                 cast(str, item["key"]): tuple(cast(list[str], item["dependencies"]))
                 for raw in cast(
@@ -974,11 +1035,17 @@ def _canonical_execution_evidence(
                 if isinstance(raw, Mapping)
                 for item in [cast(Mapping[str, object], raw)]
             }
+            task_by_key = {task.key.encoded: task for task in fine_tasks}
             for result in fine_task_results:
                 _validate_fine_task_result(result.task, result)
-                if result.task.round_task != expected_rounds.get(result.round) or tuple(
-                    dependency.encoded for dependency in result.task.dependencies
-                ) != graph_dependencies.get(result.key.encoded):
+                if (
+                    (fine_tasks and result.task != task_by_key.get(result.key.encoded))
+                    or result.task.round_task != expected_rounds.get(result.round)
+                    or tuple(
+                        dependency.encoded for dependency in result.task.dependencies
+                    )
+                    != graph_dependencies.get(result.key.encoded)
+                ):
                     raise ValueError(
                         "fine SLURM granular result is not bound to the exact "
                         "submitted task graph"
@@ -989,26 +1056,37 @@ def _canonical_execution_evidence(
                         "fine SLURM granular result lacks placement evidence"
                     )
                 raw = result.to_dict()
-                for field in (
+                result_fields = (
                     "status",
                     "dask_task_key",
                     "started_at",
                     "ended_at",
                     "duration_seconds",
-                    "hostname",
-                    "pid",
-                    "slurm_job_id",
                     "native_threads",
                     "artifact_paths",
                     "reused_artifacts",
                     "log_path",
                     "failure",
-                ):
+                )
+                if placement["placement_accepted"] is True:
+                    result_fields = (
+                        *result_fields,
+                        "hostname",
+                        "pid",
+                        "slurm_job_id",
+                    )
+                for field in result_fields:
                     if placement[field] != raw[field]:
                         raise ValueError(
                             "fine SLURM granular result contradicts terminal "
                             f"placement field {field}"
                         )
+            if fine_tasks:
+                _validate_fine_successor_expansion(
+                    task_by_key,
+                    fine_task_results,
+                    location="fine SLURM evidence",
+                )
     return canonical_json(copy.deepcopy(evidence))
 
 
@@ -1467,6 +1545,7 @@ class SlurmExecutor:
         self._modules = _modules
         self._version = _version
         self._execution_evidence: dict[str, object] = {}
+        self._fine_tasks: tuple[FineWorkflowTask, ...] = ()
         self._fine_task_results: tuple[FineTaskResult, ...] = ()
         self._fine_attempt_counts: tuple[tuple[str, int], ...] = ()
         self._fine_reference_result: RoundResult | None = None
@@ -1481,6 +1560,11 @@ class SlurmExecutor:
     def fine_task_results(self) -> tuple[FineTaskResult, ...]:
         """Return exact settled granular results for public-summary validation."""
         return self._fine_task_results
+
+    @property
+    def fine_tasks(self) -> tuple[FineWorkflowTask, ...]:
+        """Return exact immutable tasks materialized by the fine controller."""
+        return self._fine_tasks
 
     @property
     def fine_reference_result(self) -> RoundResult | None:
@@ -1660,6 +1744,7 @@ class SlurmExecutor:
         observed_probes: dict[str, WorkerProbe] = {}
         requested_workers = worker_count
         controller: FineGraphController | None = None
+        self._fine_tasks = ()
         self._fine_task_results = ()
         self._fine_attempt_counts = ()
         self._fine_reference_result = None
@@ -2094,6 +2179,7 @@ class SlurmExecutor:
                     )
                 )
                 self._fine_task_results = task_results
+                self._fine_tasks = controller.tasks
                 self._fine_attempt_counts = attempts
                 self._fine_round_results = moving_results
                 fine_state.finalize_graph(
@@ -2114,6 +2200,7 @@ class SlurmExecutor:
                         cast(list[str], observed["connected_workers"])
                     ),
                     observed_probes=tuple(validated_probes.values()),
+                    fine_tasks=controller.tasks,
                 )
             else:
                 moving_results, _attempts = collect_distributed_results(
@@ -2213,6 +2300,7 @@ class SlurmExecutor:
             )
             if fine_state is not None:
                 if controller is not None:
+                    self._fine_tasks = controller.tasks
                     self._fine_task_results = controller.task_results
                     self._fine_round_results = controller._settled_round_results()
                     fine_state.finalize_graph(

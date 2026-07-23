@@ -2146,10 +2146,35 @@ def test_slurm_invalid_evidence_fails_closed_with_a_durable_operational_summary(
         "ValueError",
     }
     assert run_record["operational_failure"]["phase"] == "execution_evidence"
-    assert [item["status"] for item in run_record["rounds"]] == [
-        "completed",
-        "failed" if round_failed else "completed",
+    assert run_record["rounds"] == []
+
+
+def test_normal_evidence_error_persists_only_pre_run_authenticated_reuse(
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2, 3))
+    for artifact in _artifacts(sequential_plan.tasks[0]):
+        _commit_artifact(artifact, sequential_plan)
+    plan = replace(
+        sequential_plan,
+        execution=_slurm_execution(sequential_plan, tmp_path),
+    )
+    invalid = _slurm_evidence()
+    invalid["unexpected"] = "forged"
+    fake = _FakeExecutor(
+        lambda tasks: tuple(_result(task) for task in tasks),
+        execution_evidence=invalid,
+    )
+
+    with pytest.raises(ExecutorStartupError, match="execution evidence") as captured:
+        run_workflow(plan, _executor_factory=_factory(fake))
+
+    record = json.loads(Path(captured.value.run_record).read_text())
+    assert [(item["round"], item["status"]) for item in record["rounds"]] == [
+        (2, "reused"),
     ]
+    assert record["execution"] is None
+    assert record["operational_failure"]["phase"] == "execution_evidence"
 
 
 @pytest.mark.parametrize(
@@ -3582,6 +3607,114 @@ def test_fine_local_cancellation_binds_completed_partial_round_summary(
         (2, "completed"),
     ]
     assert record["execution"]["round_results"] == [record["rounds"][1]]
+
+
+def test_fine_sequential_rejected_partial_summary_is_not_persisted(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        plan,
+        execution=replace(
+            plan.execution,
+            parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+        ),
+    )
+    summary, evidence = _successful_fine_execution(
+        plan.reference_task,
+        plan.tasks[0],
+    )
+    forged = replace(summary, duration_seconds=999.0)
+    interruption = KeyboardInterrupt("forged sequential partial")
+
+    class InterruptedSequentialExecutor:
+        execution_evidence = replace(evidence, cancelled=True)
+
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            round_tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            raise workflow_api._SequentialExecutionInterrupted(
+                interruption,
+                (_reference_result(reference_task), forged),
+            )
+
+    with pytest.raises(KeyboardInterrupt, match="forged sequential partial"):
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: InterruptedSequentialExecutor(),
+        )
+
+    record_path = next(
+        WorkflowLayout.for_dataset(
+            plan.execution.paths.output_root,
+            plan.dataset_id,
+        ).workflow_runs.glob("*.json")
+    )
+    record = json.loads(record_path.read_text())
+    assert record["rounds"] == []
+    assert record["execution"] is None
+    assert "public summaries" in record["execution_evidence_error"]["message"]
+
+
+def test_fine_distributed_rejected_partial_summary_is_not_persisted(
+    tmp_path: Path,
+) -> None:
+    sequential_plan = _plan(tmp_path, rounds=(2,))
+    profile = replace(
+        _local_execution(sequential_plan, tmp_path),
+        parallelism=replace(
+            sequential_plan.execution.parallelism,
+            mode="fine_grained",
+        ),
+    )
+    plan = replace(sequential_plan, execution=profile)
+    summary, evidence = _successful_fine_execution(
+        plan.reference_task,
+        plan.tasks[0],
+    )
+    forged = replace(summary, duration_seconds=999.0)
+    assert profile.local_dask is not None
+    distributed_evidence = replace(
+        evidence,
+        executor="local_dask",
+        worker_cap=profile.local_dask.workers,
+        round_results=(forged,),
+        cancelled=True,
+        cleanup=(
+            ("client", True, None, None),
+            ("cluster", True, None, None),
+            ("configuration", True, None, None),
+        ),
+    )
+
+    class InterruptedDistributedExecutor:
+        execution_evidence = distributed_evidence
+
+        def execute(
+            self,
+            reference_task: ReferenceTask,
+            round_tasks: tuple[RoundTask, ...],
+        ) -> tuple[RoundResult, ...]:
+            raise KeyboardInterrupt("forged distributed partial")
+
+    with pytest.raises(KeyboardInterrupt, match="forged distributed partial"):
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: InterruptedDistributedExecutor(),
+        )
+
+    record_path = next(
+        WorkflowLayout.for_dataset(
+            profile.paths.output_root,
+            plan.dataset_id,
+        ).workflow_runs.glob("*.json")
+    )
+    record = json.loads(record_path.read_text())
+    assert record["rounds"] == []
+    assert record["execution"] is None
+    assert "canonical aggregation" in record["execution_evidence_error"]["message"]
 
 
 def test_run_workflow_skips_unhashable_partial_result_during_cancellation(

@@ -17,7 +17,12 @@ from cyexm.execution.preflight import (
     WorkerProbe,
     validate_slurm_worker_identities,
 )
-from cyexm.workflow.fine_models import FineTaskResult
+from cyexm.workflow.fine_models import (
+    _FINE_TASK_RESULT_KEYS,
+    FineTaskKey,
+    FineTaskResult,
+    FineWorkflowTask,
+)
 from cyexm.workflow.models import RoundFailure, RoundTask
 
 _GRAPH_KEYS = frozenset(
@@ -30,6 +35,7 @@ _GRAPH_KEYS = frozenset(
         "task_graph",
         "attempt_counts",
         "placements",
+        "task_results",
         "blocked_descendants",
         "cancelled",
         "interruption",
@@ -298,6 +304,7 @@ class FineSlurmEvidence:
                     ),
                 )
             ],
+            "task_results": [result.to_dict() for result in self.results],
             "blocked_descendants": sorted(blocked, key=canonical_fine_task_key),
             "cancelled": self.cancelled,
             "interruption": (
@@ -344,6 +351,36 @@ def _decode_task_graph(raw_graph: object) -> tuple[tuple[str, tuple[str, ...]], 
     return tuple(description)
 
 
+def _decode_task_results(
+    value: object,
+    tasks: tuple[FineWorkflowTask, ...],
+) -> tuple[dict[str, object], ...]:
+    results: list[dict[str, object]] = []
+    keys: list[str] = []
+    task_by_key = {task.key.encoded: task for task in tasks}
+    for index, raw in enumerate(_array(value, "fine_graph.task_results")):
+        location = f"fine_graph.task_results[{index}]"
+        result = _object(raw, location, _FINE_TASK_RESULT_KEYS)
+        key = FineTaskKey.from_encoded(_string(result["key"], f"{location}.key"))
+        task = task_by_key.get(key.encoded)
+        if tasks and task is None:
+            raise ValueError(f"{location} is not bound to an exact controller task")
+        if task is not None:
+            from cyexm.workflow._execution_validation import (
+                _validate_fine_task_result,
+            )
+
+            decoded = FineTaskResult.from_dict(task, result)
+            _validate_fine_task_result(task, decoded)
+        keys.append(key.encoded)
+        results.append(result)
+    if len(keys) != len(set(keys)):
+        raise ValueError("fine task result keys must be unique")
+    if tuple(keys) != tuple(sorted(keys, key=canonical_fine_task_key)):
+        raise ValueError("fine task results must use canonical task ordering")
+    return tuple(results)
+
+
 def validate_fine_slurm_evidence(
     value: object,
     *,
@@ -355,6 +392,7 @@ def validate_fine_slurm_evidence(
     round_tasks: tuple[RoundTask, ...],
     observed_workers: Sequence[str],
     observed_probes: Sequence[WorkerProbe],
+    fine_tasks: tuple[FineWorkflowTask, ...] = (),
 ) -> None:
     """Strictly validate one version-2 fine SLURM evidence object."""
     graph = _object(value, "execution_evidence.fine_graph", _GRAPH_KEYS)
@@ -688,6 +726,47 @@ def validate_fine_slurm_evidence(
         raise ValueError(
             "fine placements must exactly and canonically match every attempt"
         )
+    task_results = _decode_task_results(graph["task_results"], fine_tasks)
+    final_placements = {
+        cast(str, placement["task_key"]): placement
+        for placement in (
+            cast(dict[str, object], raw)
+            for raw in _array(graph["placements"], "fine_graph.placements")
+        )
+    }
+    if tuple(cast(str, result["key"]) for result in task_results) != tuple(
+        final_placements
+    ):
+        raise ValueError(
+            "fine task results must exactly and canonically cover final placements"
+        )
+    for result in task_results:
+        placement = final_placements[cast(str, result["key"])]
+        result_fields = (
+            "status",
+            "dask_task_key",
+            "started_at",
+            "ended_at",
+            "duration_seconds",
+            "native_threads",
+            "artifact_paths",
+            "reused_artifacts",
+            "log_path",
+            "failure",
+        )
+        if placement["placement_accepted"] is True:
+            result_fields = (
+                *result_fields,
+                "hostname",
+                "pid",
+                "slurm_job_id",
+            )
+        for field_name in result_fields:
+            if result[field_name] != placement[field_name]:
+                raise ValueError(
+                    "fine task result contradicts terminal placement field "
+                    f"{field_name}"
+                )
 
     blocked = _fine_keys(graph["blocked_descendants"], "fine_graph.blocked")
     if not set(blocked) <= set(task_keys) or set(blocked) & set(attempts):

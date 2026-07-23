@@ -34,6 +34,7 @@ from cyexm.execution.preflight import WorkerProbe
 from cyexm.execution.slurm import SlurmExecutor
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow.fine_models import (
+    ChannelTransformTask,
     FineTaskResult,
     FineWorkflowTask,
     RoundPreparationTask,
@@ -2868,7 +2869,7 @@ def test_fine_slurm_rejects_granular_result_forged_beyond_placement(
 
     with pytest.raises(
         (RoundExecutionError, ValueError),
-        match=r"placement|reused|aggregation",
+        match=r"placement|persisted|reused|aggregation",
     ):
         slurm_module._canonical_execution_evidence(
             executor.execution_evidence,
@@ -2900,6 +2901,131 @@ def test_fine_slurm_rejects_duplicate_granular_result_identity(
             task_retries=0,
             expected_results=results,
             fine_task_results=duplicated,
+        )
+
+
+def test_fine_slurm_persists_complete_canonical_task_results(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+
+    executor.execute(reference, (task,))
+
+    fine_graph = cast(
+        dict[str, object],
+        executor.execution_evidence["fine_graph"],
+    )
+    assert fine_graph["task_results"] == [
+        result.to_dict() for result in executor.fine_task_results
+    ]
+
+
+def test_fine_slurm_rejects_noncanonical_persisted_task_result_shape(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    results = executor.execute(reference, (task,))
+    evidence = deepcopy(executor.execution_evidence)
+    fine_graph = cast(dict[str, object], evidence["fine_graph"])
+    raw_results = cast(list[dict[str, object]], fine_graph["task_results"])
+    raw_results[0].pop("prepared_descriptor")
+
+    with pytest.raises(ValueError, match=r"task_results.*keys must be exactly"):
+        slurm_module._canonical_execution_evidence(
+            evidence,
+            expected_tasks=(reference, task),
+            task_retries=0,
+            expected_results=results,
+            fine_task_results=executor.fine_task_results,
+        )
+
+
+def test_fine_slurm_rejects_forged_preparation_descriptor_expansion(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    task = _chunked_task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    results = executor.execute(reference, (task,))
+    preparation = next(
+        result
+        for result in executor.fine_task_results
+        if type(result.task) is RoundPreparationTask
+    )
+    forged_raw = preparation.to_dict()
+    descriptor = cast(dict[str, object], forged_raw["prepared_descriptor"])
+    native_fixed = cast(dict[str, object], descriptor["native_fixed"])
+    native_fixed["path"] = "/forged/native-fixed.npy"
+    forged_preparation = FineTaskResult.from_dict(preparation.task, forged_raw)
+    granular = tuple(
+        forged_preparation if result is preparation else result
+        for result in executor.fine_task_results
+    )
+    evidence = deepcopy(executor.execution_evidence)
+    fine_graph = cast(dict[str, object], evidence["fine_graph"])
+    fine_graph["task_results"] = [result.to_dict() for result in granular]
+
+    with pytest.raises(
+        RoundExecutionError,
+        match="successor tasks must match exact producer expansion",
+    ):
+        slurm_module._canonical_execution_evidence(
+            evidence,
+            expected_tasks=(reference, task),
+            task_retries=0,
+            expected_results=results,
+            fine_task_results=granular,
+            fine_tasks=executor.fine_tasks,
+        )
+
+
+def test_fine_slurm_binds_materialized_channel_to_exact_producer_task(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    results = executor.execute(reference, (task,))
+    channel = next(
+        task for task in executor.fine_tasks if type(task) is ChannelTransformTask
+    )
+    forged_round = replace(
+        channel.round_task,
+        channels=(
+            replace(
+                channel.round_task.channels[0],
+                source=tmp_path / "forged-channel-source.tif",
+            ),
+        ),
+    )
+    forged_channel = replace(channel, round_task=forged_round)
+    fine_tasks = tuple(
+        forged_channel if item is channel else item for item in executor.fine_tasks
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="granular result is not bound to the exact submitted task graph",
+    ):
+        slurm_module._canonical_execution_evidence(
+            executor.execution_evidence,
+            expected_tasks=(reference, task),
+            task_retries=0,
+            expected_results=results,
+            fine_task_results=executor.fine_task_results,
+            fine_tasks=fine_tasks,
         )
 
 

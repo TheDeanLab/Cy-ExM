@@ -26,6 +26,10 @@
   Cross-check public summaries against actual controller task results after
   scientific work; missing or malformed evidence fails closed and never becomes
   scientific reuse authority.
+- Treat results derived during the current execution as provisional until the exact
+  execution evidence validates. On evidence rejection or malformed cancellation
+  evidence, persist only reuse results authenticated before this run; never write a
+  rejected partial summary into the durable workflow record.
 - Validate successful preparation evidence with the authoritative
   `PreparedManifest` parser before graph expansion. Malformed worker descriptors
   must become ordinary current-attempt failures so configured retries and

@@ -622,6 +622,29 @@ type FineWorkflowTask = (
     | RoundValidationTask
 )
 
+_FINE_TASK_RESULT_KEYS = frozenset(
+    {
+        "key",
+        "round",
+        "stage",
+        "item",
+        "status",
+        "started_at",
+        "ended_at",
+        "duration_seconds",
+        "hostname",
+        "pid",
+        "dask_task_key",
+        "slurm_job_id",
+        "native_threads",
+        "artifact_paths",
+        "reused_artifacts",
+        "log_path",
+        "failure",
+        "prepared_descriptor",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class FineTaskResult:
@@ -737,6 +760,112 @@ class FineTaskResult:
                 else _json_object(self.prepared_descriptor, "prepared descriptor")
             ),
         }
+
+    @classmethod
+    def from_dict(
+        cls,
+        task: FineWorkflowTask,
+        payload: object,
+    ) -> Self:
+        """Decode the exact JSON representation for one known immutable task."""
+        if type(payload) is not dict or any(type(key) is not str for key in payload):
+            raise TypeError("fine task result must be an exact JSON object")
+        raw = cast(dict[str, object], payload)
+        if frozenset(raw) != _FINE_TASK_RESULT_KEYS:
+            raise ValueError(
+                "fine task result keys must be exactly "
+                f"{sorted(_FINE_TASK_RESULT_KEYS)!r}"
+            )
+        if (
+            raw["key"] != task.key.encoded
+            or raw["round"] != task.round
+            or raw["stage"] != task.key.stage
+            or raw["item"] != task.key.item
+        ):
+            raise ValueError("fine task result identity must match the exact task")
+        for name in ("status", "started_at", "ended_at", "hostname", "log_path"):
+            if type(raw[name]) is not str:
+                raise TypeError(f"fine task result {name} must be an exact string")
+        if type(raw["pid"]) is not int:
+            raise TypeError("fine task result pid must be an exact integer")
+        if type(raw["duration_seconds"]) is not float:
+            raise TypeError("fine task result duration_seconds must be an exact float")
+        for name in ("dask_task_key", "slurm_job_id"):
+            if raw[name] is not None and type(raw[name]) is not str:
+                raise TypeError(
+                    f"fine task result {name} must be null or an exact string"
+                )
+
+        def decode_strings(name: str) -> tuple[str, ...]:
+            value = raw[name]
+            if type(value) is not list or any(type(item) is not str for item in value):
+                raise TypeError(
+                    f"fine task result {name} must be an exact string array"
+                )
+            return tuple(cast(list[str], value))
+
+        native_raw = raw["native_threads"]
+        if type(native_raw) is not list:
+            raise TypeError("fine task result native_threads must be an exact array")
+        native_threads: list[tuple[str, int]] = []
+        for pair in cast(list[object], native_raw):
+            if (
+                type(pair) is not list
+                or len(pair) != 2
+                or type(pair[0]) is not str
+                or type(pair[1]) is not int
+            ):
+                raise TypeError(
+                    "fine task result native_threads entries must be exact pairs"
+                )
+            native_threads.append((cast(str, pair[0]), cast(int, pair[1])))
+
+        from cyexm.workflow.models import RoundFailure
+
+        failure_raw = raw["failure"]
+        failure: RoundFailure | None
+        if failure_raw is None:
+            failure = None
+        else:
+            if type(failure_raw) is not dict or frozenset(failure_raw) != frozenset(
+                {"stage", "exception_type", "message"}
+            ):
+                raise ValueError(
+                    "fine task result failure must use the exact failure schema"
+                )
+            failure_values = cast(dict[str, object], failure_raw)
+            if any(
+                type(failure_values[name]) is not str
+                for name in ("stage", "exception_type", "message")
+            ):
+                raise TypeError("fine task result failure values must be exact strings")
+            failure = RoundFailure(
+                stage=cast(str, failure_values["stage"]),
+                exception_type=cast(str, failure_values["exception_type"]),
+                message=cast(str, failure_values["message"]),
+            )
+        descriptor = raw["prepared_descriptor"]
+        if descriptor is not None and type(descriptor) is not dict:
+            raise TypeError(
+                "fine task result prepared_descriptor must be null or an exact object"
+            )
+        return cls(
+            task=task,
+            status=cast(FineTaskStatus, raw["status"]),
+            started_at=cast(str, raw["started_at"]),
+            ended_at=cast(str, raw["ended_at"]),
+            duration_seconds=cast(float, raw["duration_seconds"]),
+            hostname=cast(str, raw["hostname"]),
+            pid=cast(int, raw["pid"]),
+            dask_task_key=cast(str | None, raw["dask_task_key"]),
+            slurm_job_id=cast(str | None, raw["slurm_job_id"]),
+            native_threads=tuple(native_threads),
+            artifact_paths=decode_strings("artifact_paths"),
+            reused_artifacts=decode_strings("reused_artifacts"),
+            log_path=cast(str, raw["log_path"]),
+            failure=failure,
+            prepared_descriptor=cast(dict[str, object] | None, descriptor),
+        )
 
 
 type FineTask = FineWorkflowTask

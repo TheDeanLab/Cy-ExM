@@ -41,6 +41,10 @@ Focused RED cases were observed before their production fixes:
 - failed references and all-reused fine runs lacked representable pre-controller
   evidence; and
 - SLURM version-2 public summaries were not bound to exact granular results.
+- rejected current-run partial summaries could be written durably before their
+  execution evidence authenticated them; and
+- SLURM version-2 omitted full preparation descriptors, allowing a forged
+  descriptor to disagree with already-materialized chunk successors.
 
 Each case was made GREEN independently before the focused regression suite.
 
@@ -71,9 +75,16 @@ Each case was made GREEN independently before the focused regression suite.
   before a future settles, cancels unfinished futures, and records owned cleanup.
   Sequential, Local Dask, and SLURM cancellation select exact controller-settled
   public summaries before evidence validation and serialization.
-- SLURM version-2 retains its existing graph and placement envelope while exact
-  in-memory granular results are aggregated through the shared helper and checked
-  against both public summaries and terminal placement fields.
+- SLURM version-2 retains its existing graph and placement envelope and now persists
+  every complete terminal `FineTaskResult` in canonical order. Its exact
+  `FineTaskResult.from_dict` inverse and the common scheduler-neutral result
+  validator decode those records, bind them to the controller's immutable tasks,
+  and run the shared producer-successor expansion check. Raw rejected-attempt
+  placement claims remain distinct from synthesized terminal failed results.
+- Current-run derived summaries remain provisional until exact evidence validation
+  succeeds. Evidence rejection persists only reuse results authenticated before the
+  run; rejected sequential, Local Dask, and SLURM partial summaries never enter the
+  durable workflow record.
 - Missing or malformed fine evidence fails closed through the existing durable
   execution-evidence failure path.
 - Scientific JSON and fingerprints remain byte-identical across coarse and fine
@@ -94,11 +105,13 @@ Each case was made GREEN independently before the focused regression suite.
   and coordinator-only scheduling for `run_workflow`, `SequentialExecutor`,
   `LocalDaskExecutor`, and `SlurmExecutor`.
 - Updated workflow and execution `AGENTS.md` guidance for authoritative logs,
-  scheduler-neutral evidence, exact summary cross-checking, and cleanup evidence.
+  scheduler-neutral evidence, exact summary cross-checking, authenticate-before-
+  persist ordering, full SLURM results, immutable expansion, rejected placement,
+  and cleanup evidence.
 
 ## Verification
 
-- Portable unit suite: all 2,258 collected non-HPC unit tests passed.
+- Portable unit suite: all 2,265 collected non-HPC unit tests passed.
 - Portable integration suite: all 58 collected non-HPC integration tests passed.
 - `uv lock --check`: passed.
 - `uv sync --locked --group dev --extra examples --extra hpc`: passed.
@@ -106,8 +119,8 @@ Each case was made GREEN independently before the focused regression suite.
 - Repository-wide BasedPyright: passed with 0 errors, warnings, or notes.
 - `pre-commit run --all-files`: passed.
 - `git diff --check`: passed.
-- Final independent remediation re-review: approved with no remaining Critical or
-  Important findings.
+- Final independent second-remediation re-review: approved with no remaining
+  Critical, Important, or Minor findings.
 
 No SLURM jobs were submitted, no active datasets were accessed, and the unrelated
 `src/cy_exm.egg-info/` tree was left untouched.

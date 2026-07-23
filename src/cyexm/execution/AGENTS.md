@@ -76,6 +76,13 @@
   scheduler-neutral controller owns immutable canonical task/dependency evidence;
   `_slurm_evidence` owns typed scale-event construction and decoding; `slurm`
   owns cluster scale, preflight, activation, submission, cancellation, and cleanup.
+  Persist every settled full `FineTaskResult`, including a preparation descriptor,
+  in canonical order and decode it through the authoritative result model and common
+  scheduler-neutral validator. Bind those results to the controller's exact immutable
+  tasks and use the shared `chunk_tasks`/`channel_tasks` expansion validation; a
+  structurally plausible but different descriptor must not authenticate descendants.
+  Preserve rejected raw placement claims separately from the synthesized terminal
+  failed result; require identity equality only for accepted placements.
   Successful producers require the exact successors materialized by the controller.
   Downstream omission is truthful only after a failed/cancelled/blocking task or an
   observed cancellation/scale failure before that producer settled. Preserve

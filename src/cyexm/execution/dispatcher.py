@@ -238,6 +238,38 @@ class FineGraphController:
             self._round_terminal(round_number) for round_number in self._round_tasks
         )
 
+    @property
+    def ready_count(self) -> int:
+        """Return the exact number of dependency-ready, unsubmitted tasks."""
+        return sum(len(queue) for queue in self._ready.values())
+
+    @property
+    def tasks(self) -> tuple[FineWorkflowTask, ...]:
+        """Return every currently materialized graph node canonically."""
+        return tuple(
+            self._tasks[key] for key in sorted(self._tasks, key=_canonical_key)
+        )
+
+    @property
+    def graph_description(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Return immutable canonical task/dependency evidence."""
+        return tuple(
+            (
+                task.key.encoded,
+                tuple(dependency.encoded for dependency in task.dependencies),
+            )
+            for task in self.tasks
+        )
+
+    @property
+    def blocked_keys(self) -> tuple[FineTaskKey, ...]:
+        """Return dependency-blocked descendants in canonical order."""
+        return tuple(
+            key
+            for key in sorted(self._states, key=_canonical_key)
+            if self._states[key] == "blocked"
+        )
+
     def _round_result(self, round_number: int) -> RoundResult:
         if not self._round_terminal(round_number):
             raise RuntimeError("round result requires a terminal fine graph round")

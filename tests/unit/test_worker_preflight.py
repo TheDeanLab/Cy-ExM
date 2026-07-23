@@ -6,6 +6,7 @@ import shutil
 import socket
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import replace
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import cast
@@ -16,6 +17,7 @@ from cyexm.errors import WorkerPreflightError
 from cyexm.execution.preflight import (
     WorkerProbe,
     probe_worker,
+    validate_slurm_worker_identities,
     validate_worker_probes,
 )
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
@@ -148,6 +150,42 @@ def test_probe_accepts_remote_dask_worker_keyword_injection(
     assert probe["ok"] is True
     assert probe["worker_address"] == "tcp://worker.example.org:8786"
     assert probe["network_host"] == "worker.example.org"
+
+
+def test_slurm_identity_validation_rejects_missing_and_duplicate_job_identity() -> None:
+    base = WorkerProbe.from_dict(
+        {
+            "ok": True,
+            "worker_address": "tcp://node-a:1234",
+            "hostname": "node-a",
+            "pid": 12,
+            "slurm_job_id": "9001",
+            "package_versions": [],
+            "native_threads": [],
+            "dataset_visible": True,
+            "output_writable": True,
+            "scratch_usable": True,
+            "memory_limit_bytes": 1,
+            "network_host": "node-a",
+            "errors": [],
+        }
+    )
+
+    validate_slurm_worker_identities((base,))
+    with pytest.raises(WorkerPreflightError, match="SLURM_JOB_ID is required"):
+        validate_slurm_worker_identities((replace(base, slurm_job_id=None),))
+    with pytest.raises(WorkerPreflightError, match="duplicate SLURM_JOB_ID"):
+        validate_slurm_worker_identities(
+            (
+                base,
+                replace(
+                    base,
+                    worker_address="tcp://node-b:1234",
+                    hostname="node-b",
+                    network_host="node-b",
+                ),
+            )
+        )
 
 
 def test_probe_reports_package_mismatches_and_missing_distributions_together(

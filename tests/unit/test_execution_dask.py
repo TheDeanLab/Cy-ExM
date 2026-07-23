@@ -23,7 +23,9 @@ from cyexm.config.models import (
 )
 from cyexm.errors import ExecutorStartupError, RoundExecutionError
 from cyexm.execution import dask as dask_module
+from cyexm.execution._dask_common import collect_distributed_fine_results
 from cyexm.execution.dask import LocalDaskExecutor
+from cyexm.execution.dispatcher import FineGraphController
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow.fine_models import (
     FineTaskResult,
@@ -591,6 +593,36 @@ def test_fine_local_executor_starts_exact_configured_workers_and_expands_on_coor
     assert all(call.pure is False and call.retries == 0 for call in fine_calls)
     assert tuple(result.round for result in results) == (1, 2)
     assert results[1].status == "completed"
+
+
+def test_fine_collector_queries_scheduler_neutral_capacity_after_each_transition(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    controller = FineGraphController((_task(tmp_path, 2), _task(tmp_path, 3)))
+    client = _FakeClient(modules)
+    observations: list[tuple[int, int]] = []
+
+    def capacity_provider(graph: FineGraphController, running: int) -> int:
+        observations.append((running, graph.ready_count))
+        return 2
+
+    results, task_results, _attempts = collect_distributed_fine_results(
+        controller,
+        runner=_fine_result,
+        client=client,
+        as_completed=modules.as_completed,
+        task_retries=0,
+        capacity=4,
+        active=set(),
+        capacity_provider=capacity_provider,
+    )
+
+    assert tuple(result.round for result in results) == (2, 3)
+    assert task_results
+    assert observations[0] == (0, 2)
+    assert len(observations) == len(task_results) + 1
+    assert all(running <= 2 and ready >= 0 for running, ready in observations)
 
 
 def test_fine_local_executor_retries_exact_task_without_recording_intermediate_failure(

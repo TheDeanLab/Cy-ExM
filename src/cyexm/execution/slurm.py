@@ -1,4 +1,4 @@
-"""Owned, import-light SLURMCluster execution for coarse round tasks."""
+"""Owned, import-light SLURMCluster execution for coarse and fine tasks."""
 
 from __future__ import annotations
 
@@ -22,19 +22,29 @@ from cyexm.errors import (
     WorkerPreflightError,
 )
 from cyexm.execution._dask_common import (
+    ROUND_RESOURCE,
+    collect_distributed_fine_results,
     collect_distributed_results,
     dask_scheduler_config_overlay,
     future_is_unfinished,
     utc_now,
     validate_distributed_tasks,
 )
-from cyexm.execution.base import WorkflowTaskRunner
+from cyexm.execution._slurm_evidence import (
+    FineScaleEvent,
+    FineSlurmEvidence,
+    validate_fine_slurm_evidence,
+)
+from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
+from cyexm.execution.dispatcher import FineGraphController
 from cyexm.execution.preflight import (
     WorkerProbe,
     probe_worker,
+    validate_slurm_worker_identities,
     validate_worker_probes,
 )
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
+from cyexm.workflow.fine_models import FineTaskResult
 from cyexm.workflow.models import (
     ReferenceTask,
     RoundResult,
@@ -72,6 +82,7 @@ _EVIDENCE_KEYS = frozenset(
         "cleanup",
     }
 )
+_FINE_EVIDENCE_KEYS = _EVIDENCE_KEYS | frozenset({"schema_version", "fine_graph"})
 _REQUESTED_KEYS = frozenset(
     {"workers", "configured_workers", "startup_timeout", "task_retries", "memory"}
 )
@@ -719,11 +730,23 @@ def _canonical_execution_evidence(
             raise ValueError(f"duplicate submitted task identity: {identity!r}")
         expected_identities.append(identity)
     retries = _evidence_integer(task_retries, "task_retries", minimum=0)
+    raw_evidence = _evidence_object(value, "execution_evidence")
+    fine_mode = "schema_version" in raw_evidence or "fine_graph" in raw_evidence
     evidence = _evidence_object(
         value,
         "execution_evidence",
-        exact_keys=_EVIDENCE_KEYS,
+        exact_keys=_FINE_EVIDENCE_KEYS if fine_mode else _EVIDENCE_KEYS,
     )
+    if (
+        fine_mode
+        and _evidence_integer(
+            evidence["schema_version"],
+            "execution_evidence.schema_version",
+            minimum=2,
+        )
+        != 2
+    ):
+        raise ValueError("fine SLURM execution evidence schema_version must equal 2")
     if _evidence_string(evidence["executor"], "execution_evidence.executor") != "slurm":
         raise ValueError("execution_evidence.executor must be 'slurm'")
     workers, configured, requested_retries = _validate_requested(evidence["requested"])
@@ -758,9 +781,12 @@ def _canonical_execution_evidence(
         startup_phase=phase,
         startup_outcome=outcome,
     )
+    attempt_identities = (
+        tuple(expected_identities[:1]) if fine_mode else tuple(expected_identities)
+    )
     _validate_attempts(
         evidence["attempt_counts"],
-        expected_identities=tuple(expected_identities),
+        expected_identities=attempt_identities,
         task_retries=retries,
         startup_outcome=outcome,
         cancellation_present=cancellation_present,
@@ -768,6 +794,29 @@ def _canonical_execution_evidence(
     )
     _validate_timestamps(evidence["timestamps"])
     _validate_cleanup(evidence["cleanup"], completed_startup=completed)
+    if fine_mode:
+        if configured is None:
+            raise ValueError("fine SLURM evidence requires configured_workers")
+        raw_probes = _evidence_array(
+            cast(Mapping[str, object], evidence["observed"]).get("worker_probes"),
+            "execution_evidence.observed.worker_probes",
+        )
+        validate_fine_slurm_evidence(
+            evidence["fine_graph"],
+            configured_workers=configured,
+            task_retries=retries,
+            cancellation_present=cancellation_present,
+            round_tasks=tuple(cast(RoundTask, task) for task in expected_tasks[1:]),
+            observed_probes=tuple(
+                WorkerProbe.from_dict(
+                    _evidence_object(
+                        raw,
+                        f"execution_evidence.observed.worker_probes[{index}]",
+                    )
+                )
+                for index, raw in enumerate(raw_probes)
+            ),
+        )
     return canonical_json(copy.deepcopy(evidence))
 
 
@@ -965,12 +1014,17 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> int:
         "--memory-limit": None,
         "--death-timeout": [str(_DEATH_TIMEOUT_SECONDS)],
         "--local-directory": [str(scratch)],
-        "--resources": ["round_slot=1"],
+        "--resources": (
+            [] if profile.parallelism.mode == "fine_grained" else ["round_slot=1"]
+        ),
         "--interface": [spec.interface],
     }
     for option, expected in expected_values.items():
         observed = values[option]
-        if len(observed) != 1 or (expected is not None and observed != expected):
+        expected_count = 0 if expected == [] else 1
+        if len(observed) != expected_count or (
+            expected is not None and observed != expected
+        ):
             raise _rendered_script_error(
                 f"worker option {option!r} must occur once with {expected!r}; "
                 f"got {observed!r}"
@@ -998,6 +1052,18 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> int:
             f"worker flags must be exactly ['--nanny']; got {flags!r}"
         )
     return worker_memory_bytes
+
+
+def _activate_round_slot(
+    *,
+    worker_address: str,
+    dask_scheduler: Any,
+) -> None:
+    """Make one preflighted worker eligible for scientific work."""
+    dask_scheduler.add_resources(
+        worker_address,
+        resources=dict(ROUND_RESOURCE),
+    )
 
 
 def _scheduler_snapshot(
@@ -1044,6 +1110,46 @@ def _scheduler_snapshot(
     return scheduler_address, tuple(addresses)
 
 
+def _validate_scheduler_resources(
+    client: Any,
+    *,
+    candidates: tuple[str, ...],
+    validated: tuple[str, ...],
+) -> None:
+    try:
+        info = client.scheduler_info()
+        workers = info["workers"]
+    except Exception as error:
+        raise WorkerPreflightError(
+            "Could not inspect gated SLURM worker resources: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    if not isinstance(workers, Mapping):
+        raise WorkerPreflightError("Dask scheduler workers must be a mapping")
+    expected = set(candidates) | set(validated)
+    if set(workers) != expected:
+        raise WorkerPreflightError(
+            "SLURM worker set changed during resource activation: "
+            f"expected={sorted(expected)!r}, observed={sorted(workers)!r}"
+        )
+    for address, expected_slot in (
+        *((address, 0) for address in candidates),
+        *((address, 1) for address in validated),
+    ):
+        details = workers[address]
+        resources = details.get("resources") if isinstance(details, Mapping) else None
+        if not isinstance(resources, Mapping):
+            raise WorkerPreflightError(
+                f"Worker {address!r} has no scheduler resource mapping"
+            )
+        observed = resources.get("round_slot", 0)
+        if observed != expected_slot:
+            raise WorkerPreflightError(
+                f"Worker {address!r} must expose round_slot={expected_slot}; "
+                f"got {observed!r}"
+            )
+
+
 def _returned_probe_addresses(probes: object) -> tuple[str, ...]:
     if not isinstance(probes, Mapping):
         raise WorkerPreflightError(
@@ -1078,21 +1184,25 @@ def _decodable_probe_evidence(
 
 
 class SlurmExecutor:
-    """Run independent rounds through an owned ``SLURMCluster``."""
+    """Run one coarse or fine graph through an owned ``SLURMCluster``."""
 
     def __init__(
         self,
         profile: ExecutionProfile,
         *,
         _runner: WorkflowTaskRunner = run_workflow_task,
+        _fine_runner: FineWorkflowTaskRunner | None = None,
         _modules: Callable[[], Any] = _slurm_modules,
         _version: Callable[[str], str] = package_version,
     ) -> None:
         self.profile = profile
         self._runner = _runner
+        self._fine_runner = _fine_runner
         self._modules = _modules
         self._version = _version
         self._execution_evidence: dict[str, object] = {}
+        self._fine_task_results: tuple[FineTaskResult, ...] = ()
+        self._fine_attempt_counts: tuple[tuple[str, int], ...] = ()
 
     @property
     def execution_evidence(self) -> Mapping[str, object]:
@@ -1244,18 +1354,30 @@ class SlurmExecutor:
         tasks: tuple[WorkflowTask, ...] = (reference_task, *round_tasks)
         validate_distributed_tasks(tasks, executor_name="SlurmExecutor")
         submission_runner = _serialize_workflow_task_runner(self._runner)
-        worker_count = min(max(1, len(round_tasks)), spec.workers)
+        fine_mode = self.profile.parallelism.mode == "fine_grained"
+        worker_count = 1 if fine_mode else min(max(1, len(round_tasks)), spec.workers)
         rendered, observed, startup, cleanup, evidence = self._begin_evidence(
             worker_count=worker_count,
             spec=spec,
             memory=memory,
         )
+        fine_state: FineSlurmEvidence | None = None
+        if fine_mode:
+            fine_state = FineSlurmEvidence(spec.workers)
+            evidence["schema_version"] = 2
+            evidence["fine_graph"] = fine_state.to_dict()
         reference_attempts = [0]
         moving_attempts = [0 for _task in round_tasks]
         cluster: Any | None = None
         client: Any | None = None
         configuration: AbstractContextManager[Any] | None = None
         active: set[Any] = set()
+        validated_workers: set[str] = set()
+        validated_probes: dict[str, WorkerProbe] = {}
+        requested_workers = worker_count
+        controller: FineGraphController | None = None
+        self._fine_task_results = ()
+        self._fine_attempt_counts = ()
 
         try:
             try:
@@ -1287,7 +1409,7 @@ class SlurmExecutor:
                     job_script_prologue=_native_thread_prologue(self.profile),
                     job_extra_directives=list(spec.job_extra_directives),
                     job_directives_skip=[],
-                    worker_extra_args=list(_WORKER_EXTRA_ARGS),
+                    worker_extra_args=([] if fine_mode else list(_WORKER_EXTRA_ARGS)),
                 )
                 cluster = opened_cluster
                 startup["phase"] = "template_rendering"
@@ -1302,10 +1424,17 @@ class SlurmExecutor:
                 validate_slurm_job_script(script, self.profile)
                 startup["phase"] = "scaling"
                 startup["scale_attempted"] = True
+                initial_scale_event: FineScaleEvent | None = None
+                if fine_state is not None:
+                    initial_scale_event = fine_state.begin_scale(
+                        worker_count, utc_now()
+                    )
                 try:
                     opened_cluster.scale(jobs=worker_count)
-                except BaseException:
+                except BaseException as error:
                     startup["scale_succeeded"] = False
+                    if initial_scale_event is not None:
+                        initial_scale_event.fail(error, utc_now())
                     raise
                 startup["scale_succeeded"] = True
                 startup["phase"] = "client_creation"
@@ -1330,17 +1459,23 @@ class SlurmExecutor:
                 )
                 observed["scheduler_address"] = scheduler_address
                 observed["connected_workers"] = list(connected)
+                if initial_scale_event is not None:
+                    initial_scale_event.connected.extend(connected)
+                    assert fine_state is not None
+                    fine_state.candidates.update(connected)
                 startup["phase"] = "worker_probe"
-                raw_probes = opened_client.run(
-                    probe_worker,
-                    dataset_root=str(self.profile.paths.dataset_root),
-                    output_root=str(self.profile.paths.output_root),
-                    worker_local_directory=str(
+                probe_arguments: dict[str, object] = {
+                    "dataset_root": str(self.profile.paths.dataset_root),
+                    "output_root": str(self.profile.paths.output_root),
+                    "worker_local_directory": str(
                         self.profile.paths.worker_local_directory
                     ),
-                    expected_versions=dict(versions),
-                    expected_threads=_native_thread_values(self.profile),
-                )
+                    "expected_versions": dict(versions),
+                    "expected_threads": _native_thread_values(self.profile),
+                }
+                if fine_mode:
+                    probe_arguments["workers"] = list(connected)
+                raw_probes = opened_client.run(probe_worker, **probe_arguments)
                 if isinstance(raw_probes, Mapping):
                     observed["worker_probes"] = _decodable_probe_evidence(raw_probes)
                 returned = _returned_probe_addresses(raw_probes)
@@ -1355,6 +1490,10 @@ class SlurmExecutor:
                 probes = validate_worker_probes(
                     cast(Mapping[str, Mapping[str, object]], raw_probes)
                 )
+                if fine_mode:
+                    validate_slurm_worker_identities(probes)
+                    assert initial_scale_event is not None
+                    initial_scale_event.probed.extend(connected)
                 mismatches = [
                     f"scheduler address {address!r} reported worker address "
                     f"{probe.worker_address!r}"
@@ -1366,6 +1505,23 @@ class SlurmExecutor:
                         "Worker preflight reported worker address mismatches:\n- "
                         + "\n- ".join(mismatches)
                     )
+                if fine_mode:
+                    assert initial_scale_event is not None
+                    validated_probes.update(zip(connected, probes, strict=True))
+                    for address in connected:
+                        opened_client.run_on_scheduler(
+                            _activate_round_slot,
+                            worker_address=address,
+                        )
+                        initial_scale_event.activated.append(address)
+                    validated_workers.update(connected)
+                    _validate_scheduler_resources(
+                        opened_client,
+                        candidates=(),
+                        validated=tuple(sorted(validated_workers)),
+                    )
+                    assert fine_state is not None
+                    fine_state.validated.update(validated_workers)
                 startup["phase"] = "worker_stability_check"
                 scheduler_after, connected_after = _scheduler_snapshot(
                     opened_client,
@@ -1379,6 +1535,8 @@ class SlurmExecutor:
                     )
                 startup["phase"] = "complete"
                 startup["outcome"] = "succeeded"
+                if initial_scale_event is not None:
+                    initial_scale_event.ended_at = utc_now()
             except ExecutorStartupError as error:
                 startup["outcome"] = "failed"
                 startup["error"] = _error_payload(error)
@@ -1406,23 +1564,176 @@ class SlurmExecutor:
                 return reference_results
             if not round_tasks:
                 return reference_results
-            moving_results, _attempts = collect_distributed_results(
-                round_tasks,
-                runner=submission_runner,
-                client=execution_client,
-                as_completed=modules.as_completed,
-                task_retries=spec.task_retries,
-                active=active,
-                attempts=moving_attempts,
-            )
+            if fine_mode:
+                assert fine_state is not None
+
+                def eligible_capacity(
+                    controller: FineGraphController,
+                    running_count: int,
+                ) -> int:
+                    nonlocal requested_workers
+                    desired = max(
+                        1,
+                        min(
+                            spec.workers,
+                            running_count + controller.ready_count,
+                        ),
+                    )
+                    if desired <= requested_workers:
+                        return len(validated_workers)
+                    event = fine_state.begin_scale(desired, utc_now())
+                    try:
+                        opened_cluster.scale(jobs=desired)
+                        requested_workers = desired
+                        execution_client.wait_for_workers(
+                            desired,
+                            timeout=modules.parse_timedelta(spec.startup_timeout),
+                        )
+                        next_scheduler, next_connected = _scheduler_snapshot(
+                            execution_client,
+                            expected_workers=desired,
+                        )
+                        if next_scheduler != scheduler_address:
+                            raise WorkerPreflightError(
+                                "SLURM scheduler identity changed during scale-up"
+                            )
+                        if not validated_workers < set(next_connected):
+                            raise WorkerPreflightError(
+                                "SLURM worker scale-up did not preserve every "
+                                "validated worker and add a new candidate"
+                            )
+                        newcomers = tuple(
+                            address
+                            for address in next_connected
+                            if address not in validated_workers
+                        )
+                        event.connected.extend(newcomers)
+                        fine_state.candidates.update(newcomers)
+                        _validate_scheduler_resources(
+                            execution_client,
+                            candidates=newcomers,
+                            validated=tuple(sorted(validated_workers)),
+                        )
+                        raw_new = execution_client.run(
+                            probe_worker,
+                            dataset_root=str(self.profile.paths.dataset_root),
+                            output_root=str(self.profile.paths.output_root),
+                            worker_local_directory=str(
+                                self.profile.paths.worker_local_directory
+                            ),
+                            expected_versions=dict(versions),
+                            expected_threads=_native_thread_values(self.profile),
+                            workers=list(newcomers),
+                        )
+                        returned_new = _returned_probe_addresses(raw_new)
+                        if returned_new != newcomers:
+                            raise WorkerPreflightError(
+                                "Scaled worker preflight returned a different "
+                                "candidate set"
+                            )
+                        new_probes = validate_worker_probes(
+                            cast(
+                                Mapping[str, Mapping[str, object]],
+                                raw_new,
+                            )
+                        )
+                        combined = tuple(
+                            (
+                                *validated_probes.values(),
+                                *new_probes,
+                            )
+                        )
+                        validate_slurm_worker_identities(combined)
+                        event.probed.extend(newcomers)
+                        for address in newcomers:
+                            execution_client.run_on_scheduler(
+                                _activate_round_slot,
+                                worker_address=address,
+                            )
+                            event.activated.append(address)
+                        validated_probes.update(zip(newcomers, new_probes, strict=True))
+                        validated_workers.update(newcomers)
+                        _validate_scheduler_resources(
+                            execution_client,
+                            candidates=(),
+                            validated=tuple(sorted(validated_workers)),
+                        )
+                        fine_state.validated.update(validated_workers)
+                        cast(dict[str, object], evidence["requested"])["workers"] = (
+                            requested_workers
+                        )
+                        observed["connected_workers"] = sorted(validated_workers)
+                        observed["worker_probes"] = [
+                            validated_probes[address].to_dict()
+                            for address in sorted(validated_probes)
+                        ]
+                    except BaseException as error:
+                        event.fail(error, utc_now())
+                        raise
+                    finally:
+                        event.ended_at = utc_now()
+                    return len(validated_workers)
+
+                fine_runner = self._fine_runner
+                if fine_runner is None:
+                    from cyexm.workflow.fine_task import run_fine_task
+
+                    fine_runner = run_fine_task
+                controller = FineGraphController(round_tasks)
+                moving_results, task_results, attempts = (
+                    collect_distributed_fine_results(
+                        controller,
+                        runner=fine_runner,
+                        client=execution_client,
+                        as_completed=modules.as_completed,
+                        task_retries=spec.task_retries,
+                        capacity=spec.workers,
+                        active=active,
+                        capacity_provider=eligible_capacity,
+                    )
+                )
+                self._fine_task_results = task_results
+                self._fine_attempt_counts = attempts
+                fine_state.finalize_graph(
+                    controller,
+                    attempts,
+                    task_results,
+                    validated_probes,
+                )
+                validate_fine_slurm_evidence(
+                    fine_state.to_dict(),
+                    configured_workers=spec.workers,
+                    task_retries=spec.task_retries,
+                    cancellation_present=False,
+                    round_tasks=round_tasks,
+                    observed_probes=tuple(validated_probes.values()),
+                )
+            else:
+                moving_results, _attempts = collect_distributed_results(
+                    round_tasks,
+                    runner=submission_runner,
+                    client=execution_client,
+                    as_completed=modules.as_completed,
+                    task_retries=spec.task_retries,
+                    active=active,
+                    attempts=moving_attempts,
+                )
             return (*reference_results, *moving_results)
         except BaseException as error:
+            if (
+                fine_state is not None
+                and fine_state.events
+                and fine_state.events[-1].ended_at is None
+            ):
+                fine_state.events[-1].fail(error, utc_now())
             if startup["outcome"] == "in_progress":
                 startup["outcome"] = (
                     "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
                 )
                 startup["error"] = _error_payload(error)
             if isinstance(error, KeyboardInterrupt):
+                if fine_state is not None:
+                    fine_state.cancelled = True
                 unfinished: tuple[Any, ...] = ()
                 if client is not None:
                     unfinished = tuple(
@@ -1455,6 +1766,15 @@ class SlurmExecutor:
             evidence["attempt_counts"] = self._attempt_evidence(
                 tasks, [*reference_attempts, *moving_attempts]
             )
+            if fine_state is not None:
+                if controller is not None:
+                    fine_state.finalize_graph(
+                        controller,
+                        self._fine_attempt_counts,
+                        self._fine_task_results,
+                        validated_probes,
+                    )
+                evidence["fine_graph"] = fine_state.to_dict()
             self._close_owned(client, cluster, configuration, cleanup)
             cast(dict[str, str], evidence["timestamps"])["ended_at"] = utc_now()
 

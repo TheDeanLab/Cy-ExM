@@ -305,6 +305,7 @@ def collect_distributed_fine_results(
     task_retries: int,
     capacity: int,
     active: set[Any],
+    capacity_provider: Callable[[FineGraphController, int], int] | None = None,
 ) -> tuple[
     tuple[RoundResult, ...],
     tuple[FineTaskResult, ...],
@@ -343,7 +344,22 @@ def collect_distributed_fine_results(
         return future
 
     def admit() -> list[Any]:
-        available = capacity - len(active)
+        eligible_capacity = (
+            capacity_provider(controller, len(active))
+            if capacity_provider is not None
+            else capacity
+        )
+        if (
+            isinstance(eligible_capacity, bool)
+            or not isinstance(eligible_capacity, int)
+            or eligible_capacity < 1
+            or eligible_capacity > capacity
+        ):
+            raise ValueError(
+                "fine distributed eligible capacity must be between one and "
+                "the configured capacity"
+            )
+        available = eligible_capacity - len(active)
         if available <= 0:
             return []
         return [submit(task) for task in controller.pop_ready(limit=available)]

@@ -55,6 +55,17 @@
   the latest actual task end. All actual results for one round must agree on native
   thread evidence. Full multi-host, process, scheduler, and log provenance remains
   per-task evidence; never concatenate it into singular `RoundResult` fields.
+- Fine-grained SLURM starts one candidate worker for the reference barrier and
+  scales upward only to `min(configured workers, running + ready)`. Candidate
+  workers advertise no `round_slot`; the coordinator must run the complete
+  worker preflight on each exact new address, validate one dedicated SLURM
+  job/worker identity, add exactly one scheduler-side `round_slot`, and verify
+  the post-activation scheduler snapshot before scientific submission.
+- Keep fine SLURM lifecycle evidence versioned, strict, and operational. The
+  scheduler-neutral controller owns immutable canonical task/dependency evidence;
+  `_slurm_evidence` owns typed scale-event construction and decoding; `slurm`
+  owns cluster scale, preflight, activation, submission, cancellation, and cleanup.
+  Do not let scheduler evidence authorize scientific artifact reuse.
 - Allow no nested tasks. Permit no nested chunk scheduling or silent fallback.
 - On operator cancellation, stop submission and cancel unfinished futures. Always
   close the client before its owned cluster on success, failure, and cancellation,

@@ -189,6 +189,13 @@ def test_one_chunk_and_whole_apply_the_same_real_estimated_transform_pair(
     for artifact in (whole.warp, chunked.warp, local_warp):
         assert artifact.is_file()
         assert store.record_path(artifact).is_file()
+    scalar_core = local_warp.parent / "chunk_0000_registered_core.npy"
+    assert scalar_core.is_file()
+    assert store.record_path(scalar_core).is_file()
+    scalar_core_array = np.load(scalar_core, allow_pickle=False)
+    assert scalar_core_array.shape == _SHAPE
+    assert scalar_core_array.dtype == np.dtype(np.float32)
+    assert np.isfinite(scalar_core_array).all()
     assert returned_candidates
     assert all(not path.exists() for path in returned_candidates)
 

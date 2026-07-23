@@ -10,10 +10,12 @@ import pytest
 import cyexm.io.atomic as atomic_module
 from cyexm.errors import CacheValidationError
 from cyexm.registration.artifacts import (
+    AcceptedArtifactProgress,
     ArtifactStore,
     CompletionRecord,
     FileIdentity,
     StageRequest,
+    observe_artifact_progress,
 )
 from cyexm.spatial import ImageGeometry
 
@@ -216,6 +218,39 @@ def test_commit_then_reuse(tmp_path: Path) -> None:
     value = store.reuse(artifact, make_request(source), Path.read_bytes)
 
     assert value == b"affine"
+
+
+def test_progress_observer_reports_only_accepted_commit_and_exact_reuse(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "moving.tif"
+    source.write_bytes(b"source")
+    artifact = tmp_path / "linear_transform_2.mat"
+    store = ArtifactStore()
+    request = make_request(source)
+    observed: list[AcceptedArtifactProgress] = []
+
+    with observe_artifact_progress(observed.append):
+        store.commit(
+            artifact,
+            request,
+            writer=write_bytes(b"affine"),
+            validator=lambda path: path.read_bytes() == b"affine",
+        )
+        assert store.reuse(artifact, request, Path.read_bytes) == b"affine"
+        with pytest.raises(CacheValidationError, match="request mismatch"):
+            store.reuse(
+                artifact,
+                make_request(source, accuracy="high"),
+                Path.read_bytes,
+            )
+
+    store.reuse(artifact, request, Path.read_bytes)
+    assert [(item.path, item.reused) for item in observed] == [
+        (artifact, False),
+        (artifact, True),
+    ]
+    assert all(item.record.request == request for item in observed)
 
 
 def test_absent_artifact_and_record_are_a_cache_miss(tmp_path: Path) -> None:

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
@@ -278,6 +280,43 @@ class CompletionRecord:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class AcceptedArtifactProgress:
+    """One exact request accepted by the artifact store in this context."""
+
+    path: Path
+    record: CompletionRecord
+    reused: bool
+
+
+_PROGRESS_OBSERVER: ContextVar[Callable[[AcceptedArtifactProgress], None] | None] = (
+    ContextVar("cyexm_artifact_progress_observer", default=None)
+)
+
+
+@contextmanager
+def observe_artifact_progress(
+    observer: Callable[[AcceptedArtifactProgress], None],
+) -> Iterator[None]:
+    """Observe only artifacts committed or exactly reused inside this context."""
+    token = _PROGRESS_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _PROGRESS_OBSERVER.reset(token)
+
+
+def _report_progress(
+    path: Path,
+    record: CompletionRecord,
+    *,
+    reused: bool,
+) -> None:
+    observer = _PROGRESS_OBSERVER.get()
+    if observer is not None:
+        observer(AcceptedArtifactProgress(path, record, reused))
+
+
 class ArtifactStore:
     def record_path(self, artifact: Path) -> Path:
         return artifact.with_name(f"{artifact.name}.complete.json")
@@ -317,11 +356,13 @@ class ArtifactStore:
         if record.artifact != artifact_identity:
             raise CacheValidationError(f"Cached artifact identity mismatch: {artifact}")
         try:
-            return reader(artifact)
+            value = reader(artifact)
         except Exception as error:
             raise CacheValidationError(
                 f"Cached artifact is unreadable: {artifact}"
             ) from error
+        _report_progress(artifact, record, reused=True)
+        return value
 
     def commit(
         self,
@@ -346,6 +387,7 @@ class ArtifactStore:
             lambda path: CompletionRecord.read(path) == record,
         )
         self.stale_path(artifact).unlink(missing_ok=True)
+        _report_progress(artifact, record, reused=False)
 
     def mark_stale(self, artifact: Path) -> None:
         record = self.record_path(artifact)
@@ -354,8 +396,10 @@ class ArtifactStore:
 
 
 __all__ = [
+    "AcceptedArtifactProgress",
     "ArtifactStore",
     "CompletionRecord",
     "FileIdentity",
     "StageRequest",
+    "observe_artifact_progress",
 ]

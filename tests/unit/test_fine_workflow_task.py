@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,6 +138,51 @@ def _resolved(task: object) -> ResolvedNativeThreads:
     )
 
 
+def _progress_request(
+    task: object,
+    tmp_path: Path,
+) -> object:
+    from cyexm.registration.artifacts import FileIdentity, StageRequest
+    from cyexm.spatial import ImageGeometry
+
+    source = tmp_path / "progress-source.tif"
+    upstream = tmp_path / "progress-upstream.mat"
+    source.write_bytes(b"source")
+    upstream.write_bytes(b"upstream")
+    is_channel = type(task) is ChannelTransformTask
+    return StageRequest.for_identities(
+        stage="channel-transform-v1" if is_channel else "nonlinear",
+        inputs=(FileIdentity.from_path(source),),
+        geometry=ImageGeometry(
+            shape=(3, 4, 5),
+            origin=(0.0, 0.0, 0.0),
+            spacing=(1.0, 1.0, 1.0),
+            direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        ),
+        method="warp-affine" if is_channel else "SyNOnly",
+        accuracy="not-applicable" if is_channel else "high",
+        native_threads=_resolved(task).values,
+        upstream=FileIdentity.from_path(upstream),
+        parameters={
+            "nonlinear_metric": "CC",
+            "nonlinear_radius": 4,
+            "interpolation": "linear",
+        },
+    )
+
+
+def _commit_test_artifact(path: Path, request: object) -> None:
+    from cyexm.registration.artifacts import ArtifactStore
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ArtifactStore().commit(
+        path,
+        request,  # type: ignore[arg-type]
+        lambda candidate: candidate.write_bytes(b"artifact"),
+        lambda candidate: candidate.read_bytes() == b"artifact",
+    )
+
+
 def test_fine_task_import_is_scientific_and_scheduler_runtime_free() -> None:
     code = """
 import sys
@@ -233,32 +279,229 @@ def test_each_stage_failure_returns_one_exact_isolated_result(
     assert Path(result.log_path).is_file()
 
 
-def test_stage_failure_preserves_revalidated_durable_partial_evidence(
+def test_stage_failure_preserves_a_real_newly_committed_partial_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import cyexm.workflow.fine_task as worker
+    from cyexm.registration.artifacts import ArtifactStore
+
+    task = _tasks(tmp_path)[3]
+    path = task.output_paths[1]
+    request = _progress_request(task, tmp_path)
+    monkeypatch.setattr(
+        worker, "configure_native_threads", lambda _config: _resolved(task)
+    )
+
+    def execute(*_args: object) -> object:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ArtifactStore().commit(
+            path,
+            request,  # type: ignore[arg-type]
+            lambda candidate: candidate.write_bytes(b"partial"),
+            lambda candidate: candidate.read_bytes() == b"partial",
+        )
+        raise RuntimeError("after commit")
+
+    monkeypatch.setattr(worker, "_execute_fine_task", execute)
+
+    result = run_fine_task(task)
+
+    assert result.status == "failed"
+    assert result.artifact_paths == (str(path),)
+    assert result.reused_artifacts == ()
+
+
+def test_stage_failure_preserves_real_accepted_unchanged_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import cyexm.workflow.fine_task as worker
+    from cyexm.registration.artifacts import ArtifactStore
+
+    task = _tasks(tmp_path)[3]
+    path = task.output_paths[1]
+    request = _progress_request(task, tmp_path)
+    _commit_test_artifact(path, request)
+    monkeypatch.setattr(
+        worker, "configure_native_threads", lambda _config: _resolved(task)
+    )
+
+    def execute(*_args: object) -> object:
+        assert ArtifactStore().reuse(path, request, lambda candidate: candidate) == path  # type: ignore[arg-type]
+        raise RuntimeError("after reuse")
+
+    monkeypatch.setattr(worker, "_execute_fine_task", execute)
+
+    result = run_fine_task(task)
+
+    assert result.artifact_paths == (str(path),)
+    assert result.reused_artifacts == (str(path),)
+
+
+def test_forced_stage_failure_never_reports_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import cyexm.workflow.fine_task as worker
+    from cyexm.registration.artifacts import ArtifactStore
+
+    round_task = replace(_round_task(tmp_path, strategy="whole_image"), force=True)
+    task = WholeImageRegistrationTask.create(round_task)
+    path = task.output_paths[1]
+    request = _progress_request(task, tmp_path)
+    _commit_test_artifact(path, request)
+    monkeypatch.setattr(
+        worker, "configure_native_threads", lambda _config: _resolved(task)
+    )
+
+    def execute(*_args: object) -> object:
+        ArtifactStore().reuse(path, request, lambda candidate: candidate)  # type: ignore[arg-type]
+        raise RuntimeError("after forced reuse")
+
+    monkeypatch.setattr(worker, "_execute_fine_task", execute)
+
+    result = run_fine_task(task)
+
+    assert result.artifact_paths == (str(path),)
+    assert result.reused_artifacts == ()
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    (
+        "metric",
+        "radius",
+        "interpolation",
+        "stage",
+        "method",
+        "accuracy",
+        "geometry",
+        "source",
+        "upstream",
+    ),
+)
+def test_failure_rejects_current_but_request_mismatched_completion_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    import cyexm.workflow.fine_task as worker
+    from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
+    from cyexm.spatial import ImageGeometry
+
+    task = _tasks(tmp_path)[4 if mismatch == "interpolation" else 3]
+    path = task.output_paths[0 if mismatch == "interpolation" else 1]
+    expected = _progress_request(task, tmp_path)
+    assert type(expected) is StageRequest
+    parameters = dict(expected.parameters)
+    alternate = tmp_path / f"alternate-{mismatch}"
+    alternate.write_bytes(b"alternate")
+    replacements: dict[str, object] = {}
+    if mismatch == "metric":
+        parameters["nonlinear_metric"] = "Mattes"
+        replacements["parameters"] = parameters
+    elif mismatch == "radius":
+        parameters["nonlinear_radius"] = 3
+        replacements["parameters"] = parameters
+    elif mismatch == "interpolation":
+        parameters["interpolation"] = "nearestNeighbor"
+        replacements["parameters"] = parameters
+    elif mismatch == "stage":
+        replacements["stage"] = "affine"
+    elif mismatch == "method":
+        replacements["method"] = "SyN"
+    elif mismatch == "accuracy":
+        replacements["accuracy"] = "low"
+    elif mismatch == "geometry":
+        replacements["geometry"] = ImageGeometry(
+            shape=(3, 4, 6),
+            origin=(0.0, 0.0, 0.0),
+            spacing=(1.0, 1.0, 1.0),
+            direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        )
+    elif mismatch == "source":
+        replacements["inputs"] = (FileIdentity.from_path(alternate),)
+    else:
+        replacements["upstream"] = FileIdentity.from_path(alternate)
+    stale = replace(expected, **replacements)  # type: ignore[arg-type]
+    _commit_test_artifact(path, stale)
+    monkeypatch.setattr(
+        worker, "configure_native_threads", lambda _config: _resolved(task)
+    )
+
+    def execute(*_args: object) -> object:
+        ArtifactStore().reuse(path, expected, lambda candidate: candidate)
+        raise AssertionError("request-mismatched reuse must not be accepted")
+
+    monkeypatch.setattr(worker, "_execute_fine_task", execute)
+
+    result = run_fine_task(task)
+
+    assert result.status == "failed"
+    assert result.artifact_paths == ()
+    assert result.reused_artifacts == ()
+
+
+def test_failure_revalidates_the_exact_accepted_record_after_progress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import cyexm.workflow.fine_task as worker
+    from cyexm.registration.artifacts import (
+        ArtifactStore,
+        CompletionRecord,
+        FileIdentity,
+        StageRequest,
+    )
+
+    task = _tasks(tmp_path)[3]
+    path = task.output_paths[1]
+    request = _progress_request(task, tmp_path)
+    assert type(request) is StageRequest
+    store = ArtifactStore()
+    monkeypatch.setattr(
+        worker, "configure_native_threads", lambda _config: _resolved(task)
+    )
+
+    def execute(*_args: object) -> object:
+        _commit_test_artifact(path, request)
+        changed = replace(
+            request,
+            parameters={**request.parameters, "nonlinear_radius": 99},
+        )
+        store.record_path(path).write_text(
+            CompletionRecord(1, changed, FileIdentity.from_path(path)).to_json(),
+            encoding="utf-8",
+        )
+        raise RuntimeError("record changed after accepted progress")
+
+    monkeypatch.setattr(worker, "_execute_fine_task", execute)
+
+    result = run_fine_task(task)
+
+    assert result.status == "failed"
+    assert result.artifact_paths == ()
+    assert result.reused_artifacts == ()
+
+
+def test_worker_rejects_unplanned_stage_outcome(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import cyexm.workflow.fine_task as worker
 
-    task = _tasks(tmp_path)[0]
-    durable = task.output_paths[:2]
+    task = _tasks(tmp_path)[3]
     monkeypatch.setattr(
         worker, "configure_native_threads", lambda _config: _resolved(task)
     )
     monkeypatch.setattr(
         worker,
         "_execute_fine_task",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("after commits")),
-    )
-    monkeypatch.setattr(
-        worker,
-        "_durable_progress",
-        lambda *_args: (durable, durable[:1]),
+        lambda *_args: worker._StageOutcome((tmp_path / "wrong.tif",), (), None),
     )
 
     result = run_fine_task(task)
 
     assert result.status == "failed"
-    assert result.artifact_paths == tuple(str(path) for path in durable)
-    assert result.reused_artifacts == (str(durable[0]),)
+    assert result.artifact_paths == ()
+    assert result.failure is not None
+    assert "exact planned outputs" in result.failure.message
 
 
 def test_exact_dispatch_preserves_coarse_round_result(

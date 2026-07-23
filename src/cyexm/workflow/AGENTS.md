@@ -17,6 +17,11 @@
   exactly one immutable stage, and never create clients, workers, or descendant
   tasks. Concurrent stages use deterministic per-task logs rather than the coarse
   round log.
+- Fine failure results may retain only task-planned artifacts explicitly accepted by
+  the current delegate through the exact Phase 1 artifact-store request boundary and
+  still backed by the identical canonical completion record. Never infer partial
+  progress from current file identities or thread counts alone; force suppresses all
+  reused-artifact evidence.
 - Fine chunk assembly preserves the legacy ascending-ID overwrite rule for expected
   overlapping output slices. Scheduling and completion order must not change the
   canonical assembly order or scientific artifact identity.

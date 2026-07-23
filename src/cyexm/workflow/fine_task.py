@@ -132,41 +132,155 @@ def _unchanged(
 def _durable_progress(
     task: FineWorkflowTask,
     actual_threads: dict[str, int],
-    before: dict[Path, object],
+    accepted_progress: dict[Path, object],
 ) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
     from cyexm.registration.artifacts import (
+        AcceptedArtifactProgress,
         ArtifactStore,
         CompletionRecord,
         FileIdentity,
     )
-    from cyexm.workflow._round_provenance import completion_snapshot
 
     store = ArtifactStore()
     accepted: list[Path] = []
     reused: list[Path] = []
     for path in task.output_paths:
         try:
-            record = CompletionRecord.read(store.record_path(path))
+            progress = accepted_progress.get(path)
+            if type(progress) is not AcceptedArtifactProgress:
+                continue
+            record_path = store.record_path(path)
+            text = record_path.read_text(encoding="utf-8")
+            record = CompletionRecord.read(record_path)
             if (
-                record.artifact != FileIdentity.from_path(path)
+                text != record.to_json()
+                or record != progress.record
+                or record.artifact != FileIdentity.from_path(path)
                 or record.request.native_threads != actual_threads
-                or any(
-                    FileIdentity.from_path(Path(identity.path)) != identity
-                    for identity in record.request.inputs
-                )
-                or (
-                    record.request.upstream is not None
-                    and FileIdentity.from_path(Path(record.request.upstream.path))
-                    != record.request.upstream
-                )
             ):
                 continue
         except Exception:
             continue
         accepted.append(path)
-        if path in before and completion_snapshot(path) == before[path]:
+        if progress.reused and not task.round_task.force:
             reused.append(path)
     return tuple(accepted), tuple(reused)
+
+
+def _progress_signature(
+    task: FineWorkflowTask,
+    path: Path,
+) -> tuple[str, str, str] | None:
+    from cyexm.registration.prepared import PreparedRoundPaths
+    from cyexm.workflow._round_provenance import RegistrationArtifactPaths
+
+    round_task = task.round_task
+    registration = RegistrationArtifactPaths.for_round(
+        round_task.registration_directory, round_task.round
+    )
+    common: dict[Path, tuple[str, str, str]] = {
+        registration.affine: (
+            "affine",
+            round_task.registration.linear.type,
+            round_task.registration.linear.accuracy,
+        ),
+        registration.warp: (
+            "nonlinear",
+            round_task.registration.nonlinear.type,
+            round_task.registration.nonlinear.accuracy,
+        ),
+        registration.registered: (
+            "registered-image",
+            round_task.registration.nonlinear.type,
+            round_task.registration.nonlinear.accuracy,
+        ),
+        registration.pre_metrics: (
+            "metrics:pre-registration",
+            "Correlation+MattesMutualInformation",
+            "full",
+        ),
+        registration.linear_metrics: (
+            "metrics:linearly-registered",
+            "Correlation+MattesMutualInformation",
+            "full",
+        ),
+        registration.nonlinear_metrics: (
+            "metrics:nonlinear-registered",
+            "Correlation+MattesMutualInformation",
+            "full",
+        ),
+        registration.moving_crop: (
+            "crop:moving",
+            "robust-bounding-box",
+            "legacy-robust",
+        ),
+    }
+    if type(task) is RoundPreparationTask:
+        prepared = PreparedRoundPaths.for_round(
+            round_task.registration_directory, round_task.round
+        )
+        roles = (
+            "fixed_scalar",
+            "moving_linear_scalar",
+            "fixed_mask",
+            "moving_linear_mask",
+        )
+        common.update(
+            {
+                prepared_path: (
+                    f"prepared:{role}",
+                    round_task.registration.linear.type,
+                    round_task.registration.linear.accuracy,
+                )
+                for prepared_path, role in zip(prepared.array_paths, roles, strict=True)
+            }
+        )
+        common[prepared.manifest] = (
+            "prepared:manifest",
+            round_task.registration.linear.type,
+            round_task.registration.linear.accuracy,
+        )
+    elif type(task) is NonlinearChunkTask:
+        common = {
+            task.output_paths[0]: (
+                f"nonlinear-chunk:{task.chunk.chunk_id}",
+                round_task.registration.nonlinear.type,
+                round_task.registration.nonlinear.accuracy,
+            ),
+            task.output_paths[1]: (
+                f"nonlinear-chunk-scalar-core:{task.chunk.chunk_id}",
+                "local-warp-reconstruction",
+                "exact",
+            ),
+        }
+    elif type(task) is ChunkAssemblyTask:
+        common[task.output_paths[3]] = (
+            "nonlinear-chunk-manifest",
+            "serial-chunk-grid",
+            "exact",
+        )
+    elif type(task) is ChannelTransformTask:
+        common = {
+            task.output_paths[0]: (
+                "channel-transform-v1",
+                "warp-affine",
+                "not-applicable",
+            )
+        }
+    return common.get(path)
+
+
+def _accept_progress_for_task(
+    task: FineWorkflowTask,
+    progress: object,
+) -> bool:
+    from cyexm.registration.artifacts import AcceptedArtifactProgress
+
+    if type(progress) is not AcceptedArtifactProgress:
+        return False
+    signature = _progress_signature(task, progress.path)
+    request = progress.record.request
+    return signature == (request.stage, request.method, request.accuracy)
 
 
 def _run_preparation(task: RoundPreparationTask) -> _StageOutcome:
@@ -702,7 +816,7 @@ def run_fine_task(task: FineWorkflowTask) -> FineTaskResult:
     pid = 1
     dask_key: str | None = None
     slurm_job: str | None = None
-    before = _snapshots(task.output_paths)
+    accepted_progress: dict[Path, object] = {}
     try:
         hostname = socket.gethostname()
         pid = os.getpid()
@@ -714,7 +828,19 @@ def run_fine_task(task: FineWorkflowTask) -> FineTaskResult:
         )
         resolved = configure_native_threads(threads)
         _write_log(task.log_path, f"{task.key.encoded} started")
-        outcome = _execute_fine_task(task, resolved)
+        from cyexm.registration.artifacts import (
+            AcceptedArtifactProgress,
+            observe_artifact_progress,
+        )
+
+        def accept_progress(progress: AcceptedArtifactProgress) -> None:
+            if progress.path in task.output_paths and _accept_progress_for_task(
+                task, progress
+            ):
+                accepted_progress[progress.path] = progress
+
+        with observe_artifact_progress(accept_progress):
+            outcome = _execute_fine_task(task, resolved)
         if outcome.artifact_paths != task.output_paths:
             raise RuntimeError(
                 "fine task stage returned artifacts other than exact planned outputs"
@@ -755,7 +881,7 @@ def run_fine_task(task: FineWorkflowTask) -> FineTaskResult:
             if resolved is None
             else dict(resolved.values)
         )
-        completed, reused = _durable_progress(task, actual_threads, before)
+        completed, reused = _durable_progress(task, actual_threads, accepted_progress)
         _best_effort_log(
             task.log_path,
             f"{task.key.encoded} failed: {type(error).__name__}: {error}\n"

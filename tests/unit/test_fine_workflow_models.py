@@ -175,6 +175,45 @@ def test_stage_specific_models_reject_invalid_inputs(tmp_path: Path) -> None:
         )
 
 
+def test_direct_chunk_requires_its_exact_canonical_grid_member(
+    tmp_path: Path,
+) -> None:
+    round_task = _round_task(tmp_path)
+    preparation = RoundPreparationTask.create(round_task)
+    canonical = compute_chunk_grid((9, 17, 19), (4, 8, 8), 0.25)[0]
+    task = NonlinearChunkTask.create(
+        round_task,
+        canonical,
+        prepared_descriptor=_descriptor(),
+        dependencies=(preparation.key,),
+    )
+
+    with pytest.raises(ValueError, match="canonical prepared-grid member"):
+        replace(task, chunk=replace(canonical, x_end_ext=canonical.x_end_ext - 1))
+    with pytest.raises(ValueError):
+        replace(task, chunk=replace(canonical, chunk_id=1))
+
+
+def test_direct_chunk_supports_canonical_ids_above_9999(tmp_path: Path) -> None:
+    round_task = replace(
+        _round_task(tmp_path),
+        chunk_size_zyx=(1, 1, 1),
+        overlap_fraction=0.0,
+    )
+    descriptor = json.loads(json.dumps(_descriptor()))
+    descriptor["geometry"]["shape"] = [1, 1, 10001]
+    chunks = compute_chunk_grid((1, 1, 10001), (1, 1, 1), 0.0)
+    task = NonlinearChunkTask.create(
+        round_task,
+        chunks[10000],
+        prepared_descriptor=descriptor,
+        dependencies=(RoundPreparationTask.create(round_task).key,),
+    )
+
+    assert task.key.item == "10000"
+    assert task.chunk.chunk_id == 10000
+
+
 def test_all_exact_task_types_embed_the_authoritative_round(tmp_path: Path) -> None:
     chunked = _round_task(tmp_path)
     whole = _round_task(tmp_path, strategy="whole_image")

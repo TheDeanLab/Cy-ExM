@@ -302,7 +302,27 @@ class NonlinearChunkTask(_FineTask):
                 chunk_root / f"chunk_{self.chunk.chunk_id:04d}_registered_core.npy",
             ),
         )
-        _json_object(json.loads(self.prepared_descriptor_json), "prepared descriptor")
+        descriptor = _json_object(
+            json.loads(self.prepared_descriptor_json), "prepared descriptor"
+        )
+        from cyexm.chunking import compute_chunk_grid
+        from cyexm.registration.prepared import PreparedManifest
+
+        manifest = PreparedManifest.from_dict(descriptor)
+        if (
+            self.round_task.chunk_size_zyx is None
+            or self.round_task.overlap_fraction is None
+        ):
+            raise ValueError("chunk task requires chunk geometry")
+        chunks = compute_chunk_grid(
+            manifest.geometry.shape,
+            self.round_task.chunk_size_zyx,
+            self.round_task.overlap_fraction,
+        )
+        if self.chunk.chunk_id >= len(chunks) or (
+            chunks[self.chunk.chunk_id] != self.chunk
+        ):
+            raise ValueError("chunk must equal its canonical prepared-grid member")
 
     @property
     def prepared_descriptor(self) -> dict[str, object]:

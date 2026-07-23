@@ -33,6 +33,10 @@ def test_transform_channel_resamples_unequal_native_shape_to_fixed_geometry(
 
     fixed_shape = (4, 6, 8)
     moving_shape = (3, 5, 7)
+    assert all(
+        fixed_size != moving_size
+        for fixed_size, moving_size in zip(fixed_shape, moving_shape, strict=True)
+    )
     fixed_geometry = ImageGeometry(
         shape=fixed_shape,
         origin=(0.5, -1.0, 2.0),
@@ -89,6 +93,10 @@ def test_transform_channel_resamples_unequal_native_shape_to_fixed_geometry(
     assert (
         backend.geometry(backend.load_image(output_path, _PIXEL_SIZE)) == fixed_geometry
     )
+    completion = CompletionRecord.read(ArtifactStore().record_path(output_path))
+    assert completion.artifact == FileIdentity.from_path(output_path)
+    assert completion.request.stage == "channel-transform-v1"
+    assert completion.request.geometry == fixed_geometry
 
 
 def test_transform_channel_applies_identity_chain_clips_and_reuses_exactly(

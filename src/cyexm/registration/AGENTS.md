@@ -47,7 +47,11 @@
   native-thread state without repeating preparation.
 - `prepared.py` owns the internal fixed-grid float32 NPY bundle. Commit each array
   through the ordinary artifact store, promote the strict manifest last, and let
-  workers copy only one extended region from validated read-only memory maps.
+  workers copy only one extended region from validated read-only memory maps. The
+  manifest must record and bind the exact supported ANTs pixel type for all four
+  prepared roles; reconstruct each regional image with that type so an integer
+  legacy fixed grid retains its scalar-resampling behavior while floating inputs
+  remain unquantized.
 - Pre-registration metrics resample unequal moving scalar and mask grids to the fixed
   grid for diagnosis only; this must not replace or pre-resample the native moving
   inputs supplied to affine estimation.

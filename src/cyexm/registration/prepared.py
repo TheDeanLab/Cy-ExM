@@ -29,7 +29,16 @@ if TYPE_CHECKING:
     from cyexm.registration.chunked import ChunkInfo
     from cyexm.registration.whole_image import ImageRegistration, _LinearPreparation
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
+_PIXELTYPE_ROLES = (
+    "fixed_mask",
+    "fixed_scalar",
+    "moving_linear_mask",
+    "moving_linear_scalar",
+)
+_SUPPORTED_ANTS_PIXELTYPES = frozenset(
+    {"unsigned char", "unsigned int", "float", "double"}
+)
 _MANIFEST_KEYS = frozenset(
     {
         "format_version",
@@ -45,6 +54,7 @@ _MANIFEST_KEYS = frozenset(
         "scalar_policy",
         "mask_policy",
         "native_threads",
+        "pixeltypes",
     }
 )
 
@@ -127,6 +137,7 @@ class PreparedManifest:
     scalar_policy: str
     mask_policy: str
     native_threads: dict[str, int]
+    pixeltypes: dict[str, str]
 
     def __post_init__(self) -> None:
         if self.format_version != _FORMAT_VERSION:
@@ -168,6 +179,18 @@ class PreparedManifest:
             raise ValueError("native_threads values must be positive integers")
         if list(self.native_threads) != sorted(self.native_threads):
             raise ValueError("native_threads must use canonical sorted ordering")
+        if set(self.pixeltypes) != set(_PIXELTYPE_ROLES):
+            raise ValueError("pixeltype roles must match prepared image roles")
+        if list(self.pixeltypes) != sorted(self.pixeltypes):
+            raise ValueError("pixeltype roles must use canonical sorted ordering")
+        for role, pixeltype in self.pixeltypes.items():
+            if (
+                type(pixeltype) is not str
+                or pixeltype not in _SUPPORTED_ANTS_PIXELTYPES
+            ):
+                raise ValueError(
+                    f"unsupported ANTs pixeltype for {role}: {pixeltype!r}"
+                )
 
     @property
     def array_identities(
@@ -197,6 +220,7 @@ class PreparedManifest:
             "scalar_policy": self.scalar_policy,
             "mask_policy": self.mask_policy,
             "native_threads": dict(self.native_threads),
+            "pixeltypes": dict(self.pixeltypes),
         }
 
     @classmethod
@@ -211,6 +235,7 @@ class PreparedManifest:
             raise TypeError("format_version must be an integer")
         moving_crop = payload["moving_crop"]
         native_threads = _mapping(payload["native_threads"], "native_threads")
+        pixeltypes = _mapping(payload["pixeltypes"], "pixeltypes")
         parsed_threads: dict[str, int] = {}
         for name, value in native_threads.items():
             if isinstance(value, bool) or not isinstance(value, int):
@@ -236,6 +261,10 @@ class PreparedManifest:
             scalar_policy=_string(payload["scalar_policy"], "scalar_policy"),
             mask_policy=_string(payload["mask_policy"], "mask_policy"),
             native_threads=parsed_threads,
+            pixeltypes={
+                role: _string(pixeltypes[role], f"pixeltypes[{role!r}]")
+                for role in sorted(pixeltypes)
+            },
         )
 
 
@@ -248,6 +277,7 @@ class PreparedRegion:
     fixed_mask: Any
     moving_linear_mask: Any
     geometry: ImageGeometry
+    pixeltypes: dict[str, str]
 
 
 def _prepared_array(
@@ -307,6 +337,7 @@ def _array_request(
     geometry: ImageGeometry,
     role: str,
     affine: FileIdentity,
+    pixeltype: str,
 ) -> StageRequest:
     parameters = common_parameters(
         crop=registration.crop,
@@ -319,6 +350,7 @@ def _array_request(
             "prepared_role": role,
             "scalar_policy": PREPARED_SCALAR_POLICY,
             "mask_policy": PREPARED_MASK_POLICY,
+            "ants_pixeltype": pixeltype,
         }
     )
     return StageRequest.for_identities(
@@ -406,6 +438,28 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
         _prepared_array(np, backend, state.fixed_mask, geometry),
         _prepared_array(np, backend, state.moving_linear_mask, geometry),
     )
+    images = (
+        state.fixed,
+        state.moving_linear,
+        state.fixed_mask,
+        state.moving_linear_mask,
+    )
+    pixeltypes: dict[str, str] = {}
+    for role, image in zip(
+        (
+            "fixed_scalar",
+            "moving_linear_scalar",
+            "fixed_mask",
+            "moving_linear_mask",
+        ),
+        images,
+        strict=True,
+    ):
+        pixeltype = getattr(image, "pixeltype", None)
+        if type(pixeltype) is not str or pixeltype not in _SUPPORTED_ANTS_PIXELTYPES:
+            raise ValueError(f"unsupported ANTs pixeltype for {role}: {pixeltype!r}")
+        pixeltypes[role] = pixeltype
+    pixeltypes = dict(sorted(pixeltypes.items()))
     paths = PreparedRoundPaths.for_round(
         Path(registration.save_directory), registration.imaging_round
     )
@@ -429,7 +483,14 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
         _require_identity(affine, "affine")
         if moving_crop is not None:
             _require_identity(moving_crop, "moving crop")
-        request = _array_request(registration, state, geometry, role, affine)
+        request = _array_request(
+            registration,
+            state,
+            geometry,
+            role,
+            affine,
+            pixeltypes[role],
+        )
         cached = None
         if not registration.force_override:
             cached = registration._reuse_artifact(
@@ -498,6 +559,7 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
         scalar_policy=PREPARED_SCALAR_POLICY,
         mask_policy=PREPARED_MASK_POLICY,
         native_threads=dict(sorted(state.resolved.values.items())),
+        pixeltypes=pixeltypes,
     )
     manifest_request = StageRequest.for_identities(
         stage="prepared:manifest",
@@ -516,6 +578,7 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
             "format_version": _FORMAT_VERSION,
             "scalar_policy": PREPARED_SCALAR_POLICY,
             "mask_policy": PREPARED_MASK_POLICY,
+            "pixeltypes": pixeltypes,
         },
     )
     cached_manifest = None
@@ -692,6 +755,7 @@ def read_prepared_region(
             spacing=manifest.geometry.spacing,
             direction=manifest.geometry.direction,
         ),
+        pixeltypes=dict(manifest.pixeltypes),
     )
 
 

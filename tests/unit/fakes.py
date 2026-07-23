@@ -72,6 +72,10 @@ class FakeImage:
     def components(self) -> int:
         return self.data.shape[-1] if self.has_components else 1
 
+    @property
+    def pixeltype(self) -> str:
+        return "float"
+
     def numpy(self) -> np.ndarray:
         return self.data.copy()
 

@@ -34,6 +34,9 @@
   `PreparedManifest` parser before graph expansion. Malformed worker descriptors
   must become ordinary current-attempt failures so configured retries and
   independent-sibling settlement remain intact.
+- Fine chunk workers must reconstruct every prepared regional image with the exact
+  manifest-bound ANTs pixel type. Missing, unsupported, or request-mismatched pixel
+  evidence fails closed rather than silently changing legacy scalar interpolation.
 - Fine failure results may retain only task-planned artifacts explicitly accepted by
   the current delegate through the exact Phase 1 artifact-store request boundary and
   still backed by the identical canonical completion record. Never infer partial

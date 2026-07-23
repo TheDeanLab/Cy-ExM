@@ -106,6 +106,35 @@ def test_manifest_transport_rejects_unknown_keys(tmp_path: Path) -> None:
         PreparedManifest.from_dict(payload)
 
 
+def test_manifest_transport_rejects_missing_or_unsupported_pixeltype(
+    tmp_path: Path,
+) -> None:
+    payload = commit_prepared_round(_registration(tmp_path)).to_dict()
+    assert payload["pixeltypes"] == {
+        "fixed_mask": "float",
+        "fixed_scalar": "float",
+        "moving_linear_mask": "float",
+        "moving_linear_scalar": "float",
+    }
+
+    missing = dict(payload)
+    missing["pixeltypes"] = {
+        key: value
+        for key, value in payload["pixeltypes"].items()  # type: ignore[union-attr]
+        if key != "fixed_scalar"
+    }
+    with pytest.raises(ValueError, match="pixeltype roles"):
+        PreparedManifest.from_dict(missing)
+
+    unsupported = dict(payload)
+    unsupported["pixeltypes"] = {
+        **payload["pixeltypes"],  # type: ignore[dict-item]
+        "fixed_scalar": "unsigned short",
+    }
+    with pytest.raises(ValueError, match="unsupported ANTs pixeltype"):
+        PreparedManifest.from_dict(unsupported)
+
+
 def test_commit_writes_exact_float32_c_arrays_with_completion_records(
     tmp_path: Path,
 ) -> None:

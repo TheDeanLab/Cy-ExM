@@ -52,7 +52,13 @@ Tasks:
   expansion validation. Full gates are clean (2,265 unit, 58 integration,
   repository Ruff/BasedPyright/pre-commit), and final independent re-review
   approved; the second remediation is committed.
-- Task 10: pending
+- Task 10: implementation complete pending independent review; bounded real-ANTs
+  coarse/fine and fine sequential/Local-Dask parity, unequal XYZ shapes, four
+  nonlinear chunks, three moving channels, completion-order-independent legacy
+  assembly, and two-stage exact restart are green. A RED-exposed prepared regional
+  pixeltype defect is fixed with format-version-2 manifest/request identity and
+  exact ANTs reconstruction; full gates: 2,266 unit, 61 integration, repository
+  Ruff/BasedPyright/pre-commit clean.
 - Task 11: pending
 - Task 12: pending
 - Task 13: pending

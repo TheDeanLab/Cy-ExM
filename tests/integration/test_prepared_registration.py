@@ -40,6 +40,13 @@ def test_real_ants_prepared_bundle_reconstructs_one_fixed_grid_region(
     chunk = compute_chunk_grid(manifest.geometry.shape, (8, 16, 16), 0.25)[1]
     region = read_prepared_region(manifest, chunk)
 
+    assert manifest.pixeltypes == {
+        "fixed_mask": "float",
+        "fixed_scalar": "float",
+        "moving_linear_mask": "float",
+        "moving_linear_scalar": "float",
+    }
+    assert region.pixeltypes == manifest.pixeltypes
     assert region.geometry.shape == chunk.extended_shape
     assert region.geometry.spacing == manifest.geometry.spacing
     for array in (
@@ -53,3 +60,35 @@ def test_real_ants_prepared_bundle_reconstructs_one_fixed_grid_region(
         assert array.flags.c_contiguous
         assert array.flags.owndata
         assert np.isfinite(array).all()
+    reconstructed = (
+        backend.from_geometry(
+            region.fixed_scalar,
+            geometry=region.geometry,
+            pixeltype=region.pixeltypes["fixed_scalar"],
+        ),
+        backend.from_geometry(
+            region.moving_linear_scalar,
+            geometry=region.geometry,
+            pixeltype=region.pixeltypes["moving_linear_scalar"],
+        ),
+        backend.from_geometry(
+            region.fixed_mask,
+            geometry=region.geometry,
+            pixeltype=region.pixeltypes["fixed_mask"],
+        ),
+        backend.from_geometry(
+            region.moving_linear_mask,
+            geometry=region.geometry,
+            pixeltype=region.pixeltypes["moving_linear_mask"],
+        ),
+    )
+    assert tuple(image.pixeltype for image in reconstructed) == (
+        "float",
+        "float",
+        "float",
+        "float",
+    )
+    assert any(
+        np.any(values % np.float32(1.0))
+        for values in (region.fixed_scalar, region.moving_linear_scalar)
+    )

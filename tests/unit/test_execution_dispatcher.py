@@ -137,7 +137,7 @@ def _round_task(tmp_path: Path, round_number: int) -> RoundTask:
 def _descriptor(z_size: int) -> dict[str, object]:
     identity = {"path": "/tmp/artifact", "st_size": 1, "st_mtime_ns": 2}
     return {
-        "format_version": 1,
+        "format_version": 2,
         "fixed_scalar": identity,
         "moving_linear_scalar": identity,
         "fixed_mask": identity,
@@ -161,6 +161,12 @@ def _descriptor(z_size: int) -> dict[str, object]:
             "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
         ),
         "native_threads": {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 2},
+        "pixeltypes": {
+            "fixed_mask": "float",
+            "fixed_scalar": "float",
+            "moving_linear_mask": "float",
+            "moving_linear_scalar": "float",
+        },
     }
 
 

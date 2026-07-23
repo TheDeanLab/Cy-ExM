@@ -422,6 +422,7 @@ def _validated_prepared_manifest(
             "prepared_role": role,
             "scalar_policy": PREPARED_SCALAR_POLICY,
             "mask_policy": PREPARED_MASK_POLICY,
+            "ants_pixeltype": manifest.pixeltypes[role],
         }
         expected = StageRequest.for_identities(
             stage=f"prepared:{role}",
@@ -459,6 +460,7 @@ def _validated_prepared_manifest(
             "format_version": manifest.format_version,
             "scalar_policy": PREPARED_SCALAR_POLICY,
             "mask_policy": PREPARED_MASK_POLICY,
+            "pixeltypes": manifest.pixeltypes,
         },
     )
     manifest_record = CompletionRecord.read(store.record_path(prepared.manifest))
@@ -552,15 +554,25 @@ def _chunk_context(
             raise TypeError("regional chunk context requires a nonlinear chunk task")
         selected = task.chunk
     region = read_prepared_region(manifest, selected)  # type: ignore[arg-type]
-    fixed_region = backend.from_geometry(region.fixed_scalar, geometry=region.geometry)
+    fixed_region = backend.from_geometry(
+        region.fixed_scalar,
+        geometry=region.geometry,
+        pixeltype=region.pixeltypes["fixed_scalar"],
+    )
     moving_region = backend.from_geometry(
-        region.moving_linear_scalar, geometry=region.geometry
+        region.moving_linear_scalar,
+        geometry=region.geometry,
+        pixeltype=region.pixeltypes["moving_linear_scalar"],
     )
     fixed_mask_region = backend.from_geometry(
-        region.fixed_mask, geometry=region.geometry
+        region.fixed_mask,
+        geometry=region.geometry,
+        pixeltype=region.pixeltypes["fixed_mask"],
     )
     moving_mask_region = backend.from_geometry(
-        region.moving_linear_mask, geometry=region.geometry
+        region.moving_linear_mask,
+        geometry=region.geometry,
+        pixeltype=region.pixeltypes["moving_linear_mask"],
     )
     context = ChunkStageContext(
         source_identities=source_identities,

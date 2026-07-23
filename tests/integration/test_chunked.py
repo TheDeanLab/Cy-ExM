@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,11 @@ from cyexm.registration import linear, nonlinear
 from cyexm.registration._native_paths import discard_path
 from cyexm.registration.artifacts import ArtifactStore
 from cyexm.registration.backend import AntsRegistrationBackend
+from cyexm.registration.chunk_stages import (
+    ChunkStageArtifacts,
+    ChunkStageContext,
+    assemble_nonlinear_chunks,
+)
 from cyexm.registration.chunked import ChunkedImageRegistration, compute_chunk_grid
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
 from cyexm.runtime import NativeThreadConfig
@@ -320,3 +326,89 @@ def test_unequal_native_shapes_are_affine_resampled_before_chunking(
     assert geometry_compatible(
         backend.geometry(backend.read_warp(paths.warp)), fixed_geometry
     )
+
+
+def test_real_chunk_assembly_is_independent_of_completion_order(
+    synthetic_tiffs: tuple[Path, Path],
+    tmp_path: Path,
+    native_threads: NativeThreadConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+    import tifffile
+
+    import cyexm.registration.chunked as chunked_module
+
+    fixed_path, moving_path = synthetic_tiffs
+    captured: list[tuple[ChunkStageContext, tuple[ChunkStageArtifacts, ...]]] = []
+    canonical_assemble = chunked_module.assemble_nonlinear_chunks
+
+    def capture(
+        context: ChunkStageContext,
+        artifacts: tuple[ChunkStageArtifacts, ...] | list[ChunkStageArtifacts],
+    ) -> object:
+        values = tuple(artifacts)
+        captured.append((context, values))
+        return canonical_assemble(context, values)
+
+    monkeypatch.setattr(chunked_module, "assemble_nonlinear_chunks", capture)
+    registration = ChunkedImageRegistration(
+        fixed_path,
+        moving_path,
+        tmp_path / "source",
+        imaging_round=2,
+        pixel_size=_PIXEL_SIZE,
+        enable_logging=False,
+        chunk_size=(10, 24, 32),
+        overlap_fraction=0.25,
+        native_threads=native_threads,
+        linear_accuracy="dry run",
+        nonlinear_accuracy="dry run",
+    )
+    registration.register()
+
+    assert len(captured) == 1
+    source_context, artifacts = captured[0]
+    assert len(artifacts) == len(source_context.chunks) == 4
+    orders = (
+        artifacts,
+        tuple(reversed(artifacts)),
+        tuple(artifacts[index] for index in (2, 0, 3, 1)),
+    )
+    assembled_warps = []
+    assembled_tiffs = []
+    backend = AntsRegistrationBackend(native_threads)
+    for index, order in enumerate(orders):
+        destination = tmp_path / f"assembly-{index}"
+        destination.mkdir()
+        context = replace(
+            source_context,
+            output_directory=destination,
+            force=True,
+            require_existing=False,
+        )
+        result = assemble_nonlinear_chunks(context, order)
+        warp = backend.read_warp(result.warp_path)
+        assert geometry_compatible(
+            backend.geometry(warp),
+            source_context.fixed_geometry,
+        )
+        assembled_warps.append(np.asarray(backend.to_array(warp)))
+        registered = tifffile.imread(result.registered_path)
+        assert registered.shape == source_context.fixed_geometry.shape
+        assembled_tiffs.append(registered)
+        for path in (
+            result.warp_path,
+            result.registered_path,
+            result.nonlinear_metrics_path,
+            result.chunk_manifest_path,
+        ):
+            assert path.is_file()
+            assert ArtifactStore().record_path(path).is_file()
+
+    for values in (*assembled_warps, *assembled_tiffs):
+        assert np.isfinite(values).all()
+    np.testing.assert_array_equal(assembled_warps[0], assembled_warps[1])
+    np.testing.assert_array_equal(assembled_warps[0], assembled_warps[2])
+    np.testing.assert_array_equal(assembled_tiffs[0], assembled_tiffs[1])
+    np.testing.assert_array_equal(assembled_tiffs[0], assembled_tiffs[2])

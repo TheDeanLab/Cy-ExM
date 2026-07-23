@@ -23,6 +23,10 @@ from . import transforms as transform_helpers
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_ANTS_PIXELTYPES = frozenset(
+    {"unsigned char", "unsigned int", "float", "double"}
+)
+
 
 def _scientific_runtime() -> tuple[Any, Any]:
     import ants
@@ -63,6 +67,7 @@ class RegistrationBackend(Protocol):
         *,
         geometry: ImageGeometry,
         has_components: bool = False,
+        pixeltype: str | None = None,
     ) -> object:
         raise NotImplementedError
 
@@ -224,16 +229,24 @@ class AntsRegistrationBackend:
         *,
         geometry: ImageGeometry,
         has_components: bool = False,
+        pixeltype: str | None = None,
     ) -> object:
         self._prepare()
         ants, np = _scientific_runtime()
-        return ants.from_numpy(
+        if pixeltype is not None and pixeltype not in _SUPPORTED_ANTS_PIXELTYPES:
+            raise ValueError(f"unsupported ANTs pixeltype: {pixeltype!r}")
+        image = ants.from_numpy(
             external_to_ants_array(np.asarray(array)),
             origin=geometry.origin,
             spacing=geometry.spacing,
             direction=geometry.direction,
             has_components=has_components,
         )
+        if pixeltype is not None and image.pixeltype != pixeltype:
+            image = image.clone(pixeltype)
+        if pixeltype is not None and image.pixeltype != pixeltype:
+            raise ValueError("ANTs image reconstruction did not preserve pixeltype")
+        return image
 
     def crop_image(
         self,

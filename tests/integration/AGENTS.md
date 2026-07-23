@@ -31,6 +31,13 @@
   prove restart from the committed upstream record.
 - Prepared-array integration tests must exercise real ANTs fixed-grid conversion and
   one bounded regional reconstruction; full-volume worker reads are not acceptable.
+  Pin both an integer fixed-grid case that matches legacy scalar quantization and a
+  floating fixed-grid case that remains floating, and compare coarse/fine diagnostics
+  without weakening the established deterministic tolerance.
+- Fine scientific regressions use at least four real nonlinear chunks and three
+  moving channels overall, compare every affine/warp/core/metric/channel artifact,
+  permute valid chunk completion order, and interrupt after committed chunk and
+  channel boundaries to prove exact ArtifactStore-authorized restart identities.
 - `legacy_baseline.py` is executed only from the pinned ClearEx environment at commit
   `2311a873b783477add7391ff00245f76490147f0`. It may write only to its explicit
   `--output` directory and must never modify the ClearEx checkout.

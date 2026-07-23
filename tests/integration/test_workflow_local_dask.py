@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from cyexm.chunking import compute_chunk_grid
 from cyexm.config.models import (
     ChannelSpec,
     DatasetManifest,
@@ -27,7 +28,10 @@ from cyexm.config.models import (
 from cyexm.execution.dask import LocalDaskExecutor
 from cyexm.execution.sequential import SequentialExecutor
 from cyexm.io.tiff import read_tiff_geometry
+from cyexm.metrics import read_metrics
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
+from cyexm.registration.backend import AntsRegistrationBackend
+from cyexm.registration.prepared import PreparedRoundPaths
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS, NativeThreadConfig
 from cyexm.workflow._round_provenance import RegistrationArtifactPaths
 from cyexm.workflow.api import run_workflow
@@ -323,6 +327,111 @@ def _assert_round_outputs_equivalent(
         _assert_tiff_equivalent(sequential_channel.output, local_channel.output)
 
 
+def _assert_chunked_fine_arrays_equivalent(
+    sequential: RoundTask,
+    local: RoundTask,
+) -> None:
+    import numpy as np
+
+    backend = AntsRegistrationBackend(NativeThreadConfig(1, 1))
+    sequential_paths = RegistrationArtifactPaths.for_round(
+        sequential.registration_directory,
+        sequential.round,
+    )
+    local_paths = RegistrationArtifactPaths.for_round(
+        local.registration_directory,
+        local.round,
+    )
+    sequential_affine = backend.read_affine(sequential_paths.affine)
+    local_affine = backend.read_affine(local_paths.affine)
+    np.testing.assert_allclose(
+        sequential_affine.parameters,
+        local_affine.parameters,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+    def warp_values(path: Path) -> object:
+        warp = backend.read_warp(path)
+        values = np.asarray(backend.to_array(warp))
+        assert np.isfinite(values).all()
+        return values
+
+    np.testing.assert_allclose(
+        warp_values(sequential_paths.warp),
+        warp_values(local_paths.warp),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    assert sequential.chunk_size_zyx is not None
+    assert sequential.overlap_fraction is not None
+    chunks = compute_chunk_grid(
+        _SHAPE,
+        sequential.chunk_size_zyx,
+        sequential.overlap_fraction,
+    )
+    assert len(chunks) >= 2
+    for chunk in chunks:
+        sequential_root = sequential_paths.output / f"round_{sequential.round}_chunks"
+        local_root = local_paths.output / f"round_{local.round}_chunks"
+        sequential_warp = sequential_root / f"chunk_{chunk.chunk_id:04d}_warp.nii.gz"
+        local_warp = local_root / f"chunk_{chunk.chunk_id:04d}_warp.nii.gz"
+        np.testing.assert_allclose(
+            warp_values(sequential_warp),
+            warp_values(local_warp),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        sequential_core = np.load(
+            sequential_root / f"chunk_{chunk.chunk_id:04d}_registered_core.npy",
+            allow_pickle=False,
+        )
+        local_core = np.load(
+            local_root / f"chunk_{chunk.chunk_id:04d}_registered_core.npy",
+            allow_pickle=False,
+        )
+        np.testing.assert_allclose(
+            sequential_core,
+            local_core,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+    sequential_prepared = PreparedRoundPaths.for_round(
+        sequential_paths.output,
+        sequential.round,
+    )
+    local_prepared = PreparedRoundPaths.for_round(
+        local_paths.output,
+        local.round,
+    )
+    for sequential_array, local_array in zip(
+        sequential_prepared.array_paths,
+        local_prepared.array_paths,
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.load(sequential_array, allow_pickle=False),
+            np.load(local_array, allow_pickle=False),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+    for sequential_metric, local_metric in (
+        (sequential_paths.pre_metrics, local_paths.pre_metrics),
+        (sequential_paths.linear_metrics, local_paths.linear_metrics),
+        (sequential_paths.nonlinear_metrics, local_paths.nonlinear_metrics),
+    ):
+        sequential_values = read_metrics(sequential_metric)
+        local_values = read_metrics(local_metric)
+        assert set(sequential_values) == set(local_values)
+        np.testing.assert_allclose(
+            tuple(sequential_values.values()),
+            tuple(local_values.values()),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+
 def _artifact_and_record_identities(
     plan: WorkflowPlan,
 ) -> tuple[tuple[FileIdentity, FileIdentity], ...]:
@@ -524,6 +633,7 @@ def test_fine_executors_match_real_outputs_and_local_dask_reuses(
         strict=True,
     ):
         _assert_round_outputs_equivalent(sequential_task, local_task)
+        _assert_chunked_fine_arrays_equivalent(sequential_task, local_task)
 
     identities_before_reuse = _artifact_and_record_identities(local_plan)
     reused = local_executor.execute(local_plan.reference_task, local_plan.tasks)

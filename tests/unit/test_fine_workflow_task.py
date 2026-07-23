@@ -73,7 +73,7 @@ def _round_task(tmp_path: Path, *, strategy: str = "serial_chunked") -> RoundTas
 def _descriptor() -> dict[str, object]:
     identity = {"path": "/tmp/artifact", "st_size": 1, "st_mtime_ns": 2}
     return {
-        "format_version": 1,
+        "format_version": 2,
         "fixed_scalar": identity,
         "moving_linear_scalar": identity,
         "fixed_mask": identity,
@@ -93,6 +93,12 @@ def _descriptor() -> dict[str, object]:
             "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
         ),
         "native_threads": {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 2},
+        "pixeltypes": {
+            "fixed_mask": "float",
+            "fixed_scalar": "float",
+            "moving_linear_mask": "float",
+            "moving_linear_scalar": "float",
+        },
     }
 
 
@@ -671,14 +677,21 @@ def test_chunk_context_reconstructs_only_the_prepared_region(
         direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
     )
     identity = FileIdentity("/tmp/source", 1, 2)
+    pixeltypes = {
+        "fixed_mask": "float",
+        "fixed_scalar": "float",
+        "moving_linear_mask": "float",
+        "moving_linear_scalar": "float",
+    }
     manifest = SimpleNamespace(
         geometry=whole_geometry,
         native_fixed=identity,
         native_moving=identity,
         affine=identity,
+        pixeltypes=pixeltypes,
     )
     array = np.zeros(task.chunk.extended_shape, dtype=np.float32)
-    region = PreparedRegion(array, array, array, array, geometry)
+    region = PreparedRegion(array, array, array, array, geometry, pixeltypes)
     calls: list[ImageGeometry] = []
 
     class Backend:
@@ -688,7 +701,14 @@ def test_chunk_context_reconstructs_only_the_prepared_region(
         def load_image(self, *_args: object) -> object:
             raise AssertionError("chunk workers must not load a full TIFF")
 
-        def from_geometry(self, _array: object, *, geometry: ImageGeometry) -> object:
+        def from_geometry(
+            self,
+            _array: object,
+            *,
+            geometry: ImageGeometry,
+            pixeltype: str | None = None,
+        ) -> object:
+            assert pixeltype == "float"
             calls.append(geometry)
             return SimpleNamespace(geometry=geometry)
 
@@ -752,7 +772,7 @@ def test_prepared_bundle_is_bound_to_exact_round_and_runtime(
         FileIdentity.from_path(path) for path in prepared.array_paths
     )
     manifest = PreparedManifest(
-        format_version=1,
+        format_version=2,
         fixed_scalar=array_identities[0],
         moving_linear_scalar=array_identities[1],
         fixed_mask=array_identities[2],
@@ -765,6 +785,12 @@ def test_prepared_bundle_is_bound_to_exact_round_and_runtime(
         scalar_policy=PREPARED_SCALAR_POLICY,
         mask_policy=PREPARED_MASK_POLICY,
         native_threads=dict(sorted(actual_threads.items())),
+        pixeltypes={
+            "fixed_mask": "float",
+            "fixed_scalar": "float",
+            "moving_linear_mask": "float",
+            "moving_linear_scalar": "float",
+        },
     )
     prepared.manifest.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
     store = ArtifactStore()
@@ -794,10 +820,11 @@ def test_prepared_bundle_is_bound_to_exact_round_and_runtime(
             upstream=affine,
             parameters={
                 **common,
-                "format_version": 1,
+                "format_version": 2,
                 "prepared_role": role,
                 "scalar_policy": PREPARED_SCALAR_POLICY,
                 "mask_policy": PREPARED_MASK_POLICY,
+                "ants_pixeltype": "float",
             },
         )
         store.record_path(path).write_text(
@@ -812,9 +839,10 @@ def test_prepared_bundle_is_bound_to_exact_round_and_runtime(
         native_threads=actual_threads,
         upstream=affine,
         parameters={
-            "format_version": 1,
+            "format_version": 2,
             "scalar_policy": PREPARED_SCALAR_POLICY,
             "mask_policy": PREPARED_MASK_POLICY,
+            "pixeltypes": manifest.pixeltypes,
         },
     )
     store.record_path(prepared.manifest).write_text(

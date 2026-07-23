@@ -33,3 +33,6 @@
 - Executor tests must make the reference barrier observable: reference submission
   precedes moving submissions, failure prevents descendant submission, and one owned
   client/cluster lifecycle spans both stages.
+- Prepared-manifest tests must fail closed on missing, extra, unsupported, or
+  request-mismatched ANTs pixel types for every fixed scalar, moving scalar, and mask
+  role; fake floating images must not imply that integer fixed grids are equivalent.

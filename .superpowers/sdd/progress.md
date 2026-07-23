@@ -61,6 +61,12 @@ Tasks:
   parity plus authoritative requests and exact only-missing restart status/identity
   across the full accepted chain; full gates: 2,266 unit, 61 integration,
   repository Ruff/BasedPyright/pre-commit clean.
-- Task 11: pending
-- Task 12: pending
+- Task 11: independently approved after remediation. Explicit coarse/fine examples
+  parse through production loaders; exact log, prepared-pixeltype, graph, artifact,
+  restart, historical coarse acceptance, and pending fine-SLURM boundaries are
+  enforced in user docs and every owning AGENTS layer. Remediation focused policy:
+  123 passed; full portable unit: 2,272 passed; integration: 61 passed; strict HTML
+  docs build/routes, Ruff, format, BasedPyright, full pre-commit, and diff checks
+  clean.
+- Task 12: portable gates and whole-range review in progress
 - Task 13: pending

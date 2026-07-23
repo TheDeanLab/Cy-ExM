@@ -97,19 +97,30 @@ class SequentialExecutor:
 
     def _record_fine_evidence(
         self,
-        controller: FineGraphController,
+        reference_result: RoundResult | None,
+        controller: FineGraphController | None,
         attempts: list[tuple[str, int]],
         *,
         cancelled: bool,
+        pre_controller_terminal: tuple[str, str, str, str] | None = None,
     ) -> None:
         self._execution_evidence = _FineExecutionEvidence(
             executor="sequential",
             worker_cap=1,
-            tasks=controller.tasks,
-            task_graph=controller.graph_description,
-            task_results=controller.task_results,
+            reference_result=reference_result,
+            round_results=(
+                () if controller is None else controller._settled_round_results()
+            ),
+            pre_controller_terminal=pre_controller_terminal,
+            tasks=() if controller is None else controller.tasks,
+            task_graph=() if controller is None else controller.graph_description,
+            task_results=() if controller is None else controller.task_results,
             attempt_counts=tuple(attempts),
-            blocked_descendants=tuple(key.encoded for key in controller.blocked_keys),
+            blocked_descendants=(
+                ()
+                if controller is None
+                else tuple(key.encoded for key in controller.blocked_keys)
+            ),
             cancelled=cancelled,
             cleanup=(),
         )
@@ -183,7 +194,9 @@ class SequentialExecutor:
         return result
 
     def _execute_fine_tasks(
-        self, round_tasks: tuple[RoundTask, ...]
+        self,
+        reference_result: RoundResult,
+        round_tasks: tuple[RoundTask, ...],
     ) -> tuple[RoundResult, ...]:
         controller = FineGraphController(round_tasks)
         attempts: list[tuple[str, int]] = []
@@ -199,6 +212,7 @@ class SequentialExecutor:
                 result = self._run_fine(task)
             except KeyboardInterrupt as error:
                 self._record_fine_evidence(
+                    reference_result,
                     controller,
                     attempts,
                     cancelled=True,
@@ -209,7 +223,12 @@ class SequentialExecutor:
                     controller.task_results,
                 ) from error
             controller.record(task, result)
-        self._record_fine_evidence(controller, attempts, cancelled=False)
+        self._record_fine_evidence(
+            reference_result,
+            controller,
+            attempts,
+            cancelled=False,
+        )
         return controller.round_results()
 
     def execute(
@@ -218,14 +237,59 @@ class SequentialExecutor:
         round_tasks: tuple[RoundTask, ...],
     ) -> tuple[RoundResult, ...]:
         self._execution_evidence = None
-        reference_results = self._execute_tasks((reference_task,))
+        try:
+            reference_results = self._execute_tasks((reference_task,))
+        except _SequentialExecutionInterrupted as error:
+            if self._profile.parallelism.mode == "fine_grained":
+                self._record_fine_evidence(
+                    None,
+                    None,
+                    [],
+                    cancelled=True,
+                    pre_controller_terminal=(
+                        "reference",
+                        "cancelled",
+                        type(error.original).__name__,
+                        str(error.original),
+                    ),
+                )
+            raise
         if reference_results[0].status not in {"completed", "reused"}:
+            if self._profile.parallelism.mode == "fine_grained":
+                reference_result = reference_results[0]
+                failure = reference_result.failure
+                self._record_fine_evidence(
+                    reference_result,
+                    None,
+                    [],
+                    cancelled=False,
+                    pre_controller_terminal=(
+                        "reference",
+                        reference_result.status,
+                        "" if failure is None else failure.exception_type,
+                        "" if failure is None else failure.message,
+                    ),
+                )
+            return reference_results
+        if self._profile.parallelism.mode == "fine_grained" and not round_tasks:
+            self._record_fine_evidence(
+                reference_results[0],
+                None,
+                [],
+                cancelled=False,
+                pre_controller_terminal=(
+                    "moving",
+                    "reused",
+                    "",
+                    "all submitted moving rounds were already complete",
+                ),
+            )
             return reference_results
         try:
             moving_results = (
                 self._execute_tasks(round_tasks)
                 if self._profile.parallelism.mode == "coarse"
-                else self._execute_fine_tasks(round_tasks)
+                else self._execute_fine_tasks(reference_results[0], round_tasks)
             )
         except _SequentialExecutionInterrupted as error:
             raise _SequentialExecutionInterrupted(
@@ -233,6 +297,28 @@ class SequentialExecutor:
                 (*reference_results, *error.completed_results),
                 error.fine_task_results,
             ) from error
+        except KeyboardInterrupt as error:
+            if (
+                self._profile.parallelism.mode == "fine_grained"
+                and self._execution_evidence is None
+            ):
+                self._record_fine_evidence(
+                    reference_results[0],
+                    None,
+                    [],
+                    cancelled=True,
+                    pre_controller_terminal=(
+                        "moving",
+                        "cancelled",
+                        type(error).__name__,
+                        str(error),
+                    ),
+                )
+                raise _SequentialExecutionInterrupted(
+                    error,
+                    reference_results,
+                ) from error
+            raise
         return (*reference_results, *moving_results)
 
 

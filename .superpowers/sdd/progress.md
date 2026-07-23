@@ -35,12 +35,15 @@ Tasks:
   placement admission history in `e9df695`; portable unit/integration and HPC
   collect-only gates clean; final malformed raw-candidate versus validated-worker
   identity remediation committed in `437f37d`
-- Task 9: implemented and locally verified from `437f37d`; public coarse/fine
-  orchestration, mode-aware authoritative logs, strict scheduler-neutral fine
-  evidence, summary/task cross-validation, cancellation/cleanup persistence,
-  cache-direction reuse, status authority, API documentation, and AGENTS guidance
-  complete; 2,238 portable unit and 58 portable integration tests pass, with
-  repository policy gates clean; pending independent review
+- Task 9: implemented from `437f37d` in `c7acb1a`; independent review found
+  pre-controller, full-summary, cancellation-order, SLURM-v2, YAML-identity, and
+  genuine ArtifactStore reuse gaps. All findings are remediated locally with one
+  canonical Task 6 aggregator, exact reference/terminal-summary evidence,
+  production Sequential/Local-Dask/SLURM empty-graph causes, pre-serialization
+  partial-summary validation, SLURM granular/placement binding, YAML-built
+  identity, and canonical fine-to-coarse local-warp reuse. Full gates: 2,258 unit,
+  58 integration, repository Ruff/BasedPyright/pre-commit clean; final remediation
+  re-review approved; commit pending.
 - Task 10: pending
 - Task 11: pending
 - Task 12: pending

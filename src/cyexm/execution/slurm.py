@@ -729,6 +729,9 @@ def _canonical_execution_evidence(
     *,
     expected_tasks: tuple[WorkflowTask, ...],
     task_retries: int,
+    expected_results: tuple[RoundResult, ...] = (),
+    fine_task_results: tuple[FineTaskResult, ...] = (),
+    expected_interruption: tuple[str, str] | None = None,
 ) -> str:
     """Validate and detach Task 2 evidence against the submitted work context."""
     if type(expected_tasks) is not tuple:
@@ -849,6 +852,163 @@ def _canonical_execution_evidence(
                 for index, raw in enumerate(raw_probes)
             ),
         )
+        fine_graph = cast(Mapping[str, object], evidence["fine_graph"])
+        terminal = fine_graph["pre_controller_terminal"]
+        interruption_cause = fine_graph["interruption"]
+        if (expected_interruption is None) != (interruption_cause is None):
+            raise ValueError(
+                "fine SLURM cancellation must match the caught interruption"
+            )
+        if (
+            isinstance(interruption_cause, Mapping)
+            and (
+                interruption_cause.get("exception_type"),
+                interruption_cause.get("message"),
+            )
+            != expected_interruption
+        ):
+            raise ValueError(
+                "fine SLURM caught interruption cause is not authoritative"
+            )
+        reference_results = tuple(
+            result
+            for result in expected_results
+            if result.round == expected_tasks[0].round
+        )
+        if isinstance(terminal, Mapping):
+            phase = terminal.get("phase")
+            if phase == "reference":
+                if len(reference_results) > 1 or (
+                    reference_results
+                    and terminal.get("status") != reference_results[0].status
+                ):
+                    raise ValueError(
+                        "fine SLURM reference terminal contradicts public result"
+                    )
+                if reference_results and reference_results[0].failure is not None:
+                    failure = reference_results[0].failure
+                    if (
+                        terminal.get("exception_type"),
+                        terminal.get("message"),
+                    ) != (failure.exception_type, failure.message):
+                        raise ValueError(
+                            "fine SLURM reference terminal cause is not authoritative"
+                        )
+            elif phase == "moving":
+                has_moving = any(type(task) is RoundTask for task in expected_tasks)
+                reused_terminal = terminal.get("status") == "reused" and not has_moving
+                cancelled_terminal = (
+                    terminal.get("status") == "cancelled" and has_moving
+                )
+                if (
+                    reference_results == ()
+                    or reference_results[0].status not in {"completed", "reused"}
+                    or (not reused_terminal and not cancelled_terminal)
+                ):
+                    raise ValueError(
+                        "fine SLURM moving terminal contradicts submitted work"
+                    )
+            if (
+                terminal.get("status") == "cancelled"
+                and (
+                    terminal.get("exception_type"),
+                    terminal.get("message"),
+                )
+                != expected_interruption
+            ):
+                raise ValueError("fine SLURM cancellation cause is not authoritative")
+        expected_rounds = {
+            task.round: task for task in expected_tasks if type(task) is RoundTask
+        }
+        public_moving = tuple(
+            result for result in expected_results if result.round in expected_rounds
+        )
+        if type(fine_task_results) is not tuple or any(
+            type(result) is not FineTaskResult for result in fine_task_results
+        ):
+            raise TypeError("fine_task_results must be exact FineTaskResult values")
+        if public_moving or fine_task_results:
+            from cyexm.execution.dispatcher import _summarize_fine_round
+            from cyexm.workflow._execution_validation import (
+                _validate_fine_task_result,
+            )
+
+            derived = tuple(
+                _summarize_fine_round(
+                    expected_rounds[summary.round],
+                    tuple(
+                        result
+                        for result in fine_task_results
+                        if result.round == summary.round
+                    ),
+                )
+                for summary in public_moving
+            )
+            if derived != public_moving:
+                raise ValueError(
+                    "fine SLURM public summaries must exactly equal canonical "
+                    "granular aggregation"
+                )
+            placements = cast(
+                list[object],
+                cast(Mapping[str, object], evidence["fine_graph"])["placements"],
+            )
+            final_placements = {
+                cast(str, item["task_key"]): item
+                for raw in placements
+                if isinstance(raw, Mapping)
+                for item in [cast(Mapping[str, object], raw)]
+            }
+            result_keys = tuple(result.key.encoded for result in fine_task_results)
+            if result_keys != tuple(final_placements):
+                raise ValueError(
+                    "fine SLURM granular results must uniquely and canonically "
+                    "cover final placements"
+                )
+            graph_dependencies = {
+                cast(str, item["key"]): tuple(cast(list[str], item["dependencies"]))
+                for raw in cast(
+                    list[object],
+                    cast(Mapping[str, object], evidence["fine_graph"])["task_graph"],
+                )
+                if isinstance(raw, Mapping)
+                for item in [cast(Mapping[str, object], raw)]
+            }
+            for result in fine_task_results:
+                _validate_fine_task_result(result.task, result)
+                if result.task.round_task != expected_rounds.get(result.round) or tuple(
+                    dependency.encoded for dependency in result.task.dependencies
+                ) != graph_dependencies.get(result.key.encoded):
+                    raise ValueError(
+                        "fine SLURM granular result is not bound to the exact "
+                        "submitted task graph"
+                    )
+                placement = final_placements.get(result.key.encoded)
+                if placement is None:
+                    raise ValueError(
+                        "fine SLURM granular result lacks placement evidence"
+                    )
+                raw = result.to_dict()
+                for field in (
+                    "status",
+                    "dask_task_key",
+                    "started_at",
+                    "ended_at",
+                    "duration_seconds",
+                    "hostname",
+                    "pid",
+                    "slurm_job_id",
+                    "native_threads",
+                    "artifact_paths",
+                    "reused_artifacts",
+                    "log_path",
+                    "failure",
+                ):
+                    if placement[field] != raw[field]:
+                        raise ValueError(
+                            "fine SLURM granular result contradicts terminal "
+                            f"placement field {field}"
+                        )
     return canonical_json(copy.deepcopy(evidence))
 
 
@@ -1309,11 +1469,28 @@ class SlurmExecutor:
         self._execution_evidence: dict[str, object] = {}
         self._fine_task_results: tuple[FineTaskResult, ...] = ()
         self._fine_attempt_counts: tuple[tuple[str, int], ...] = ()
+        self._fine_reference_result: RoundResult | None = None
+        self._fine_round_results: tuple[RoundResult, ...] = ()
 
     @property
     def execution_evidence(self) -> Mapping[str, object]:
         """Return a detached JSON-compatible copy of observed execution evidence."""
         return copy.deepcopy(self._execution_evidence)
+
+    @property
+    def fine_task_results(self) -> tuple[FineTaskResult, ...]:
+        """Return exact settled granular results for public-summary validation."""
+        return self._fine_task_results
+
+    @property
+    def fine_reference_result(self) -> RoundResult | None:
+        """Return the exact settled reference result, when one exists."""
+        return self._fine_reference_result
+
+    @property
+    def fine_round_results(self) -> tuple[RoundResult, ...]:
+        """Return exact terminal moving summaries retained by the controller."""
+        return self._fine_round_results
 
     def _spec(self) -> SlurmSpec:
         if self.profile.executor != "slurm":
@@ -1485,6 +1662,8 @@ class SlurmExecutor:
         controller: FineGraphController | None = None
         self._fine_task_results = ()
         self._fine_attempt_counts = ()
+        self._fine_reference_result = None
+        self._fine_round_results = ()
 
         try:
             try:
@@ -1685,6 +1864,8 @@ class SlurmExecutor:
                 active=active,
                 attempts=reference_attempts,
             )
+            if fine_mode:
+                self._fine_reference_result = reference_results[0]
             if reference_results[0].status not in {"completed", "reused"}:
                 if fine_state is not None:
                     reference_result = reference_results[0]
@@ -1699,6 +1880,13 @@ class SlurmExecutor:
                     )
                 return reference_results
             if not round_tasks:
+                if fine_state is not None:
+                    fine_state.pre_controller_terminal = PreControllerTerminal(
+                        phase="moving",
+                        status="reused",
+                        exception_type="",
+                        message="all submitted moving rounds were already complete",
+                    )
                 return reference_results
             if fine_mode:
                 assert fine_state is not None
@@ -1879,6 +2067,12 @@ class SlurmExecutor:
                             hostname=None if raw is None else raw.hostname,
                             pid=None if raw is None else raw.pid,
                             slurm_job_id=None if raw is None else raw.slurm_job_id,
+                            native_threads=observation.settled_result.native_threads,
+                            artifact_paths=observation.settled_result.artifact_paths,
+                            reused_artifacts=(
+                                observation.settled_result.reused_artifacts
+                            ),
+                            log_path=observation.settled_result.log_path,
                             placement_accepted=placement_accepted,
                             rejection_reason=observation.rejection_reason,
                             failure=observation.settled_result.failure,
@@ -1901,6 +2095,7 @@ class SlurmExecutor:
                 )
                 self._fine_task_results = task_results
                 self._fine_attempt_counts = attempts
+                self._fine_round_results = moving_results
                 fine_state.finalize_graph(
                     controller,
                     attempts,
@@ -1947,21 +2142,43 @@ class SlurmExecutor:
                 fine_state is not None
                 and controller is None
                 and fine_state.pre_controller_terminal is None
-                and startup["outcome"] in {"failed", "interrupted"}
             ):
-                fine_state.pre_controller_terminal = PreControllerTerminal(
-                    phase="startup",
-                    status=(
-                        "cancelled"
-                        if isinstance(error, KeyboardInterrupt)
-                        else "failed"
-                    ),
-                    exception_type=type(error).__name__,
-                    message=str(error),
-                )
+                if (
+                    isinstance(error, KeyboardInterrupt)
+                    and self._fine_reference_result is not None
+                    and self._fine_reference_result.status in {"completed", "reused"}
+                ):
+                    fine_state.pre_controller_terminal = PreControllerTerminal(
+                        phase="moving",
+                        status="cancelled",
+                        exception_type=type(error).__name__,
+                        message=str(error),
+                    )
+                elif (
+                    isinstance(error, KeyboardInterrupt)
+                    and startup["outcome"] == "succeeded"
+                ):
+                    fine_state.pre_controller_terminal = PreControllerTerminal(
+                        phase="reference",
+                        status="cancelled",
+                        exception_type=type(error).__name__,
+                        message=str(error),
+                    )
+                elif startup["outcome"] in {"failed", "interrupted"}:
+                    fine_state.pre_controller_terminal = PreControllerTerminal(
+                        phase="startup",
+                        status=(
+                            "cancelled"
+                            if isinstance(error, KeyboardInterrupt)
+                            else "failed"
+                        ),
+                        exception_type=type(error).__name__,
+                        message=str(error),
+                    )
             if isinstance(error, KeyboardInterrupt):
                 if fine_state is not None:
                     fine_state.cancelled = True
+                    fine_state.interruption = (type(error).__name__, str(error))
                 unfinished: tuple[Any, ...] = ()
                 if client is not None:
                     unfinished = tuple(
@@ -1996,6 +2213,8 @@ class SlurmExecutor:
             )
             if fine_state is not None:
                 if controller is not None:
+                    self._fine_task_results = controller.task_results
+                    self._fine_round_results = controller._settled_round_results()
                     fine_state.finalize_graph(
                         controller,
                         self._fine_attempt_counts,

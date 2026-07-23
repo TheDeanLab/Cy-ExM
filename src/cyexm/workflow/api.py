@@ -36,10 +36,12 @@ from cyexm.registration.artifacts import ArtifactStore, FileIdentity
 from cyexm.workflow._execution_validation import (
     _canonical_fine_execution_evidence,
     _canonical_path,
+    _FineExecutionEvidence,
     _validate_round_result,
     _validate_round_result_structure,
     _validate_round_task_structure,
 )
+from cyexm.workflow.fine_models import FineTaskResult
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
     ReferenceChannelTask,
@@ -785,6 +787,7 @@ def _executor_execution_evidence_json(
     executor: object | None,
     expected_tasks: tuple[WorkflowTask, ...],
     expected_results: tuple[RoundResult, ...] = (),
+    interruption: KeyboardInterrupt | None = None,
 ) -> str:
     if executor is None:
         return "{}"
@@ -804,12 +807,18 @@ def _executor_execution_evidence_json(
             return _canonical_fine_execution_evidence(
                 evidence,
                 expected_executor=profile.executor,
+                expected_reference_task=cast(ReferenceTask, expected_tasks[0]),
                 expected_round_tasks=tuple(
                     task for task in expected_tasks if type(task) is RoundTask
                 ),
                 expected_round_results=expected_results,
                 expected_worker_cap=worker_cap,
                 task_retries=task_retries,
+                expected_interruption=(
+                    None
+                    if interruption is None
+                    else (type(interruption).__name__, str(interruption))
+                ),
             )
         if profile.executor != "slurm":
             return "{}"
@@ -822,6 +831,16 @@ def _executor_execution_evidence_json(
             evidence,
             expected_tasks=expected_tasks,
             task_retries=profile.slurm.task_retries,
+            expected_results=expected_results,
+            fine_task_results=cast(
+                tuple[FineTaskResult, ...],
+                getattr(executor, "fine_task_results", ()),
+            ),
+            expected_interruption=(
+                None
+                if interruption is None
+                else (type(interruption).__name__, str(interruption))
+            ),
         )
     except KeyboardInterrupt:
         raise
@@ -1084,42 +1103,95 @@ def run_workflow(
             raise
         raise active_error from startup_error
     except KeyboardInterrupt as interruption:
-        evidence_error = None
-        try:
-            execution_evidence_json = _executor_execution_evidence_json(
-                plan.execution,
-                executor,
-                (reference_task, *submitted),
-            )
-        except BaseException as evidence_access_error:
-            evidence_error = (
-                evidence_access_error
-                if isinstance(evidence_access_error, _ExecutorEvidenceError)
-                else _ExecutorEvidenceError(
-                    evidence_access_error,
-                    executor=plan.execution.executor,
-                )
-            )
-            evidence_label = "SLURM " if plan.execution.executor == "slurm" else ""
-            _LOGGER.error(
-                "invalid %sexecution evidence during cancellation: %s",
-                evidence_label,
-                evidence_error,
-            )
         original_interruption = interruption
+        partial_results: tuple[RoundResult, ...] = ()
+        partial_evidence_error: _ExecutorEvidenceError | None = None
         if isinstance(interruption, _SequentialExecutionInterrupted):
             partial_results = _validated_partial_results(
                 (reference_task, *submitted),
                 interruption.completed_results,
                 fine_mode=plan.execution.parallelism.mode == "fine_grained",
             )
-            preserved_results = tuple(
-                sorted(
-                    (*preserved_results, *partial_results),
-                    key=lambda result: result.round,
-                )
-            )
             original_interruption = interruption.original
+        elif (
+            plan.execution.parallelism.mode == "fine_grained"
+            and plan.execution.executor in {"local_dask", "slurm"}
+            and executor is not None
+        ):
+            try:
+                raw_evidence = (
+                    cast(_ExecutionEvidenceOwner, executor).execution_evidence
+                    if plan.execution.executor == "local_dask"
+                    else None
+                )
+                if type(raw_evidence) is _FineExecutionEvidence:
+                    partial_results = _validated_partial_results(
+                        (reference_task, *submitted),
+                        (
+                            *(
+                                ()
+                                if raw_evidence.reference_result is None
+                                else (raw_evidence.reference_result,)
+                            ),
+                            *raw_evidence.round_results,
+                        ),
+                        fine_mode=True,
+                    )
+                elif plan.execution.executor == "slurm":
+                    reference_result = getattr(
+                        executor,
+                        "fine_reference_result",
+                        None,
+                    )
+                    partial_results = _validated_partial_results(
+                        (reference_task, *submitted),
+                        (
+                            *(() if reference_result is None else (reference_result,)),
+                            *cast(
+                                tuple[RoundResult, ...],
+                                getattr(executor, "fine_round_results", ()),
+                            ),
+                        ),
+                        fine_mode=True,
+                    )
+            except BaseException as evidence_access_error:
+                partial_evidence_error = _ExecutorEvidenceError(
+                    evidence_access_error,
+                    executor=plan.execution.executor,
+                )
+        preserved_by_round = {
+            result.round: result for result in (*preserved_results, *partial_results)
+        }
+        preserved_results = tuple(
+            preserved_by_round[round_number]
+            for round_number in sorted(preserved_by_round)
+        )
+        evidence_error = partial_evidence_error
+        if evidence_error is None:
+            try:
+                execution_evidence_json = _executor_execution_evidence_json(
+                    plan.execution,
+                    executor,
+                    (reference_task, *submitted),
+                    partial_results,
+                    original_interruption,
+                )
+            except BaseException as evidence_access_error:
+                evidence_error = (
+                    evidence_access_error
+                    if isinstance(evidence_access_error, _ExecutorEvidenceError)
+                    else _ExecutorEvidenceError(
+                        evidence_access_error,
+                        executor=plan.execution.executor,
+                    )
+                )
+        if evidence_error is not None:
+            evidence_label = "SLURM " if plan.execution.executor == "slurm" else ""
+            _LOGGER.error(
+                "invalid %sexecution evidence during cancellation: %s",
+                evidence_label,
+                evidence_error,
+            )
         cancelled = WorkflowResult(
             dataset_id=plan.dataset_id,
             scientific_fingerprint=plan.scientific_fingerprint,

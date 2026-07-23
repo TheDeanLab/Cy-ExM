@@ -1334,6 +1334,10 @@ def test_fine_slurm_cancellation_during_scale_closes_owned_lifecycle(
         executor.execution_evidence,
         expected_tasks=(reference, *tasks),
         task_retries=0,
+        expected_interruption=(
+            "KeyboardInterrupt",
+            "injected scale cancellation",
+        ),
     )
     assert (
         cast(dict[str, object], json.loads(encoded)["fine_graph"])["cancelled"] is True
@@ -2710,7 +2714,193 @@ def test_fine_slurm_reference_failure_has_canonical_pre_controller_evidence(
         executor.execution_evidence,
         expected_tasks=(reference, task),
         task_retries=0,
+        expected_results=results,
+        fine_task_results=executor.fine_task_results,
     )
+
+
+def test_fine_slurm_all_reused_has_canonical_pre_controller_evidence(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+
+    results = executor.execute(reference, ())
+    evidence = executor.execution_evidence
+
+    fine_graph = cast(dict[str, object], evidence["fine_graph"])
+    assert fine_graph["task_graph"] == []
+    assert fine_graph["pre_controller_terminal"] == {
+        "phase": "moving",
+        "status": "reused",
+        "exception_type": "",
+        "message": "all submitted moving rounds were already complete",
+    }
+    slurm_module._canonical_execution_evidence(
+        evidence,
+        expected_tasks=(reference,),
+        task_retries=0,
+        expected_results=results,
+        fine_task_results=executor.fine_task_results,
+    )
+
+
+def test_fine_slurm_rejects_forged_public_summary_aggregation(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    results = executor.execute(reference, (task,))
+    forged = (
+        results[0],
+        replace(results[1], duration_seconds=results[1].duration_seconds + 99.0),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"public summaries.*canonical granular aggregation",
+    ):
+        slurm_module._canonical_execution_evidence(
+            executor.execution_evidence,
+            expected_tasks=(reference, task),
+            task_retries=0,
+            expected_results=forged,
+            fine_task_results=executor.fine_task_results,
+        )
+
+
+def test_fine_slurm_cancellation_binds_settled_sibling_to_live_granular_results(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.order = (2, 3)
+    modules.interrupt_after = 5
+    modules.pending_rounds = {3}
+    reference = _reference_task(tmp_path)
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    executor = _executor(tmp_path, modules, workers=2, mode="fine_grained")
+
+    with pytest.raises(KeyboardInterrupt, match="collection interruption") as caught:
+        executor.execute(reference, tasks)
+
+    assert tuple(result.round for result in executor.fine_round_results) == (2,)
+    assert {result.round for result in executor.fine_task_results} == {2, 3}
+    encoded = slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, *tasks),
+        task_retries=0,
+        expected_results=(
+            executor.fine_reference_result,
+            *executor.fine_round_results,
+        ),  # type: ignore[arg-type]
+        fine_task_results=executor.fine_task_results,
+        expected_interruption=(
+            type(caught.value).__name__,
+            str(caught.value),
+        ),
+    )
+    assert json.loads(encoded)["fine_graph"]["cancelled"] is True
+
+
+def test_fine_slurm_reference_barrier_interruption_has_exact_terminal_cause(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.interrupt_after = 0
+    modules.pending_rounds = {1}
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+
+    with pytest.raises(KeyboardInterrupt, match="collection interruption") as caught:
+        executor.execute(reference, (task,))
+
+    encoded = slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+        expected_interruption=(
+            type(caught.value).__name__,
+            str(caught.value),
+        ),
+    )
+    fine = json.loads(encoded)["fine_graph"]
+    assert fine["pre_controller_terminal"] == {
+        "phase": "reference",
+        "status": "cancelled",
+        "exception_type": "KeyboardInterrupt",
+        "message": "injected collection interruption",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda result: replace(result, hostname="forged-host"),
+        lambda result: replace(
+            result,
+            reused_artifacts=result.artifact_paths,
+        ),
+    ),
+    ids=("representative-host", "reuse-provenance"),
+)
+def test_fine_slurm_rejects_granular_result_forged_beyond_placement(
+    mutation: Callable[[FineTaskResult], FineTaskResult],
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    results = executor.execute(reference, (task,))
+    granular = tuple(
+        mutation(result) if index == 0 else result
+        for index, result in enumerate(executor.fine_task_results)
+    )
+
+    with pytest.raises(
+        (RoundExecutionError, ValueError),
+        match=r"placement|reused|aggregation",
+    ):
+        slurm_module._canonical_execution_evidence(
+            executor.execution_evidence,
+            expected_tasks=(reference, task),
+            task_retries=0,
+            expected_results=results,
+            fine_task_results=granular,
+        )
+
+
+def test_fine_slurm_rejects_duplicate_granular_result_identity(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    results = executor.execute(reference, (task,))
+    duplicated = (
+        executor.fine_task_results[0],
+        *executor.fine_task_results,
+    )
+
+    with pytest.raises(ValueError, match="uniquely and canonically"):
+        slurm_module._canonical_execution_evidence(
+            executor.execution_evidence,
+            expected_tasks=(reference, task),
+            task_retries=0,
+            expected_results=results,
+            fine_task_results=duplicated,
+        )
 
 
 def test_slurm_executor_submission_deserializes_without_worker_importing_hpc(

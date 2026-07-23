@@ -131,6 +131,8 @@ class LocalDaskExecutor:
         self._fine_attempt_counts: tuple[tuple[str, int], ...] = ()
         self._fine_live_attempts: dict[str, int] = {}
         self._fine_controller: FineGraphController | None = None
+        self._fine_reference_result: RoundResult | None = None
+        self._fine_pre_controller_terminal: tuple[str, str, str, str] | None = None
         self._fine_cancelled = False
         self._fine_cleanup: tuple[tuple[str, bool, str | None, str | None], ...] = ()
 
@@ -138,23 +140,32 @@ class LocalDaskExecutor:
     def execution_evidence(self) -> _FineExecutionEvidence:
         """Return detached scheduler-neutral fine graph evidence."""
         controller = self._fine_controller
-        if controller is None:
-            raise RuntimeError("fine execution evidence is not available")
         attempts = self._fine_attempt_counts
         if self._fine_cancelled and not attempts:
             attempts = tuple(
                 (key, self._fine_live_attempts[key])
-                for key, _dependencies in controller.graph_description
+                for key, _dependencies in (
+                    () if controller is None else controller.graph_description
+                )
                 if key in self._fine_live_attempts
             )
         return _FineExecutionEvidence(
             executor="local_dask",
             worker_cap=self._spec().workers,
-            tasks=controller.tasks,
-            task_graph=controller.graph_description,
-            task_results=controller.task_results,
+            reference_result=self._fine_reference_result,
+            round_results=(
+                () if controller is None else controller._settled_round_results()
+            ),
+            pre_controller_terminal=self._fine_pre_controller_terminal,
+            tasks=() if controller is None else controller.tasks,
+            task_graph=() if controller is None else controller.graph_description,
+            task_results=() if controller is None else controller.task_results,
             attempt_counts=attempts,
-            blocked_descendants=tuple(key.encoded for key in controller.blocked_keys),
+            blocked_descendants=(
+                ()
+                if controller is None
+                else tuple(key.encoded for key in controller.blocked_keys)
+            ),
             cancelled=self._fine_cancelled,
             cleanup=self._fine_cleanup,
         )
@@ -191,6 +202,8 @@ class LocalDaskExecutor:
         self._fine_attempt_counts = ()
         self._fine_live_attempts = {}
         self._fine_controller = None
+        self._fine_reference_result = None
+        self._fine_pre_controller_terminal = None
         self._fine_cancelled = False
         self._fine_cleanup = ()
 
@@ -232,9 +245,26 @@ class LocalDaskExecutor:
                 task_retries=spec.task_retries,
                 active=active,
             )
+            if fine_mode:
+                self._fine_reference_result = reference_results[0]
             if reference_results[0].status not in {"completed", "reused"}:
+                if fine_mode:
+                    failure = reference_results[0].failure
+                    self._fine_pre_controller_terminal = (
+                        "reference",
+                        reference_results[0].status,
+                        "" if failure is None else failure.exception_type,
+                        "" if failure is None else failure.message,
+                    )
                 return reference_results
             if not round_tasks:
+                if fine_mode:
+                    self._fine_pre_controller_terminal = (
+                        "moving",
+                        "reused",
+                        "",
+                        "all submitted moving rounds were already complete",
+                    )
                 return reference_results
             if fine_mode:
                 fine_runner = self._fine_runner
@@ -273,8 +303,21 @@ class LocalDaskExecutor:
                     active=active,
                 )
             return (*reference_results, *moving_results)
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as error:
             self._fine_cancelled = fine_mode
+            if fine_mode and self._fine_controller is None:
+                phase = (
+                    "moving"
+                    if self._fine_reference_result is not None
+                    and self._fine_reference_result.status in {"completed", "reused"}
+                    else "reference"
+                )
+                self._fine_pre_controller_terminal = (
+                    phase,
+                    "cancelled",
+                    type(error).__name__,
+                    str(error),
+                )
             if client is not None and active:
                 unfinished = tuple(
                     future

@@ -32,6 +32,7 @@ _GRAPH_KEYS = frozenset(
         "placements",
         "blocked_descendants",
         "cancelled",
+        "interruption",
         "pre_controller_terminal",
     }
 )
@@ -192,6 +193,10 @@ class FinePlacementAttempt:
     hostname: str | None
     pid: int | None
     slurm_job_id: str | None
+    native_threads: tuple[tuple[str, int], ...]
+    artifact_paths: tuple[str, ...]
+    reused_artifacts: tuple[str, ...]
+    log_path: str
     placement_accepted: bool
     rejection_reason: str | None
     failure: RoundFailure | None
@@ -209,6 +214,10 @@ class FinePlacementAttempt:
             "hostname": self.hostname,
             "pid": self.pid,
             "slurm_job_id": self.slurm_job_id,
+            "native_threads": [list(item) for item in self.native_threads],
+            "artifact_paths": list(self.artifact_paths),
+            "reused_artifacts": list(self.reused_artifacts),
+            "log_path": self.log_path,
             "placement_accepted": self.placement_accepted,
             "rejection_reason": self.rejection_reason,
             "failure": None if self.failure is None else self.failure.to_dict(),
@@ -229,6 +238,7 @@ class FineSlurmEvidence:
     probes: dict[str, WorkerProbe] = field(default_factory=dict)
     placement_attempts: list[FinePlacementAttempt] = field(default_factory=list)
     cancelled: bool = False
+    interruption: tuple[str, str] | None = None
     pre_controller_terminal: PreControllerTerminal | None = None
 
     def begin_scale(self, requested: int, started_at: str) -> FineScaleEvent:
@@ -290,6 +300,14 @@ class FineSlurmEvidence:
             ],
             "blocked_descendants": sorted(blocked, key=canonical_fine_task_key),
             "cancelled": self.cancelled,
+            "interruption": (
+                None
+                if self.interruption is None
+                else {
+                    "exception_type": self.interruption[0],
+                    "message": self.interruption[1],
+                }
+            ),
             "pre_controller_terminal": (
                 None
                 if self.pre_controller_terminal is None
@@ -421,15 +439,21 @@ def validate_fine_slurm_evidence(
         )
         phase = _string(terminal["phase"], "pre_controller_terminal.phase")
         status = _string(terminal["status"], "pre_controller_terminal.status")
-        _string(
-            terminal["exception_type"],
-            "pre_controller_terminal.exception_type",
-        )
+        if phase == "moving":
+            if type(terminal["exception_type"]) is not str:
+                raise TypeError(
+                    "pre_controller_terminal.exception_type must be a string"
+                )
+        else:
+            _string(
+                terminal["exception_type"],
+                "pre_controller_terminal.exception_type",
+            )
         if type(terminal["message"]) is not str:
             raise TypeError("pre_controller_terminal.message must be a string")
-        if phase not in {"startup", "reference"}:
+        if phase not in {"startup", "reference", "moving"}:
             raise ValueError("pre_controller_terminal phase is unsupported")
-        if status not in {"failed", "cancelled"}:
+        if status not in {"failed", "cancelled", "reused"}:
             raise ValueError("pre_controller_terminal status is unsupported")
         if phase == "startup" and startup_outcome not in {"failed", "interrupted"}:
             raise ValueError("startup terminal cause contradicts startup outcome")
@@ -439,6 +463,29 @@ def validate_fine_slurm_evidence(
             raise ValueError(
                 "reference terminal cause lacks successful startup/attempt"
             )
+        if phase == "moving":
+            reused_terminal = (
+                status == "reused"
+                and not cancellation_present
+                and not round_tasks
+                and terminal["exception_type"] == ""
+                and bool(terminal["message"])
+            )
+            cancelled_terminal = (
+                status == "cancelled"
+                and cancellation_present
+                and bool(round_tasks)
+                and bool(terminal["exception_type"])
+            )
+            if (
+                startup_outcome != "succeeded"
+                or not reference_attempted
+                or (not reused_terminal and not cancelled_terminal)
+            ):
+                raise ValueError(
+                    "moving terminal cause contradicts reference, pending work, "
+                    "or cancellation"
+                )
     raw_task_graph = _array(graph["task_graph"], "fine_graph.task_graph")
     if not raw_task_graph:
         if terminal is None:
@@ -522,6 +569,10 @@ def validate_fine_slurm_evidence(
                     "hostname",
                     "pid",
                     "slurm_job_id",
+                    "native_threads",
+                    "artifact_paths",
+                    "reused_artifacts",
+                    "log_path",
                     "placement_accepted",
                     "rejection_reason",
                     "failure",
@@ -558,6 +609,27 @@ def validate_fine_slurm_evidence(
             placement["slurm_job_id"],
             f"{location}.slurm_job_id",
         )
+        native_threads = _array(
+            placement["native_threads"],
+            f"{location}.native_threads",
+        )
+        for thread_index, thread in enumerate(native_threads):
+            pair = _array(
+                thread,
+                f"{location}.native_threads[{thread_index}]",
+            )
+            if len(pair) != 2 or type(pair[0]) is not str or type(pair[1]) is not int:
+                raise TypeError("fine placement native_threads is invalid")
+        for result_field in ("artifact_paths", "reused_artifacts"):
+            values = tuple(
+                _string(item, f"{location}.{result_field}[{item_index}]")
+                for item_index, item in enumerate(
+                    _array(placement[result_field], f"{location}.{result_field}")
+                )
+            )
+            if len(values) != len(set(values)):
+                raise ValueError(f"{location}.{result_field} must be unique")
+        _string(placement["log_path"], f"{location}.log_path")
         accepted = placement["placement_accepted"]
         if type(accepted) is not bool:
             raise TypeError(f"{location}.placement_accepted must be an exact boolean")
@@ -638,6 +710,21 @@ def validate_fine_slurm_evidence(
         raise TypeError("fine_graph.cancelled must be an exact boolean")
     if graph["cancelled"] != cancellation_present:
         raise ValueError("fine cancellation contradicts observed cancellation")
+    interruption = graph["interruption"]
+    if interruption is None:
+        if cancellation_present:
+            raise ValueError("fine cancellation requires an exact interruption cause")
+    else:
+        cause = _object(
+            interruption,
+            "fine_graph.interruption",
+            frozenset({"exception_type", "message"}),
+        )
+        _string(cause["exception_type"], "fine_graph.interruption.exception_type")
+        if type(cause["message"]) is not str:
+            raise TypeError("fine_graph.interruption.message must be a string")
+        if not cancellation_present:
+            raise ValueError("fine interruption cause requires cancellation")
 
 
 __all__ = [

@@ -225,6 +225,127 @@ def _parsed_timestamp(value: str, role: str) -> datetime:
     return timestamp
 
 
+def _summarize_fine_round(
+    round_task: RoundTask,
+    actual: tuple[FineTaskResult, ...],
+) -> RoundResult:
+    """Aggregate exact granular results into the canonical public round summary."""
+    if type(round_task) is not RoundTask:
+        raise TypeError("fine round summary requires an exact RoundTask")
+    if type(actual) is not tuple or not actual:
+        raise RuntimeError("fine round summary requires actual task results")
+    if any(
+        type(result) is not FineTaskResult
+        or result.round != round_task.round
+        or result.task.round_task != round_task
+        for result in actual
+    ):
+        raise ValueError(
+            "fine round summary results must bind to the exact authoritative round"
+        )
+    thread_evidence = actual[0].native_threads
+    if any(result.native_threads != thread_evidence for result in actual[1:]):
+        raise ValueError(
+            f"round {round_task.round} has inconsistent native-thread evidence"
+        )
+    intervals = tuple(
+        (
+            _parsed_timestamp(result.started_at, "started_at"),
+            _parsed_timestamp(result.ended_at, "ended_at"),
+            result,
+        )
+        for result in actual
+    )
+    if any(ended < started for started, ended, _result in intervals):
+        raise ValueError("fine task end timestamp precedes its start timestamp")
+    started, started_result = min(
+        ((started, result) for started, _ended, result in intervals),
+        key=lambda item: (item[0], _canonical_key(item[1].key)),
+    )
+    ended, ended_result = max(
+        ((ended, result) for _started, ended, result in intervals),
+        key=lambda item: (item[0], _canonical_key(item[1].key)),
+    )
+    duration = (ended - started).total_seconds()
+    if duration < 0:
+        raise ValueError("fine round end timestamp precedes its start timestamp")
+
+    validation = next(
+        (
+            result
+            for result in actual
+            if type(result.task) is RoundValidationTask and result.status in _SUCCESS
+        ),
+        None,
+    )
+    failed = tuple(result for result in actual if result.status == "failed")
+    cancelled = tuple(result for result in actual if result.status == "cancelled")
+    if failed:
+        representative = min(failed, key=lambda item: _canonical_key(item.key))
+        status: Literal["reused", "completed", "failed", "cancelled"] = "failed"
+        failure = representative.failure
+    elif cancelled:
+        representative = min(cancelled, key=lambda item: _canonical_key(item.key))
+        status = "cancelled"
+        failure = None
+    elif validation is not None:
+        representative = validation
+        failure = None
+        producer_reuse = {
+            path
+            for result in actual
+            if type(result.task) is not RoundValidationTask
+            for path in result.reused_artifacts
+        }
+        status = (
+            "reused"
+            if set(validation.artifact_paths).issubset(producer_reuse)
+            else "completed"
+        )
+    else:
+        raise RuntimeError("terminal successful fine round lacks validation evidence")
+
+    validation_task = RoundValidationTask.create(
+        round_task,
+        dependencies=tuple(
+            FineTaskKey(round_task.round, "channel", f"{index:04d}")
+            for index in range(len(round_task.channels))
+        ),
+    )
+    public_order = tuple(str(path) for path in validation_task.output_paths)
+    reported = {path for result in actual for path in result.artifact_paths}
+    reused_reported = {
+        path
+        for result in actual
+        if type(result.task) is not RoundValidationTask
+        for path in result.reused_artifacts
+    }
+    artifact_paths = (
+        validation.artifact_paths
+        if validation is not None and status in _SUCCESS
+        else tuple(path for path in public_order if path in reported)
+    )
+    reused_artifacts = tuple(path for path in artifact_paths if path in reused_reported)
+    return RoundResult(
+        dataset_id=round_task.dataset_id,
+        round=round_task.round,
+        status=status,
+        started_at=started_result.started_at,
+        ended_at=ended_result.ended_at,
+        duration_seconds=duration,
+        hostname=representative.hostname,
+        pid=representative.pid,
+        dask_task_key=representative.dask_task_key,
+        slurm_job_id=representative.slurm_job_id,
+        strategy=round_task.strategy,
+        native_threads=thread_evidence,
+        artifact_paths=artifact_paths,
+        reused_artifacts=reused_artifacts,
+        log_path=representative.log_path,
+        failure=failure,
+    )
+
+
 class FineGraphController:
     """Admit immutable fine tasks fairly without owning a scheduler.
 
@@ -428,114 +549,7 @@ class FineGraphController:
         actual = tuple(
             result for result in self.task_results if result.round == round_number
         )
-        if not actual:
-            raise RuntimeError("terminal fine graph round has no actual task results")
-        thread_evidence = actual[0].native_threads
-        if any(result.native_threads != thread_evidence for result in actual[1:]):
-            raise ValueError(
-                f"round {round_number} has inconsistent native-thread evidence"
-            )
-        intervals = tuple(
-            (
-                _parsed_timestamp(result.started_at, "started_at"),
-                _parsed_timestamp(result.ended_at, "ended_at"),
-                result,
-            )
-            for result in actual
-        )
-        if any(ended < started for started, ended, _result in intervals):
-            raise ValueError("fine task end timestamp precedes its start timestamp")
-        started, started_result = min(
-            ((started, result) for started, _ended, result in intervals),
-            key=lambda item: (item[0], _canonical_key(item[1].key)),
-        )
-        ended, ended_result = max(
-            ((ended, result) for _started, ended, result in intervals),
-            key=lambda item: (item[0], _canonical_key(item[1].key)),
-        )
-        duration = (ended - started).total_seconds()
-        if duration < 0:
-            raise ValueError("fine round end timestamp precedes its start timestamp")
-
-        validation = next(
-            (
-                result
-                for result in actual
-                if type(result.task) is RoundValidationTask
-                and result.status in _SUCCESS
-            ),
-            None,
-        )
-        failed = tuple(result for result in actual if result.status == "failed")
-        cancelled = tuple(result for result in actual if result.status == "cancelled")
-        if failed:
-            representative = min(failed, key=lambda item: _canonical_key(item.key))
-            status: Literal["reused", "completed", "failed", "cancelled"] = "failed"
-            failure = representative.failure
-        elif cancelled:
-            representative = min(cancelled, key=lambda item: _canonical_key(item.key))
-            status = "cancelled"
-            failure = None
-        elif validation is not None:
-            representative = validation
-            failure = None
-            producer_reuse = {
-                path
-                for result in actual
-                if type(result.task) is not RoundValidationTask
-                for path in result.reused_artifacts
-            }
-            status = (
-                "reused"
-                if set(validation.artifact_paths).issubset(producer_reuse)
-                else "completed"
-            )
-        else:
-            raise RuntimeError(
-                "terminal successful fine round lacks validation evidence"
-            )
-
-        validation_task = RoundValidationTask.create(
-            round_task,
-            dependencies=tuple(
-                FineTaskKey(round_number, "channel", f"{index:04d}")
-                for index in range(len(round_task.channels))
-            ),
-        )
-        public_order = tuple(str(path) for path in validation_task.output_paths)
-        reported = {path for result in actual for path in result.artifact_paths}
-        reused_reported = {
-            path
-            for result in actual
-            if type(result.task) is not RoundValidationTask
-            for path in result.reused_artifacts
-        }
-        artifact_paths = (
-            validation.artifact_paths
-            if validation is not None and status in _SUCCESS
-            else tuple(path for path in public_order if path in reported)
-        )
-        reused_artifacts = tuple(
-            path for path in artifact_paths if path in reused_reported
-        )
-        return RoundResult(
-            dataset_id=round_task.dataset_id,
-            round=round_number,
-            status=status,
-            started_at=started_result.started_at,
-            ended_at=ended_result.ended_at,
-            duration_seconds=duration,
-            hostname=representative.hostname,
-            pid=representative.pid,
-            dask_task_key=representative.dask_task_key,
-            slurm_job_id=representative.slurm_job_id,
-            strategy=round_task.strategy,
-            native_threads=thread_evidence,
-            artifact_paths=artifact_paths,
-            reused_artifacts=reused_artifacts,
-            log_path=representative.log_path,
-            failure=failure,
-        )
+        return _summarize_fine_round(round_task, actual)
 
     def _settled_round_results(self) -> tuple[RoundResult, ...]:
         return tuple(

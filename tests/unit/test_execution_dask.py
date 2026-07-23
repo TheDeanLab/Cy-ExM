@@ -1135,6 +1135,29 @@ def test_local_executor_runs_reference_when_no_moving_rounds_are_pending(
     assert loaded is True
 
 
+def test_fine_local_executor_records_all_reused_pre_controller_evidence(
+    tmp_path: Path,
+) -> None:
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: _FakeDistributedModules(),
+    )
+
+    results = executor.execute(_reference_task(tmp_path), ())
+    evidence = executor.execution_evidence
+
+    assert tuple(result.round for result in results) == (1,)
+    assert evidence.reference_result == results[0]
+    assert evidence.round_results == ()
+    assert evidence.tasks == ()
+    assert evidence.pre_controller_terminal == (
+        "moving",
+        "reused",
+        "",
+        "all submitted moving rounds were already complete",
+    )
+
+
 def test_local_executor_collects_independently_but_returns_plan_order(
     tmp_path: Path,
 ) -> None:
@@ -1162,6 +1185,26 @@ def test_local_executor_does_not_submit_moving_rounds_after_reference_failure(
     assert tuple(result.round for result in results) == (1,)
     assert results[0].status == "failed"
     assert [call.task.round for call in modules.submit_calls] == [1]
+
+
+def test_fine_local_reference_failure_has_authoritative_empty_graph_evidence(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    reference = _reference_task(tmp_path)
+    modules.outcomes[1] = [_reference_result(reference, status="failed")]
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
+
+    results = executor.execute(reference, (_task(tmp_path, 2),))
+    evidence = executor.execution_evidence
+
+    assert evidence.reference_result == results[0]
+    assert evidence.tasks == ()
+    assert evidence.pre_controller_terminal is not None
+    assert evidence.pre_controller_terminal[:2] == ("reference", "failed")
 
 
 def test_local_executor_resubmits_failed_results_with_a_unique_bounded_key(

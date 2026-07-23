@@ -44,6 +44,9 @@ class _FineExecutionEvidence:
 
     executor: str
     worker_cap: int
+    reference_result: RoundResult | None
+    round_results: tuple[RoundResult, ...]
+    pre_controller_terminal: tuple[str, str, str, str] | None
     tasks: tuple[FineWorkflowTask, ...]
     task_graph: tuple[tuple[str, tuple[str, ...]], ...]
     task_results: tuple[FineTaskResult, ...]
@@ -747,13 +750,16 @@ def _canonical_fine_execution_evidence(
     value: object,
     *,
     expected_executor: str,
+    expected_reference_task: ReferenceTask,
     expected_round_tasks: tuple[RoundTask, ...],
     expected_round_results: tuple[RoundResult, ...],
     expected_worker_cap: int,
     task_retries: int,
+    expected_interruption: tuple[str, str] | None = None,
 ) -> str:
     """Validate and canonically encode scheduler-neutral fine execution evidence."""
     from cyexm.execution.dispatcher import (
+        _summarize_fine_round,
         canonical_fine_task_key,
         validate_fine_graph_description,
     )
@@ -781,6 +787,138 @@ def _canonical_fine_execution_evidence(
         )
     if type(value.cancelled) is not bool:
         raise RoundExecutionError(f"{location} cancelled must be an exact boolean")
+    if value.cancelled != (expected_interruption is not None):
+        raise RoundExecutionError(
+            f"{location} cancellation must match the caught interruption"
+        )
+    if type(expected_reference_task) is not ReferenceTask:
+        raise RoundExecutionError(
+            f"{location} requires the exact submitted reference task"
+        )
+    reference_summaries = tuple(
+        result
+        for result in expected_round_results
+        if result.round == expected_reference_task.round
+    )
+    if value.reference_result is None:
+        if reference_summaries:
+            raise RoundExecutionError(
+                f"{location} is missing the exact reference result"
+            )
+    else:
+        if type(value.reference_result) is not RoundResult:
+            raise RoundExecutionError(
+                f"{location} reference_result must be an exact RoundResult"
+            )
+        _validate_round_result(expected_reference_task, value.reference_result)
+        if reference_summaries != (value.reference_result,):
+            raise RoundExecutionError(
+                f"{location} reference result must equal the public summary"
+            )
+    if type(value.round_results) is not tuple or any(
+        type(result) is not RoundResult for result in value.round_results
+    ):
+        raise RoundExecutionError(
+            f"{location} round_results must be exact RoundResult values"
+        )
+    moving_summaries = tuple(
+        result
+        for result in expected_round_results
+        if result.round in {task.round for task in expected_round_tasks}
+    )
+    if value.round_results != moving_summaries:
+        raise RoundExecutionError(
+            f"{location} terminal round results must equal the public summaries"
+        )
+    terminal = value.pre_controller_terminal
+    if terminal is not None and (
+        type(terminal) is not tuple
+        or len(terminal) != 4
+        or any(type(item) is not str for item in terminal)
+    ):
+        raise RoundExecutionError(f"{location} pre_controller_terminal is invalid")
+    if value.tasks:
+        if terminal is not None:
+            raise RoundExecutionError(
+                f"{location} materialized graph cannot claim a pre-controller cause"
+            )
+    else:
+        if terminal is None:
+            raise RoundExecutionError(
+                f"{location} empty graph requires a pre-controller cause"
+            )
+        phase, status, exception_type, message = terminal
+        if phase == "reference":
+            if status not in {"failed", "cancelled"}:
+                raise RoundExecutionError(
+                    f"{location} reference terminal status is invalid"
+                )
+            if value.reference_result is None:
+                if not value.cancelled or status != "cancelled":
+                    raise RoundExecutionError(
+                        f"{location} missing reference result requires cancellation"
+                    )
+            elif value.reference_result.status != status:
+                raise RoundExecutionError(
+                    f"{location} reference terminal contradicts its result"
+                )
+            failure = (
+                None
+                if value.reference_result is None
+                else value.reference_result.failure
+            )
+            expected_exception = (
+                type(None).__name__
+                if failure is None and not value.cancelled
+                else (exception_type if failure is None else failure.exception_type)
+            )
+            if failure is not None and (
+                exception_type != expected_exception or message != failure.message
+            ):
+                raise RoundExecutionError(
+                    f"{location} reference terminal cause is not authoritative"
+                )
+            if (
+                failure is None
+                and value.cancelled
+                and (exception_type, message) != expected_interruption
+            ):
+                raise RoundExecutionError(
+                    f"{location} reference cancellation cause is not authoritative"
+                )
+        elif phase == "moving":
+            reference_succeeded = (
+                value.reference_result is not None
+                and value.reference_result.status in {"completed", "reused"}
+            )
+            reused_terminal = (
+                status == "reused"
+                and not value.cancelled
+                and reference_succeeded
+                and not expected_round_tasks
+                and not exception_type
+                and bool(message)
+            )
+            cancelled_terminal = (
+                status == "cancelled"
+                and value.cancelled
+                and reference_succeeded
+                and bool(expected_round_tasks)
+                and bool(exception_type)
+            )
+            if not reused_terminal and not cancelled_terminal:
+                raise RoundExecutionError(
+                    f"{location} moving terminal cause is contradictory"
+                )
+            if (
+                cancelled_terminal
+                and (exception_type, message) != expected_interruption
+            ):
+                raise RoundExecutionError(
+                    f"{location} moving cancellation cause is not authoritative"
+                )
+        else:
+            raise RoundExecutionError(f"{location} pre-controller phase is unsupported")
     exact_task_types = (
         RoundPreparationTask,
         NonlinearChunkTask,
@@ -815,7 +953,8 @@ def _canonical_fine_execution_evidence(
         raise RoundExecutionError(
             f"{location} task_graph must exactly describe immutable tasks"
         )
-    initial = initial_fine_tasks(expected_round_tasks)
+    graph_round_tasks = () if terminal is not None else expected_round_tasks
+    initial = initial_fine_tasks(graph_round_tasks)
     if tuple(task for task in value.tasks if not task.dependencies) != initial:
         raise RoundExecutionError(
             f"{location} initial tasks must match submitted moving rounds"
@@ -868,11 +1007,7 @@ def _canonical_fine_execution_evidence(
                 f"{location} successor tasks must match exact producer expansion"
             )
 
-    summaries = {
-        result.round: result
-        for result in expected_round_results
-        if result.round in {task.round for task in expected_round_tasks}
-    }
+    summaries = {result.round: result for result in value.round_results}
     if len(summaries) != len(
         tuple(
             result
@@ -881,9 +1016,11 @@ def _canonical_fine_execution_evidence(
         )
     ):
         raise RoundExecutionError(f"{location} round summaries must be unique")
-    if not value.cancelled and set(summaries) != {
-        task.round for task in expected_round_tasks
-    }:
+    if (
+        not value.cancelled
+        and value.tasks
+        and set(summaries) != {task.round for task in expected_round_tasks}
+    ):
         raise RoundExecutionError(
             f"{location} requires one summary per submitted moving round"
         )
@@ -891,65 +1028,24 @@ def _canonical_fine_execution_evidence(
         actual = tuple(
             result for result in results_by_key.values() if result.round == round_number
         )
-        failed = tuple(result for result in actual if result.status == "failed")
-        cancelled = tuple(result for result in actual if result.status == "cancelled")
-        validation = next(
-            (
-                result
-                for result in actual
-                if result.key.stage == "validation"
-                and result.status in {"completed", "reused"}
-            ),
-            None,
-        )
-        if failed:
-            representative = min(
-                failed,
-                key=lambda result: canonical_fine_task_key(result.key.encoded),
+        try:
+            authoritative = _summarize_fine_round(
+                expected_by_round[round_number],
+                actual,
             )
-            expected_status = "failed"
-        elif cancelled:
-            representative = min(
-                cancelled,
-                key=lambda result: canonical_fine_task_key(result.key.encoded),
-            )
-            expected_status = "cancelled"
-        elif validation is not None:
-            representative = validation
-            producer_reuse = {
-                path
-                for result in actual
-                if result.key.stage != "validation"
-                for path in result.reused_artifacts
-            }
-            expected_status = (
-                "reused"
-                if set(validation.artifact_paths).issubset(producer_reuse)
-                else "completed"
-            )
-        else:
-            if value.cancelled:
-                continue
+        except (TypeError, ValueError, RuntimeError) as error:
             raise RoundExecutionError(
-                f"{location} successful round lacks validation task evidence"
-            )
-        if (
-            summary.status != expected_status
-            or summary.log_path != representative.log_path
-            or summary.failure != representative.failure
-            or summary.hostname != representative.hostname
-            or summary.pid != representative.pid
-            or summary.dask_task_key != representative.dask_task_key
-            or summary.slurm_job_id != representative.slurm_job_id
-        ):
+                f"{location} cannot aggregate round {round_number}: {error}"
+            ) from error
+        if summary != authoritative:
             raise RoundExecutionError(
-                f"{location} round summary disagrees with canonical task evidence"
+                f"{location} round summary must exactly equal canonical aggregation"
             )
 
     try:
         task_keys, dependencies = validate_fine_graph_description(
             value.task_graph,
-            expected_round_tasks,
+            graph_round_tasks,
             allow_partial=value.cancelled,
             terminal_statuses=terminal_statuses,
         )
@@ -1089,6 +1185,22 @@ def _canonical_fine_execution_evidence(
             "executor": value.executor,
             "mode": "fine_grained",
             "worker_cap": value.worker_cap,
+            "reference_result": (
+                None
+                if value.reference_result is None
+                else value.reference_result.to_dict()
+            ),
+            "round_results": [result.to_dict() for result in value.round_results],
+            "pre_controller_terminal": (
+                None
+                if value.pre_controller_terminal is None
+                else {
+                    "phase": value.pre_controller_terminal[0],
+                    "status": value.pre_controller_terminal[1],
+                    "exception_type": value.pre_controller_terminal[2],
+                    "message": value.pre_controller_terminal[3],
+                }
+            ),
             "task_graph": [
                 {"key": key, "dependencies": list(task_dependencies)}
                 for key, task_dependencies in value.task_graph

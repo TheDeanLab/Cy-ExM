@@ -17,8 +17,9 @@ schema-version-2 envelope and validated `fine_graph` extension.
 - Reused `FineGraphController` graph descriptions, canonical task ordering, and
   `validate_fine_graph_description` rather than reimplementing dependency or
   blocked-descendant semantics.
-- Reused the existing SLURM evidence decoder unchanged for scheduler-specific
-  scale, preflight, placement, cancellation, and cleanup validation.
+- Extended the existing SLURM version-2 decoder in place for scheduler-specific
+  scale, preflight, placement, cancellation, cleanup, pre-controller, and exact
+  public-summary validation; no second SLURM evidence envelope was added.
 - Phase 1 completion records remain the only scientific reuse authority.
 
 ## TDD evidence
@@ -34,6 +35,12 @@ Focused RED cases were observed before their production fixes:
 - interrupted Local Dask work omitted a submitted but unsettled attempt;
 - cleanup failures lost exact exception evidence; and
 - fine task evidence could embed a forged `RoundTask`.
+- public timing, duration, native-thread, artifact, and reuse fields could be
+  forged independently of granular results;
+- cancellation validated evidence before selecting terminal partial summaries;
+- failed references and all-reused fine runs lacked representable pre-controller
+  evidence; and
+- SLURM version-2 public summaries were not bound to exact granular results.
 
 Each case was made GREEN independently before the focused regression suite.
 
@@ -43,9 +50,18 @@ Each case was made GREEN independently before the focused regression suite.
   fine summaries require the validation-task log; failure and cancellation require
   an exact canonical representative fine-task log.
 - Fine evidence is versioned, canonical, detached, and validated after scientific
-  work. It includes normalized mode/executor/cap, canonical task graph and
-  dependencies, every actual task result, attempts, blocked descendants,
-  cancellation, and exact cleanup outcomes.
+  work. It includes the exact reference result, exact terminal moving summaries,
+  normalized mode/executor/cap, canonical task graph and dependencies, every
+  actual task result, attempts, blocked descendants, cancellation, and exact
+  cleanup outcomes.
+- A single scheduler-neutral aggregation helper now owns the Task 6 public-summary
+  contract. The controller and post-execution evidence validators use the same
+  helper for earliest start, latest end, wall interval, native threads, canonical
+  representative, public-only artifacts, and producer-derived reuse.
+- Empty moving graphs require an exact pre-controller cause. Failed/cancelled
+  reference barriers and successful references with zero pending moving rounds are
+  represented explicitly by Sequential, Local Dask, and SLURM production
+  executors; reference scientific failure remains a `WorkflowExecutionError`.
 - Fine results are bound to the exact submitted authoritative `RoundTask`, exact
   expanded native-thread evidence, task outputs, dependencies, timestamps, logs,
   and failure contract. Public summaries are cross-checked against the canonical
@@ -53,12 +69,19 @@ Each case was made GREEN independently before the focused regression suite.
 - Sequential interruption retains the actual partial graph, settled results, and
   admissions. Local Dask retains live submissions even when interruption occurs
   before a future settles, cancels unfinished futures, and records owned cleanup.
+  Sequential, Local Dask, and SLURM cancellation select exact controller-settled
+  public summaries before evidence validation and serialization.
+- SLURM version-2 retains its existing graph and placement envelope while exact
+  in-memory granular results are aggregated through the shared helper and checked
+  against both public summaries and terminal placement fields.
 - Missing or malformed fine evidence fails closed through the existing durable
   execution-evidence failure path.
 - Scientific JSON and fingerprints remain byte-identical across coarse and fine
-  profiles. Operational evidence remains outside scientific identity.
+  profiles. This is exercised through real dataset/execution YAML loaders and the
+  public planner. Operational evidence remains outside scientific identity.
 - Coarse-complete to fine excludes accepted moving work from the graph. Fine-partial
-  to coarse preserves local warp evidence for ordinary Phase 1 validation.
+  to coarse preserves a canonical local-warp request committed and reused through
+  the real `ArtifactStore` for ordinary Phase 1 validation.
 - Public status ignores invalid internal prepared manifests and scalar cores when
   all independently verifiable public outputs remain valid.
 - Force propagation, deterministic result ordering, CLI exit mapping, native-thread
@@ -75,9 +98,7 @@ Each case was made GREEN independently before the focused regression suite.
 
 ## Verification
 
-- Focused API/status/thread/CLI/sequential/Dask/dispatcher/SLURM regressions:
-  525 passed.
-- Portable unit suite: all 2,238 collected non-HPC unit tests passed.
+- Portable unit suite: all 2,258 collected non-HPC unit tests passed.
 - Portable integration suite: all 58 collected non-HPC integration tests passed.
 - `uv lock --check`: passed.
 - `uv sync --locked --group dev --extra examples --extra hpc`: passed.
@@ -85,6 +106,8 @@ Each case was made GREEN independently before the focused regression suite.
 - Repository-wide BasedPyright: passed with 0 errors, warnings, or notes.
 - `pre-commit run --all-files`: passed.
 - `git diff --check`: passed.
+- Final independent remediation re-review: approved with no remaining Critical or
+  Important findings.
 
 No SLURM jobs were submitted, no active datasets were accessed, and the unrelated
 `src/cy_exm.egg-info/` tree was left untouched.

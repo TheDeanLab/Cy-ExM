@@ -5,13 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from cyexm.config import load_execution_profile
 from cyexm.config.models import ExecutionProfile
 from hpc.environment import (
     HpcAcceptanceContext,
     prepare_acceptance_context,
     require_coordinator_native_threads,
     require_explicit_hpc_selection,
+    require_hpc_opt_in,
+    validate_additional_acceptance_profile,
 )
 from hpc.fine_workflow_acceptance import fine_acceptance_profiles
 
@@ -40,6 +41,12 @@ class FineHpcProfiles:
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("cyexm-hpc", "explicit Cy-ExM HPC acceptance")
+    group.addoption(
+        "--run-hpc",
+        action="store_true",
+        default=False,
+        help="explicitly authorize selected real-SLURM acceptance tests",
+    )
     group.addoption(
         "--cyexm-dataset",
         action="store",
@@ -82,6 +89,7 @@ def _required_hpc_context(
     request: pytest.FixtureRequest,
 ) -> HpcAcceptanceContext:
     try:
+        require_hpc_opt_in(request.config.getoption("--run-hpc"))
         require_explicit_hpc_selection(request.config.invocation_params.args)
         context = prepare_acceptance_context(
             request.config.getoption("--cyexm-dataset"),
@@ -139,9 +147,17 @@ def fine_hpc_profiles(
             "same approved coarse profile; both profile paths must be files"
         )
     try:
+        validated_fine_path, validated_fine = validate_additional_acceptance_profile(
+            hpc_context,
+            fine_path,
+            repository_root=REPOSITORY_ROOT,
+            protected_roots=(CLEAREX_ROOT, *LIVE_SPHEROID_ROOTS),
+        )
+        if validated_fine_path != fine_path:
+            raise ValueError("fine profile identity changed during validation")
         coarse, fine = fine_acceptance_profiles(
-            load_execution_profile(coarse_path),
-            load_execution_profile(fine_path),
+            hpc_context.profile,
+            validated_fine,
         )
         if fine.slurm is None or fine.slurm.task_retries < 1:
             raise ValueError(
@@ -156,7 +172,6 @@ def fine_hpc_profiles(
         if (
             fine.source_path.resolve(strict=True) != fine_path
             or fine_dataset != coarse_dataset
-            or fine.paths.worker_local_directory != coarse.paths.worker_local_directory
             or not fine_output.is_relative_to(archive)
             or fine_output.is_relative_to(coarse_output)
             or coarse_output.is_relative_to(fine_output)
@@ -164,8 +179,8 @@ def fine_hpc_profiles(
             or not fine_output.is_dir()
         ):
             raise ValueError(
-                "fine profile must preserve the approved dataset/scratch roots "
-                "and use a distinct existing real output root below /archive"
+                "fine profile must preserve the approved dataset root and use a "
+                "distinct existing real output root below /archive"
             )
         require_coordinator_native_threads(fine)
     except Exception as error:

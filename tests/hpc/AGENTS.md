@@ -2,7 +2,8 @@
 
 - Every test in this directory is marked `hpc`; explicitly selected `hpc` execution
   means the actual pytest invocation contains exactly `-m hpc`, independent of
-  marker defaults, and supplies all three caller-owned Cy-ExM options.
+  marker defaults, includes exact `--run-hpc`, and supplies all three caller-owned
+  Cy-ExM options.
   Fail closed when an option, approved path, scheduler fact, allocation fact, or
   cleanup fact is missing. Never skip by hostname or infer approval from being on a
   login node.
@@ -95,6 +96,22 @@
   Its test alone additionally requires exact `--cyexm-coarse-execution` and
   `--cyexm-fine-execution` profiles; the former must identify the same file as the
   legacy `--cyexm-execution` option. Never derive either operator approval silently.
+- Apply the complete canonical archive/project/protected-root/input validation to
+  both approved profiles before creating any scenario root or contacting SLURM.
+  The profiles may differ only in coarse/fine mode, source path, and deliberately
+  disjoint output root, project scratch root, and job name; worker count, processes,
+  cores, memory, threads, queue, network, retries, directives, and controls must be
+  exact for a fair comparison. Protected roots include ClearEx and both declared
+  live spheroid paths above.
+- Preflight two serial-chunked rounds with real dependent channels before any
+  acceptance write. Failure, cancellation, and worker-loss controls bind exact
+  cross-round task keys. Every summarized claim must cross-check checksum-bound raw
+  attempt, placement, probe, scale, marker, deterministic, comparison, and queue
+  evidence; a summary boolean is never acceptance authority.
+- Cross-worker placement ordering uses coordinator submission/readiness timestamps,
+  never worker wall clocks. The performance gate compares a conservative fine
+  coordinator upper bound through assembly against a coarse worker-monotonic lower
+  bound so clock skew cannot manufacture a speedup.
 - Keep fine-only report schemas and audit decoders in
   `fine_workflow_acceptance.py`. Keep shared submission, cleanup, fresh-coordinator,
   and acceptance-only worker-runner machinery in `workflow_acceptance.py`.

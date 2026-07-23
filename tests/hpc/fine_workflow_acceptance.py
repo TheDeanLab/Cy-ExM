@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import cast
 
-from cyexm.config.models import ExecutionProfile
+from cyexm.config.models import DatasetManifest, ExecutionProfile
 from cyexm.workflow.models import WorkflowPlan
 from hpc.workflow_acceptance import HpcWorkflowAcceptanceError
 
@@ -92,11 +93,95 @@ def fine_acceptance_profiles(
         raise HpcWorkflowAcceptanceError(
             "fine acceptance profiles must explicitly select coarse and fine_grained"
         )
-    if coarse.paths.output_root == fine.paths.output_root:
+    coarse_slurm = coarse.slurm
+    fine_slurm = fine.slurm
+    assert coarse_slurm is not None and fine_slurm is not None
+    coarse_scratch = coarse.paths.worker_local_directory
+    fine_scratch = fine.paths.worker_local_directory
+    if coarse_scratch is None or fine_scratch is None:
         raise HpcWorkflowAcceptanceError(
-            "coarse and fine acceptance roots must be distinct"
+            "fine acceptance profiles require explicit worker scratch roots"
+        )
+    coarse_output = coarse.paths.output_root.resolve(strict=False)
+    fine_output = fine.paths.output_root.resolve(strict=False)
+    coarse_scratch_resolved = coarse_scratch.resolve(strict=False)
+    fine_scratch_resolved = fine_scratch.resolve(strict=False)
+
+    def disjoint(left: Path, right: Path) -> bool:
+        return not left.is_relative_to(right) and not right.is_relative_to(left)
+
+    if (
+        not disjoint(coarse_output, fine_output)
+        or not disjoint(coarse_scratch_resolved, fine_scratch_resolved)
+        or coarse_slurm.job_name == fine_slurm.job_name
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "coarse and fine output/scratch roots must be canonically disjoint "
+            "and job names must be distinct"
+        )
+    normalized_fine = replace(
+        fine,
+        paths=replace(
+            fine.paths,
+            output_root=coarse.paths.output_root,
+            worker_local_directory=coarse_scratch,
+        ),
+        slurm=replace(fine_slurm, job_name=coarse_slurm.job_name),
+        source_path=coarse.source_path,
+        parallelism=coarse.parallelism,
+    )
+    if normalized_fine != coarse:
+        raise HpcWorkflowAcceptanceError(
+            "coarse and fine acceptance profiles must be otherwise identical"
         )
     return coarse, fine
+
+
+def fine_acceptance_manifest(
+    manifest: DatasetManifest,
+) -> tuple[DatasetManifest, dict[str, str]]:
+    """Select and preflight the exact two-round acceptance task identities."""
+    rounds = tuple(
+        sorted(
+            (item for item in manifest.rounds if item.strategy == "serial_chunked"),
+            key=lambda item: item.round,
+        )[:2]
+    )
+    if len(rounds) != 2:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance requires two serial-chunked rounds before submission"
+        )
+    dependent_indices: list[int] = []
+    for item in rounds:
+        indices = [
+            index
+            for index, channel in enumerate(item.channels)
+            if channel.file != item.registration_channel
+        ]
+        if not indices:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance requires an actual dependent channel in each "
+                "selected round before submission"
+            )
+        dependent_indices.append(indices[0])
+    first, second = rounds
+    targets = {
+        "chunk_target": f"round-{first.round:03d}:chunk:0000",
+        "chunk_peer": f"round-{second.round:03d}:chunk:0000",
+        "channel_target": (
+            f"round-{first.round:03d}:channel:{dependent_indices[0]:04d}"
+        ),
+        "channel_peer": (
+            f"round-{second.round:03d}:channel:{dependent_indices[1]:04d}"
+        ),
+        "replacement_target": f"round-{first.round:03d}:chunk:0000",
+        "liveness_peer": f"round-{second.round:03d}:chunk:0000",
+    }
+    if len(set(targets.values())) < 4:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance exact task prerequisites are not distinct"
+        )
+    return replace(manifest, rounds=rounds), targets
 
 
 def fine_internal_parity_evidence(
@@ -329,6 +414,65 @@ def _fine_relative_path(value: object, location: str) -> str:
     return encoded
 
 
+def _evidence_reference(
+    value: object,
+    *,
+    owned_root: Path,
+    location: str,
+) -> tuple[str, str, object]:
+    reference = _fine_object(
+        value,
+        keys=frozenset({"relative_path", "sha256"}),
+        location=location,
+    )
+    relative = _fine_relative_path(
+        reference["relative_path"], f"{location}.relative_path"
+    )
+    claimed = _fine_sha256(reference["sha256"], f"{location}.sha256")
+    try:
+        path = (owned_root / PurePosixPath(relative)).resolve(strict=True)
+        path.relative_to(owned_root)
+        observed = _file_sha256(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError) as error:
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {location} is missing, unsafe, or invalid JSON"
+        ) from error
+    if not path.is_file() or path.is_symlink() or observed != claimed:
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {location} checksum is stale or forged"
+        )
+    return relative, claimed, payload
+
+
+def _maximum_metric_difference(value: object) -> float:
+    differences: list[float] = []
+
+    def visit(item: object) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                if key == "absolute_differences" and isinstance(child, Mapping):
+                    differences.extend(
+                        _fine_number(
+                            difference,
+                            "Tier 1 evidence metric absolute difference",
+                        )
+                        for difference in child.values()
+                    )
+                else:
+                    visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    if not differences:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance Tier 1 evidence contains no metric differences"
+        )
+    return max(differences)
+
+
 def _fine_artifacts(value: object, location: str) -> tuple[dict[str, object], ...]:
     artifacts: list[dict[str, object]] = []
     paths: list[str] = []
@@ -364,18 +508,29 @@ def _fine_exact_strings(value: object, location: str) -> tuple[str, ...]:
     return values
 
 
-def _validate_fine_resume(value: object, location: str, expected_kind: str) -> None:
+def _validate_fine_resume(
+    value: object,
+    location: str,
+    expected_kind: str,
+    *,
+    owned_root: Path,
+) -> tuple[tuple[str, str], ...]:
     resume = _fine_object(
         value,
         keys=frozenset(
             {
                 "injected_task_key",
                 "failure_status",
-                "settled_sibling_keys",
+                "failed_attempts",
+                "settled_peer_key",
                 "preserved_artifacts",
                 "resume_reused_keys",
                 "resume_recomputed_keys",
                 "ordinary_artifact_store_reuse",
+                "failure_evidence_file",
+                "resume_evidence_file",
+                "failure_marker_file",
+                "settled_peer_file",
             }
         ),
         location=location,
@@ -388,8 +543,8 @@ def _validate_fine_resume(value: object, location: str, expected_kind: str) -> N
             f"fine acceptance {location} lacks the exact injected "
             f"{expected_kind} failure"
         )
-    settled = _fine_exact_strings(
-        resume["settled_sibling_keys"], f"{location}.settled_sibling_keys"
+    settled_peer = _fine_nonempty_string(
+        resume["settled_peer_key"], f"{location}.settled_peer_key"
     )
     reused = _fine_exact_strings(
         resume["resume_reused_keys"], f"{location}.resume_reused_keys"
@@ -398,16 +553,90 @@ def _validate_fine_resume(value: object, location: str, expected_kind: str) -> N
         resume["resume_recomputed_keys"], f"{location}.resume_recomputed_keys"
     )
     if (
-        not settled
-        or injected not in recomputed
+        resume["failed_attempts"] != 1
+        or settled_peer == injected
+        or f":{expected_kind}:" not in settled_peer
+        or injected.split(":", 1)[0] == settled_peer.split(":", 1)[0]
         or set(reused) & set(recomputed)
-        or not set(settled) <= set(reused)
+        or reused != (settled_peer,)
+        or recomputed != (injected,)
         or resume["ordinary_artifact_store_reuse"] is not True
     ):
         raise HpcWorkflowAcceptanceError(
             f"fine acceptance {location} does not prove exact ArtifactStore resume"
         )
+    references: list[tuple[str, str]] = []
+    payloads: dict[str, object] = {}
+    for name in (
+        "failure_evidence_file",
+        "resume_evidence_file",
+        "failure_marker_file",
+        "settled_peer_file",
+    ):
+        relative, digest, payload = _evidence_reference(
+            resume[name],
+            owned_root=owned_root,
+            location=f"{location}.{name}",
+        )
+        references.append((relative, digest))
+        payloads[name] = payload
+    failure_evidence = payloads["failure_evidence_file"]
+    resume_evidence = payloads["resume_evidence_file"]
+    marker = payloads["failure_marker_file"]
+    settled_marker = payloads["settled_peer_file"]
+    try:
+        failure_graph = cast(Mapping[str, object], failure_evidence)["fine_graph"]
+        failed_placements = [
+            item
+            for item in cast(
+                list[dict[str, object]],
+                cast(Mapping[str, object], failure_graph)["placements"],
+            )
+            if item.get("task_key") == injected and item.get("status") == "failed"
+        ]
+        failure_results = cast(
+            list[dict[str, object]],
+            cast(Mapping[str, object], failure_graph)["task_results"],
+        )
+        resume_results = cast(
+            list[dict[str, object]],
+            cast(
+                Mapping[str, object],
+                cast(Mapping[str, object], resume_evidence)["fine_graph"],
+            )["task_results"],
+        )
+    except (KeyError, TypeError) as error:
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {location} raw graph evidence is malformed"
+        ) from error
+    resume_by_key = {
+        cast(str, item.get("key")): item.get("status") for item in resume_results
+    }
+    if (
+        len(failed_placements) != 1
+        or failed_placements[0].get("attempt") != 1
+        or not any(
+            item.get("key") == settled_peer
+            and item.get("status") in {"completed", "reused"}
+            for item in failure_results
+        )
+        or not isinstance(marker, Mapping)
+        or marker.get("task_key") != injected
+        or marker.get("settled_peer_key") != settled_peer
+        or marker.get("status") != "injected"
+        or not isinstance(settled_marker, Mapping)
+        or settled_marker.get("task_key") != settled_peer
+        or settled_marker.get("status") not in {"completed", "reused"}
+        or not settled_marker.get("artifacts")
+        or resume_by_key.get(injected) != "completed"
+        or resume_by_key.get(settled_peer) != "reused"
+    ):
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {location} does not match checksum-bound exact "
+            "failure, peer settlement, and resume evidence"
+        )
     _fine_artifacts(resume["preserved_artifacts"], f"{location}.preserved_artifacts")
+    return tuple(references)
 
 
 def _validate_duration_summary(
@@ -432,6 +661,275 @@ def _validate_duration_summary(
         raise HpcWorkflowAcceptanceError(
             f"fine acceptance {location} is not an ordered duration distribution"
         )
+
+
+def _fine_worker_identity(value: object, location: str) -> dict[str, object]:
+    identity = _fine_object(
+        value,
+        keys=frozenset({"worker_address", "hostname", "pid", "slurm_job_id"}),
+        location=location,
+    )
+    for name in ("worker_address", "hostname", "slurm_job_id"):
+        _fine_nonempty_string(identity[name], f"{location}.{name}")
+    if type(identity["pid"]) is not int or cast(int, identity["pid"]) < 1:
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {location}.pid must be a positive integer"
+        )
+    return identity
+
+
+def _validate_worker_replacement(
+    value: object, *, owned_root: Path
+) -> tuple[tuple[str, str], ...]:
+    location = "durability.worker_replacement"
+    replacement = _fine_object(
+        value,
+        keys=frozenset(
+            {
+                "loss_marker",
+                "evidence_file",
+                "queue_after_file",
+                "loss_marker_file",
+                "failed_attempt",
+                "departed_worker",
+                "replacement_worker",
+                "retry",
+                "liveness",
+                "owned_job_ids",
+                "remaining_owned_job_ids",
+            }
+        ),
+        location=location,
+    )
+    evidence_relative, evidence_sha, raw_evidence = _evidence_reference(
+        replacement["evidence_file"],
+        owned_root=owned_root,
+        location=f"{location}.evidence_file",
+    )
+    queue_relative, queue_sha, raw_queue = _evidence_reference(
+        replacement["queue_after_file"],
+        owned_root=owned_root,
+        location=f"{location}.queue_after_file",
+    )
+    marker_relative, marker_sha, raw_marker = _evidence_reference(
+        replacement["loss_marker_file"],
+        owned_root=owned_root,
+        location=f"{location}.loss_marker_file",
+    )
+    loss = _fine_object(
+        replacement["loss_marker"],
+        keys=frozenset(
+            {"task_key", "worker_address", "hostname", "pid", "slurm_job_id"}
+        ),
+        location=f"{location}.loss_marker",
+    )
+    loss_key = _fine_nonempty_string(
+        loss["task_key"], f"{location}.loss_marker.task_key"
+    )
+    loss_identity = _fine_worker_identity(
+        {
+            name: loss[name]
+            for name in ("worker_address", "hostname", "pid", "slurm_job_id")
+        },
+        f"{location}.loss_marker.identity",
+    )
+    if (
+        not isinstance(raw_marker, Mapping)
+        or raw_marker.get("schema_version") != 1
+        or raw_marker.get("status") != "worker-loss-injected"
+        or raw_marker.get("task_key") != loss_key
+        or {
+            name: raw_marker.get(name)
+            for name in ("worker_address", "hostname", "pid", "slurm_job_id")
+        }
+        != loss_identity
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance loss-marker summary is not checksum-bound to raw marker"
+        )
+    failed = _fine_object(
+        replacement["failed_attempt"],
+        keys=frozenset({"task_key", "attempt", "status"}),
+        location=f"{location}.failed_attempt",
+    )
+    departed = _fine_worker_identity(
+        replacement["departed_worker"], f"{location}.departed_worker"
+    )
+    activated = _fine_worker_identity(
+        replacement["replacement_worker"], f"{location}.replacement_worker"
+    )
+    retry = _fine_object(
+        replacement["retry"],
+        keys=frozenset(
+            {
+                "task_key",
+                "attempt",
+                "status",
+                "worker_address",
+                "hostname",
+                "pid",
+                "slurm_job_id",
+            }
+        ),
+        location=f"{location}.retry",
+    )
+    retry_identity = _fine_worker_identity(
+        {
+            name: retry[name]
+            for name in ("worker_address", "hostname", "pid", "slurm_job_id")
+        },
+        f"{location}.retry.identity",
+    )
+    liveness = _fine_object(
+        replacement["liveness"],
+        keys=frozenset(
+            {
+                "task_key",
+                "status",
+                "worker_address",
+                "hostname",
+                "pid",
+                "slurm_job_id",
+            }
+        ),
+        location=f"{location}.liveness",
+    )
+    liveness_identity = _fine_worker_identity(
+        {
+            name: liveness[name]
+            for name in ("worker_address", "hostname", "pid", "slurm_job_id")
+        },
+        f"{location}.liveness.identity",
+    )
+    owned = _fine_exact_strings(
+        replacement["owned_job_ids"], f"{location}.owned_job_ids"
+    )
+    remaining = _fine_exact_strings(
+        replacement["remaining_owned_job_ids"],
+        f"{location}.remaining_owned_job_ids",
+    )
+    if (
+        failed["task_key"] != loss_key
+        or failed["attempt"] != 1
+        or failed["status"] != "failed"
+        or departed != loss_identity
+        or activated == departed
+        or retry["task_key"] != loss_key
+        or retry["attempt"] != 2
+        or retry["status"] != "completed"
+        or retry_identity != activated
+        or liveness["task_key"] == loss_key
+        or liveness["status"] not in {"completed", "reused"}
+        or set(owned)
+        != {
+            cast(str, departed["slurm_job_id"]),
+            cast(str, activated["slurm_job_id"]),
+        }
+        or remaining
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance worker loss, departure, replacement activation, "
+            "exact retry, liveness, or cleanup lineage is inconsistent"
+        )
+    if not isinstance(raw_evidence, Mapping) or not isinstance(raw_queue, Mapping):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance replacement raw evidence must be canonical objects"
+        )
+    graph = raw_evidence.get("fine_graph")
+    if not isinstance(graph, Mapping):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance replacement evidence lacks a fine graph"
+        )
+    events = graph.get("scale_events")
+    attempts = graph.get("attempt_counts")
+    placements = graph.get("placements")
+    if not all(isinstance(item, list) for item in (events, attempts, placements)):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance replacement evidence lacks canonical event records"
+        )
+
+    def raw_identity(item: object) -> dict[str, object]:
+        if not isinstance(item, Mapping):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance replacement probe/placement is malformed"
+            )
+        return _fine_worker_identity(
+            {
+                name: item.get(name)
+                for name in ("worker_address", "hostname", "pid", "slurm_job_id")
+            },
+            f"{location}.raw_identity",
+        )
+
+    activation_index: int | None = None
+    departure_index: int | None = None
+    for index, event in enumerate(cast(list[object], events)):
+        if not isinstance(event, Mapping):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance replacement scale event is malformed"
+            )
+        activated_probes = event.get("activated_probes")
+        if not isinstance(activated_probes, list):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance replacement scale probes are malformed"
+            )
+        identities = [raw_identity(item) for item in activated_probes]
+        if loss_identity in identities and activation_index is None:
+            activation_index = index
+        if (
+            activation_index is not None
+            and index > activation_index
+            and cast(str, loss_identity["worker_address"])
+            in cast(list[object], event.get("departed", []))
+            and activated in identities
+        ):
+            departure_index = index
+            break
+    attempt_by_key = {
+        cast(str, item["task_key"]): item["attempts"]
+        for item in cast(list[dict[str, object]], attempts)
+        if isinstance(item, dict)
+        and type(item.get("task_key")) is str
+        and type(item.get("attempts")) is int
+    }
+    target_placements = [
+        item
+        for item in cast(list[dict[str, object]], placements)
+        if isinstance(item, dict) and item.get("task_key") == loss_key
+    ]
+    liveness_placements = [
+        item
+        for item in cast(list[dict[str, object]], placements)
+        if isinstance(item, dict) and item.get("task_key") == liveness["task_key"]
+    ]
+    if (
+        activation_index is None
+        or departure_index is None
+        or attempt_by_key.get(loss_key) != 2
+        or len(target_placements) != 2
+        or [item.get("attempt") for item in target_placements] != [1, 2]
+        or target_placements[0].get("status") != "failed"
+        or target_placements[0].get("placement_accepted") is not False
+        or target_placements[1].get("status") != "completed"
+        or target_placements[1].get("placement_accepted") is not True
+        or raw_identity(target_placements[1]) != activated
+        or not liveness_placements
+        or liveness_placements[-1].get("status") not in {"completed", "reused"}
+        or liveness_placements[-1].get("placement_accepted") is not True
+        or raw_identity(liveness_placements[-1]) != liveness_identity
+        or cast(str, liveness_placements[-1].get("coordinator_ready_at", ""))
+        <= cast(str, target_placements[1].get("coordinator_ready_at", ""))
+        or raw_queue.get("jobs") != []
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance replacement report is not derived from canonical "
+            "probe, scale, attempt, placement, liveness, and queue evidence"
+        )
+    return (
+        (evidence_relative, evidence_sha),
+        (queue_relative, queue_sha),
+        (marker_relative, marker_sha),
+    )
 
 
 def validate_fine_acceptance_report(
@@ -620,6 +1118,7 @@ def validate_fine_acceptance_report(
         scientific["tier1"],
         keys=frozenset(
             {
+                "evidence_file",
                 "metric_absolute_tolerance",
                 "maximum_metric_absolute_difference",
                 "structure_equal",
@@ -631,6 +1130,15 @@ def validate_fine_acceptance_report(
         tier1["maximum_metric_absolute_difference"],
         "scientific.tier1.maximum_metric_absolute_difference",
     )
+    tier1_reference, tier1_sha256, tier1_payload = _evidence_reference(
+        tier1["evidence_file"],
+        owned_root=owned_root,
+        location="scientific.tier1.evidence_file",
+    )
+    if abs(_maximum_metric_difference(tier1_payload) - maximum_difference) > 1e-12:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance Tier 1 summary does not match full equivalence evidence"
+        )
     if (
         tier1["metric_absolute_tolerance"] != 0.01
         or maximum_difference > 0.01
@@ -643,6 +1151,7 @@ def validate_fine_acceptance_report(
         scientific["tier2"],
         keys=frozenset(
             {
+                "evidence_file",
                 "seed",
                 "native_threads",
                 "affine_exact",
@@ -672,6 +1181,22 @@ def validate_fine_acceptance_report(
         raise HpcWorkflowAcceptanceError(
             "fine acceptance Tier 2 exact seeded one-thread gate failed"
         )
+    tier2_reference, tier2_sha256, tier2_payload = _evidence_reference(
+        tier2["evidence_file"],
+        owned_root=owned_root,
+        location="scientific.tier2.evidence_file",
+    )
+    from hpc.workflow_acceptance import _validated_deterministic_parity_evidence
+
+    deterministic = _validated_deterministic_parity_evidence(
+        tier2_payload,
+        require_fine_internal=True,
+    )
+    strict = cast(dict[str, object], deterministic["strict_parity"])
+    strict_rounds = cast(list[dict[str, object]], strict["rounds"])
+    expected_channel_count = sum(
+        len(cast(list[object], item["channels"])) for item in strict_rounds
+    )
     channels = _fine_array(tier2["channels"], "scientific.tier2.channels")
     if not channels:
         raise HpcWorkflowAcceptanceError(
@@ -697,6 +1222,10 @@ def validate_fine_acceptance_report(
     if channel_paths != sorted(set(channel_paths)):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance Tier 2 channels are duplicate or noncanonical"
+        )
+    if len(channels) != expected_channel_count:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance Tier 2 channels do not match deterministic evidence"
         )
 
     fixed = _fine_object(
@@ -852,8 +1381,8 @@ def validate_fine_acceptance_report(
             "job_id",
             "hostname",
             "worker",
-            "started_at",
-            "ended_at",
+            "coordinator_submitted_at",
+            "coordinator_ready_at",
             "duration_seconds",
         }
     )
@@ -873,15 +1402,15 @@ def validate_fine_acceptance_report(
             )
         for name in ("job_id", "hostname", "worker"):
             _fine_nonempty_string(task[name], f"placement.tasks[{index}].{name}")
-        started = _timestamp(cast(str, task["started_at"]))
-        ended = _timestamp(cast(str, task["ended_at"]))
-        duration = _fine_number(
+        submitted = _timestamp(cast(str, task["coordinator_submitted_at"]))
+        ready = _timestamp(cast(str, task["coordinator_ready_at"]))
+        _fine_number(
             task["duration_seconds"],
             f"placement.tasks[{index}].duration_seconds",
         )
-        if ended < started or abs((ended - started).total_seconds() - duration) > 1e-6:
+        if ready < submitted:
             raise HpcWorkflowAcceptanceError(
-                "fine acceptance placement task timestamps contradict duration"
+                "fine acceptance coordinator observed task readiness before submission"
             )
         task_keys.append(key)
         by_kind[kind].append(task)
@@ -897,12 +1426,12 @@ def validate_fine_acceptance_report(
                     left["job_id"] != right["job_id"]
                     and left["hostname"] != right["hostname"]
                     and max(
-                        _timestamp(cast(str, left["started_at"])),
-                        _timestamp(cast(str, right["started_at"])),
+                        _timestamp(cast(str, left["coordinator_submitted_at"])),
+                        _timestamp(cast(str, right["coordinator_submitted_at"])),
                     )
                     < min(
-                        _timestamp(cast(str, left["ended_at"])),
-                        _timestamp(cast(str, right["ended_at"])),
+                        _timestamp(cast(str, left["coordinator_ready_at"])),
+                        _timestamp(cast(str, right["coordinator_ready_at"])),
                     )
                 ):
                     concurrent = True
@@ -918,19 +1447,22 @@ def validate_fine_acceptance_report(
                 "chunk_failure_resume",
                 "channel_failure_resume",
                 "cancellation_resume",
+                "worker_replacement",
             }
         ),
         location="durability",
     )
-    _validate_fine_resume(
+    chunk_resume_references = _validate_fine_resume(
         durability["chunk_failure_resume"],
         "durability.chunk_failure_resume",
         "chunk",
+        owned_root=owned_root,
     )
-    _validate_fine_resume(
+    channel_resume_references = _validate_fine_resume(
         durability["channel_failure_resume"],
         "durability.channel_failure_resume",
         "channel",
+        owned_root=owned_root,
     )
     cancellation = _fine_object(
         durability["cancellation_resume"],
@@ -938,11 +1470,15 @@ def validate_fine_acceptance_report(
             {
                 "status",
                 "structured_cancellation",
+                "blocked_task_key",
+                "committed_peer_key",
+                "committed_peer_file",
+                "ready_marker_file",
+                "trigger_file",
+                "queue_after_file",
                 "preserved_artifacts",
                 "resume_reused_keys",
                 "resume_recomputed_keys",
-                "replacement_events",
-                "liveness_proven",
                 "owned_job_ids",
                 "remaining_owned_job_ids",
             }
@@ -957,22 +1493,70 @@ def validate_fine_acceptance_report(
         cancellation["remaining_owned_job_ids"],
         "durability.cancellation_resume.remaining_owned_job_ids",
     )
+    blocked_task_key = _fine_nonempty_string(
+        cancellation["blocked_task_key"],
+        "durability.cancellation_resume.blocked_task_key",
+    )
+    committed_peer_key = _fine_nonempty_string(
+        cancellation["committed_peer_key"],
+        "durability.cancellation_resume.committed_peer_key",
+    )
+    reused_keys = _fine_exact_strings(
+        cancellation["resume_reused_keys"],
+        "durability.cancellation_resume.resume_reused_keys",
+    )
+    recomputed_keys = _fine_exact_strings(
+        cancellation["resume_recomputed_keys"],
+        "durability.cancellation_resume.resume_recomputed_keys",
+    )
+    cancellation_references: list[tuple[str, str]] = []
+    cancellation_payloads: dict[str, object] = {}
+    for name in (
+        "committed_peer_file",
+        "ready_marker_file",
+        "trigger_file",
+        "queue_after_file",
+    ):
+        relative, digest, payload = _evidence_reference(
+            cancellation[name],
+            owned_root=owned_root,
+            location=f"durability.cancellation_resume.{name}",
+        )
+        cancellation_references.append((relative, digest))
+        cancellation_payloads[name] = payload
+    committed_payload = cancellation_payloads["committed_peer_file"]
+    ready_payload = cancellation_payloads["ready_marker_file"]
+    trigger_payload = cancellation_payloads["trigger_file"]
+    cancellation_queue_payload = cancellation_payloads["queue_after_file"]
     if (
         cancellation["status"] != "cancelled"
         or cancellation["structured_cancellation"] is not True
+        or blocked_task_key == committed_peer_key
+        or blocked_task_key.split(":", 1)[0] == committed_peer_key.split(":", 1)[0]
+        or committed_peer_key not in reused_keys
+        or blocked_task_key not in recomputed_keys
         or not owned_jobs
         or remaining_jobs
-        or type(cancellation["replacement_events"]) is not int
-        or cast(int, cancellation["replacement_events"]) < 1
-        or cancellation["liveness_proven"] is not True
-        or not _fine_exact_strings(
-            cancellation["resume_reused_keys"],
-            "durability.cancellation_resume.resume_reused_keys",
-        )
-        or not _fine_exact_strings(
-            cancellation["resume_recomputed_keys"],
-            "durability.cancellation_resume.resume_recomputed_keys",
-        )
+        or not reused_keys
+        or not recomputed_keys
+        or not isinstance(committed_payload, Mapping)
+        or committed_payload.get("task_key") != committed_peer_key
+        or committed_payload.get("status") not in {"completed", "reused"}
+        or not committed_payload.get("artifacts")
+        or ready_payload
+        != {
+            "blocked_task_key": blocked_task_key,
+            "committed_peer_key": committed_peer_key,
+            "status": "waiting-for-coordinator-interruption",
+        }
+        or not isinstance(trigger_payload, Mapping)
+        or trigger_payload.get("blocked_task_key") != blocked_task_key
+        or trigger_payload.get("committed_peer_key") != committed_peer_key
+        or trigger_payload.get("status") != "interrupted"
+        or trigger_payload.get("signal") != "SIGINT"
+        or trigger_payload.get("exit_code") != 130
+        or not isinstance(cancellation_queue_payload, Mapping)
+        or cancellation_queue_payload.get("jobs") != []
     ):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance cancellation, replacement, liveness, resume, "
@@ -982,6 +1566,9 @@ def validate_fine_acceptance_report(
         cancellation["preserved_artifacts"],
         "durability.cancellation_resume.preserved_artifacts",
     )
+    replacement_references = _validate_worker_replacement(
+        durability["worker_replacement"], owned_root=owned_root
+    )
 
     performance = _fine_object(
         report["performance"],
@@ -989,6 +1576,7 @@ def validate_fine_acceptance_report(
             {
                 "coarse_nonlinear_wall_seconds",
                 "fine_nonlinear_wall_seconds",
+                "clock_policy",
                 "end_to_end_wall_seconds",
                 "task_seconds",
                 "node_hours",
@@ -1011,6 +1599,12 @@ def validate_fine_acceptance_report(
         "performance.fine_nonlinear_wall_seconds",
         minimum=1e-300,
     )
+    if performance["clock_policy"] != (
+        "coordinator-fine-upper-bound-vs-worker-monotonic-coarse-lower-bound"
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance performance clock policy is not skew-safe"
+        )
     if fine_wall > 0.8 * coarse_wall:
         raise HpcWorkflowAcceptanceError(
             "fine acceptance does not satisfy the 20% nonlinear wall-time reduction"
@@ -1047,6 +1641,7 @@ def validate_fine_acceptance_report(
             "fine acceptance contains no evidence checksums"
         )
     evidence_paths: list[str] = []
+    evidence_digests: dict[str, str] = {}
     for index, raw in enumerate(evidence_files):
         evidence = _fine_object(
             raw,
@@ -1075,10 +1670,23 @@ def validate_fine_acceptance_report(
                 "fine acceptance evidence checksum is forged or stale"
             )
         evidence_paths.append(relative)
+        evidence_digests[relative] = claimed
     if evidence_paths != sorted(set(evidence_paths)):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance evidence checksums contain duplicate or noncanonical paths"
         )
+    for relative, digest in (
+        (tier1_reference, tier1_sha256),
+        (tier2_reference, tier2_sha256),
+        *replacement_references,
+        *cancellation_references,
+        *chunk_resume_references,
+        *channel_resume_references,
+    ):
+        if evidence_digests.get(relative) != digest:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance Tier evidence is not bound into evidence checksums"
+            )
     return json.loads(json.dumps(report, allow_nan=False, sort_keys=True))
 
 
@@ -1155,6 +1763,7 @@ def build_fine_acceptance_report(
 
 __all__ = [
     "build_fine_acceptance_report",
+    "fine_acceptance_manifest",
     "fine_acceptance_profiles",
     "fine_evidence_checksums",
     "fine_internal_parity_evidence",

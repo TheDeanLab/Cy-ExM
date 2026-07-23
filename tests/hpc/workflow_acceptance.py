@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -1498,30 +1500,27 @@ def run_profiled_fine_task(
 def run_injected_fine_failure_task(
     task: Any,
     *,
-    target_round: int,
-    target_stage: str,
+    target_key: str,
+    peer_key: str,
     failure_marker: Path,
-    settled_marker: Path | None = None,
+    settled_marker: Path,
     timeout_seconds: float = 1_800.0,
     _run_fine_task: Callable[[Any], Any] = _production_fine_task,
 ) -> Any:
-    """Inject one exact chunk or channel failure after ordinary siblings may settle."""
-    if target_stage not in {"chunk", "channel"}:
-        raise HpcWorkflowAcceptanceError(
-            "fine failure injection stage must be chunk or channel"
-        )
+    """Inject one exact-key failure once after one exact peer durably settles."""
+    from cyexm.workflow.fine_models import FineTaskKey
+
+    target = FineTaskKey.from_encoded(target_key)
+    peer = FineTaskKey.from_encoded(peer_key)
+    if target == peer or target.stage not in {"chunk", "channel"}:
+        raise HpcWorkflowAcceptanceError("fine failure keys must be distinct peers")
     key = getattr(task, "key", None)
-    is_target = (
-        getattr(task, "round", None) == target_round
-        and getattr(key, "stage", None) == target_stage
-    )
+    encoded = getattr(key, "encoded", None)
+    is_target = encoded == target_key
     if is_target:
-        encoded = getattr(key, "encoded", None)
-        if type(encoded) is not str:
-            raise HpcWorkflowAcceptanceError(
-                "fine failure target lacks an exact task identity"
-            )
-        if settled_marker is not None:
+        if failure_marker.exists():
+            return _run_fine_task(task)
+        if not settled_marker.is_file():
             deadline = time.monotonic() + timeout_seconds
             while not settled_marker.is_file():
                 if time.monotonic() >= deadline:
@@ -1529,72 +1528,138 @@ def run_injected_fine_failure_task(
                         "fine failure injection timed out waiting for a settled sibling"
                     )
                 time.sleep(0.25)
+        peer_record = json.loads(settled_marker.read_text(encoding="utf-8"))
+        if (
+            not isinstance(peer_record, dict)
+            or peer_record.get("task_key") != peer_key
+            or peer_record.get("status") not in {"completed", "reused"}
+            or not peer_record.get("artifacts")
+        ):
+            raise HpcWorkflowAcceptanceError(
+                "fine failure settled-peer marker is not exact committed evidence"
+            )
         _write_marker(
             failure_marker,
             {
                 "schema_version": 1,
-                "task_key": encoded,
-                "round": target_round,
-                "stage": target_stage,
+                "task_key": target_key,
+                "settled_peer_key": peer_key,
                 "status": "injected",
                 "injected_at": _utc_now(),
             },
         )
-        raise RuntimeError(f"injected fine acceptance failure for {encoded}")
+        raise RuntimeError(f"injected fine acceptance failure for {target_key}")
     result = _run_fine_task(task)
-    if (
-        settled_marker is not None
-        and getattr(key, "stage", None) == target_stage
-        and getattr(result, "status", None) in {"completed", "reused"}
-    ):
-        _write_marker(
-            settled_marker,
-            {
-                "schema_version": 1,
-                "task_key": getattr(key, "encoded", ""),
-                "status": getattr(result, "status", None),
-                "settled_at": _utc_now(),
-            },
-        )
+    if encoded == peer_key and getattr(result, "status", None) in {
+        "completed",
+        "reused",
+    }:
+        _write_fine_peer_commit(settled_marker, peer_key, result)
     return result
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_fine_peer_commit(path: Path, peer_key: str, result: Any) -> None:
+    artifacts = []
+    for raw in getattr(result, "artifact_paths", ()):
+        artifact = Path(raw).resolve(strict=True)
+        if not artifact.is_file():
+            raise HpcWorkflowAcceptanceError(
+                "fine committed peer artifact is not a real file"
+            )
+        artifacts.append(
+            {
+                "identity": FileIdentity.from_path(artifact).to_dict(),
+                "sha256": _file_digest(artifact),
+            }
+        )
+    if not artifacts:
+        raise HpcWorkflowAcceptanceError(
+            "fine committed peer must persist at least one artifact"
+        )
+    _write_marker(
+        path,
+        {
+            "schema_version": 1,
+            "task_key": peer_key,
+            "status": getattr(result, "status", None),
+            "artifacts": artifacts,
+            "committed_at": _utc_now(),
+        },
+    )
 
 
 def run_fine_cancellation_task(
     task: Any,
     *,
-    target_round: int,
-    target_stage: str,
+    target_key: str,
+    peer_key: str,
+    committed_marker: Path,
     ready_marker: Path,
     timeout_seconds: float,
     _run_fine_task: Callable[[Any], Any] = _production_fine_task,
     _monotonic: Callable[[], float] = time.monotonic,
     _sleep: Callable[[float], None] = time.sleep,
 ) -> Any:
-    """Block one exact fine task until the coordinator cancellation settles it."""
-    if target_stage not in {"chunk", "channel"} or timeout_seconds <= 0.0:
+    """Commit one exact peer, then block one distinct exact task for cancellation."""
+    from cyexm.workflow.fine_models import FineTaskKey
+
+    target = FineTaskKey.from_encoded(target_key)
+    peer = FineTaskKey.from_encoded(peer_key)
+    if (
+        target == peer
+        or target.round == peer.round
+        or target.stage not in {"chunk", "channel"}
+        or peer.stage != target.stage
+        or timeout_seconds <= 0.0
+    ):
         raise HpcWorkflowAcceptanceError(
-            "fine cancellation requires a chunk/channel stage and positive timeout"
+            "fine cancellation requires distinct cross-round exact peer keys"
         )
     key = getattr(task, "key", None)
-    if not (
-        getattr(task, "round", None) == target_round
-        and getattr(key, "stage", None) == target_stage
-    ):
-        return _run_fine_task(task)
     encoded = getattr(key, "encoded", None)
-    if type(encoded) is not str:
+    if encoded == peer_key:
+        result = _run_fine_task(task)
+        if getattr(result, "status", None) not in {"completed", "reused"}:
+            raise HpcWorkflowAcceptanceError(
+                "fine cancellation peer did not commit successfully"
+            )
+        _write_fine_peer_commit(committed_marker, peer_key, result)
+        return result
+    if encoded != target_key:
+        return _run_fine_task(task)
+    deadline = _monotonic() + timeout_seconds
+    while not committed_marker.is_file():
+        if _monotonic() >= deadline:
+            raise HpcWorkflowAcceptanceError(
+                "fine cancellation timed out waiting for committed exact peer"
+            )
+        _sleep(0.25)
+    committed = json.loads(committed_marker.read_text(encoding="utf-8"))
+    if (
+        not isinstance(committed, dict)
+        or committed.get("task_key") != peer_key
+        or committed.get("status") not in {"completed", "reused"}
+        or not committed.get("artifacts")
+    ):
         raise HpcWorkflowAcceptanceError(
-            "fine cancellation target lacks an exact task identity"
+            "fine cancellation peer marker lacks committed artifact evidence"
         )
     _write_marker(
         ready_marker,
         {
-            "blocked_round": target_round,
-            "committed_round": target_round,
+            "blocked_task_key": target_key,
+            "committed_peer_key": peer_key,
             "status": "waiting-for-coordinator-interruption",
         },
     )
-    deadline = _monotonic() + timeout_seconds
     while _monotonic() < deadline:
         _sleep(min(0.25, max(0.0, deadline - _monotonic())))
     raise HpcWorkflowAcceptanceError(
@@ -1605,36 +1670,54 @@ def run_fine_cancellation_task(
 def run_fine_worker_loss_task(
     task: Any,
     *,
-    target_round: int,
-    target_stage: str,
+    target_key: str,
     loss_marker: Path,
     _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+    _worker_identity: Callable[[], dict[str, object]] | None = None,
+    _utc_now: Callable[[], str] = _utc_now,
     _exit: Callable[[int], Any] = os._exit,
 ) -> Any:
     """Terminate one worker exactly once, then let the replacement retry succeed."""
-    if target_stage not in {"chunk", "channel"}:
+    from cyexm.workflow.fine_models import FineTaskKey
+
+    target = FineTaskKey.from_encoded(target_key)
+    if target.stage not in {"chunk", "channel"}:
         raise HpcWorkflowAcceptanceError(
             "fine worker-loss stage must be chunk or channel"
         )
     key = getattr(task, "key", None)
-    if (
-        not (
-            getattr(task, "round", None) == target_round
-            and getattr(key, "stage", None) == target_stage
-        )
-        or loss_marker.exists()
-    ):
+    if getattr(key, "encoded", None) != target_key or loss_marker.exists():
         return _run_fine_task(task)
-    encoded = getattr(key, "encoded", None)
-    if type(encoded) is not str:
+
+    def production_identity() -> dict[str, object]:
+        from distributed import get_worker
+
+        return {
+            "worker_address": get_worker().address,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        }
+
+    identity = (_worker_identity or production_identity)()
+    if (
+        set(identity) != {"worker_address", "hostname", "pid", "slurm_job_id"}
+        or any(
+            type(identity[name]) is not str or not identity[name]
+            for name in ("worker_address", "hostname", "slurm_job_id")
+        )
+        or type(identity["pid"]) is not int
+        or cast(int, identity["pid"]) < 1
+    ):
         raise HpcWorkflowAcceptanceError(
-            "fine worker-loss target lacks an exact task identity"
+            "fine worker-loss marker requires one exact worker identity"
         )
     _write_marker(
         loss_marker,
         {
             "schema_version": 1,
-            "task_key": encoded,
+            "task_key": target_key,
+            **identity,
             "status": "worker-loss-injected",
             "injected_at": _utc_now(),
         },
@@ -1871,6 +1954,8 @@ def execute_cancellation_acceptance(
     ready_marker: Path,
     successful_round: int,
     blocked_round: int,
+    committed_peer_key: str | None = None,
+    blocked_task_key: str | None = None,
     timeout_seconds: float,
     fine_runner: Callable[[Any], Any] | None = None,
     _execute_owned: Callable[..., Any] | None = None,
@@ -1884,9 +1969,23 @@ def execute_cancellation_acceptance(
             "cancellation timeout must be positive and bounded"
         )
     stopped = threading.Event()
+    if (committed_peer_key is None) != (blocked_task_key is None):
+        raise HpcWorkflowAcceptanceError(
+            "exact cancellation task keys must be supplied together"
+        )
+    exact_keys = committed_peer_key is not None and blocked_task_key is not None
     trigger: dict[str, object] = {
-        "blocked_round": blocked_round,
-        "committed_round": successful_round,
+        **(
+            {
+                "blocked_task_key": blocked_task_key,
+                "committed_peer_key": committed_peer_key,
+            }
+            if exact_keys
+            else {
+                "blocked_round": blocked_round,
+                "committed_round": successful_round,
+            }
+        ),
         "signal": "SIGINT",
         "status": "waiting",
         "timeout_seconds": timeout_seconds,
@@ -1903,8 +2002,17 @@ def execute_cancellation_acceptance(
                     trigger["error"] = _error_payload(error)
                     return
                 expected = {
-                    "blocked_round": blocked_round,
-                    "committed_round": successful_round,
+                    **(
+                        {
+                            "blocked_task_key": blocked_task_key,
+                            "committed_peer_key": committed_peer_key,
+                        }
+                        if exact_keys
+                        else {
+                            "blocked_round": blocked_round,
+                            "committed_round": successful_round,
+                        }
+                    ),
                     "status": "waiting-for-coordinator-interruption",
                 }
                 if payload != expected:

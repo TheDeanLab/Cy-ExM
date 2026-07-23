@@ -17,7 +17,10 @@ from cyexm.workflow.models import WorkflowPlan, WorkflowResult, canonical_json
 from cyexm.workflow.planning import build_workflow_plan
 from cyexm.workflow.task import run_workflow_task
 from hpc.environment import HpcAcceptanceContext, write_evidence_json
-from hpc.fine_workflow_acceptance import build_fine_acceptance_report
+from hpc.fine_workflow_acceptance import (
+    build_fine_acceptance_report,
+    fine_acceptance_manifest,
+)
 from hpc.workflow_acceptance import (
     HpcWorkflowAcceptanceError,
     coordination_timeout_seconds,
@@ -93,24 +96,6 @@ def _prepare_roots(coarse_output: Path, fine_output: Path) -> _ScenarioRoots:
     return roots
 
 
-def _bounded_manifest(context: HpcAcceptanceContext) -> Any:
-    rounds = tuple(
-        sorted(
-            (
-                item
-                for item in context.manifest.rounds
-                if item.strategy == "serial_chunked" and item.channels
-            ),
-            key=lambda item: item.round,
-        )[:2]
-    )
-    if len(rounds) != 2:
-        raise HpcWorkflowAcceptanceError(
-            "fine acceptance requires two multi-channel serial_chunked rounds"
-        )
-    return replace(context.manifest, rounds=rounds)
-
-
 def _profile_fingerprint(profile: Any) -> str:
     return sha256(
         canonical_json(_execution_profile_mapping(profile)).encode("utf-8")
@@ -167,8 +152,8 @@ def _placement(evidence: dict[str, object]) -> dict[str, object]:
                 "job_id": item["slurm_job_id"],
                 "hostname": item["hostname"],
                 "worker": item["worker_address"],
-                "started_at": item["started_at"],
-                "ended_at": item["ended_at"],
+                "coordinator_submitted_at": item["coordinator_submitted_at"],
+                "coordinator_ready_at": item["coordinator_ready_at"],
                 "duration_seconds": item["duration_seconds"],
                 "_submitted": item["coordinator_submitted_at"],
             }
@@ -302,13 +287,32 @@ def _profiled_performance(
     def timestamp(value: object) -> datetime:
         return datetime.fromisoformat(cast(str, value).replace("Z", "+00:00"))
 
-    coarse_wall = (
-        max(timestamp(item["ended_at"]) for item in coarse_calls)
-        - min(timestamp(item["started_at"]) for item in coarse_calls)
-    ).total_seconds()
+    fine_graph = cast(dict[str, object], fine_evidence["fine_graph"])
+    coarse_wall = max(
+        float(cast(int | float, item["duration_seconds"])) for item in coarse_calls
+    )
+    raw_placements = cast(list[dict[str, object]], fine_graph["placements"])
+    chunk_attempts = [
+        item
+        for item in raw_placements
+        if ":chunk:" in cast(str, item["task_key"])
+        and item["placement_accepted"]
+        and item["status"] in {"completed", "reused"}
+    ]
+    assembly_attempts = [
+        item
+        for item in raw_placements
+        if ":assembly:" in cast(str, item["task_key"])
+        and item["placement_accepted"]
+        and item["status"] in {"completed", "reused"}
+    ]
+    if not chunk_attempts or not assembly_attempts:
+        raise HpcWorkflowAcceptanceError(
+            "fine performance lacks coordinator-observed chunk/assembly boundaries"
+        )
     fine_wall = (
-        max(timestamp(item["ended_at"]) for item in assemblies)
-        - min(timestamp(item["started_at"]) for item in fine_calls)
+        max(timestamp(item["coordinator_ready_at"]) for item in assembly_attempts)
+        - min(timestamp(item["coordinator_submitted_at"]) for item in chunk_attempts)
     ).total_seconds()
     result_wall = (
         timestamp(fine_result.ended_at) - timestamp(fine_result.started_at)
@@ -316,7 +320,6 @@ def _profiled_performance(
     task_seconds = sum(
         float(cast(int | float, item["duration_seconds"])) for item in fine_records
     )
-    fine_graph = cast(dict[str, object], fine_evidence["fine_graph"])
     scale_events = cast(list[dict[str, object]], fine_graph["scale_events"])
     first_scale = scale_events[0]
     execution_started = cast(dict[str, object], fine_evidence["timestamps"])[
@@ -350,6 +353,9 @@ def _profiled_performance(
     return {
         "coarse_nonlinear_wall_seconds": coarse_wall,
         "fine_nonlinear_wall_seconds": fine_wall,
+        "clock_policy": (
+            "coordinator-fine-upper-bound-vs-worker-monotonic-coarse-lower-bound"
+        ),
         "end_to_end_wall_seconds": result_wall,
         "task_seconds": task_seconds,
         "node_hours": worker_seconds / 3600.0,
@@ -418,58 +424,84 @@ def _failure_resume(
     resumed: WorkflowResult,
     stage: str,
     owned_root: Path,
+    target_key: str,
+    peer_key: str,
+    failure_evidence_path: Path,
+    resume_evidence_path: Path,
+    failure_marker_path: Path,
+    settled_peer_path: Path,
 ) -> dict[str, object]:
     fine = cast(dict[str, object], failed_evidence["fine_graph"])
     results = cast(list[dict[str, object]], fine["task_results"])
-    failed = next(
+    failed_placements = [
+        item
+        for item in cast(list[dict[str, object]], fine["placements"])
+        if item["task_key"] == target_key and item["status"] == "failed"
+    ]
+    if len(failed_placements) != 1 or failed_placements[0]["attempt"] != 1:
+        raise HpcWorkflowAcceptanceError(
+            "fine injected failure did not produce one exact failed attempt"
+        )
+    settled = [
         item
         for item in results
-        if item["stage"] == stage and item["status"] == "failed"
-    )
-    settled = sorted(
-        cast(str, item["key"])
-        for item in results
-        if item["stage"] == stage and item["status"] in {"completed", "reused"}
-    )
+        if item["key"] == peer_key and item["status"] in {"completed", "reused"}
+    ]
+    if len(settled) != 1:
+        raise HpcWorkflowAcceptanceError(
+            "fine injected failure lacks one exact settled peer"
+        )
     resume_evidence = json.loads(resumed.execution_evidence_json)
     resume_results = cast(
         list[dict[str, object]],
         cast(dict[str, object], resume_evidence["fine_graph"])["task_results"],
     )
-    reused = sorted(
-        cast(str, item["key"])
-        for item in resume_results
-        if item["stage"] == stage and item["status"] == "reused"
-    )
-    recomputed = sorted(
-        cast(str, item["key"])
-        for item in resume_results
-        if item["stage"] == stage and item["status"] == "completed"
-    )
-    preserved_paths = sorted(
-        {
-            cast(str, path)
-            for item in results
-            if item["status"] in {"completed", "reused"}
-            for path in cast(list[str], item["artifact_paths"])
-            if Path(path).is_file()
-        }
-    )
+    resumed_by_key = {cast(str, item["key"]): item for item in resume_results}
+    if resumed_by_key.get(peer_key, {}).get("status") != "reused" or (
+        resumed_by_key.get(target_key, {}).get("status") != "completed"
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine resume does not reuse the exact peer and recompute the exact target"
+        )
+    preserved_paths = [
+        cast(str, path)
+        for path in cast(list[str], settled[0]["artifact_paths"])
+        if Path(path).is_file()
+    ]
     return {
-        "injected_task_key": failed["key"],
+        "failure_evidence_file": {
+            "relative_path": failure_evidence_path.name,
+            "sha256": _file_sha256(failure_evidence_path),
+        },
+        "resume_evidence_file": {
+            "relative_path": resume_evidence_path.name,
+            "sha256": _file_sha256(resume_evidence_path),
+        },
+        "failure_marker_file": {
+            "relative_path": failure_marker_path.name,
+            "sha256": _file_sha256(failure_marker_path),
+        },
+        "settled_peer_file": {
+            "relative_path": settled_peer_path.name,
+            "sha256": _file_sha256(settled_peer_path),
+        },
+        "injected_task_key": target_key,
         "failure_status": "failed",
-        "settled_sibling_keys": settled,
+        "failed_attempts": 1,
+        "settled_peer_key": peer_key,
         "preserved_artifacts": _artifact_path_entries(
             preserved_paths,
             owned_root=owned_root,
         ),
-        "resume_reused_keys": reused,
-        "resume_recomputed_keys": recomputed,
-        "ordinary_artifact_store_reuse": bool(reused),
+        "resume_reused_keys": [peer_key],
+        "resume_recomputed_keys": [target_key],
+        "ordinary_artifact_store_reuse": True,
     }
 
 
-def _tier1_summary(equivalence: dict[str, object]) -> dict[str, object]:
+def _tier1_summary(
+    equivalence: dict[str, object], *, evidence_path: Path
+) -> dict[str, object]:
     differences: list[float] = []
 
     def visit(value: object) -> None:
@@ -485,20 +517,186 @@ def _tier1_summary(equivalence: dict[str, object]) -> dict[str, object]:
 
     visit(equivalence)
     return {
+        "evidence_file": {
+            "relative_path": evidence_path.name,
+            "sha256": _file_sha256(evidence_path),
+        },
         "metric_absolute_tolerance": 0.01,
         "maximum_metric_absolute_difference": max(differences, default=0.0),
         "structure_equal": True,
     }
 
 
+def _tier2_summary(
+    deterministic: dict[str, object],
+    *,
+    evidence_path: Path,
+) -> dict[str, object]:
+    strict = cast(dict[str, object], deterministic["strict_parity"])
+    rounds = cast(list[dict[str, object]], strict["rounds"])
+
+    def exact_numeric(value: object) -> bool:
+        if isinstance(value, dict):
+            if "array_equal" in value and value["array_equal"] is not True:
+                return False
+            return all(exact_numeric(item) for item in value.values())
+        if isinstance(value, list):
+            return all(exact_numeric(item) for item in value)
+        return True
+
+    channel_records = [
+        (
+            f"deterministic/round-{round_index:04d}/channel-{channel_index:04d}",
+            item,
+        )
+        for round_index, round_record in enumerate(rounds)
+        for channel_index, item in enumerate(
+            cast(list[dict[str, object]], round_record["channels"])
+        )
+    ]
+    internal = cast(dict[str, object], deterministic["strict_internal_parity"])
+    return {
+        "evidence_file": {
+            "relative_path": evidence_path.name,
+            "sha256": _file_sha256(evidence_path),
+        },
+        "seed": deterministic["seed"],
+        "native_threads": 1,
+        "affine_exact": all(exact_numeric(item["affine"]) for item in rounds),
+        "local_warp_exact": internal["local_warp_exact"],
+        "full_warp_exact": all(exact_numeric(item["warp"]) for item in rounds),
+        "diagnostic_exact": internal["diagnostic_exact"],
+        "metrics_exact": all(exact_numeric(item["metrics"]) for item in rounds),
+        "channels": [
+            {"relative_path": path, "exact": exact_numeric(record)}
+            for path, record in channel_records
+        ],
+    }
+
+
+def _replacement_lineage(
+    evidence: dict[str, object],
+    *,
+    evidence_path: Path,
+    queue_after_path: Path,
+    loss_marker_path: Path,
+    target_key: str,
+) -> dict[str, object]:
+    marker = cast(
+        dict[str, object],
+        json.loads(loss_marker_path.read_text(encoding="utf-8")),
+    )
+    graph = cast(dict[str, object], evidence["fine_graph"])
+    events = cast(list[dict[str, object]], graph["scale_events"])
+    placements = cast(list[dict[str, object]], graph["placements"])
+
+    def identity(item: dict[str, object]) -> dict[str, object]:
+        return {
+            name: item[name]
+            for name in ("worker_address", "hostname", "pid", "slurm_job_id")
+        }
+
+    loss_identity = identity(marker)
+    activated_index = next(
+        index
+        for index, event in enumerate(events)
+        if loss_identity
+        in [
+            identity(item)
+            for item in cast(list[dict[str, object]], event["activated_probes"])
+        ]
+    )
+    replacement_event = next(
+        event
+        for event in events[activated_index + 1 :]
+        if marker["worker_address"] in cast(list[object], event["departed"])
+        and cast(list[dict[str, object]], event["activated_probes"])
+    )
+    replacement_identity = next(
+        identity(item)
+        for item in cast(list[dict[str, object]], replacement_event["activated_probes"])
+        if identity(item) != loss_identity
+    )
+    target_attempts = [item for item in placements if item["task_key"] == target_key]
+    if (
+        len(target_attempts) != 2
+        or target_attempts[0]["attempt"] != 1
+        or target_attempts[0]["status"] != "failed"
+        or target_attempts[1]["attempt"] != 2
+        or target_attempts[1]["status"] != "completed"
+        or identity(target_attempts[1]) != replacement_identity
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "replacement trial lacks the exact failed/retried target lineage"
+        )
+    retry_ready = cast(str, target_attempts[1]["coordinator_ready_at"])
+    liveness = min(
+        (
+            item
+            for item in placements
+            if item["task_key"] != target_key
+            and item["placement_accepted"]
+            and item["status"] in {"completed", "reused"}
+            and cast(str, item["coordinator_ready_at"]) > retry_ready
+        ),
+        key=lambda item: cast(str, item["coordinator_ready_at"]),
+    )
+    queue_after = json.loads(queue_after_path.read_text(encoding="utf-8"))
+    if queue_after.get("jobs") != []:
+        raise HpcWorkflowAcceptanceError(
+            "replacement trial retains an owned named job after cleanup"
+        )
+    loss_summary = {"task_key": target_key, **loss_identity}
+    return {
+        "evidence_file": {
+            "relative_path": evidence_path.name,
+            "sha256": _file_sha256(evidence_path),
+        },
+        "queue_after_file": {
+            "relative_path": queue_after_path.name,
+            "sha256": _file_sha256(queue_after_path),
+        },
+        "loss_marker_file": {
+            "relative_path": loss_marker_path.name,
+            "sha256": _file_sha256(loss_marker_path),
+        },
+        "loss_marker": loss_summary,
+        "failed_attempt": {
+            "task_key": target_key,
+            "attempt": 1,
+            "status": "failed",
+        },
+        "departed_worker": loss_identity,
+        "replacement_worker": replacement_identity,
+        "retry": {
+            "task_key": target_key,
+            "attempt": 2,
+            "status": "completed",
+            **replacement_identity,
+        },
+        "liveness": {
+            "task_key": liveness["task_key"],
+            "status": liveness["status"],
+            **identity(liveness),
+        },
+        "owned_job_ids": sorted(
+            {
+                cast(str, loss_identity["slurm_job_id"]),
+                cast(str, replacement_identity["slurm_job_id"]),
+            }
+        ),
+        "remaining_owned_job_ids": [],
+    }
+
+
 def _run_fine_acceptance(
     context: HpcAcceptanceContext, profiles: Any
 ) -> dict[str, object]:
+    manifest, targets = fine_acceptance_manifest(context.manifest)
     roots = _prepare_roots(
         profiles.coarse.paths.output_root,
         profiles.fine.paths.output_root,
     )
-    manifest = _bounded_manifest(context)
     coarse_profile = replace(
         profiles.coarse,
         paths=replace(profiles.coarse.paths, output_root=roots.coarse),
@@ -628,23 +826,27 @@ def _run_fine_acceptance(
         ),
     )
     equivalence = scientific_equivalence_evidence(coarse_plan, fine_plan)
+    tier1_evidence_path = context.evidence_dir / "fine-tier1-equivalence.json"
+    write_evidence_json(tier1_evidence_path, equivalence)
     fine_evidence = cast(dict[str, object], json.loads(fine.execution_evidence_json))
     placement = _placement(fine_evidence)
 
     failure_records: dict[str, tuple[dict[str, object], WorkflowResult]] = {}
-    for stage, root in (
-        ("chunk", roots.chunk_failure),
-        ("channel", roots.channel_failure),
-    ):
+    for stage in ("chunk", "channel"):
         profile = fine_scenario_profiles[f"{stage}_failure"]
+        profile = replace(
+            profile,
+            slurm=replace(cast(Any, profile.slurm), task_retries=0),
+        )
         plan = build_workflow_plan(manifest, profile)
-        marker = root / f"injected-{stage}.json"
+        marker = context.evidence_dir / f"fine-{stage}-failure-marker.json"
+        settled_marker = context.evidence_dir / f"fine-{stage}-settled-peer.json"
         runner = partial(
             run_injected_fine_failure_task,
-            target_round=plan.tasks[0].round,
-            target_stage=stage,
+            target_key=targets[f"{stage}_target"],
+            peer_key=targets[f"{stage}_peer"],
             failure_marker=marker,
-            settled_marker=root / f"settled-{stage}-sibling.json",
+            settled_marker=settled_marker,
             timeout_seconds=coordination_timeout_seconds(profile),
         )
         try:
@@ -684,11 +886,13 @@ def _run_fine_acceptance(
 
     cancellation_profile = fine_scenario_profiles["cancellation"]
     cancellation_plan = build_workflow_plan(manifest, cancellation_profile)
-    ready = roots.cancellation / "cancellation-ready.json"
+    ready = context.evidence_dir / "fine-cancellation-ready.json"
+    committed_peer_marker = context.evidence_dir / "fine-cancellation-peer.json"
     cancellation_runner = partial(
         run_fine_cancellation_task,
-        target_round=cancellation_plan.tasks[0].round,
-        target_stage="chunk",
+        target_key=targets["chunk_target"],
+        peer_key=targets["chunk_peer"],
+        committed_marker=committed_peer_marker,
         ready_marker=ready,
         timeout_seconds=coordination_timeout_seconds(cancellation_profile),
     )
@@ -700,8 +904,10 @@ def _run_fine_acceptance(
         operation="fine-cancellation",
         user=user,
         ready_marker=ready,
-        successful_round=cancellation_plan.tasks[0].round,
-        blocked_round=cancellation_plan.tasks[0].round,
+        successful_round=manifest.rounds[1].round,
+        blocked_round=manifest.rounds[0].round,
+        committed_peer_key=targets["chunk_peer"],
+        blocked_task_key=targets["chunk_target"],
         timeout_seconds=coordination_timeout_seconds(cancellation_profile),
     )
     cancelled_evidence = json.loads(
@@ -724,9 +930,8 @@ def _run_fine_acceptance(
     replacement_plan = build_workflow_plan(manifest, replacement_profile)
     replacement_runner = partial(
         run_fine_worker_loss_task,
-        target_round=replacement_plan.tasks[0].round,
-        target_stage="chunk",
-        loss_marker=roots.replacement / "worker-loss.json",
+        target_key=targets["replacement_target"],
+        loss_marker=context.evidence_dir / "fine-worker-loss-marker.json",
     )
     replacement_result = cast(
         WorkflowResult,
@@ -750,17 +955,9 @@ def _run_fine_acceptance(
         evidence_dir=context.evidence_dir,
         timeout_seconds=coordination_timeout_seconds(profiles.fine) + 600.0,
     )
-    internal_parity = cast(dict[str, object], deterministic["strict_internal_parity"])
-    tier2_channels = [
-        {
-            "relative_path": channel.output.relative_to(
-                fine_plan.execution.paths.output_root
-            ).as_posix(),
-            "exact": True,
-        }
-        for task in fine_plan.tasks
-        for channel in task.channels
-    ]
+    deterministic_evidence_path = (
+        context.evidence_dir / "deterministic-executor-parity.json"
+    )
     prepared = _prepared_grid(fine_evidence, owned_root=roots.fine)
     performance = _profiled_performance(
         coarse_timing=coarse_timing,
@@ -772,7 +969,6 @@ def _run_fine_acceptance(
     cancellation_graph = cast(
         dict[str, object], cast(dict[str, object], cancelled_evidence)["fine_graph"]
     )
-    replacement_graph = cast(dict[str, object], replacement_evidence["fine_graph"])
     cancellation_results = cast(
         list[dict[str, object]], cancellation_graph["task_results"]
     )
@@ -790,8 +986,24 @@ def _run_fine_acceptance(
         ]["task_results"]
         if item["status"] == "completed"
     )
-    raw_files = tuple(
-        sorted(path for path in context.evidence_dir.rglob("*") if path.is_file())
+    if (
+        targets["chunk_peer"] not in cancellation_reused
+        or targets["chunk_target"] not in cancellation_recomputed
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "cancellation resume did not reuse the committed peer and recompute "
+            "the exact blocked task"
+        )
+    replacement_lineage = _replacement_lineage(
+        replacement_evidence,
+        evidence_path=(
+            context.evidence_dir / "fine-worker-replacement-slurm-execution.json"
+        ),
+        queue_after_path=(
+            context.evidence_dir / "fine-worker-replacement-queue-after.json"
+        ),
+        loss_marker_path=context.evidence_dir / "fine-worker-loss-marker.json",
+        target_key=targets["replacement_target"],
     )
     input_paths = tuple(
         sorted(
@@ -831,17 +1043,14 @@ def _run_fine_acceptance(
             "fine_fingerprint": fine_plan.scientific_fingerprint,
             "public_artifacts_coarse": _artifact_entries(coarse_plan),
             "public_artifacts_fine": _artifact_entries(fine_plan),
-            "tier1": _tier1_summary(equivalence),
-            "tier2": {
-                "seed": deterministic["seed"],
-                "native_threads": 1,
-                "affine_exact": True,
-                "local_warp_exact": internal_parity["local_warp_exact"],
-                "full_warp_exact": True,
-                "diagnostic_exact": internal_parity["diagnostic_exact"],
-                "metrics_exact": True,
-                "channels": tier2_channels,
-            },
+            "tier1": _tier1_summary(
+                equivalence,
+                evidence_path=tier1_evidence_path,
+            ),
+            "tier2": _tier2_summary(
+                deterministic,
+                evidence_path=deterministic_evidence_path,
+            ),
         },
         fixed_grid=prepared,
         placement=placement,
@@ -851,16 +1060,50 @@ def _run_fine_acceptance(
                 failure_records["chunk"][1],
                 "chunk",
                 roots.chunk_failure,
+                targets["chunk_target"],
+                targets["chunk_peer"],
+                context.evidence_dir / "fine-chunk-failure-slurm-execution.json",
+                context.evidence_dir / "fine-chunk-resume-slurm-execution.json",
+                context.evidence_dir / "fine-chunk-failure-marker.json",
+                context.evidence_dir / "fine-chunk-settled-peer.json",
             ),
             "channel_failure_resume": _failure_resume(
                 failure_records["channel"][0],
                 failure_records["channel"][1],
                 "channel",
                 roots.channel_failure,
+                targets["channel_target"],
+                targets["channel_peer"],
+                context.evidence_dir / "fine-channel-failure-slurm-execution.json",
+                context.evidence_dir / "fine-channel-resume-slurm-execution.json",
+                context.evidence_dir / "fine-channel-failure-marker.json",
+                context.evidence_dir / "fine-channel-settled-peer.json",
             ),
             "cancellation_resume": {
                 "status": "cancelled",
                 "structured_cancellation": cancellation_graph["cancelled"],
+                "blocked_task_key": targets["chunk_target"],
+                "committed_peer_key": targets["chunk_peer"],
+                "committed_peer_file": {
+                    "relative_path": committed_peer_marker.name,
+                    "sha256": _file_sha256(committed_peer_marker),
+                },
+                "ready_marker_file": {
+                    "relative_path": ready.name,
+                    "sha256": _file_sha256(ready),
+                },
+                "trigger_file": {
+                    "relative_path": "fine-cancellation-trigger.json",
+                    "sha256": _file_sha256(
+                        context.evidence_dir / "fine-cancellation-trigger.json"
+                    ),
+                },
+                "queue_after_file": {
+                    "relative_path": "fine-cancellation-queue-after.json",
+                    "sha256": _file_sha256(
+                        context.evidence_dir / "fine-cancellation-queue-after.json"
+                    ),
+                },
                 "preserved_artifacts": _artifact_path_entries(
                     [
                         cast(str, path)
@@ -870,17 +1113,8 @@ def _run_fine_acceptance(
                     ],
                     owned_root=roots.cancellation,
                 ),
-                "resume_reused_keys": cancellation_reused,
-                "resume_recomputed_keys": cancellation_recomputed,
-                "replacement_events": sum(
-                    bool(item["departed"])
-                    for item in cast(
-                        list[dict[str, object]], replacement_graph["scale_events"]
-                    )
-                ),
-                "liveness_proven": (
-                    replacement_result.succeeded and bool(cancellation_recomputed)
-                ),
+                "resume_reused_keys": [targets["chunk_peer"]],
+                "resume_recomputed_keys": [targets["chunk_target"]],
                 "owned_job_ids": sorted(
                     {
                         cast(str, item["slurm_job_id"])
@@ -893,10 +1127,13 @@ def _run_fine_acceptance(
                 ),
                 "remaining_owned_job_ids": [],
             },
+            "worker_replacement": replacement_lineage,
         },
         performance=performance,
         evidence_root=context.evidence_dir,
-        evidence_paths=raw_files,
+        evidence_paths=tuple(
+            sorted(path for path in context.evidence_dir.rglob("*") if path.is_file())
+        ),
     )
     write_evidence_json(
         context.evidence_dir / "fine-grained-acceptance.json",

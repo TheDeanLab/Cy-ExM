@@ -24,6 +24,7 @@ from hpc.deterministic_parity import (
 )
 from hpc.fine_workflow_acceptance import (
     build_fine_acceptance_report,
+    fine_acceptance_manifest,
     fine_acceptance_profiles,
     validate_fine_acceptance_report,
 )
@@ -150,6 +151,229 @@ def _profile(tmp_path: Path, *, workers: int = 4) -> ExecutionProfile:
 def _fine_acceptance_report(root: Path) -> dict[str, object]:
     evidence_path = root / "fine-execution.json"
     evidence_path.write_bytes(b'{"fine":"evidence"}\n')
+    tier1_path = root / "tier1-equivalence.json"
+    tier1_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "rounds": [
+                    {
+                        "metrics": {
+                            "absolute_differences": {
+                                "Correlation": 0.009,
+                                "MattesMutualInformation": 0.004,
+                            }
+                        }
+                    }
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    tier2_path = root / "deterministic-executor-parity.json"
+    tier2_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "seed": "20260722",
+                "native_threads": {
+                    "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1,
+                    "OMP_NUM_THREADS": 1,
+                    "OPENBLAS_NUM_THREADS": 1,
+                    "MKL_NUM_THREADS": 1,
+                    "NUMEXPR_NUM_THREADS": 1,
+                    "VECLIB_MAXIMUM_THREADS": 1,
+                },
+                "inputs": {},
+                "parallel": {"status": "completed"},
+                "sequential": {"status": "completed"},
+                "strict_parity": _strict_parity_payload(),
+                "strict_internal_parity": _strict_internal_parity_payload(),
+                "final_queue": {
+                    "jobs": [],
+                    "coarse": {"jobs": []},
+                    "fine": {"jobs": []},
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    replacement_path = root / "fine-worker-replacement-slurm-execution.json"
+    replacement_path.write_text(
+        json.dumps(
+            {
+                "observed": {
+                    "worker_probes": [
+                        {
+                            "worker_address": "tcp://node-a:1",
+                            "hostname": "node-a",
+                            "pid": 111,
+                            "slurm_job_id": "101",
+                        },
+                        {
+                            "worker_address": "tcp://node-c:1",
+                            "hostname": "node-c",
+                            "pid": 333,
+                            "slurm_job_id": "103",
+                        },
+                    ]
+                },
+                "fine_graph": {
+                    "scale_events": [
+                        {
+                            "departed": [],
+                            "activated": ["tcp://node-a:1"],
+                            "activated_probes": [
+                                {
+                                    "worker_address": "tcp://node-a:1",
+                                    "hostname": "node-a",
+                                    "pid": 111,
+                                    "slurm_job_id": "101",
+                                }
+                            ],
+                        },
+                        {
+                            "departed": ["tcp://node-a:1"],
+                            "activated": ["tcp://node-c:1"],
+                            "activated_probes": [
+                                {
+                                    "worker_address": "tcp://node-c:1",
+                                    "hostname": "node-c",
+                                    "pid": 333,
+                                    "slurm_job_id": "103",
+                                }
+                            ],
+                        },
+                    ],
+                    "attempt_counts": [
+                        {"task_key": "round-002:chunk:0000", "attempts": 2},
+                        {"task_key": "round-003:chunk:0000", "attempts": 1},
+                    ],
+                    "placements": [
+                        {
+                            "task_key": "round-002:chunk:0000",
+                            "attempt": 1,
+                            "status": "failed",
+                            "worker_address": None,
+                            "hostname": None,
+                            "pid": None,
+                            "slurm_job_id": None,
+                            "placement_accepted": False,
+                            "coordinator_ready_at": "2026-07-22T10:00:01Z",
+                        },
+                        {
+                            "task_key": "round-002:chunk:0000",
+                            "attempt": 2,
+                            "status": "completed",
+                            "worker_address": "tcp://node-c:1",
+                            "hostname": "node-c",
+                            "pid": 333,
+                            "slurm_job_id": "103",
+                            "placement_accepted": True,
+                            "coordinator_ready_at": "2026-07-22T10:00:02Z",
+                        },
+                        {
+                            "task_key": "round-003:chunk:0000",
+                            "attempt": 1,
+                            "status": "completed",
+                            "worker_address": "tcp://node-c:1",
+                            "hostname": "node-c",
+                            "pid": 333,
+                            "slurm_job_id": "103",
+                            "placement_accepted": True,
+                            "coordinator_ready_at": "2026-07-22T10:00:03Z",
+                        },
+                    ],
+                },
+                "cleanup": {
+                    "recorded_job_ids": ["101", "103"],
+                    "remaining_owned_job_ids": [],
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    replacement_queue_path = root / "fine-worker-replacement-queue-after.json"
+    replacement_queue_path.write_text(
+        json.dumps({"jobs": []}, sort_keys=True),
+        encoding="utf-8",
+    )
+    loss_marker_path = root / "worker-loss.json"
+    loss_marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_key": "round-002:chunk:0000",
+                "worker_address": "tcp://node-a:1",
+                "hostname": "node-a",
+                "pid": 111,
+                "slurm_job_id": "101",
+                "status": "worker-loss-injected",
+                "injected_at": "2026-07-22T10:00:00Z",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    committed_peer_path = root / "committed-peer.json"
+    committed_peer_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_key": "round-003:chunk:0000",
+                "status": "completed",
+                "artifacts": [
+                    {
+                        "identity": {
+                            "path": "/owned/peer",
+                            "st_size": 1,
+                            "st_mtime_ns": 1,
+                        },
+                        "sha256": "a" * 64,
+                    }
+                ],
+                "committed_at": "2026-07-22T10:00:00Z",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    cancellation_ready_path = root / "cancellation-ready.json"
+    cancellation_ready_path.write_text(
+        json.dumps(
+            {
+                "blocked_task_key": "round-002:chunk:0000",
+                "committed_peer_key": "round-003:chunk:0000",
+                "status": "waiting-for-coordinator-interruption",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    cancellation_trigger_path = root / "fine-cancellation-trigger.json"
+    cancellation_trigger_path.write_text(
+        json.dumps(
+            {
+                "blocked_task_key": "round-002:chunk:0000",
+                "committed_peer_key": "round-003:chunk:0000",
+                "signal": "SIGINT",
+                "status": "interrupted",
+                "timeout_seconds": 1800.0,
+                "exit_code": 130,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    cancellation_queue_path = root / "fine-cancellation-queue-after.json"
+    cancellation_queue_path.write_text(
+        json.dumps({"jobs": []}, sort_keys=True),
+        encoding="utf-8",
+    )
     prepared_path = root / "fine" / "schema-v1" / "sample" / "prepared" / "fixed.npy"
     prepared_path.parent.mkdir(parents=True)
     prepared_path.write_bytes(b"prepared")
@@ -168,8 +392,8 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
             "job_id": "101",
             "hostname": "node-a",
             "worker": "tcp://node-a:1",
-            "started_at": "2026-07-22T10:00:00Z",
-            "ended_at": "2026-07-22T10:00:10Z",
+            "coordinator_submitted_at": "2026-07-22T10:00:00Z",
+            "coordinator_ready_at": "2026-07-22T10:00:12Z",
             "duration_seconds": 10.0,
         },
         {
@@ -179,8 +403,8 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
             "job_id": "102",
             "hostname": "node-b",
             "worker": "tcp://node-b:1",
-            "started_at": "2026-07-22T10:00:01Z",
-            "ended_at": "2026-07-22T10:00:11Z",
+            "coordinator_submitted_at": "2026-07-22T10:00:01Z",
+            "coordinator_ready_at": "2026-07-22T10:00:13Z",
             "duration_seconds": 10.0,
         },
         {
@@ -190,8 +414,8 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
             "job_id": "101",
             "hostname": "node-a",
             "worker": "tcp://node-a:1",
-            "started_at": "2026-07-22T10:00:12Z",
-            "ended_at": "2026-07-22T10:00:18Z",
+            "coordinator_submitted_at": "2026-07-22T10:00:12Z",
+            "coordinator_ready_at": "2026-07-22T10:00:20Z",
             "duration_seconds": 6.0,
         },
         {
@@ -201,8 +425,8 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
             "job_id": "102",
             "hostname": "node-b",
             "worker": "tcp://node-b:1",
-            "started_at": "2026-07-22T10:00:13Z",
-            "ended_at": "2026-07-22T10:00:19Z",
+            "coordinator_submitted_at": "2026-07-22T10:00:13Z",
+            "coordinator_ready_at": "2026-07-22T10:00:21Z",
             "duration_seconds": 6.0,
         },
     ]
@@ -211,10 +435,102 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
         "relative_path": "schema-v1/sample/rounds/round-002/channels/result.tif",
         "sha256": "b" * 64,
     }
+
+    def failure_sources(kind: str) -> dict[str, object]:
+        target = f"round-002:{kind}:0000"
+        peer = f"round-003:{kind}:0000"
+        failed_path = root / f"{kind}-failure-execution.json"
+        resume_path = root / f"{kind}-resume-execution.json"
+        marker_path = root / f"{kind}-failure-marker.json"
+        settled_path = root / f"{kind}-settled-peer.json"
+        failed_path.write_text(
+            json.dumps(
+                {
+                    "fine_graph": {
+                        "placements": [
+                            {
+                                "task_key": target,
+                                "attempt": 1,
+                                "status": "failed",
+                            }
+                        ],
+                        "task_results": [
+                            {
+                                "key": peer,
+                                "status": "completed",
+                                "artifact_paths": ["/owned/peer"],
+                            }
+                        ],
+                    }
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        resume_path.write_text(
+            json.dumps(
+                {
+                    "fine_graph": {
+                        "task_results": [
+                            {"key": target, "status": "completed"},
+                            {"key": peer, "status": "reused"},
+                        ]
+                    }
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_key": target,
+                    "settled_peer_key": peer,
+                    "status": "injected",
+                    "injected_at": "2026-07-22T10:00:00Z",
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        settled_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_key": peer,
+                    "status": "completed",
+                    "artifacts": [{"path": "/owned/peer", "sha256": "a" * 64}],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "failure_evidence_file": {
+                "relative_path": failed_path.name,
+                "sha256": sha256(failed_path.read_bytes()).hexdigest(),
+            },
+            "resume_evidence_file": {
+                "relative_path": resume_path.name,
+                "sha256": sha256(resume_path.read_bytes()).hexdigest(),
+            },
+            "failure_marker_file": {
+                "relative_path": marker_path.name,
+                "sha256": sha256(marker_path.read_bytes()).hexdigest(),
+            },
+            "settled_peer_file": {
+                "relative_path": settled_path.name,
+                "sha256": sha256(settled_path.read_bytes()).hexdigest(),
+            },
+        }
+
     resume = {
+        **failure_sources("chunk"),
         "injected_task_key": "round-002:chunk:0000",
         "failure_status": "failed",
-        "settled_sibling_keys": ["round-003:chunk:0000"],
+        "failed_attempts": 1,
+        "settled_peer_key": "round-003:chunk:0000",
         "preserved_artifacts": [artifact],
         "resume_reused_keys": ["round-003:chunk:0000"],
         "resume_recomputed_keys": ["round-002:chunk:0000"],
@@ -249,11 +565,19 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
             "public_artifacts_coarse": [artifact],
             "public_artifacts_fine": [artifact],
             "tier1": {
+                "evidence_file": {
+                    "relative_path": tier1_path.name,
+                    "sha256": sha256(tier1_path.read_bytes()).hexdigest(),
+                },
                 "metric_absolute_tolerance": 0.01,
                 "maximum_metric_absolute_difference": 0.009,
                 "structure_equal": True,
             },
             "tier2": {
+                "evidence_file": {
+                    "relative_path": tier2_path.name,
+                    "sha256": sha256(tier2_path.read_bytes()).hexdigest(),
+                },
                 "seed": "20260722",
                 "native_threads": 1,
                 "affine_exact": True,
@@ -292,24 +616,103 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
             "chunk_failure_resume": resume,
             "channel_failure_resume": {
                 **resume,
+                **failure_sources("channel"),
                 "injected_task_key": "round-002:channel:0000",
-                "settled_sibling_keys": ["round-003:channel:0000"],
+                "settled_peer_key": "round-003:channel:0000",
                 "resume_reused_keys": ["round-003:channel:0000"],
                 "resume_recomputed_keys": ["round-002:channel:0000"],
             },
             "cancellation_resume": {
                 "status": "cancelled",
                 "structured_cancellation": True,
+                "blocked_task_key": "round-002:chunk:0000",
+                "committed_peer_key": "round-003:chunk:0000",
+                "committed_peer_file": {
+                    "relative_path": committed_peer_path.name,
+                    "sha256": sha256(committed_peer_path.read_bytes()).hexdigest(),
+                },
+                "ready_marker_file": {
+                    "relative_path": cancellation_ready_path.name,
+                    "sha256": sha256(cancellation_ready_path.read_bytes()).hexdigest(),
+                },
+                "trigger_file": {
+                    "relative_path": cancellation_trigger_path.name,
+                    "sha256": sha256(
+                        cancellation_trigger_path.read_bytes()
+                    ).hexdigest(),
+                },
+                "queue_after_file": {
+                    "relative_path": cancellation_queue_path.name,
+                    "sha256": sha256(cancellation_queue_path.read_bytes()).hexdigest(),
+                },
                 "preserved_artifacts": [artifact],
                 "resume_reused_keys": ["round-003:chunk:0000"],
                 "resume_recomputed_keys": ["round-002:chunk:0000"],
-                "replacement_events": 1,
-                "liveness_proven": True,
                 "owned_job_ids": ["101", "102"],
+                "remaining_owned_job_ids": [],
+            },
+            "worker_replacement": {
+                "evidence_file": {
+                    "relative_path": replacement_path.name,
+                    "sha256": sha256(replacement_path.read_bytes()).hexdigest(),
+                },
+                "queue_after_file": {
+                    "relative_path": replacement_queue_path.name,
+                    "sha256": sha256(replacement_queue_path.read_bytes()).hexdigest(),
+                },
+                "loss_marker_file": {
+                    "relative_path": loss_marker_path.name,
+                    "sha256": sha256(loss_marker_path.read_bytes()).hexdigest(),
+                },
+                "loss_marker": {
+                    "task_key": "round-002:chunk:0000",
+                    "worker_address": "tcp://node-a:1",
+                    "hostname": "node-a",
+                    "pid": 111,
+                    "slurm_job_id": "101",
+                },
+                "failed_attempt": {
+                    "task_key": "round-002:chunk:0000",
+                    "attempt": 1,
+                    "status": "failed",
+                },
+                "departed_worker": {
+                    "worker_address": "tcp://node-a:1",
+                    "hostname": "node-a",
+                    "pid": 111,
+                    "slurm_job_id": "101",
+                },
+                "replacement_worker": {
+                    "worker_address": "tcp://node-c:1",
+                    "hostname": "node-c",
+                    "pid": 333,
+                    "slurm_job_id": "103",
+                },
+                "retry": {
+                    "task_key": "round-002:chunk:0000",
+                    "attempt": 2,
+                    "status": "completed",
+                    "worker_address": "tcp://node-c:1",
+                    "hostname": "node-c",
+                    "pid": 333,
+                    "slurm_job_id": "103",
+                },
+                "liveness": {
+                    "task_key": "round-003:chunk:0000",
+                    "status": "completed",
+                    "worker_address": "tcp://node-c:1",
+                    "hostname": "node-c",
+                    "pid": 333,
+                    "slurm_job_id": "103",
+                },
+                "owned_job_ids": ["101", "103"],
                 "remaining_owned_job_ids": [],
             },
         },
         "performance": {
+            "clock_policy": (
+                "coordinator-fine-upper-bound-vs-worker-monotonic-coarse-lower-bound"
+            ),
             "coarse_nonlinear_wall_seconds": 100.0,
             "fine_nonlinear_wall_seconds": 80.0,
             "end_to_end_wall_seconds": 140.0,
@@ -333,10 +736,36 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
         },
         "owned_root": str(root),
         "evidence_files": [
-            {
-                "relative_path": "fine-execution.json",
-                "sha256": sha256(evidence_path.read_bytes()).hexdigest(),
-            }
+            *[
+                {
+                    "relative_path": path.name,
+                    "sha256": sha256(path.read_bytes()).hexdigest(),
+                }
+                for path in sorted(
+                    (
+                        tier2_path,
+                        evidence_path,
+                        replacement_path,
+                        replacement_queue_path,
+                        loss_marker_path,
+                        committed_peer_path,
+                        cancellation_ready_path,
+                        cancellation_trigger_path,
+                        cancellation_queue_path,
+                        tier1_path,
+                        *(
+                            root / f"{kind}-{suffix}.json"
+                            for kind in ("chunk", "channel")
+                            for suffix in (
+                                "failure-execution",
+                                "resume-execution",
+                                "failure-marker",
+                                "settled-peer",
+                            )
+                        ),
+                    )
+                )
+            ],
         ],
     }
 
@@ -349,11 +778,18 @@ def test_fine_acceptance_profiles_preserve_science_and_select_only_admission_mod
         approved,
         paths=replace(approved.paths, output_root=tmp_path / "coarse"),
         parallelism=ParallelismSpec(mode="coarse"),
+        source_path=tmp_path / "coarse.yaml",
     )
     fine_approved = replace(
         approved,
-        paths=replace(approved.paths, output_root=tmp_path / "fine"),
+        paths=replace(
+            approved.paths,
+            output_root=tmp_path / "fine",
+            worker_local_directory=tmp_path / "fine-scratch",
+        ),
+        slurm=replace(cast(SlurmSpec, approved.slurm), job_name="cyexm-task5-fine"),
         parallelism=ParallelismSpec(mode="fine_grained"),
+        source_path=tmp_path / "fine.yaml",
     )
 
     coarse, fine = fine_acceptance_profiles(coarse_approved, fine_approved)
@@ -364,6 +800,199 @@ def test_fine_acceptance_profiles_preserve_science_and_select_only_admission_mod
     assert fine.paths.output_root == tmp_path / "fine"
     assert coarse is coarse_approved
     assert fine is fine_approved
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda profile: replace(
+            profile, native_threads=NativeThreadSpec(itk=2, blas=1)
+        ),
+        lambda profile: replace(
+            profile,
+            slurm=replace(cast(SlurmSpec, profile.slurm), workers=5),
+        ),
+        lambda profile: replace(
+            profile,
+            slurm=replace(cast(SlurmSpec, profile.slurm), cores_per_worker=16),
+        ),
+        lambda profile: replace(
+            profile,
+            slurm=replace(cast(SlurmSpec, profile.slurm), memory="128GiB"),
+        ),
+        lambda profile: replace(
+            profile,
+            slurm=replace(cast(SlurmSpec, profile.slurm), interface="eth0"),
+        ),
+        lambda profile: replace(
+            profile,
+            slurm=replace(cast(SlurmSpec, profile.slurm), task_retries=2),
+        ),
+    ),
+)
+def test_fine_acceptance_rejects_unfair_profile_differences(
+    tmp_path: Path,
+    mutation: object,
+) -> None:
+    approved = _profile(tmp_path)
+    coarse = replace(
+        approved,
+        paths=replace(approved.paths, output_root=tmp_path / "coarse"),
+        parallelism=ParallelismSpec(mode="coarse"),
+        source_path=tmp_path / "coarse.yaml",
+    )
+    fine = replace(
+        approved,
+        paths=replace(
+            approved.paths,
+            output_root=tmp_path / "fine",
+            worker_local_directory=tmp_path / "fine-scratch",
+        ),
+        slurm=replace(cast(SlurmSpec, approved.slurm), job_name="cyexm-task5-fine"),
+        parallelism=ParallelismSpec(mode="fine_grained"),
+        source_path=tmp_path / "fine.yaml",
+    )
+    assert callable(mutation)
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="otherwise identical"):
+        fine_acceptance_profiles(coarse, cast(ExecutionProfile, mutation(fine)))
+
+
+@pytest.mark.parametrize("shared", ("scratch", "job_name"))
+def test_fine_acceptance_requires_distinct_operational_ownership(
+    tmp_path: Path,
+    shared: str,
+) -> None:
+    approved = _profile(tmp_path)
+    coarse = replace(
+        approved,
+        paths=replace(approved.paths, output_root=tmp_path / "coarse"),
+        parallelism=ParallelismSpec(mode="coarse"),
+        source_path=tmp_path / "coarse.yaml",
+    )
+    fine = replace(
+        approved,
+        paths=replace(
+            approved.paths,
+            output_root=tmp_path / "fine",
+            worker_local_directory=(
+                approved.paths.worker_local_directory
+                if shared == "scratch"
+                else tmp_path / "fine-scratch"
+            ),
+        ),
+        slurm=replace(
+            cast(SlurmSpec, approved.slurm),
+            job_name=(
+                cast(SlurmSpec, approved.slurm).job_name
+                if shared == "job_name"
+                else "cyexm-task5-fine"
+            ),
+        ),
+        parallelism=ParallelismSpec(mode="fine_grained"),
+        source_path=tmp_path / "fine.yaml",
+    )
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="distinct"):
+        fine_acceptance_profiles(coarse, fine)
+
+
+@pytest.mark.parametrize("role", ("output", "scratch"))
+def test_fine_acceptance_requires_canonically_disjoint_owned_roots(
+    tmp_path: Path,
+    role: str,
+) -> None:
+    approved = _profile(tmp_path)
+    coarse = replace(
+        approved,
+        paths=replace(
+            approved.paths,
+            output_root=tmp_path / "coarse",
+            worker_local_directory=tmp_path / "coarse-scratch",
+        ),
+        parallelism=ParallelismSpec(mode="coarse"),
+        source_path=tmp_path / "coarse.yaml",
+    )
+    fine = replace(
+        approved,
+        paths=replace(
+            approved.paths,
+            output_root=(
+                coarse.paths.output_root / "fine"
+                if role == "output"
+                else tmp_path / "fine"
+            ),
+            worker_local_directory=(
+                cast(Path, coarse.paths.worker_local_directory) / "fine"
+                if role == "scratch"
+                else tmp_path / "fine-scratch"
+            ),
+        ),
+        slurm=replace(cast(SlurmSpec, approved.slurm), job_name="cyexm-task5-fine"),
+        parallelism=ParallelismSpec(mode="fine_grained"),
+        source_path=tmp_path / "fine.yaml",
+    )
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="disjoint"):
+        fine_acceptance_profiles(coarse, fine)
+
+
+def test_fine_acceptance_manifest_requires_two_rounds_with_dependent_channels() -> None:
+    insufficient = _manifest(
+        RoundSpec(
+            round=2,
+            strategy="serial_chunked",
+            registration_channel=PurePosixPath("round-2.tif"),
+            channels=(ChannelSpec(PurePosixPath("round-2.tif"), "linear"),),
+            chunk_size_zyx=(8, 16, 16),
+            overlap_fraction=0.25,
+        ),
+        _round(3, "serial_chunked"),
+    )
+
+    with pytest.raises(
+        HpcWorkflowAcceptanceError, match=r"dependent channel.*before submission"
+    ):
+        fine_acceptance_manifest(insufficient)
+
+
+def test_fine_acceptance_manifest_preflights_exact_cross_round_task_keys() -> None:
+    manifest = _manifest(
+        RoundSpec(
+            round=4,
+            strategy="serial_chunked",
+            registration_channel=PurePosixPath("round-4.tif"),
+            channels=(
+                ChannelSpec(PurePosixPath("round-4.tif"), "linear"),
+                ChannelSpec(PurePosixPath("round-4-dependent.tif"), "linear"),
+            ),
+            chunk_size_zyx=(8, 16, 16),
+            overlap_fraction=0.25,
+        ),
+        RoundSpec(
+            round=7,
+            strategy="serial_chunked",
+            registration_channel=PurePosixPath("round-7.tif"),
+            channels=(
+                ChannelSpec(PurePosixPath("round-7-dependent.tif"), "linear"),
+                ChannelSpec(PurePosixPath("round-7.tif"), "linear"),
+            ),
+            chunk_size_zyx=(8, 16, 16),
+            overlap_fraction=0.25,
+        ),
+    )
+
+    bounded, targets = fine_acceptance_manifest(manifest)
+
+    assert tuple(item.round for item in bounded.rounds) == (4, 7)
+    assert targets == {
+        "chunk_target": "round-004:chunk:0000",
+        "chunk_peer": "round-007:chunk:0000",
+        "channel_target": "round-004:channel:0001",
+        "channel_peer": "round-007:channel:0000",
+        "replacement_target": "round-004:chunk:0000",
+        "liveness_peer": "round-007:chunk:0000",
+    }
 
 
 def test_fine_acceptance_report_validates_every_portable_gate(tmp_path: Path) -> None:
@@ -386,7 +1015,29 @@ def test_fine_acceptance_builder_hashes_only_owned_evidence(tmp_path: Path) -> N
         durability=cast(dict[str, object], payload["durability"]),
         performance=cast(dict[str, object], payload["performance"]),
         evidence_root=tmp_path,
-        evidence_paths=(tmp_path / "fine-execution.json",),
+        evidence_paths=tuple(
+            tmp_path / name
+            for name in (
+                "deterministic-executor-parity.json",
+                "fine-execution.json",
+                "fine-worker-replacement-slurm-execution.json",
+                "fine-worker-replacement-queue-after.json",
+                "worker-loss.json",
+                "committed-peer.json",
+                "cancellation-ready.json",
+                "fine-cancellation-trigger.json",
+                "fine-cancellation-queue-after.json",
+                "tier1-equivalence.json",
+                "chunk-failure-execution.json",
+                "chunk-resume-execution.json",
+                "chunk-failure-marker.json",
+                "chunk-settled-peer.json",
+                "channel-failure-execution.json",
+                "channel-resume-execution.json",
+                "channel-failure-marker.json",
+                "channel-settled-peer.json",
+            )
+        ),
     )
 
     assert built == payload
@@ -405,7 +1056,7 @@ def test_fine_acceptance_builder_hashes_only_owned_evidence(tmp_path: Path) -> N
         )
 
 
-def test_fine_failure_and_cancellation_runners_target_only_exact_stage(
+def test_fine_failure_and_cancellation_runners_bind_exact_target_and_peer_keys(
     tmp_path: Path,
 ) -> None:
     target = SimpleNamespace(
@@ -416,14 +1067,31 @@ def test_fine_failure_and_cancellation_runners_target_only_exact_stage(
         round=3,
         key=SimpleNamespace(stage="chunk", encoded="round-003:chunk:0000"),
     )
+    unrelated = SimpleNamespace(
+        round=2,
+        key=SimpleNamespace(stage="chunk", encoded="round-002:chunk:0001"),
+    )
     observed: list[object] = []
+    settled = tmp_path / "settled.json"
+    settled.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "task_key": sibling.key.encoded,
+                "status": "completed",
+                "artifacts": [{"path": "/owned/peer", "sha256": "a" * 64}],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     assert (
         run_injected_fine_failure_task(
-            sibling,
-            target_round=2,
-            target_stage="chunk",
+            unrelated,
+            target_key=target.key.encoded,
+            peer_key=sibling.key.encoded,
             failure_marker=tmp_path / "failure.json",
+            settled_marker=settled,
             _run_fine_task=lambda task: observed.append(task) or "completed",
         )
         == "completed"
@@ -431,28 +1099,61 @@ def test_fine_failure_and_cancellation_runners_target_only_exact_stage(
     with pytest.raises(RuntimeError, match="round-002:chunk:0000"):
         run_injected_fine_failure_task(
             target,
-            target_round=2,
-            target_stage="chunk",
+            target_key=target.key.encoded,
+            peer_key=sibling.key.encoded,
             failure_marker=tmp_path / "failure.json",
+            settled_marker=settled,
         )
     marker = json.loads((tmp_path / "failure.json").read_text(encoding="utf-8"))
     assert marker["task_key"] == "round-002:chunk:0000"
-    assert observed == [sibling]
+    assert marker["settled_peer_key"] == "round-003:chunk:0000"
+    assert observed == [unrelated]
+    assert (
+        run_injected_fine_failure_task(
+            target,
+            target_key=target.key.encoded,
+            peer_key=sibling.key.encoded,
+            failure_marker=tmp_path / "failure.json",
+            settled_marker=settled,
+            _run_fine_task=lambda task: observed.append(task) or "retry-completed",
+        )
+        == "retry-completed"
+    )
 
+    peer_artifact = tmp_path / "peer-artifact.bin"
+    peer_artifact.write_bytes(b"committed")
+    committed = tmp_path / "committed-peer.json"
+    peer_result = SimpleNamespace(
+        status="completed",
+        artifact_paths=(str(peer_artifact),),
+    )
+    assert (
+        run_fine_cancellation_task(
+            sibling,
+            target_key=target.key.encoded,
+            peer_key=sibling.key.encoded,
+            committed_marker=committed,
+            ready_marker=tmp_path / "ready.json",
+            timeout_seconds=1.0,
+            _run_fine_task=lambda _task: peer_result,
+        )
+        is peer_result
+    )
     times = iter((0.0, 0.5, 1.0, 1.0))
     with pytest.raises(HpcWorkflowAcceptanceError, match="bounded wait"):
         run_fine_cancellation_task(
             target,
-            target_round=2,
-            target_stage="chunk",
+            target_key=target.key.encoded,
+            peer_key=sibling.key.encoded,
+            committed_marker=committed,
             ready_marker=tmp_path / "ready.json",
             timeout_seconds=1.0,
             _monotonic=lambda: next(times),
             _sleep=lambda _seconds: None,
         )
     assert json.loads((tmp_path / "ready.json").read_text(encoding="utf-8")) == {
-        "blocked_round": 2,
-        "committed_round": 2,
+        "blocked_task_key": "round-002:chunk:0000",
+        "committed_peer_key": "round-003:chunk:0000",
         "status": "waiting-for-coordinator-interruption",
     }
 
@@ -472,25 +1173,37 @@ def test_fine_worker_loss_is_injected_once_before_replacement_retry(
     with pytest.raises(SystemExit, match="75"):
         run_fine_worker_loss_task(
             target,
-            target_round=2,
-            target_stage="chunk",
+            target_key=target.key.encoded,
             loss_marker=marker,
+            _worker_identity=lambda: {
+                "worker_address": "tcp://node-a:1",
+                "hostname": "node-a",
+                "pid": 123,
+                "slurm_job_id": "101",
+            },
+            _utc_now=lambda: "2026-07-23T00:00:00Z",
             _exit=injected_exit,
         )
 
     assert (
         run_fine_worker_loss_task(
             target,
-            target_round=2,
-            target_stage="chunk",
+            target_key=target.key.encoded,
             loss_marker=marker,
             _run_fine_task=lambda _task: "replacement-completed",
         )
         == "replacement-completed"
     )
-    assert json.loads(marker.read_text(encoding="utf-8"))["task_key"] == (
-        "round-002:chunk:0000"
-    )
+    assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "hostname": "node-a",
+        "injected_at": "2026-07-23T00:00:00Z",
+        "pid": 123,
+        "schema_version": 1,
+        "slurm_job_id": "101",
+        "status": "worker-loss-injected",
+        "task_key": "round-002:chunk:0000",
+        "worker_address": "tcp://node-a:1",
+    }
 
 
 def test_fine_profiler_writes_external_peak_memory_and_restores_backend(
@@ -635,6 +1348,270 @@ def test_fine_acceptance_report_rejects_incomplete_or_forged_evidence(
     mutation(report)
 
     with pytest.raises(HpcWorkflowAcceptanceError, match=message):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def _refresh_report_evidence_digest(
+    report: dict[str, object],
+    path: Path,
+    *references: dict[str, object],
+) -> None:
+    digest = sha256(path.read_bytes()).hexdigest()
+    for reference in references:
+        reference["sha256"] = digest
+    evidence_files = cast(list[dict[str, object]], report["evidence_files"])
+    entry = next(item for item in evidence_files if item["relative_path"] == path.name)
+    entry["sha256"] = digest
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: value["fine_graph"]["attempt_counts"][0].update({"attempts": 3}),
+        lambda value: value["fine_graph"]["scale_events"].reverse(),
+        lambda value: value["fine_graph"]["scale_events"][1].update({"departed": []}),
+        lambda value: value["fine_graph"]["scale_events"][1]["activated_probes"][
+            0
+        ].update({"slurm_job_id": "999"}),
+        lambda value: value["fine_graph"]["placements"][0].update(
+            {"status": "completed"}
+        ),
+        lambda value: value["fine_graph"]["placements"][1].update(
+            {"worker_address": "tcp://node-a:1"}
+        ),
+        lambda value: value["fine_graph"]["placements"][2].update(
+            {"coordinator_ready_at": "2026-07-22T10:00:01Z"}
+        ),
+    ),
+)
+def test_fine_acceptance_rejects_mutated_raw_replacement_lineage(
+    tmp_path: Path,
+    mutation: object,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / "fine-worker-replacement-slurm-execution.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert callable(mutation)
+    mutation(payload)
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    replacement = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["worker_replacement"],
+    )
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], replacement["evidence_file"]),
+    )
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="replacement"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_rejects_nonempty_replacement_queue(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / "fine-worker-replacement-queue-after.json"
+    path.write_text(json.dumps({"jobs": [{"job_id": "103"}]}), encoding="utf-8")
+    replacement = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["worker_replacement"],
+    )
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], replacement["queue_after_file"]),
+    )
+    with pytest.raises(HpcWorkflowAcceptanceError, match="replacement"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_rejects_loss_marker_identity_drift(tmp_path: Path) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / "worker-loss.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["hostname"] = "forged-node"
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    replacement = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["worker_replacement"],
+    )
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], replacement["loss_marker_file"]),
+    )
+    with pytest.raises(HpcWorkflowAcceptanceError, match="loss-marker"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("filename", "reference_name", "mutation"),
+    (
+        (
+            "chunk-failure-execution.json",
+            "failure_evidence_file",
+            lambda value: value["fine_graph"]["placements"][0].update({"attempt": 2}),
+        ),
+        (
+            "chunk-resume-execution.json",
+            "resume_evidence_file",
+            lambda value: value["fine_graph"]["task_results"][0].update(
+                {"status": "reused"}
+            ),
+        ),
+        (
+            "chunk-failure-marker.json",
+            "failure_marker_file",
+            lambda value: value.update({"task_key": "round-003:chunk:0000"}),
+        ),
+        (
+            "chunk-settled-peer.json",
+            "settled_peer_file",
+            lambda value: value.update({"artifacts": []}),
+        ),
+    ),
+)
+def test_fine_acceptance_rejects_mutated_failure_resume_sources(
+    tmp_path: Path,
+    filename: str,
+    reference_name: str,
+    mutation: object,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / filename
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert callable(mutation)
+    mutation(payload)
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    resume = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["chunk_failure_resume"],
+    )
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], resume[reference_name]),
+    )
+    with pytest.raises(HpcWorkflowAcceptanceError, match="failure"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("filename", "reference_name", "mutation"),
+    (
+        (
+            "committed-peer.json",
+            "committed_peer_file",
+            lambda value: value.update({"task_key": "round-002:chunk:0000"}),
+        ),
+        (
+            "cancellation-ready.json",
+            "ready_marker_file",
+            lambda value: value.update({"committed_peer_key": "round-002:chunk:0000"}),
+        ),
+        (
+            "fine-cancellation-trigger.json",
+            "trigger_file",
+            lambda value: value.update({"status": "waiting"}),
+        ),
+        (
+            "fine-cancellation-queue-after.json",
+            "queue_after_file",
+            lambda value: value.update({"jobs": [{"job_id": "102"}]}),
+        ),
+    ),
+)
+def test_fine_acceptance_rejects_mutated_cancellation_sources(
+    tmp_path: Path,
+    filename: str,
+    reference_name: str,
+    mutation: object,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / filename
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert callable(mutation)
+    mutation(payload)
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    cancellation = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["cancellation_resume"],
+    )
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], cancellation[reference_name]),
+    )
+    with pytest.raises(HpcWorkflowAcceptanceError, match="cancellation"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_rejects_cancellation_resume_key_drift(tmp_path: Path) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    cancellation = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["cancellation_resume"],
+    )
+    cancellation["resume_reused_keys"] = ["round-002:chunk:0000"]
+    with pytest.raises(HpcWorkflowAcceptanceError, match="cancellation"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_rejects_tier_content_drift_with_refreshed_checksums(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / "tier1-equivalence.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["rounds"][0]["metrics"]["absolute_differences"]["Correlation"] = 0.008
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    tier1 = cast(
+        dict[str, object],
+        cast(dict[str, object], report["scientific"])["tier1"],
+    )
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], tier1["evidence_file"]),
+    )
+    with pytest.raises(HpcWorkflowAcceptanceError, match="Tier 1 summary"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_requires_tier_source_in_evidence_checksum_set(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    evidence = cast(list[dict[str, object]], report["evidence_files"])
+    evidence[:] = [
+        item
+        for item in evidence
+        if item["relative_path"] != "deterministic-executor-parity.json"
+    ]
+    with pytest.raises(HpcWorkflowAcceptanceError, match="bound"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_rejects_nonexact_tier2_source_with_refreshed_checksums(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / "deterministic-executor-parity.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["strict_parity"]["rounds"][0]["affine"]["parameters"]["array_equal"] = False
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    tier2 = cast(
+        dict[str, object],
+        cast(dict[str, object], report["scientific"])["tier2"],
+    )
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], tier2["evidence_file"]),
+    )
+    with pytest.raises(HpcWorkflowAcceptanceError, match="affine"):
         validate_fine_acceptance_report(report, evidence_root=tmp_path)
 
 

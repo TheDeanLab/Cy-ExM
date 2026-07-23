@@ -116,6 +116,14 @@ def require_explicit_hpc_selection(arguments: Sequence[str]) -> None:
         )
 
 
+def require_hpc_opt_in(value: object) -> None:
+    """Require the exact destructive-test opt-in before any fixture action."""
+    if value is not True:
+        raise HpcAcceptanceError(
+            "explicit HPC acceptance requires the exact --run-hpc opt-in"
+        )
+
+
 def require_coordinator_native_threads(
     profile: ExecutionProfile,
     *,
@@ -1202,10 +1210,14 @@ def run_environment_smoke(
         fixed_image = task.registration_channel_source
         moving_image = task.registration_channel_source
         strategy = "reference-preparation"
-    else:
+    elif type(task) is RoundTask:
         fixed_image = task.fixed_image
         moving_image = task.moving_image
         strategy = task.strategy
+    else:
+        raise HpcAcceptanceError(
+            "environment smoke accepts only exact coarse workflow tasks"
+        )
     record = {
         "schema_version": 1,
         "dataset_id": task.dataset_id,
@@ -1442,6 +1454,43 @@ def prepare_acceptance_context(
     )
 
 
+def validate_additional_acceptance_profile(
+    context: HpcAcceptanceContext,
+    execution: str | Path,
+    *,
+    repository_root: Path,
+    archive_root: Path = Path("/archive"),
+    project_root: Path = Path("/project"),
+    protected_roots: Sequence[Path] = (),
+) -> tuple[Path, ExecutionProfile]:
+    """Apply the canonical storage/input safety policy to an extra profile."""
+    execution_path = _resolved_file(Path(execution), "additional execution profile")
+    repository = repository_root.resolve(strict=True)
+    archive = archive_root.resolve(strict=True)
+    project = project_root.resolve(strict=True)
+    protected = tuple(path.resolve(strict=False) for path in protected_roots)
+    profile = load_execution_profile(execution_path)
+    if profile.executor != "slurm" or profile.slurm is None:
+        raise HpcAcceptanceError(
+            "additional execution profile must load a strict executor: slurm profile"
+        )
+    _validate_storage(
+        context_paths=(context.dataset_path, execution_path, context.evidence_dir),
+        profile=profile,
+        repository_root=repository,
+        archive_root=archive,
+        project_root=project,
+        protected_roots=protected,
+    )
+    _validate_dataset_files(
+        context.manifest,
+        profile,
+        archive_root=archive,
+        protected_roots=(repository, *protected),
+    )
+    return execution_path, profile
+
+
 __all__ = [
     "ACCEPTANCE_PACKAGES",
     "HpcAcceptanceContext",
@@ -1459,9 +1508,11 @@ __all__ = [
     "require_cli_paths",
     "require_coordinator_native_threads",
     "require_explicit_hpc_selection",
+    "require_hpc_opt_in",
     "run_environment_smoke",
     "shared_path_identity",
     "smoke_module_by_value",
+    "validate_additional_acceptance_profile",
     "validate_rendered_job_script",
     "validate_scheduler_interface",
     "validate_slurm_job_node_resources",

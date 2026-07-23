@@ -107,6 +107,19 @@
 - On operator cancellation, stop submission and cancel unfinished futures. Always
   close the client before its owned cluster on success, failure, and cancellation,
   including partial startup.
+- While fine SLURM futures are active, periodically check completion before
+  reconciling the exact scheduler/worker identities. Healthy long-running tasks have
+  no execution deadline. If an activated worker departs, bound only the replacement
+  wait by the configured startup timeout; preflight and resource-gate every
+  replacement before retry or new admission, record the departed identity, and fail
+  closed if replacement validation does not complete. Reconciliation at the current
+  cap must not issue another scale request. Local Dask retains its scheduler-native
+  blocking completion behavior.
+- Scheduler-neutral cancellation evidence must bind the exact caught interruption
+  type/message and the actual cancellation outcome. Sequential cancellation is
+  explicitly `not_applicable`; distributed cancellation distinguishes no unfinished
+  futures, successful forced cancellation, and cancellation failure with its exact
+  error. Never infer this evidence after cleanup.
 - Treat rendered job templates, requested resources, scheduler/worker identities,
   worker probes, attempts, timestamps, cancellation, and cleanup as operational
   evidence. Operational evidence never authorizes artifact reuse; Phase 1 completion

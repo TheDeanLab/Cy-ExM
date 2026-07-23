@@ -39,6 +39,19 @@ from cyexm.workflow.models import (
 
 
 @dataclass(frozen=True, slots=True)
+class _FineCancellationEvidence:
+    """Detached evidence for scheduler cancellation after an interruption."""
+
+    outcome: str
+    attempted: bool
+    unfinished_futures: int
+    force: bool | None
+    succeeded: bool | None
+    exception_type: str | None
+    message: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _FineExecutionEvidence:
     """Detached scheduler-neutral evidence for one fine graph execution."""
 
@@ -54,6 +67,8 @@ class _FineExecutionEvidence:
     blocked_descendants: tuple[str, ...]
     cancelled: bool
     cleanup: tuple[tuple[str, bool, str | None, str | None], ...]
+    interruption: tuple[str, str] | None = None
+    cancellation: _FineCancellationEvidence | None = None
 
 
 def _canonical_path(path: object, location: str) -> Path:
@@ -817,6 +832,68 @@ def _canonical_fine_execution_evidence(
         raise RoundExecutionError(
             f"{location} cancellation must match the caught interruption"
         )
+    cancellation = value.cancellation
+    if expected_interruption is None:
+        if value.interruption is not None or cancellation is not None:
+            raise RoundExecutionError(
+                f"{location} settled execution cannot claim interruption evidence"
+            )
+    else:
+        if value.interruption != expected_interruption:
+            raise RoundExecutionError(
+                f"{location} interruption cause is not authoritative"
+            )
+        if type(cancellation) is not _FineCancellationEvidence:
+            raise RoundExecutionError(
+                f"{location} cancellation outcome evidence is required"
+            )
+        allowed_outcomes = (
+            {"not_applicable"}
+            if expected_executor == "sequential"
+            else {"no_unfinished", "cancelled", "cancel_failed"}
+        )
+        if cancellation.outcome not in allowed_outcomes:
+            raise RoundExecutionError(
+                f"{location} cancellation outcome is invalid for {expected_executor}"
+            )
+        if (
+            type(cancellation.attempted) is not bool
+            or type(cancellation.unfinished_futures) is not int
+            or cancellation.unfinished_futures < 0
+        ):
+            raise RoundExecutionError(f"{location} cancellation cardinality is invalid")
+        if cancellation.outcome in {"not_applicable", "no_unfinished"}:
+            valid_cancellation = (
+                not cancellation.attempted
+                and cancellation.unfinished_futures == 0
+                and cancellation.force is None
+                and cancellation.succeeded is None
+                and cancellation.exception_type is None
+                and cancellation.message is None
+            )
+        elif cancellation.outcome == "cancelled":
+            valid_cancellation = (
+                cancellation.attempted
+                and cancellation.unfinished_futures > 0
+                and cancellation.force is True
+                and cancellation.succeeded is True
+                and cancellation.exception_type is None
+                and cancellation.message is None
+            )
+        else:
+            valid_cancellation = (
+                cancellation.attempted
+                and cancellation.unfinished_futures > 0
+                and cancellation.force is True
+                and cancellation.succeeded is False
+                and type(cancellation.exception_type) is str
+                and bool(cancellation.exception_type)
+                and type(cancellation.message) is str
+            )
+        if not valid_cancellation:
+            raise RoundExecutionError(
+                f"{location} cancellation outcome fields are contradictory"
+            )
     if type(expected_reference_task) is not ReferenceTask:
         raise RoundExecutionError(
             f"{location} requires the exact submitted reference task"
@@ -1116,6 +1193,17 @@ def _canonical_fine_execution_evidence(
         raise RoundExecutionError(
             f"{location} settled execution attempts must have task results"
         )
+    if value.cancelled and cancellation is not None:
+        outstanding_attempts = len(set(attempts) - set(results_by_key))
+        maximum_unfinished = (
+            outstanding_attempts
+            if value.tasks
+            else (1 if expected_executor != "sequential" else 0)
+        )
+        if cancellation.unfinished_futures > maximum_unfinished:
+            raise RoundExecutionError(
+                f"{location} cancellation cardinality exceeds live attempt evidence"
+            )
 
     if type(value.blocked_descendants) is not tuple or any(
         type(key) is not str for key in value.blocked_descendants
@@ -1229,6 +1317,33 @@ def _canonical_fine_execution_evidence(
             ],
             "blocked_descendants": list(value.blocked_descendants),
             "cancelled": value.cancelled,
+            "interruption": (
+                None
+                if value.interruption is None
+                else {
+                    "exception_type": value.interruption[0],
+                    "message": value.interruption[1],
+                }
+            ),
+            "cancellation": (
+                None
+                if cancellation is None
+                else {
+                    "outcome": cancellation.outcome,
+                    "attempted": cancellation.attempted,
+                    "unfinished_futures": cancellation.unfinished_futures,
+                    "force": cancellation.force,
+                    "succeeded": cancellation.succeeded,
+                    "error": (
+                        None
+                        if cancellation.exception_type is None
+                        else {
+                            "exception_type": cancellation.exception_type,
+                            "message": cancellation.message,
+                        }
+                    ),
+                }
+            ),
             "cleanup": cleanup,
         }
     )

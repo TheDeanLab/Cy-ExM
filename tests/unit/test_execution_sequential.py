@@ -673,15 +673,24 @@ def test_sequential_fine_interruption_retains_actual_task_evidence(
         chunk_size_zyx=(4, 8, 8),
         overlap_fraction=0.0,
     )
+    executor = SequentialExecutor(
+        _profile(tmp_path, "fine_grained"),
+        runner=_successful_result,
+        fine_runner=fine_runner,
+    )
     with pytest.raises(KeyboardInterrupt) as captured:
-        SequentialExecutor(
-            _profile(tmp_path, "fine_grained"),
-            runner=_successful_result,
-            fine_runner=fine_runner,
-        ).execute(_reference_task(tmp_path), (chunked,))
+        executor.execute(_reference_task(tmp_path), (chunked,))
 
     assert captured.value.original.args == ("injected fine interruption",)  # type: ignore[attr-defined]
     assert tuple(result.round for result in captured.value.completed_results) == (1,)  # type: ignore[attr-defined]
     assert tuple(  # type: ignore[attr-defined]
         result.key.encoded for result in captured.value.fine_task_results
     ) == ("round-002:preparation:main",)
+    evidence = executor.execution_evidence
+    assert evidence.interruption == (
+        "KeyboardInterrupt",
+        "injected fine interruption",
+    )
+    assert evidence.cancellation is not None
+    assert evidence.cancellation.outcome == "not_applicable"
+    assert evidence.cancellation.attempted is False

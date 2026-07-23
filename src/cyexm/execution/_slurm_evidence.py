@@ -143,8 +143,10 @@ class FineScaleEvent:
     requested: int
     started_at: str
     connected: list[str] = field(default_factory=list)
+    departed: list[str] = field(default_factory=list)
     probed: list[str] = field(default_factory=list)
     activated: list[str] = field(default_factory=list)
+    activated_probes: list[WorkerProbe] = field(default_factory=list)
     failed: list[dict[str, str]] = field(default_factory=list)
     ended_at: str | None = None
 
@@ -156,8 +158,21 @@ class FineScaleEvent:
         result: dict[str, object] = {
             "requested": self.requested,
             "connected": sorted(self.connected),
+            "departed": sorted(self.departed),
             "probed": sorted(self.probed),
             "activated": sorted(self.activated),
+            "activated_probes": [
+                probe.to_dict()
+                for probe in sorted(
+                    self.activated_probes,
+                    key=lambda item: (
+                        item.worker_address,
+                        item.slurm_job_id,
+                        item.hostname,
+                        item.pid,
+                    ),
+                )
+            ],
             "failed": [dict(item) for item in self.failed],
             "started_at": self.started_at,
         }
@@ -192,6 +207,8 @@ class FinePlacementAttempt:
     attempt: int
     status: str
     dask_task_key: str
+    coordinator_submitted_at: str
+    coordinator_ready_at: str
     started_at: str
     ended_at: str
     duration_seconds: float
@@ -213,6 +230,8 @@ class FinePlacementAttempt:
             "attempt": self.attempt,
             "status": self.status,
             "dask_task_key": self.dask_task_key,
+            "coordinator_submitted_at": self.coordinator_submitted_at,
+            "coordinator_ready_at": self.coordinator_ready_at,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "duration_seconds": self.duration_seconds,
@@ -405,7 +424,13 @@ def validate_fine_slurm_evidence(
     if not set(validated) <= set(candidates):
         raise ValueError("validated workers must be candidate workers")
 
-    activated: list[str] = []
+    activated: set[str] = set()
+    current_activated_probes: dict[str, WorkerProbe] = {}
+    historical_activated_probes: list[WorkerProbe] = []
+    active_intervals: dict[
+        tuple[str, str, int, str | None],
+        tuple[datetime, datetime | None],
+    ] = {}
     probed_workers: set[str] = set()
     connected: set[str] = set()
     scale_probe_outcomes: list[tuple[set[str], set[str], bool]] = []
@@ -420,8 +445,10 @@ def validate_fine_slurm_evidence(
                 {
                     "requested",
                     "connected",
+                    "departed",
                     "probed",
                     "activated",
+                    "activated_probes",
                     "failed",
                     "started_at",
                     "ended_at",
@@ -429,17 +456,80 @@ def validate_fine_slurm_evidence(
             ),
         )
         requested = _integer(event["requested"], f"{location}.requested", 1)
-        if requested <= previous_request or requested > configured_workers:
-            raise ValueError("fine scale requests must increase monotonically to cap")
+        event_started = _timestamp(event["started_at"], f"{location}.started_at")
+        event_ended = _timestamp(event["ended_at"], f"{location}.ended_at")
+        if event_ended < event_started:
+            raise ValueError("fine scale event ended before it started")
+        departed = _strings(event["departed"], f"{location}.departed")
+        replacement = bool(departed)
+        if (
+            requested > configured_workers
+            or requested < previous_request
+            or (requested == previous_request and not replacement)
+        ):
+            raise ValueError(
+                "fine scale requests must increase, except explicit replacement"
+            )
         previous_request = requested
         event_connected = _strings(event["connected"], f"{location}.connected")
         probed = _strings(event["probed"], f"{location}.probed")
         event_activated = _strings(event["activated"], f"{location}.activated")
+        raw_activated_probes = _array(
+            event["activated_probes"],
+            f"{location}.activated_probes",
+        )
+        parsed_activated_probes: list[WorkerProbe] = []
+        for probe_index, raw_probe in enumerate(raw_activated_probes):
+            if not isinstance(raw_probe, Mapping):
+                raise TypeError(
+                    f"{location}.activated_probes[{probe_index}] must be an object"
+                )
+            parsed_activated_probes.append(
+                WorkerProbe.from_dict(cast(Mapping[str, object], raw_probe))
+            )
+        event_activated_probes = tuple(parsed_activated_probes)
+        if tuple(
+            probe.worker_address for probe in event_activated_probes
+        ) != event_activated or any(not probe.ok for probe in event_activated_probes):
+            raise ValueError(
+                "fine activated probes must exactly authenticate activated workers"
+            )
         if not set(event_activated) <= set(probed) <= set(event_connected):
             raise ValueError("fine scale activation must be a subset of probed workers")
+        if not set(departed) <= connected:
+            raise ValueError("fine replacement can only remove connected workers")
+        connected.difference_update(departed)
+        activated.difference_update(departed)
+        for address in departed:
+            departed_probe = current_activated_probes.pop(address, None)
+            if departed_probe is not None:
+                identity = (
+                    departed_probe.worker_address,
+                    departed_probe.hostname,
+                    departed_probe.pid,
+                    departed_probe.slurm_job_id,
+                )
+                activated_at, previous_departure = active_intervals[identity]
+                if previous_departure is not None or event_started < activated_at:
+                    raise ValueError(
+                        "fine worker departure contradicts activation interval"
+                    )
+                active_intervals[identity] = (activated_at, event_started)
         connected.update(event_connected)
         probed_workers.update(probed)
-        activated.extend(event_activated)
+        activated.update(event_activated)
+        for probe in event_activated_probes:
+            identity = (
+                probe.worker_address,
+                probe.hostname,
+                probe.pid,
+                probe.slurm_job_id,
+            )
+            if identity in active_intervals:
+                raise ValueError("fine activated worker identity cannot be reused")
+            current_activated_probes[probe.worker_address] = probe
+            historical_activated_probes.append(probe)
+            active_intervals[identity] = (event_ended, None)
         event_failures = _array(event["failed"], f"{location}.failed")
         for failure_index, failure_value in enumerate(event_failures):
             scale_failed = True
@@ -454,10 +544,6 @@ def validate_fine_slurm_evidence(
         scale_probe_outcomes.append(
             (set(probed), set(event_activated), bool(event_failures))
         )
-        if _timestamp(event["ended_at"], f"{location}.ended_at") < _timestamp(
-            event["started_at"], f"{location}.started_at"
-        ):
-            raise ValueError("fine scale event ended before it started")
     if tuple(sorted(connected)) != candidates:
         raise ValueError("scale-event candidates must match candidate_workers")
     if tuple(sorted(connected)) != tuple(observed_workers):
@@ -567,24 +653,47 @@ def validate_fine_slurm_evidence(
         raise ValueError("fine attempts must follow canonical graph ordering")
 
     probes = tuple(observed_probes)
-    probe_by_address = {probe.worker_address: probe for probe in probes}
-    if len(probe_by_address) != len(probes):
-        raise ValueError("raw worker probes must use unique worker addresses")
-    if tuple(sorted(probe_by_address)) != tuple(sorted(probed_workers)):
+    probe_identities = {
+        (
+            probe.worker_address,
+            probe.hostname,
+            probe.pid,
+            probe.slurm_job_id,
+        ): probe
+        for probe in probes
+    }
+    if len(probe_identities) != len(probes):
+        raise ValueError("raw worker probes must use unique full identities")
+    if {probe.worker_address for probe in probes} != probed_workers:
         raise ValueError("worker probes must exactly match attempted probe workers")
     for probed, event_activated, event_failed in scale_probe_outcomes:
         if probed - event_activated and not event_failed:
             raise ValueError(
                 "non-activated probed candidates require a matching failed scale event"
             )
-    validated_probes = tuple(probe_by_address[address] for address in validated)
+    if set(current_activated_probes) != set(validated):
+        raise ValueError(
+            "current activated probe identities must match validated workers"
+        )
+    activated_identity_keys = {
+        (
+            probe.worker_address,
+            probe.hostname,
+            probe.pid,
+            probe.slurm_job_id,
+        )
+        for probe in historical_activated_probes
+    }
+    if not activated_identity_keys <= set(probe_identities):
+        raise ValueError("activated probes must be present in raw probe history")
+    validated_probes = tuple(current_activated_probes[address] for address in validated)
     validate_slurm_worker_identities(validated_probes)
     if any(not probe.ok for probe in probes) and not scale_failed:
         raise ValueError("failed worker probe requires a failed scale event")
     if any(
-        not probe_by_address[address].ok
+        not current_activated_probes[address].ok
         for address in validated
-        if address in probe_by_address
+        if address in current_activated_probes
     ):
         raise ValueError("activated workers must have successful probe evidence")
     statuses: dict[str, str] = {}
@@ -600,6 +709,8 @@ def validate_fine_slurm_evidence(
                     "attempt",
                     "status",
                     "dask_task_key",
+                    "coordinator_submitted_at",
+                    "coordinator_ready_at",
                     "started_at",
                     "ended_at",
                     "duration_seconds",
@@ -632,6 +743,18 @@ def validate_fine_slurm_evidence(
         observed_dask = _string(placement["dask_task_key"], f"{location}.dask_task_key")
         if observed_dask != expected_dask:
             raise ValueError("fine placement Dask key must match terminal attempt")
+        coordinator_submitted_at = _timestamp(
+            placement["coordinator_submitted_at"],
+            f"{location}.coordinator_submitted_at",
+        )
+        coordinator_ready_at = _timestamp(
+            placement["coordinator_ready_at"],
+            f"{location}.coordinator_ready_at",
+        )
+        if coordinator_ready_at < coordinator_submitted_at:
+            raise ValueError(
+                "fine coordinator observed an attempt before its submission"
+            )
         started_at = _timestamp(placement["started_at"], f"{location}.started_at")
         ended_at = _timestamp(placement["ended_at"], f"{location}.ended_at")
         if ended_at < started_at:
@@ -671,14 +794,16 @@ def validate_fine_slurm_evidence(
         accepted = placement["placement_accepted"]
         if type(accepted) is not bool:
             raise TypeError(f"{location}.placement_accepted must be an exact boolean")
-        probe = None if worker is None else probe_by_address.get(worker)
+        placement_identity = (worker, hostname, pid, slurm_job_id)
+        interval = active_intervals.get(
+            cast(tuple[str, str, int, str | None], placement_identity)
+        )
         exact_identity = (
             worker is not None
-            and worker in validated
-            and probe is not None
-            and hostname == probe.hostname
-            and pid == probe.pid
-            and slurm_job_id == probe.slurm_job_id
+            and placement_identity in activated_identity_keys
+            and interval is not None
+            and interval[0] <= coordinator_submitted_at <= coordinator_ready_at
+            and (interval[1] is None or coordinator_ready_at <= interval[1])
         )
         if accepted and not exact_identity:
             raise ValueError("fine placement does not match worker probe identity")

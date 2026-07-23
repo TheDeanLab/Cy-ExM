@@ -58,7 +58,10 @@ from cyexm.registration.artifacts import (
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.spatial import ImageGeometry
 from cyexm.workflow import run_workflow
-from cyexm.workflow._execution_validation import _FineExecutionEvidence
+from cyexm.workflow._execution_validation import (
+    _FineCancellationEvidence,
+    _FineExecutionEvidence,
+)
 from cyexm.workflow.fine_models import (
     FineTaskKey,
     FineTaskResult,
@@ -3467,6 +3470,18 @@ def test_fine_sequential_interruption_persists_partial_graph_and_cancellation(
     record = json.loads(records[0].read_text())
     assert record["status"] == "cancelled"
     assert record["execution"]["cancelled"] is True
+    assert record["execution"]["interruption"] == {
+        "exception_type": "KeyboardInterrupt",
+        "message": "injected fine cancellation",
+    }
+    assert record["execution"]["cancellation"] == {
+        "outcome": "not_applicable",
+        "attempted": False,
+        "unfinished_futures": 0,
+        "force": None,
+        "succeeded": None,
+        "error": None,
+    }
     assert [item["task_key"] for item in record["execution"]["attempt_counts"]] == [
         "round-002:whole-image:main",
         "round-002:channel:0000",
@@ -3577,7 +3592,7 @@ def test_fine_pre_controller_cancellation_rejects_forged_cause(
     record = json.loads(record_path.read_text())
     assert record["execution"] is None
     assert record["execution_evidence_error"]["message"].endswith(
-        "reference cancellation cause is not authoritative"
+        "interruption cause is not authoritative"
     )
 
 
@@ -3624,6 +3639,16 @@ def test_fine_local_cancellation_binds_completed_partial_round_summary(
             ("client", True, None, None),
             ("cluster", True, None, None),
             ("configuration", True, None, None),
+        ),
+        interruption=("KeyboardInterrupt", "distributed partial"),
+        cancellation=_FineCancellationEvidence(
+            outcome="cancelled",
+            attempted=True,
+            unfinished_futures=1,
+            force=True,
+            succeeded=True,
+            exception_type=None,
+            message=None,
         ),
     )
 
@@ -3677,7 +3702,23 @@ def test_fine_sequential_rejected_partial_summary_is_not_persisted(
     interruption = KeyboardInterrupt("forged sequential partial")
 
     class InterruptedSequentialExecutor:
-        execution_evidence = replace(evidence, cancelled=True)
+        execution_evidence = replace(
+            evidence,
+            cancelled=True,
+            interruption=(
+                "KeyboardInterrupt",
+                "forged sequential partial",
+            ),
+            cancellation=_FineCancellationEvidence(
+                outcome="not_applicable",
+                attempted=False,
+                unfinished_futures=0,
+                force=None,
+                succeeded=None,
+                exception_type=None,
+                message=None,
+            ),
+        )
 
         def execute(
             self,
@@ -3731,6 +3772,16 @@ def test_fine_distributed_rejected_partial_summary_is_not_persisted(
         worker_cap=profile.local_dask.workers,
         round_results=(forged,),
         cancelled=True,
+        interruption=("KeyboardInterrupt", "forged distributed partial"),
+        cancellation=_FineCancellationEvidence(
+            outcome="no_unfinished",
+            attempted=False,
+            unfinished_futures=0,
+            force=None,
+            succeeded=None,
+            exception_type=None,
+            message=None,
+        ),
         cleanup=(
             ("client", True, None, None),
             ("cluster", True, None, None),

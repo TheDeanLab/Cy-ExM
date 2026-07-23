@@ -21,7 +21,10 @@ from cyexm.execution._dask_common import (
 )
 from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
 from cyexm.execution.dispatcher import FineGraphController
-from cyexm.workflow._execution_validation import _FineExecutionEvidence
+from cyexm.workflow._execution_validation import (
+    _FineCancellationEvidence,
+    _FineExecutionEvidence,
+)
 from cyexm.workflow.fine_models import FineTaskResult
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask
 from cyexm.workflow.task import run_workflow_task
@@ -134,6 +137,8 @@ class LocalDaskExecutor:
         self._fine_reference_result: RoundResult | None = None
         self._fine_pre_controller_terminal: tuple[str, str, str, str] | None = None
         self._fine_cancelled = False
+        self._fine_interruption: tuple[str, str] | None = None
+        self._fine_cancellation: _FineCancellationEvidence | None = None
         self._fine_cleanup: tuple[tuple[str, bool, str | None, str | None], ...] = ()
 
     @property
@@ -168,6 +173,8 @@ class LocalDaskExecutor:
             ),
             cancelled=self._fine_cancelled,
             cleanup=self._fine_cleanup,
+            interruption=self._fine_interruption,
+            cancellation=self._fine_cancellation,
         )
 
     def _spec(self) -> LocalDaskSpec:
@@ -205,6 +212,8 @@ class LocalDaskExecutor:
         self._fine_reference_result = None
         self._fine_pre_controller_terminal = None
         self._fine_cancelled = False
+        self._fine_interruption = None
+        self._fine_cancellation = None
         self._fine_cleanup = ()
 
         try:
@@ -305,6 +314,8 @@ class LocalDaskExecutor:
             return (*reference_results, *moving_results)
         except KeyboardInterrupt as error:
             self._fine_cancelled = fine_mode
+            if fine_mode:
+                self._fine_interruption = (type(error).__name__, str(error))
             if fine_mode and self._fine_controller is None:
                 phase = (
                     "moving"
@@ -318,6 +329,16 @@ class LocalDaskExecutor:
                     type(error).__name__,
                     str(error),
                 )
+            if fine_mode and (client is None or not active):
+                self._fine_cancellation = _FineCancellationEvidence(
+                    outcome="no_unfinished",
+                    attempted=False,
+                    unfinished_futures=0,
+                    force=None,
+                    succeeded=None,
+                    exception_type=None,
+                    message=None,
+                )
             if client is not None and active:
                 unfinished = tuple(
                     future
@@ -327,10 +348,32 @@ class LocalDaskExecutor:
                 try:
                     if unfinished:
                         client.cancel(unfinished, force=True)
-                except BaseException as error:
+                except BaseException as cancel_error:
+                    if fine_mode:
+                        self._fine_cancellation = _FineCancellationEvidence(
+                            outcome="cancel_failed",
+                            attempted=bool(unfinished),
+                            unfinished_futures=len(unfinished),
+                            force=True if unfinished else None,
+                            succeeded=False if unfinished else None,
+                            exception_type=type(cancel_error).__name__,
+                            message=str(cancel_error),
+                        )
                     _LOGGER.warning(
-                        "Failed to cancel unfinished local Dask futures: %s", error
+                        "Failed to cancel unfinished local Dask futures: %s",
+                        cancel_error,
                     )
+                else:
+                    if fine_mode:
+                        self._fine_cancellation = _FineCancellationEvidence(
+                            outcome=("cancelled" if unfinished else "no_unfinished"),
+                            attempted=bool(unfinished),
+                            unfinished_futures=len(unfinished),
+                            force=True if unfinished else None,
+                            succeeded=True if unfinished else None,
+                            exception_type=None,
+                            message=None,
+                        )
             raise
         finally:
             self._fine_cleanup = _close_owned(client, cluster, configuration)

@@ -56,6 +56,8 @@ class FineAttemptObservation:
     task: FineWorkflowTask
     attempt: int
     dask_task_key: str
+    coordinator_submitted_at: str
+    coordinator_ready_at: str
     raw_result: FineTaskResult | None
     settled_result: FineTaskResult
     rejection_reason: str | None
@@ -300,8 +302,10 @@ def collect_distributed_fine_results(
     capacity: int,
     active: set[Any],
     capacity_provider: Callable[[FineGraphController, int], int] | None = None,
+    active_wait: Callable[[tuple[Any, ...]], None] | None = None,
+    before_settle: Callable[[tuple[Any, ...]], None] | None = None,
     result_validator: (
-        Callable[[FineWorkflowTask, FineTaskResult], FineTaskResult] | None
+        Callable[[FineWorkflowTask, FineTaskResult, str, str], FineTaskResult] | None
     ) = None,
     attempt_observer: Callable[[FineAttemptObservation], None] | None = None,
     submission_observer: Callable[[FineWorkflowTask, int], None] | None = None,
@@ -375,41 +379,30 @@ def collect_distributed_fine_results(
     elif not controller.terminal:
         raise RuntimeError("non-terminal fine graph has neither active nor ready work")
 
-    if completion is not None:
-        for future, outcome in completion:
-            active.discard(future)
-            submission = submissions[future]
-            task = submission.task
-            raw_result = outcome if type(outcome) is FineTaskResult else None
-            rejection_reason: str | None = None
-            if type(outcome) is FineTaskResult:
-                try:
-                    result = _validate_fine_task_result(task, outcome)
-                    if result.dask_task_key != submission.key:
-                        raise RoundExecutionError(
-                            "Dask fine task result key does not match the current "
-                            "submitted attempt"
-                        )
-                    if result_validator is not None:
-                        result = result_validator(task, result)
-                except RoundExecutionError as error:
-                    rejection_reason = f"{type(error).__name__}: {error}"
-                    result = fine_exception_result(
+    def settle(future: Any, outcome: object, coordinator_ready_at: str) -> None:
+        nonlocal completion
+        assert completion is not None
+        active.discard(future)
+        submission = submissions[future]
+        task = submission.task
+        raw_result = outcome if type(outcome) is FineTaskResult else None
+        rejection_reason: str | None = None
+        if type(outcome) is FineTaskResult:
+            try:
+                result = _validate_fine_task_result(task, outcome)
+                if result.dask_task_key != submission.key:
+                    raise RoundExecutionError(
+                        "Dask fine task result key does not match the current "
+                        "submitted attempt"
+                    )
+                if result_validator is not None:
+                    result = result_validator(
                         task,
-                        error,
-                        key=submission.key,
-                        started_at=submission.started_at,
-                        started=submission.started,
-                        placement=outcome,
+                        result,
+                        submission.started_at,
+                        coordinator_ready_at,
                     )
-            else:
-                error = (
-                    distributed_error(outcome)
-                    if isinstance(outcome, BaseException) or type(outcome) is tuple
-                    else TypeError(
-                        f"Dask fine task returned an unsupported result: {outcome!r}"
-                    )
-                )
+            except RoundExecutionError as error:
                 rejection_reason = f"{type(error).__name__}: {error}"
                 result = fine_exception_result(
                     task,
@@ -417,27 +410,63 @@ def collect_distributed_fine_results(
                     key=submission.key,
                     started_at=submission.started_at,
                     started=submission.started,
+                    placement=outcome,
                 )
-
-            if attempt_observer is not None:
-                attempt_observer(
-                    FineAttemptObservation(
-                        task=task,
-                        attempt=submission.attempt,
-                        dask_task_key=submission.key,
-                        raw_result=raw_result,
-                        settled_result=result,
-                        rejection_reason=rejection_reason,
-                    )
+        else:
+            error = (
+                distributed_error(outcome)
+                if isinstance(outcome, BaseException) or type(outcome) is tuple
+                else TypeError(
+                    f"Dask fine task returned an unsupported result: {outcome!r}"
                 )
+            )
+            rejection_reason = f"{type(error).__name__}: {error}"
+            result = fine_exception_result(
+                task,
+                error,
+                key=submission.key,
+                started_at=submission.started_at,
+                started=submission.started,
+            )
 
-            if result.status == "failed" and submission.attempt <= task_retries:
-                completion.add(submit(task))
+        if attempt_observer is not None:
+            attempt_observer(
+                FineAttemptObservation(
+                    task=task,
+                    attempt=submission.attempt,
+                    dask_task_key=submission.key,
+                    coordinator_submitted_at=submission.started_at,
+                    coordinator_ready_at=coordinator_ready_at,
+                    raw_result=raw_result,
+                    settled_result=result,
+                    rejection_reason=rejection_reason,
+                )
+            )
+
+        if result.status == "failed" and submission.attempt <= task_retries:
+            completion.add(submit(task))
+            return
+
+        controller.record(task, result)
+        for admitted in admit():
+            completion.add(admitted)
+
+    if completion is not None and active_wait is None:
+        for future, outcome in completion:
+            settle(future, outcome, utc_now())
+    elif completion is not None:
+        wait_for_active = active_wait
+        assert wait_for_active is not None
+        while active:
+            batch = tuple(completion.next_batch(block=False))
+            if not batch:
+                wait_for_active(tuple(active))
                 continue
-
-            controller.record(task, result)
-            for admitted in admit():
-                completion.add(admitted)
+            coordinator_ready_at = utc_now()
+            if before_settle is not None:
+                before_settle(tuple(active))
+            for future, outcome in batch:
+                settle(future, outcome, coordinator_ready_at)
 
     if active:
         raise RuntimeError("Dask completion ended with active fine work")

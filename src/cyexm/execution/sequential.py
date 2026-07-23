@@ -11,6 +11,7 @@ from cyexm.execution._fine_common import failed_fine_task_result
 from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
 from cyexm.execution.dispatcher import FineGraphController
 from cyexm.workflow._execution_validation import (
+    _FineCancellationEvidence,
     _FineExecutionEvidence,
     _validate_fine_task_result,
 )
@@ -106,6 +107,7 @@ class SequentialExecutor:
         attempts: list[tuple[str, int]],
         *,
         cancelled: bool,
+        interruption: BaseException | None = None,
         pre_controller_terminal: tuple[str, str, str, str] | None = None,
     ) -> None:
         self._execution_evidence = _FineExecutionEvidence(
@@ -127,6 +129,24 @@ class SequentialExecutor:
             ),
             cancelled=cancelled,
             cleanup=(),
+            interruption=(
+                None
+                if interruption is None
+                else (type(interruption).__name__, str(interruption))
+            ),
+            cancellation=(
+                None
+                if interruption is None
+                else _FineCancellationEvidence(
+                    outcome="not_applicable",
+                    attempted=False,
+                    unfinished_futures=0,
+                    force=None,
+                    succeeded=None,
+                    exception_type=None,
+                    message=None,
+                )
+            ),
         )
 
     def _execute_tasks(
@@ -222,6 +242,7 @@ class SequentialExecutor:
                     controller,
                     attempts,
                     cancelled=True,
+                    interruption=error,
                 )
                 raise _SequentialExecutionInterrupted(
                     error,
@@ -280,6 +301,7 @@ class SequentialExecutor:
                     None,
                     [],
                     cancelled=True,
+                    interruption=error.original,
                     pre_controller_terminal=(
                         "reference",
                         "cancelled",
@@ -341,6 +363,7 @@ class SequentialExecutor:
                     None,
                     [],
                     cancelled=True,
+                    interruption=error,
                     pre_controller_terminal=(
                         "moving",
                         "cancelled",

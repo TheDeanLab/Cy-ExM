@@ -1079,6 +1079,14 @@ def test_fine_local_executor_cancels_unfinished_stage_on_interrupt(
     assert modules.events == ["client.close", "cluster.close"]
     evidence = executor.execution_evidence
     assert evidence.cancelled
+    assert evidence.interruption == (
+        "KeyboardInterrupt",
+        "injected collection interruption",
+    )
+    assert evidence.cancellation is not None
+    assert evidence.cancellation.outcome == "cancelled"
+    assert evidence.cancellation.unfinished_futures == 1
+    assert evidence.cancellation.succeeded is True
     assert evidence.attempt_counts == (("round-002:whole-image:main", 1),)
     assert evidence.task_results == ()
     assert evidence.cleanup == (
@@ -1501,18 +1509,25 @@ def test_local_executor_preserves_interrupt_when_cancel_and_cleanup_fail(
     modules.client_close_error = KeyboardInterrupt("client close failed")
     modules.cluster_close_error = SystemExit("cluster close failed")
 
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
     with (
         caplog.at_level(logging.WARNING, logger="cyexm.execution.dask"),
         pytest.raises(KeyboardInterrupt, match="collection interruption"),
     ):
-        LocalDaskExecutor(_profile(tmp_path), _modules=lambda: modules).execute(
-            _reference_task(tmp_path), (_task(tmp_path, 2),)
-        )
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert "cancel failed" in caplog.text
     assert "client close failed" in caplog.text
     assert "cluster close failed" in caplog.text
     assert modules.events == ["client.close", "cluster.close"]
+    evidence = executor.execution_evidence
+    assert evidence.cancellation is not None
+    assert evidence.cancellation.outcome == "cancel_failed"
+    assert evidence.cancellation.exception_type == "SystemExit"
+    assert evidence.cancellation.message == "cancel failed"
 
 
 def test_local_executor_exports_from_execution_namespace() -> None:

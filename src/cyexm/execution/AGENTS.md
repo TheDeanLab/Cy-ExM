@@ -114,8 +114,10 @@
   including partial startup.
 - While fine SLURM futures are active, periodically check completion before
   reconciling the exact scheduler/worker identities. Healthy long-running tasks have
-  no execution deadline. If an activated worker departs, bound only the replacement
-  wait by the configured startup timeout; preflight and resource-gate every
+  no execution deadline. Treat the Dask wait timeout at the health interval as a
+  polling tick that triggers identity/resource reconciliation, not as task failure.
+  If an activated worker departs, bound only the replacement wait by the configured
+  startup timeout; preflight and resource-gate every
   replacement before retry or new admission, record the departed identity, and fail
   closed if replacement validation does not complete. Reconciliation at the current
   cap must not issue another scale request. Local Dask retains its scheduler-native

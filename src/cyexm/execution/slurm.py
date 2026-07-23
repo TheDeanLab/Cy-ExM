@@ -2211,13 +2211,17 @@ class SlurmExecutor:
                     wait_for_completion: bool = True,
                 ) -> None:
                     if wait_for_completion:
-                        wait_result = modules.wait(
-                            active_futures,
-                            timeout=_FINE_HEALTH_INTERVAL_SECONDS,
-                            return_when="FIRST_COMPLETED",
-                        )
-                        if wait_result.done:
-                            return
+                        try:
+                            wait_result = modules.wait(
+                                active_futures,
+                                timeout=_FINE_HEALTH_INTERVAL_SECONDS,
+                                return_when="FIRST_COMPLETED",
+                            )
+                        except TimeoutError:
+                            pass
+                        else:
+                            if wait_result.done:
+                                return
                     replacement_timeout = modules.parse_timedelta(spec.startup_timeout)
                     replacement_deadline = time.monotonic() + replacement_timeout
 

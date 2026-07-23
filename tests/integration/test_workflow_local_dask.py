@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
@@ -15,12 +16,15 @@ from cyexm.config.models import (
     LocalDaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
+    ParallelismSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
     RegistrationStageSpec,
     RoundSpec,
 )
+from cyexm.execution.dask import LocalDaskExecutor
+from cyexm.execution.sequential import SequentialExecutor
 from cyexm.io.tiff import read_tiff_geometry
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS, NativeThreadConfig
@@ -28,6 +32,9 @@ from cyexm.workflow._round_provenance import RegistrationArtifactPaths
 from cyexm.workflow.api import run_workflow
 from cyexm.workflow.models import RoundResult, RoundTask, WorkflowPlan
 from cyexm.workflow.planning import build_workflow_plan
+from cyexm.workflow.task import run_workflow_task
+
+from .local_dask_helpers import guarded_fine_runner
 
 pytestmark = pytest.mark.integration
 
@@ -105,9 +112,9 @@ def _manifest() -> DatasetManifest:
                         "nearestNeighbor",
                     ),
                 ),
-                # One full-volume chunk exercises the real serial chunked strategy
-                # without expanding the bounded scientific fixture.
-                chunk_size_zyx=_SHAPE,
+                # Two overlapping Z chunks exercise dynamic fine-graph expansion
+                # while retaining a bounded 16 x 32 x 32 scientific fixture.
+                chunk_size_zyx=(10, 32, 32),
                 overlap_fraction=0.25,
             ),
         ),
@@ -119,6 +126,7 @@ def _profile(
     *,
     dataset_root: Path,
     executor: ExecutorName,
+    mode: str = "coarse",
 ) -> ExecutionProfile:
     output_root = (tmp_path / f"{executor}-output").resolve()
     local_dask = None
@@ -145,6 +153,7 @@ def _profile(
         local_dask=local_dask,
         slurm=None,
         source_path=(tmp_path / f"execution-{executor}.yaml").resolve(),
+        parallelism=ParallelismSpec(mode=mode),  # type: ignore[arg-type]
     )
 
 
@@ -368,5 +377,106 @@ def test_sequential_and_local_dask_workflows_are_scientifically_equivalent_and_r
     )
     assert tuple(result.reused_artifacts for result in reused.rounds) == tuple(
         result.artifact_paths for result in reused.rounds
+    )
+    assert _artifact_and_record_identities(local_plan) == identities_before_reuse
+
+
+def test_fine_executors_match_real_outputs_and_local_dask_reuses(
+    tmp_path: Path,
+    synthetic_tiffs: tuple[Path, Path],
+    native_threads: NativeThreadConfig,
+) -> None:
+    del native_threads
+    dataset_root = tmp_path / "dataset"
+    _write_dataset(dataset_root, synthetic_tiffs)
+    complete_manifest = _manifest()
+    manifest = replace(
+        complete_manifest,
+        rounds=(complete_manifest.rounds[1],),
+    )
+    sequential_profile = _profile(
+        tmp_path,
+        dataset_root=dataset_root,
+        executor="sequential",
+        mode="fine_grained",
+    )
+    local_profile = _profile(
+        tmp_path,
+        dataset_root=dataset_root,
+        executor="local_dask",
+        mode="fine_grained",
+    )
+    sequential_plan = build_workflow_plan(manifest, sequential_profile)
+    local_plan = build_workflow_plan(manifest, local_profile)
+
+    sequential_results = SequentialExecutor(
+        sequential_profile,
+        runner=run_workflow_task,
+    ).execute(sequential_plan.reference_task, sequential_plan.tasks)
+    local_executor = LocalDaskExecutor(
+        local_profile,
+        _fine_runner=guarded_fine_runner,
+    )
+    local_results = local_executor.execute(
+        local_plan.reference_task,
+        local_plan.tasks,
+    )
+
+    assert {result.status for result in sequential_results} == {"completed"}
+    assert {result.status for result in local_results} == {"completed"}
+    moving_local = local_results[1:]
+    assert len(moving_local) == 1
+    assert moving_local[0].pid != os.getpid()
+    assert all(
+        result.dask_task_key is not None
+        and result.dask_task_key.startswith(f"cyexm-round-{result.round:03d}-")
+        for result in moving_local
+    )
+    task_results = local_executor._fine_task_results
+    assert task_results
+    assert tuple(result.key.encoded for result in task_results) == tuple(
+        sorted(
+            (result.key.encoded for result in task_results),
+            key=lambda value: (
+                int(value.split(":", 1)[0].removeprefix("round-")),
+                {
+                    "preparation": 0,
+                    "whole-image": 0,
+                    "chunk": 1,
+                    "assembly": 2,
+                    "channel": 3,
+                    "validation": 4,
+                }[value.split(":")[1]],
+                value.split(":")[2],
+            ),
+        )
+    )
+    round_three_chunks = tuple(
+        result
+        for result in task_results
+        if result.round == 3 and result.key.stage == "chunk"
+    )
+    assert len(round_three_chunks) == 2
+    assert len({result.pid for result in round_three_chunks}) == 2
+    assert all(
+        result.dask_task_key == f"cyexm-{result.key.encoded.replace(':', '-')}"
+        for result in task_results
+    )
+    assert local_executor._fine_attempt_counts == tuple(
+        (result.key.encoded, 1) for result in task_results
+    )
+    for sequential_task, local_task in zip(
+        sequential_plan.tasks,
+        local_plan.tasks,
+        strict=True,
+    ):
+        _assert_round_outputs_equivalent(sequential_task, local_task)
+
+    identities_before_reuse = _artifact_and_record_identities(local_plan)
+    reused = local_executor.execute(local_plan.reference_task, local_plan.tasks)
+
+    assert tuple(result.status for result in reused) == (
+        "completed",
+        "reused",
     )
     assert _artifact_and_record_identities(local_plan) == identities_before_reuse

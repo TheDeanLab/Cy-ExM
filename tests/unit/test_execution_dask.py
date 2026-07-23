@@ -17,12 +17,14 @@ from cyexm.config.models import (
     LocalDaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
+    ParallelismSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
 from cyexm.errors import ExecutorStartupError, RoundExecutionError
 from cyexm.execution import dask as dask_module
 from cyexm.execution.dask import LocalDaskExecutor
+from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
 from cyexm.workflow.models import (
     ChannelTask,
     ReferenceChannelTask,
@@ -69,6 +71,7 @@ def _profile(
     *,
     workers: int = 4,
     retries: int = 0,
+    mode: str = "coarse",
 ) -> ExecutionProfile:
     return ExecutionProfile(
         schema_version=1,
@@ -89,6 +92,7 @@ def _profile(
         ),
         slurm=None,
         source_path=tmp_path / "execution.yaml",
+        parallelism=ParallelismSpec(mode=mode),  # type: ignore[arg-type]
     )
 
 
@@ -208,9 +212,41 @@ def _workflow_result(task: WorkflowTask) -> RoundResult:
     return _reference_result(task) if isinstance(task, ReferenceTask) else _result(task)
 
 
+def _fine_result(
+    task: FineWorkflowTask,
+    *,
+    status: str = "completed",
+) -> FineTaskResult:
+    failure = (
+        RoundFailure(task.key.stage, "RuntimeError", "injected failed result")
+        if status == "failed"
+        else None
+    )
+    return FineTaskResult(
+        task=task,
+        status=status,  # type: ignore[arg-type]
+        started_at="2026-07-20T10:00:00Z",
+        ended_at="2026-07-20T10:00:01Z",
+        duration_seconds=1.0,
+        hostname="worker-01",
+        pid=123,
+        dask_task_key=None,
+        slurm_job_id=None,
+        native_threads=(("itk", 2), ("blas", 3)),
+        artifact_paths=(
+            tuple(str(path) for path in task.output_paths)
+            if status in {"completed", "reused"}
+            else ()
+        ),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=failure,
+    )
+
+
 @dataclass(frozen=True)
 class _SubmitCall:
-    task: WorkflowTask
+    task: WorkflowTask | FineWorkflowTask
     key: str
     pure: bool
     retries: int
@@ -220,7 +256,7 @@ class _SubmitCall:
 class _FakeFuture:
     def __init__(
         self,
-        task: WorkflowTask,
+        task: WorkflowTask | FineWorkflowTask,
         key: str,
         outcome: object,
         *,
@@ -240,6 +276,8 @@ class _FakeAsCompleted(Iterator[tuple[_FakeFuture, object]]):
         self,
         modules: _FakeDistributedModules,
         futures: list[_FakeFuture],
+        *,
+        interrupt_after: int | None,
     ) -> None:
         self._modules = modules
         order = {
@@ -250,16 +288,14 @@ class _FakeAsCompleted(Iterator[tuple[_FakeFuture, object]]):
             key=lambda future: order.get(future.task.round, len(order)),
         )
         self._yielded = 0
+        self._interrupt_after = interrupt_after
 
     def __iter__(self) -> _FakeAsCompleted:
         return self
 
     def __next__(self) -> tuple[_FakeFuture, object]:
-        if (
-            self._modules.interrupt_after is not None
-            and self._yielded == self._modules.interrupt_after
-        ):
-            self._modules.interrupt_after = None
+        if self._interrupt_after is not None and self._yielded == self._interrupt_after:
+            self._interrupt_after = None
             raise KeyboardInterrupt("injected collection interruption")
         if not self._queue:
             raise StopIteration
@@ -294,8 +330,8 @@ class _FakeClient:
 
     def submit(
         self,
-        runner: Callable[[WorkflowTask], RoundResult],
-        task: WorkflowTask,
+        runner: Callable[..., object],
+        task: WorkflowTask | FineWorkflowTask,
         *,
         key: str,
         pure: bool,
@@ -309,8 +345,15 @@ class _FakeClient:
         self._modules.submit_calls.append(
             _SubmitCall(task, key, pure, retries, resources)
         )
-        configured = self._modules.outcomes.setdefault(task.round, [])
-        outcome = configured.pop(0) if configured else _workflow_result(task)
+        identity = task.key.encoded if hasattr(task, "key") else task.round
+        configured = self._modules.outcomes.setdefault(identity, [])
+        outcome = (
+            configured.pop(0)
+            if configured
+            else (
+                _fine_result(task) if hasattr(task, "key") else _workflow_result(task)
+            )
+        )
         return _FakeFuture(
             task,
             key,
@@ -336,12 +379,14 @@ class _FakeDistributedModules:
         self.client_timeout: str | None = None
         self.wait_call: tuple[int, float] | None = None
         self.as_completed_call: tuple[bool, bool] | None = None
+        self.as_completed_initial_counts: list[int] = []
         self.submit_calls: list[_SubmitCall] = []
         self.events: list[str] = []
         self.cancel_call: tuple[tuple[_FakeFuture, ...], bool] | None = None
-        self.outcomes: dict[int, list[object]] = {}
+        self.outcomes: dict[int | str, list[object]] = {}
         self.order: tuple[int, ...] = ()
         self.interrupt_after: int | None = None
+        self.interrupt_as_completed_call: int | None = None
         self.cluster_error: Exception | None = None
         self.client_error: Exception | None = None
         self.wait_error: Exception | None = None
@@ -409,7 +454,18 @@ class _FakeDistributedModules:
         raise_errors: bool,
     ) -> _FakeAsCompleted:
         self.as_completed_call = (with_results, raise_errors)
-        return _FakeAsCompleted(self, futures)
+        self.as_completed_initial_counts.append(len(futures))
+        call_number = len(self.as_completed_initial_counts)
+        interrupt_after = (
+            self.interrupt_after
+            if self.interrupt_as_completed_call in {None, call_number}
+            else None
+        )
+        return _FakeAsCompleted(
+            self,
+            futures,
+            interrupt_after=interrupt_after,
+        )
 
     def parse_timedelta(self, value: str) -> float:
         assert value == "30s"
@@ -441,6 +497,169 @@ def test_local_executor_uses_one_round_slot_per_bounded_worker(tmp_path: Path) -
         {"round_slot": 1},
     ]
     assert tuple(result.round for result in results) == (1, 2, 3)
+
+
+def test_fine_local_executor_starts_exact_configured_workers_and_expands_on_coordinator(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+
+    results = LocalDaskExecutor(
+        _profile(tmp_path, workers=3, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (task,))
+
+    assert modules.cluster_kwargs is not None
+    assert modules.cluster_kwargs["n_workers"] == 3
+    assert modules.wait_call == (3, 30.0)
+    assert [call.task.round for call in modules.submit_calls] == [1, 2, 2, 2]
+    fine_calls = modules.submit_calls[1:]
+    assert [call.task.key.stage for call in fine_calls] == [  # type: ignore[union-attr]
+        "whole-image",
+        "channel",
+        "validation",
+    ]
+    assert [call.key for call in fine_calls] == [
+        "cyexm-round-002-whole-image-main",
+        "cyexm-round-002-channel-0000",
+        "cyexm-round-002-validation-main",
+    ]
+    assert all(call.resources == {"round_slot": 1} for call in fine_calls)
+    assert all(call.pure is False and call.retries == 0 for call in fine_calls)
+    assert tuple(result.round for result in results) == (1, 2)
+    assert results[1].status == "completed"
+
+
+def test_fine_local_executor_retries_exact_task_without_recording_intermediate_failure(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+    key = "round-002:whole-image:main"
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    fine_task = initial_fine_tasks((task,))[0]
+    modules.outcomes[key] = [
+        _fine_result(fine_task, status="failed"),
+        _fine_result(fine_task),
+    ]
+
+    results = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, retries=1, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (task,))
+
+    assert results[1].status == "completed"
+    assert [call.key for call in modules.submit_calls[1:3]] == [
+        "cyexm-round-002-whole-image-main",
+        "cyexm-round-002-whole-image-main-attempt-002",
+    ]
+
+
+def test_fine_local_executor_bounds_initial_work_and_settles_independent_sibling(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    first = _task(tmp_path, 2)
+    second = _task(tmp_path, 3)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    failed = initial_fine_tasks((first,))[0]
+    modules.outcomes[failed.key.encoded] = [_fine_result(failed, status="failed")]
+
+    reference, first_result, second_result = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (first, second))
+
+    assert modules.as_completed_initial_counts == [1, 2]
+    assert [call.task.round for call in modules.submit_calls[1:3]] == [2, 3]
+    assert first_result.status == "failed"
+    assert second_result.status == "completed"
+    assert reference.status == "completed"
+    assert not any(
+        hasattr(call.task, "key")
+        and call.task.round == 2
+        and call.task.key.stage == "channel"
+        for call in modules.submit_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        RuntimeError("raised by worker"),
+        (RuntimeError, "not an exception", None),
+        object(),
+    ],
+)
+def test_fine_local_executor_structures_worker_and_malformed_failures(
+    tmp_path: Path,
+    outcome: object,
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    initial = initial_fine_tasks((task,))[0]
+    modules.outcomes[initial.key.encoded] = [outcome]
+
+    result = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (task,))[1]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "whole-image"
+
+
+def test_fine_local_executor_converts_mismatched_exact_result_to_submitted_task(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    submitted_round = _task(tmp_path, 2)
+    other_round = _task(tmp_path, 3)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    submitted = initial_fine_tasks((submitted_round,))[0]
+    mismatched = initial_fine_tasks((other_round,))[0]
+    modules.outcomes[submitted.key.encoded] = [_fine_result(mismatched)]
+
+    result = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (submitted_round,))[1]
+
+    assert result.round == 2
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "whole-image"
+    assert result.failure.exception_type == "RoundExecutionError"
+    assert "different exact task" in result.failure.message
+
+
+def test_fine_local_executor_cancels_unfinished_stage_on_interrupt(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    modules.interrupt_after = 0
+    modules.interrupt_as_completed_call = 2
+    modules.pending_rounds = {2}
+
+    with pytest.raises(KeyboardInterrupt, match="collection interruption"):
+        LocalDaskExecutor(
+            _profile(tmp_path, workers=2, mode="fine_grained"),
+            _modules=lambda: modules,
+        ).execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+
+    assert modules.cancel_call is not None
+    cancelled, force = modules.cancel_call
+    assert len(cancelled) == 1
+    assert cancelled[0].task.key.stage == "whole-image"  # type: ignore[union-attr]
+    assert force is True
+    assert modules.events == ["client.close", "cluster.close"]
 
 
 def test_local_executor_owns_worker_ttl_config_for_cluster_and_execution(

@@ -12,11 +12,17 @@ from types import TracebackType
 from typing import Any, cast
 
 from cyexm.errors import RoundExecutionError
-from cyexm.execution.base import WorkflowTaskRunner
+from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
+from cyexm.execution.dispatcher import FineGraphController
+from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow._execution_validation import (
     _validate_executor_reference_task,
     _validate_executor_round_task,
     _validate_round_result,
+)
+from cyexm.workflow.fine_models import (
+    FineTaskResult,
+    FineWorkflowTask,
 )
 from cyexm.workflow.models import (
     ReferenceTask,
@@ -42,6 +48,15 @@ class Submission:
     started: float
 
 
+@dataclass(frozen=True, slots=True)
+class FineSubmission:
+    task: FineWorkflowTask
+    key: str
+    started_at: str
+    started: float
+    attempt: int
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
@@ -49,6 +64,14 @@ def utc_now() -> str:
 def task_key(task: WorkflowTask, attempt: int) -> str:
     role = "reference-round" if isinstance(task, ReferenceTask) else "round"
     base = f"cyexm-{task.dataset_id}-{role}-{task.round:03d}"
+    if attempt == 1:
+        return base
+    return f"{base}-attempt-{attempt:03d}"
+
+
+def fine_task_key(task: FineWorkflowTask, attempt: int) -> str:
+    """Return one stable scheduler-safe key for an exact fine-task attempt."""
+    base = f"cyexm-{task.key.encoded.replace(':', '-')}"
     if attempt == 1:
         return base
     return f"{base}-attempt-{attempt:03d}"
@@ -87,6 +110,46 @@ def exception_result(
         log_path=str(task.log_path),
         failure=RoundFailure(
             stage="round",
+            exception_type=type(error).__name__,
+            message=str(error),
+        ),
+    )
+
+
+def fine_exception_result(
+    task: FineWorkflowTask,
+    error: BaseException,
+    *,
+    key: str,
+    started_at: str,
+    started: float,
+) -> FineTaskResult:
+    return FineTaskResult(
+        task=task,
+        status="failed",
+        started_at=started_at,
+        ended_at=utc_now(),
+        duration_seconds=max(0.0, time.monotonic() - started),
+        hostname="unknown",
+        pid=os.getpid(),
+        dask_task_key=key,
+        slurm_job_id=None,
+        native_threads=tuple(
+            (
+                name,
+                (
+                    task.native_threads.itk
+                    if name == NATIVE_THREAD_ENV_VARS[0]
+                    else task.native_threads.blas
+                ),
+            )
+            for name in NATIVE_THREAD_ENV_VARS
+        ),
+        artifact_paths=(),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=RoundFailure(
+            stage=task.key.stage,
             exception_type=type(error).__name__,
             message=str(error),
         ),
@@ -232,10 +295,129 @@ def collect_distributed_results(
     return cast(tuple[RoundResult, ...], tuple(terminal)), tuple(attempt_counts)
 
 
+def collect_distributed_fine_results(
+    controller: FineGraphController,
+    *,
+    runner: FineWorkflowTaskRunner,
+    client: Any,
+    as_completed: Callable[..., Any],
+    task_retries: int,
+    capacity: int,
+    active: set[Any],
+) -> tuple[
+    tuple[RoundResult, ...],
+    tuple[FineTaskResult, ...],
+    tuple[tuple[str, int], ...],
+]:
+    """Run a bounded coordinator-owned fine graph on an existing Dask client."""
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+        raise ValueError("fine distributed capacity must be a positive integer")
+    submissions: dict[Any, FineSubmission] = {}
+    attempts: dict[str, int] = {}
+    completion: Any | None = None
+
+    def submit(task: FineWorkflowTask) -> Any:
+        encoded = task.key.encoded
+        attempt = attempts.get(encoded, 0) + 1
+        key = fine_task_key(task, attempt)
+        started_at = utc_now()
+        started = time.monotonic()
+        future = client.submit(
+            runner,
+            task,
+            key=key,
+            pure=False,
+            retries=0,
+            resources=dict(ROUND_RESOURCE),
+        )
+        attempts[encoded] = attempt
+        submissions[future] = FineSubmission(
+            task=task,
+            key=key,
+            started_at=started_at,
+            started=started,
+            attempt=attempt,
+        )
+        active.add(future)
+        return future
+
+    def admit() -> list[Any]:
+        available = capacity - len(active)
+        if available <= 0:
+            return []
+        return [submit(task) for task in controller.pop_ready(limit=available)]
+
+    initial = admit()
+    if initial:
+        completion = as_completed(
+            initial,
+            with_results=True,
+            raise_errors=False,
+        )
+    elif not controller.terminal:
+        raise RuntimeError("non-terminal fine graph has neither active nor ready work")
+
+    if completion is not None:
+        for future, outcome in completion:
+            active.discard(future)
+            submission = submissions[future]
+            task = submission.task
+            if type(outcome) is FineTaskResult and outcome.task == task:
+                result = outcome
+            elif type(outcome) is FineTaskResult:
+                result = fine_exception_result(
+                    task,
+                    RoundExecutionError(
+                        "Dask fine task returned a result for a different exact task"
+                    ),
+                    key=submission.key,
+                    started_at=submission.started_at,
+                    started=submission.started,
+                )
+            else:
+                error = (
+                    distributed_error(outcome)
+                    if isinstance(outcome, BaseException) or type(outcome) is tuple
+                    else TypeError(
+                        f"Dask fine task returned an unsupported result: {outcome!r}"
+                    )
+                )
+                result = fine_exception_result(
+                    task,
+                    error,
+                    key=submission.key,
+                    started_at=submission.started_at,
+                    started=submission.started,
+                )
+
+            if result.status == "failed" and submission.attempt <= task_retries:
+                completion.add(submit(task))
+                continue
+
+            controller.record(task, result)
+            for admitted in admit():
+                completion.add(admitted)
+
+    if active:
+        raise RuntimeError("Dask completion ended with active fine work")
+    if not controller.terminal:
+        raise RuntimeError("non-terminal fine graph has neither active nor ready work")
+    return (
+        controller.round_results(),
+        controller.task_results,
+        tuple(
+            (result.key.encoded, attempts[result.key.encoded])
+            for result in controller.task_results
+        ),
+    )
+
+
 __all__ = [
     "ROUND_RESOURCE",
+    "collect_distributed_fine_results",
     "collect_distributed_results",
     "dask_scheduler_config_overlay",
+    "fine_task_key",
     "future_is_unfinished",
     "utc_now",
     "validate_distributed_tasks",

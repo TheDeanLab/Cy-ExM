@@ -13,12 +13,15 @@ from cyexm.config.models import ExecutionProfile, LocalDaskSpec
 from cyexm.errors import ExecutorStartupError
 from cyexm.execution._dask_common import (
     ROUND_RESOURCE,
+    collect_distributed_fine_results,
     collect_distributed_results,
     dask_scheduler_config_overlay,
     future_is_unfinished,
     validate_distributed_tasks,
 )
-from cyexm.execution.base import WorkflowTaskRunner
+from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
+from cyexm.execution.dispatcher import FineGraphController
+from cyexm.workflow.fine_models import FineTaskResult
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask
 from cyexm.workflow.task import run_workflow_task
 
@@ -80,11 +83,15 @@ class LocalDaskExecutor:
         profile: ExecutionProfile,
         *,
         _runner: WorkflowTaskRunner = run_workflow_task,
+        _fine_runner: FineWorkflowTaskRunner | None = None,
         _modules: Callable[[], Any] = _distributed_modules,
     ) -> None:
         self.profile = profile
         self._runner = _runner
+        self._fine_runner = _fine_runner
         self._modules = _modules
+        self._fine_task_results: tuple[FineTaskResult, ...] = ()
+        self._fine_attempt_counts: tuple[tuple[str, int], ...] = ()
 
     def _spec(self) -> LocalDaskSpec:
         if self.profile.executor != "local_dask":
@@ -106,11 +113,16 @@ class LocalDaskExecutor:
         validate_distributed_tasks(
             (reference_task, *round_tasks), executor_name="LocalDaskExecutor"
         )
-        worker_count = min(max(1, len(round_tasks)), spec.workers)
+        fine_mode = self.profile.parallelism.mode == "fine_grained"
+        worker_count = (
+            spec.workers if fine_mode else min(max(1, len(round_tasks)), spec.workers)
+        )
         cluster: Any | None = None
         client: Any | None = None
         configuration: AbstractContextManager[Any] | None = None
         active: set[Any] = set()
+        self._fine_task_results = ()
+        self._fine_attempt_counts = ()
 
         try:
             try:
@@ -154,14 +166,34 @@ class LocalDaskExecutor:
                 return reference_results
             if not round_tasks:
                 return reference_results
-            moving_results, _attempts = collect_distributed_results(
-                round_tasks,
-                runner=self._runner,
-                client=execution_client,
-                as_completed=modules.as_completed,
-                task_retries=spec.task_retries,
-                active=active,
-            )
+            if fine_mode:
+                fine_runner = self._fine_runner
+                if fine_runner is None:
+                    from cyexm.workflow.fine_task import run_fine_task
+
+                    fine_runner = run_fine_task
+                moving_results, task_results, attempts = (
+                    collect_distributed_fine_results(
+                        FineGraphController(round_tasks),
+                        runner=fine_runner,
+                        client=execution_client,
+                        as_completed=modules.as_completed,
+                        task_retries=spec.task_retries,
+                        capacity=worker_count,
+                        active=active,
+                    )
+                )
+                self._fine_task_results = task_results
+                self._fine_attempt_counts = attempts
+            else:
+                moving_results, _attempts = collect_distributed_results(
+                    round_tasks,
+                    runner=self._runner,
+                    client=execution_client,
+                    as_completed=modules.as_completed,
+                    task_retries=spec.task_retries,
+                    active=active,
+                )
             return (*reference_results, *moving_results)
         except KeyboardInterrupt:
             if client is not None and active:

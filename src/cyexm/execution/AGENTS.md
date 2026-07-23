@@ -6,10 +6,14 @@
   adapter lazily constructs and owns its client and cluster; real SLURM submission and
   HPC acceptance remain unaccepted until Phase 2E.
 - Scheduler imports occur only inside the selected operation.
-- Local Dask uses process-isolated workers and bounds their count to
-  `min(pending tasks, configured workers)`. Schedule one reference prerequisite and
-  one coarse task per moving round in the same owned cluster. Each worker advertises
-  one `round_slot`, and every submitted workflow task requests and consumes one.
+- Local Dask uses process-isolated workers. Coarse mode bounds their count to
+  `min(pending tasks, configured workers)`; fine mode starts exactly the configured
+  worker count because preparation determines future graph width only at runtime.
+  Schedule one reference prerequisite in the same owned cluster before moving work.
+  Coarse execution continues to schedule one coarse task per moving round.
+  The coordinator dynamically admits at most connected capacity from the shared fine
+  graph; workers never submit children. Each worker advertises one `round_slot`, and
+  every submitted workflow task requests and consumes one.
 - Every executor runs the reference-preparation task as a hard prerequisite in the
   same owned worker pool. Moving-round futures may be submitted only after the
   reference result is successful; a failed reference result ends the execution

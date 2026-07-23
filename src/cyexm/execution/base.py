@@ -3,9 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
-from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask, WorkflowTask
+from cyexm.workflow.models import (
+    ReferenceTask,
+    RoundResult,
+    RoundTask,
+    WorkflowTask,
+    WorkflowTaskResult,
+)
 
-type WorkflowTaskRunner = Callable[[WorkflowTask], RoundResult]
+type WorkflowTaskRunner = Callable[[WorkflowTask], WorkflowTaskResult]
 
 
 class WorkflowExecutor(Protocol):

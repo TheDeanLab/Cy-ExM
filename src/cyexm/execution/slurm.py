@@ -115,7 +115,7 @@ class _SerializedWorkflowTaskRunner:
         import cloudpickle
 
         runner = cast(WorkflowTaskRunner, cloudpickle.loads(self.payload))
-        return runner(task)
+        return cast(RoundResult, runner(task))
 
 
 def _serialize_workflow_task_runner(

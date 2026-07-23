@@ -4,6 +4,7 @@ import os
 import socket
 import time
 from datetime import UTC, datetime
+from typing import cast
 
 from cyexm.execution.base import WorkflowTaskRunner
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask, WorkflowTask
@@ -78,7 +79,7 @@ class SequentialExecutor:
                     )
                 )
             else:
-                results.append(result)
+                results.append(cast(RoundResult, result))
         return tuple(results)
 
     def execute(

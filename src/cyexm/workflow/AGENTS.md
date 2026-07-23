@@ -9,6 +9,17 @@
   moving task at the prepared registration-channel TIFF under the reference round's
   shared `channels` directory.
 - Workflow must not mutate a plan or create a scheduler.
+- Fine-grained workflow models embed the authoritative `RoundTask`; do not copy its
+  scientific fields into stage tasks. Initial and incremental graph expansion must
+  remain pure and use the prepared manifest's fixed-grid ZYX shape with the shared
+  canonical chunk grid.
+- Fine task workers configure native threads before lazy scientific imports, execute
+  exactly one immutable stage, and never create clients, workers, or descendant
+  tasks. Concurrent stages use deterministic per-task logs rather than the coarse
+  round log.
+- Fine chunk assembly preserves the legacy ascending-ID overwrite rule for expected
+  overlapping output slices. Scheduling and completion order must not change the
+  canonical assembly order or scientific artifact identity.
 - Phase 1 completion records remain the only restart authority.
 - Status must reconstruct moving-round provenance from the prepared reference TIFF's
   persisted geometry, not the native reference source grid. An unreadable prepared

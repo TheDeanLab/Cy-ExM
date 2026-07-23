@@ -17,6 +17,7 @@ from cyexm.config.models import (
     RegistrationStrategy,
 )
 from cyexm.spatial import ImageGeometry
+from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
 
 type TaskStrategy = Literal["reference-preparation", "whole_image", "serial_chunked"]
 
@@ -82,9 +83,6 @@ class RoundTask:
     overlap_fraction: float | None
     prepared_fixed: bool = True
     force: bool = False
-
-
-type WorkflowTask = ReferenceTask | RoundTask
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +233,10 @@ class WorkflowStatus:
         }
 
 
+type WorkflowTask = ReferenceTask | RoundTask | FineWorkflowTask
+type WorkflowTaskResult = RoundResult | FineTaskResult
+
+
 __all__ = (
     "ChannelTask",
     "ImageHeader",
@@ -248,6 +250,7 @@ __all__ = (
     "WorkflowResult",
     "WorkflowStatus",
     "WorkflowTask",
+    "WorkflowTaskResult",
     "canonical_json",
     "sha256_fingerprint",
 )

@@ -935,6 +935,76 @@ def test_fine_slurm_dynamic_failure_emits_canonical_partial_scale_evidence(
     )
 
 
+def test_fine_slurm_initial_missing_job_probe_is_rejected_with_canonical_evidence(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    address = modules.connected_workers[0]
+    malformed = _probe(address)
+    malformed["slurm_job_id"] = None
+    modules.probe_results = {address: malformed}
+    executor = _executor(tmp_path, modules, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+
+    with pytest.raises(ExecutorStartupError, match="SLURM_JOB_ID"):
+        executor.execute(reference, (task,))
+
+    assert modules.scheduler_resource_calls == []
+    assert modules.submit_calls == []
+    assert modules.events[-2:] == ["client.close", "cluster.close"]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
+
+
+@pytest.mark.parametrize("malformation", ("missing_job", "duplicate_job"))
+def test_fine_slurm_dynamic_malformed_job_probe_is_rejected_with_canonical_evidence(
+    tmp_path: Path,
+    malformation: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    first, second = modules.connected_workers[:2]
+    newcomer = _probe(second)
+    newcomer["slurm_job_id"] = None if malformation == "missing_job" else "9001"
+    modules.probe_results = {
+        first: _probe(first),
+        second: newcomer,
+    }
+    executor = _executor(tmp_path, modules, workers=2, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+
+    with pytest.raises(WorkerPreflightError, match="SLURM_JOB_ID"):
+        executor.execute(reference, tasks)
+
+    assert modules.scheduler_resource_calls == [(first, {"round_slot": 1})]
+    assert [call.task.round for call in modules.submit_calls] == [1]
+    assert modules.events[-2:] == ["client.close", "cluster.close"]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, *tasks),
+        task_retries=0,
+    )
+    forged = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    forged_fine = cast(dict[str, object], forged["fine_graph"])
+    cast(list[str], forged_fine["validated_workers"]).append(second)
+    cast(
+        list[str],
+        cast(list[dict[str, object]], forged_fine["scale_events"])[-1]["activated"],
+    ).append(second)
+    with pytest.raises(WorkerPreflightError, match="SLURM_JOB_ID"):
+        slurm_module._canonical_execution_evidence(
+            forged,
+            expected_tasks=(reference, *tasks),
+            task_retries=0,
+        )
+
+
 def test_fine_slurm_retries_exact_task_with_deterministic_attempt_identity(
     tmp_path: Path,
 ) -> None:

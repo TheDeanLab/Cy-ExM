@@ -352,6 +352,7 @@ def validate_fine_slurm_evidence(
     activated: list[str] = []
     probed_workers: set[str] = set()
     connected: set[str] = set()
+    scale_probe_outcomes: list[tuple[set[str], set[str], bool]] = []
     previous_request = 0
     scale_failed = False
     for index, raw in enumerate(_array(graph["scale_events"], "fine_graph.events")):
@@ -383,9 +384,8 @@ def validate_fine_slurm_evidence(
         connected.update(event_connected)
         probed_workers.update(probed)
         activated.extend(event_activated)
-        for failure_index, failure_value in enumerate(
-            _array(event["failed"], f"{location}.failed")
-        ):
+        event_failures = _array(event["failed"], f"{location}.failed")
+        for failure_index, failure_value in enumerate(event_failures):
             scale_failed = True
             error = _object(
                 failure_value,
@@ -395,6 +395,9 @@ def validate_fine_slurm_evidence(
             _string(error["type"], f"{location}.failed[{failure_index}].type")
             if type(error["message"]) is not str:
                 raise TypeError("fine scale failure message must be a string")
+        scale_probe_outcomes.append(
+            (set(probed), set(event_activated), bool(event_failures))
+        )
         if _timestamp(event["ended_at"], f"{location}.ended_at") < _timestamp(
             event["started_at"], f"{location}.started_at"
         ):
@@ -479,10 +482,18 @@ def validate_fine_slurm_evidence(
         raise ValueError("fine attempts must follow canonical graph ordering")
 
     probes = tuple(observed_probes)
-    validate_slurm_worker_identities(probes)
     probe_by_address = {probe.worker_address: probe for probe in probes}
+    if len(probe_by_address) != len(probes):
+        raise ValueError("raw worker probes must use unique worker addresses")
     if tuple(sorted(probe_by_address)) != tuple(sorted(probed_workers)):
-        raise ValueError("worker probes must exactly match successfully probed workers")
+        raise ValueError("worker probes must exactly match attempted probe workers")
+    for probed, event_activated, event_failed in scale_probe_outcomes:
+        if probed - event_activated and not event_failed:
+            raise ValueError(
+                "non-activated probed candidates require a matching failed scale event"
+            )
+    validated_probes = tuple(probe_by_address[address] for address in validated)
+    validate_slurm_worker_identities(validated_probes)
     if any(not probe.ok for probe in probes) and not scale_failed:
         raise ValueError("failed worker probe requires a failed scale event")
     if any(

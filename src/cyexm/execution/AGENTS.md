@@ -75,6 +75,11 @@
   Downstream omission is truthful only after a failed/cancelled/blocking task or an
   observed cancellation/scale failure before that producer settled. Preserve
   partial connected/probed/activated/validated scale state on every failure edge.
+  Treat connected/probed evidence as raw candidate observations, not validated
+  identity. A raw candidate with malformed or duplicate SLURM identity may remain
+  only when that exact scale event records rejection; it must never appear in the
+  activated/validated set. Enforce unique job/address/host/PID identity on every
+  activated worker and every accepted placement.
   Do not let scheduler evidence authorize scientific artifact reuse.
 - Allow no nested tasks. Permit no nested chunk scheduling or silent fallback.
 - On operator cancellation, stop submission and cancel unfinished futures. Always

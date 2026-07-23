@@ -481,6 +481,39 @@ def test_failure_revalidates_the_exact_accepted_record_after_progress(
     assert result.reused_artifacts == ()
 
 
+@pytest.mark.parametrize("mutated_role", ("input", "upstream"))
+def test_failure_rejects_source_chain_mutation_after_accepted_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutated_role: str,
+) -> None:
+    import cyexm.workflow.fine_task as worker
+    from cyexm.registration.artifacts import StageRequest
+
+    task = _tasks(tmp_path)[3]
+    path = task.output_paths[1]
+    request = _progress_request(task, tmp_path)
+    assert type(request) is StageRequest
+    monkeypatch.setattr(
+        worker, "configure_native_threads", lambda _config: _resolved(task)
+    )
+
+    def execute(*_args: object) -> object:
+        _commit_test_artifact(path, request)
+        identity = request.inputs[0] if mutated_role == "input" else request.upstream
+        assert identity is not None
+        Path(identity.path).write_bytes(b"changed after accepted progress")
+        raise RuntimeError(f"{mutated_role} changed after accepted progress")
+
+    monkeypatch.setattr(worker, "_execute_fine_task", execute)
+
+    result = run_fine_task(task)
+
+    assert result.status == "failed"
+    assert result.artifact_paths == ()
+    assert result.reused_artifacts == ()
+
+
 def test_worker_rejects_unplanned_stage_outcome(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

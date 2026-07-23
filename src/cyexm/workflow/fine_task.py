@@ -157,6 +157,15 @@ def _durable_progress(
                 or record != progress.record
                 or record.artifact != FileIdentity.from_path(path)
                 or record.request.native_threads != actual_threads
+                or any(
+                    FileIdentity.from_path(Path(identity.path)) != identity
+                    for identity in record.request.inputs
+                )
+                or (
+                    record.request.upstream is not None
+                    and FileIdentity.from_path(Path(record.request.upstream.path))
+                    != record.request.upstream
+                )
             ):
                 continue
         except Exception:

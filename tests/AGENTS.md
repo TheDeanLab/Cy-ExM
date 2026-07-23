@@ -27,3 +27,7 @@
   not a claim that arbitrary process-launch mechanisms are fail-closed. HPC-marked
   tests are explicitly exempt and retain the environment needed for approved real
   scheduler acceptance.
+- Fine-grained portable coverage proves the scheduler-neutral graph, real-ANTs
+  sequential/Local-Dask parity, unequal spatial shapes, worker isolation, failure,
+  cancellation, cleanup, and restart without external scheduler contact. It must not
+  be described as real-SLURM placement or production acceptance.

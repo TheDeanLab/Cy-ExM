@@ -81,6 +81,11 @@ def test_readme_documents_installation_and_scheduler_neutral_architecture() -> N
         "phase 1 completion records are the only restart authority",
         "no nested chunk multiprocessing",
         "planning is mutation-free",
+        "`parallelism.mode`",
+        "`coarse`",
+        "`fine_grained`",
+        "omitting `parallelism` normalizes to `coarse`",
+        "scientific fingerprint is unchanged",
     ):
         assert required in readme
 
@@ -356,11 +361,79 @@ def test_readme_states_hpc_acceptance_scope_and_remaining_non_goals() -> None:
         "`-m hpc`",
         "explicit allocation",
         "parallelchunkedimageregistration",
-        "per-chunk dask scheduling",
-        "parallel channel transformation",
+        "fine-grained real-slurm production acceptance remains pending",
+        "portable real-ants/local-dask evidence is complete",
+        "whole-image affine remains",
+        "multiple workers per node",
         "job arrays",
         "cloud or kubernetes executors",
         "automatic resource optimization",
         "no silent fallback",
     ):
         assert required in normalized
+
+
+def test_fine_grained_guide_documents_the_exact_graph_and_resource_contract() -> None:
+    guide_path = REPOSITORY_ROOT / "docs/fine-grained-execution.md"
+    assert guide_path.is_file()
+    guide = " ".join(guide_path.read_text(encoding="utf-8").split()).lower()
+
+    for required in (
+        "reference barrier",
+        "whole-image affine",
+        "prepared fixed-grid bundle",
+        "nonlinear chunk",
+        "deterministic assembly",
+        "dependent channel",
+        "round validation",
+        "`serial_chunked`",
+        "ascending chunk id",
+        "later ids overwrite earlier values",
+        "one scientific task per worker slot",
+        "one candidate worker",
+        "preflight",
+        "`round_slot`",
+        "demand-driven",
+        "round-robin",
+        "configured worker cap",
+        "one worker/job per dedicated node",
+        "workers never create schedulers",
+        "multiple workers per node",
+        "future optimization",
+    ):
+        assert required in guide
+
+
+def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
+    guide = " ".join(
+        (REPOSITORY_ROOT / "docs/fine-grained-execution.md")
+        .read_text(encoding="utf-8")
+        .split()
+    ).lower()
+
+    for required in (
+        "`fixed_scalar.npy`",
+        "`moving_linear_scalar.npy`",
+        "`fixed_mask.npy`",
+        "`moving_linear_mask.npy`",
+        "manifest version 2",
+        "ants pixel type",
+        "memory-mapped",
+        "fixed-reference grid",
+        "`chunk_0000_registered_core.npy`",
+        "internal progress",
+        "public completion",
+        "prepared arrays and scalar cores never make a round complete",
+        "completion records",
+        "coarse and fine-grained modes share",
+        "unique per-task logs",
+        "submitted siblings settle",
+        "cancellation",
+        "ordinary later run",
+        "unequal",
+        "z, y, and x",
+        "legacy clearex/ants behavior",
+        "portable real-ants/local-dask evidence is complete",
+        "real slurm production acceptance remains pending",
+    ):
+        assert required in guide

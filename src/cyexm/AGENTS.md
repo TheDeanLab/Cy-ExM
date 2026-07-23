@@ -18,6 +18,10 @@
   not belong in `cyexm.registration`; keep the stable Phase 1 registration API and
   the Phase 2B channel primitive usable without Dask, distributed, dask-jobqueue, or
   YAML workflow dependencies.
+- Fine-grained task models and scheduler-neutral evidence remain internal to the
+  workflow/execution namespaces. Do not export prepared-array, chunk-stage,
+  dispatcher, worker-placement, or scheduler-lifecycle internals from the package
+  root or stable `cyexm.registration` API.
 
 ## User-callable API documentation
 

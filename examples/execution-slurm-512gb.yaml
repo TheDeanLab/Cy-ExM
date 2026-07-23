@@ -1,6 +1,10 @@
 schema_version: 1
 executor: slurm
 
+# Opt-in fine graph; real-SLURM production acceptance for this mode remains pending.
+parallelism:
+  mode: fine_grained
+
 paths:
   # Site-specific editable shared dataset path; do not use this placeholder as-is.
   dataset_root: /archive/path/to/dataset

@@ -11,12 +11,12 @@
 - Workflow must not mutate a plan or create a scheduler.
 - Fine-grained workflow models embed the authoritative `RoundTask`; do not copy its
   scientific fields into stage tasks. Initial and incremental graph expansion must
-  remain pure and use the prepared manifest's fixed-grid ZYX shape with the shared
-  canonical chunk grid.
+  remain pure and coordinator-owned, and use the prepared manifest's fixed-grid ZYX
+  shape with the shared canonical chunk grid.
 - Fine task workers configure native threads before lazy scientific imports, execute
   exactly one immutable stage, and never create clients, workers, or descendant
-  tasks. Concurrent stages use deterministic per-task logs rather than the coarse
-  round log.
+  tasks. Concurrent stages use unique deterministic per-task logs rather than the
+  coarse round log.
 - `run_workflow` remains the only public execution entry point for coarse and fine
   modes. Validate the exact mode-appropriate summary log: successful fine rounds use
   their validation-task log, while failed or cancelled summaries use the canonical
@@ -45,6 +45,9 @@
 - Fine chunk assembly preserves the legacy ascending-ID overwrite rule for expected
   overlapping output slices. Scheduling and completion order must not change the
   canonical assembly order or scientific artifact identity.
+- Prepared arrays, local warps, and scalar cores are internal progress only. Public
+  completion/status authority remains the accepted affine/full warp, diagnostic,
+  metrics, declared channels, and their ordinary completion records.
 - Phase 1 completion records remain the only restart authority.
 - Round validation always executes the accepted full-chain check and therefore
   reports `completed`; reused upstream artifacts remain identified by their

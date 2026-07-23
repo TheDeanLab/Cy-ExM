@@ -10,6 +10,7 @@ from cyexm.config import (
     LocalDaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
+    ParallelismSpec,
     RegistrationSpec,
     RegistrationStageSpec,
     SlurmMemoryQuantity,
@@ -130,6 +131,7 @@ def test_sequential_example_records_portable_conservative_resources() -> None:
         worker_local_directory=None,
     )
     assert profile.native_threads == NativeThreadSpec(itk=1, blas=1)
+    assert profile.parallelism == ParallelismSpec(mode="coarse")
     assert profile.local_dask is None
     assert profile.slurm is None
 
@@ -155,6 +157,7 @@ def test_local_dask_example_records_portable_process_resources() -> None:
         worker_local_directory=(REPOSITORY_ROOT / "scratch").resolve(),
     )
     assert profile.native_threads == NativeThreadSpec(itk=1, blas=1)
+    assert profile.parallelism == ParallelismSpec(mode="fine_grained")
     assert profile.local_dask == LocalDaskSpec(
         workers=3,
         threads_per_worker=1,
@@ -187,6 +190,7 @@ def test_slurm_example_records_editable_512gb_resources() -> None:
         worker_local_directory=Path("/project/path/to/cyexm-worker").resolve(),
     )
     assert profile.native_threads == NativeThreadSpec(itk=1, blas=1)
+    assert profile.parallelism == ParallelismSpec(mode="fine_grained")
     assert profile.local_dask is None
     assert profile.slurm == SlurmSpec(
         queue="512GB",

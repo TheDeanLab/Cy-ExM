@@ -91,7 +91,8 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "do not maintain legacy",
     ),
     "src/cyexm/execution/AGENTS.md": (
-        "phase 2d implements sequential, bounded local-dask, and slurm execution",
+        "sequential, bounded local-dask, and slurm execution support coarse and "
+        "opt-in fine-grained admission",
         "executor protocol",
         "sequential, dask, and slurm adapter lifecycle",
         "never registration algorithms or artifact-validity decisions",
@@ -116,7 +117,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "before the first scale call",
         "whole binary gib",
         "production-owned callable",
-        "real slurm submission and hpc acceptance remain unaccepted until phase 2e",
+        "fine-grained real-slurm production acceptance remains pending tasks 12-13",
     ),
     "src/cyexm/workflow/AGENTS.md": (
         "phase 2b binds sequential execution to the real round worker",
@@ -289,17 +290,16 @@ def test_root_guidance_tracks_current_phase_two_runtime() -> None:
         "sequential, bounded process-based local dask, and slurm executors",
         "real scheduler-neutral round runner",
         "restart-safe transformed-channel artifacts",
-        "one coarse task per moving round",
+        "coordinator-owned immutable fine graph",
         "one `round_slot` per worker",
-        "one process per slurm job",
-        "one node per round",
-        "all-worker preflight",
+        "one process and one task per dedicated job/node",
+        "fine-grained real slurm production acceptance remains pending",
         "portable ci installs the hpc python extra",
         "never contacts an external scheduler",
         "explicitly selected `hpc` tests",
         "serial chunk workflow remains",
         "nested chunk multiprocessing",
-        "dask chunk graph",
+        "worker-owned dask graph",
         "uv lock --check",
         "uv sync --locked --group dev --extra examples --extra hpc",
     ):
@@ -335,17 +335,13 @@ def test_phase_two_optional_dependencies_are_cumulative_and_pinned() -> None:
 def test_documentation_and_examples_track_the_current_phase_two_boundary() -> None:
     documentation = _normalized_repository_file("docs/AGENTS.md")
     for required in (
-        "merged phase 1 behavior",
-        "phase 2d portable runtime available on this branch",
-        "strict yaml validation",
-        "deterministic planning",
-        "real sequential round execution",
-        "bounded process-based local dask execution",
-        "restart-safe transformed channels",
-        "slurmcluster construction",
-        "all-worker preflight",
-        "real slurm submission and hpc acceptance",
-        "phase 2e",
+        "accepted coarse phase 2e runtime",
+        "opt-in fine-grained execution",
+        "portable real-ants/local-dask fine evidence",
+        "fine-grained real slurm production acceptance remains pending",
+        "never generalize the accepted coarse phase 2 audit",
+        "exact-schema loader compatible",
+        "multiple workers per node only as a future optimization",
     ):
         assert required in documentation
 
@@ -463,6 +459,9 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
         "configures native threads before requesting the lazy scientific backend",
         "must not schedule rounds, create clients or child tasks, or import "
         "workflow/executor code",
+        "prepared.py",
+        "exact supported ants pixel type",
+        "ascending-id overwrite",
     ):
         assert required in registration
 
@@ -471,8 +470,58 @@ def test_source_guidance_keeps_execution_out_of_registration_and_runtime() -> No
         "worker process",
         "before importing ants, numpy, or scipy",
         "must not initialize or own a scheduler",
+        "one scientific task",
+        "native-thread",
     ):
         assert required in runtime
+
+
+def test_fine_grained_agent_guidance_owns_each_layer_without_production_claims() -> (
+    None
+):
+    required_by_path = {
+        "AGENTS.md": (
+            "fine_grained",
+            "opt-in",
+            "scientific invariants",
+            "fine-grained real slurm",
+            "pending",
+        ),
+        "src/cyexm/workflow/AGENTS.md": (
+            "fine-grained workflow models embed the authoritative",
+            "coordinator",
+            "public",
+            "completion",
+            "unique",
+            "task",
+            "logs",
+        ),
+        "src/cyexm/execution/AGENTS.md": (
+            "round-robin",
+            "one scientific workflow task",
+            "preflight",
+            "demand",
+            "no nested",
+            "client before its owned cluster",
+        ),
+        "tests/hpc/AGENTS.md": (
+            "coarse-versus-fine",
+            "distinct slurm jobs",
+            "cancellation",
+            "20%",
+            "real slurm",
+        ),
+        "docs/AGENTS.md": (
+            "fine-grained",
+            "portable real-ants/local-dask",
+            "real slurm",
+            "pending",
+        ),
+    }
+    for path, fragments in required_by_path.items():
+        guidance = _normalized_repository_file(path)
+        for fragment in fragments:
+            assert fragment in guidance, (path, fragment)
 
 
 def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> None:

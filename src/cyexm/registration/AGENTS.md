@@ -52,6 +52,10 @@
   prepared roles; reconstruct each regional image with that type so an integer
   legacy fixed grid retains its scalar-resampling behavior while floating inputs
   remain unquantized.
+- `chunk_stages.py` owns one prepared-region nonlinear task, float32 scalar-core
+  persistence, and full-grid assembly. Preserve the legacy ascending-ID overwrite
+  rule for expected overlapping output slices; task completion order must not change
+  scalar or displacement assembly.
 - Pre-registration metrics resample unequal moving scalar and mask grids to the fixed
   grid for diagnosis only; this must not replace or pre-resample the native moving
   inputs supplied to affine estimation.

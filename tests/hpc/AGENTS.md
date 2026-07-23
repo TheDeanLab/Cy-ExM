@@ -85,3 +85,9 @@
 - Make no acceptance claim without a real allocation and complete machine-readable
   evidence. Never commit caller data, external evidence, generated arrays, job logs,
   credentials, or site-specific approved paths.
+- Fine-grained production acceptance additionally requires exact coarse-versus-fine
+  two-tier scientific parity, nonlinear chunks and channels placed concurrently on
+  distinct SLURM jobs/hosts, the configured cap and fair round opportunities,
+  injected chunk/channel failure with resume, cancellation with resume, exact owned
+  cleanup, and at least a 20% nonlinear-stage wall-time reduction. These real SLURM
+  requirements remain pending until the exact-commit external gate is complete.

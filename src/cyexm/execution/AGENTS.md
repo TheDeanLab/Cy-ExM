@@ -2,9 +2,10 @@
 
 - Execution owns the executor protocol and sequential, Dask, and SLURM adapter
   lifecycle, never registration algorithms or artifact-validity decisions.
-- Phase 2D implements sequential, bounded local-Dask, and SLURM execution. The SLURM
-  adapter lazily constructs and owns its client and cluster; real SLURM submission and
-  HPC acceptance remain unaccepted until Phase 2E.
+- Sequential, bounded local-Dask, and SLURM execution support coarse and opt-in
+  fine-grained admission. The coarse SLURM adapter has Phase 2E acceptance; portable
+  real-ANTs/Local-Dask fine evidence is complete through Task 10, while fine-grained
+  real-SLURM production acceptance remains pending Tasks 12-13.
 - Scheduler imports occur only inside the selected operation.
 - Local Dask uses process-isolated workers. Coarse mode bounds their count to
   `min(pending tasks, configured workers)`; fine mode starts exactly the configured
@@ -13,7 +14,8 @@
   Coarse execution continues to schedule one coarse task per moving round.
   The coordinator dynamically admits at most connected capacity from the shared fine
   graph; workers never submit children. Each worker advertises one `round_slot`, and
-  every submitted workflow task requests and consumes one.
+  every submitted workflow task requests and consumes one. In fine mode that token
+  means one scientific workflow task, not one complete round.
 - Every executor runs the reference-preparation task as a hard prerequisite in the
   same owned worker pool. Moving-round futures may be submitted only after the
   reference result is successful; a failed reference result ends the execution
@@ -60,8 +62,8 @@
   cleanup in one detached scheduler-neutral evidence snapshot. Public workflow
   validation cross-checks that snapshot after scientific work; never reconstruct it
   from lossy round summaries or let it authorize artifact reuse.
-- Fine-grained SLURM starts one candidate worker for the reference barrier and
-  scales upward only to `min(configured workers, running + ready)`. Candidate
+- Fine-grained SLURM starts one candidate worker for the reference barrier and uses
+  demand-driven scale-up only to `min(configured workers, running + ready)`. Candidate
   workers advertise no `round_slot`; the coordinator must run the complete
   worker preflight on each exact new address, validate one dedicated SLURM
   job/worker identity, add exactly one scheduler-side `round_slot`, and verify

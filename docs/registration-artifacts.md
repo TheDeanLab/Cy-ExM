@@ -43,8 +43,42 @@ under `round_{round}_chunks/`:
 
 The round-level `nonlinear_warp_{round}.nii.gz` remains a separate artifact. It is the
 full displacement field stitched from all local chunk cores; it is not an alias for a
-local warp. Registered scalar chunk data is reconstructed from each committed local
-warp and stitched in memory. There are no standalone scalar chunk cache files.
+local warp. In coarse serial execution, registered scalar chunk data is reconstructed
+from each committed local warp and stitched in memory. Fine-grained execution
+persists an additional internal
+`chunk_{chunk:04d}_registered_core.npy` plus its completion record so assembly can
+resume without repeating successful worker-local reconstruction.
+
+## Fine-grained internal artifacts
+
+Fine preparation commits four internal float32 arrays and a strict format-version-2
+manifest under `round_{round}_prepared/`:
+
+| Artifact | Internal role |
+| --- | --- |
+| `fixed_scalar.npy` | fixed scalar on the exact reference grid |
+| `moving_linear_scalar.npy` | affine-resampled moving scalar on that grid |
+| `fixed_mask.npy` | fixed greater-than-zero float mask |
+| `moving_linear_mask.npy` | nearest-neighbor affine mask, thresholded on that grid |
+| `manifest.json` | identities, geometry, policies, native threads, and exact ANTs pixel types |
+
+These arrays are uncompressed C-contiguous float32 files. Chunk workers validate the
+manifest and completion records, memory-map the arrays read-only, and copy only one
+extended region. Unequal native source shapes along Z, Y, and X are supported because
+affine application is the first exact fixed-grid boundary, matching legacy
+ClearEx/ANTs behavior.
+
+Each fine chunk commits both its local warp and scalar core. Assembly ignores worker
+completion order: it processes canonical chunks in ascending numeric ID and, in
+expected overlapping legacy output slices, later IDs overwrite earlier values.
+Every fixed-grid voxel must be covered at least once.
+
+Prepared arrays, scalar cores, and local warps are internal progress. They do not
+make a workflow round complete. Public completion still requires the affine, full
+warp, diagnostic TIFF, metrics, and every declared transformed channel to pass
+ordinary artifact/completion-record validation. The internal `.npy` files remain
+retained for restart and can add four full float32 volumes plus scalar cores to disk
+usage; they do not change the public TIFF export policy.
 
 Scalar reconstruction is an explicit, versioned part of the request:
 

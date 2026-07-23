@@ -13,6 +13,7 @@ project:
         - file: registration-foundations.md
         - file: registration-artifacts.md
         - file: workflow-guide.md
+        - file: fine-grained-execution.md
     - title: Characterization and evidence
       children:
         - file: brightness-dependence-investigation.md

@@ -36,3 +36,6 @@
 - Prepared-manifest tests must fail closed on missing, extra, unsupported, or
   request-mismatched ANTs pixel types for every fixed scalar, moving scalar, and mask
   role; fake floating images must not imply that integer fixed grids are equivalent.
+- Documentation/example policy tests load every checked-in YAML through production
+  loaders, enforce explicit coarse/fine modes, and keep layered AGENTS ownership and
+  the fine-grained real-SLURM pending boundary synchronized.

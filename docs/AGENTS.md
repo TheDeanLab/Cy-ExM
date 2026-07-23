@@ -1,15 +1,17 @@
 # Documentation guidance
 
-- Describe current behavior by separating merged Phase 1 behavior from the Phase 2D
-  portable runtime available on this branch: strict YAML validation, deterministic
-  planning and status inspection, real sequential round execution, restart-safe
-  transformed channels, the workflow CLI, bounded process-based local Dask execution,
-  SLURMCluster construction, and all-worker preflight. Clearly label fake-based
-  portable SLURM evidence as construction evidence only; real SLURM submission and
-  HPC acceptance remain Phase 2E work until their explicit acceptance gates complete.
+- Describe current behavior by separating the accepted coarse Phase 2E runtime from
+  opt-in fine-grained execution. Portable real-ANTs/Local-Dask fine evidence is
+  complete through Task 10; fine-grained real SLURM production acceptance remains
+  pending Tasks 12-13. Never generalize the accepted coarse Phase 2 audit to fine
+  placement, failure, cancellation, cleanup, or performance.
 - Design and plan documents may describe later Phase 2 decisions when they label
   status and assumptions explicitly. User guides and API examples describe only the
   runtime available on the referenced branch.
+- Fine-grained examples must remain exact-schema loader compatible and declare mode
+  explicitly: sequential is coarse, while Local Dask and the editable 512-GB SLURM
+  example are fine-grained. Describe one task per slot/node today and multiple
+  workers per node only as a future optimization.
 - Keep API examples synchronized with signatures in `src/cyexm`. Use public XYZ
   spacing, explicit native-thread configuration, and exact artifact filenames.
 - Artifact and restart claims must follow the implementation: a data file alone is

@@ -26,6 +26,11 @@
   `examples/execution-sequential.yaml`, `examples/execution-local-dask.yaml`, and
   `examples/execution-slurm-512gb.yaml`. Keep them strict-loader compatible and preserve
   their separation between reusable scientific settings and editable machine resources.
+- Load every checked-in YAML through the production strict loader. Declare
+  `parallelism.mode` explicitly: the sequential example remains `coarse`, while
+  Local Dask and the editable 512-GB SLURM example use `fine_grained`. State that
+  fine real-SLURM production acceptance remains pending; examples never upgrade an
+  implementation milestone.
 - Scientific-manifest examples declare `reference.registration_channel` and every
   intended `reference.channels[].file`; do not use the retired singular
   `reference.channel` field. Reference declaration order is preserved in outputs.

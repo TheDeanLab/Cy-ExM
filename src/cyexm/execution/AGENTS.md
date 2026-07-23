@@ -64,11 +64,17 @@
   snapshot before scientific submission. Before recording any fine result or
   releasing descendants, match its SLURM job, worker address, hostname, and PID to
   one activated probe. Record rejected/no-placement outcomes explicitly as failed,
-  never as accepted placement evidence.
+  never as accepted placement evidence. Retain one exact ordered evidence record
+  for every scheduler-settled attempt, including attempts later retried; counts,
+  attempt keys, claimed placement, acceptance, and rejection reason must agree.
 - Keep fine SLURM lifecycle evidence versioned, strict, and operational. The
   scheduler-neutral controller owns immutable canonical task/dependency evidence;
   `_slurm_evidence` owns typed scale-event construction and decoding; `slurm`
   owns cluster scale, preflight, activation, submission, cancellation, and cleanup.
+  Successful producers require the exact successors materialized by the controller.
+  Downstream omission is truthful only after a failed/cancelled/blocking task or an
+  observed cancellation/scale failure before that producer settled. Preserve
+  partial connected/probed/activated/validated scale state on every failure edge.
   Do not let scheduler evidence authorize scientific artifact reuse.
 - Allow no nested tasks. Permit no nested chunk scheduling or silent fallback.
 - On operator cancellation, stop submission and cancel unfinished futures. Always

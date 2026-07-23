@@ -50,6 +50,18 @@ class Submission:
 
 
 @dataclass(frozen=True, slots=True)
+class FineAttemptObservation:
+    """One scheduler-settled attempt before retry or dependency release."""
+
+    task: FineWorkflowTask
+    attempt: int
+    dask_task_key: str
+    raw_result: FineTaskResult | None
+    settled_result: FineTaskResult
+    rejection_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class FineSubmission:
     task: FineWorkflowTask
     key: str
@@ -310,6 +322,7 @@ def collect_distributed_fine_results(
     result_validator: (
         Callable[[FineWorkflowTask, FineTaskResult], FineTaskResult] | None
     ) = None,
+    attempt_observer: Callable[[FineAttemptObservation], None] | None = None,
 ) -> tuple[
     tuple[RoundResult, ...],
     tuple[FineTaskResult, ...],
@@ -383,6 +396,8 @@ def collect_distributed_fine_results(
             active.discard(future)
             submission = submissions[future]
             task = submission.task
+            raw_result = outcome if type(outcome) is FineTaskResult else None
+            rejection_reason: str | None = None
             if type(outcome) is FineTaskResult:
                 try:
                     result = _validate_fine_task_result(task, outcome)
@@ -394,6 +409,7 @@ def collect_distributed_fine_results(
                     if result_validator is not None:
                         result = result_validator(task, result)
                 except RoundExecutionError as error:
+                    rejection_reason = f"{type(error).__name__}: {error}"
                     result = fine_exception_result(
                         task,
                         error,
@@ -410,12 +426,25 @@ def collect_distributed_fine_results(
                         f"Dask fine task returned an unsupported result: {outcome!r}"
                     )
                 )
+                rejection_reason = f"{type(error).__name__}: {error}"
                 result = fine_exception_result(
                     task,
                     error,
                     key=submission.key,
                     started_at=submission.started_at,
                     started=submission.started,
+                )
+
+            if attempt_observer is not None:
+                attempt_observer(
+                    FineAttemptObservation(
+                        task=task,
+                        attempt=submission.attempt,
+                        dask_task_key=submission.key,
+                        raw_result=raw_result,
+                        settled_result=result,
+                        rejection_reason=rejection_reason,
+                    )
                 )
 
             if result.status == "failed" and submission.attempt <= task_retries:
@@ -442,6 +471,7 @@ def collect_distributed_fine_results(
 
 __all__ = [
     "ROUND_RESOURCE",
+    "FineAttemptObservation",
     "collect_distributed_fine_results",
     "collect_distributed_results",
     "dask_scheduler_config_overlay",

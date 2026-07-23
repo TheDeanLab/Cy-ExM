@@ -34,6 +34,7 @@ type _NodeState = Literal[
     "cancelled",
     "never-submitted",
 ]
+type FineExpansionKind = Literal["chunks", "channels"]
 
 _EXACT_TASK_TYPES = (
     RoundPreparationTask,
@@ -52,6 +53,12 @@ _STAGE_ORDER = {
     "validation": 4,
 }
 _SUCCESS = frozenset({"completed", "reused"})
+_STOPPED = frozenset({"failed", "cancelled"})
+_EXPANSION_BY_STAGE: dict[str, FineExpansionKind] = {
+    "preparation": "chunks",
+    "assembly": "channels",
+    "whole-image": "channels",
+}
 
 
 def _canonical_key(key: FineTaskKey) -> tuple[int, int, int]:
@@ -62,6 +69,34 @@ def _canonical_key(key: FineTaskKey) -> tuple[int, int, int]:
 def canonical_fine_task_key(value: str) -> tuple[int, int, int]:
     """Return scheduler-neutral canonical ordering for an encoded fine key."""
     return _canonical_key(FineTaskKey.from_encoded(value))
+
+
+def fine_expansion_kind(key: FineTaskKey) -> FineExpansionKind | None:
+    """Return the one controller-owned successor expansion for a task key."""
+    return _EXPANSION_BY_STAGE.get(key.stage)
+
+
+def _expand_successors(
+    task: FineWorkflowTask,
+    result: FineTaskResult,
+) -> tuple[FineWorkflowTask, ...]:
+    kind = fine_expansion_kind(task.key)
+    if kind == "chunks":
+        return tuple(chunk_tasks(result))
+    if kind == "channels":
+        return tuple(channel_tasks(result))
+    return ()
+
+
+def _successors_may_be_absent(
+    key: FineTaskKey,
+    status: str | None,
+    *,
+    external_stop: bool,
+) -> bool:
+    if fine_expansion_kind(key) is None:
+        raise ValueError("fine task does not own a successor expansion")
+    return status in _STOPPED or (status is None and external_stop)
 
 
 def validate_fine_graph_description(
@@ -85,12 +120,21 @@ def validate_fine_graph_description(
         for dependency in values
     ):
         raise ValueError("fine graph dependencies must name graph task keys")
+    for key in terminal_statuses:
+        if key not in dependencies:
+            continue
+        if any(
+            terminal_statuses.get(dependency) not in _SUCCESS
+            for dependency in dependencies[key]
+        ):
+            raise ValueError(
+                "attempted fine graph tasks require successful terminal dependencies"
+            )
     if tuple(sorted({key.round for key in decoded.values()})) != tuple(
         sorted(task.round for task in round_tasks)
     ):
         raise ValueError("fine graph rounds must match submitted moving rounds")
 
-    stopped = {"failed", "cancelled"}
     for round_task in round_tasks:
         round_keys = tuple(
             key for key in task_keys if decoded[key].round == round_task.round
@@ -112,37 +156,55 @@ def validate_fine_graph_description(
                 raise ValueError("whole-image fine graph has incompatible stages")
             if dependencies[producer]:
                 raise ValueError("whole-image task must have no dependencies")
-            producer_stopped = terminal_statuses.get(producer) in stopped
+            producer_status = terminal_statuses.get(producer)
+            producer_blocked = False
         else:
             preparation = f"{prefix}preparation:main"
             producer = f"{prefix}assembly:main"
             chunks = stages["chunk"]
             if stages["preparation"] != (preparation,) or stages["whole-image"]:
                 raise ValueError("chunked fine graph has incompatible stages")
-            preparation_stopped = terminal_statuses.get(preparation) in stopped
-            if not chunks and (allow_partial or preparation_stopped):
+            preparation_status = terminal_statuses.get(preparation)
+            if not chunks and _successors_may_be_absent(
+                decoded[preparation],
+                preparation_status,
+                external_stop=allow_partial,
+            ):
                 if stages["assembly"] or stages["channel"] or stages["validation"]:
                     raise ValueError("partial chunk graph contains downstream stages")
                 continue
             if not chunks or stages["assembly"] != (producer,):
                 raise ValueError("chunked fine graph has incompatible stages")
+            if preparation_status not in _SUCCESS:
+                raise ValueError(
+                    "materialized chunk expansion requires successful preparation"
+                )
             if dependencies[preparation] or any(
                 dependencies[key] != (preparation,) for key in chunks
             ):
                 raise ValueError("fine chunks must depend only on preparation")
             if dependencies[producer] != chunks:
                 raise ValueError("fine assembly must depend on every chunk")
-            producer_stopped = terminal_statuses.get(producer) in stopped or any(
-                terminal_statuses.get(key) in stopped for key in chunks
+            producer_status = terminal_statuses.get(producer)
+            producer_blocked = any(
+                terminal_statuses.get(key) in _STOPPED for key in chunks
             )
         if (
-            (allow_partial or producer_stopped)
+            _successors_may_be_absent(
+                decoded[producer],
+                producer_status,
+                external_stop=allow_partial or producer_blocked,
+            )
             and not stages["channel"]
             and not stages["validation"]
         ):
             continue
         if stages["channel"] != channels or stages["validation"] != (validation,):
             raise ValueError("fine graph channels/validation must match the round")
+        if producer_status not in _SUCCESS:
+            raise ValueError(
+                "materialized channel expansion requires successful producer"
+            )
         if dependencies[validation] != channels:
             raise ValueError("fine validation must depend on every channel task")
         if any(dependencies[key] != (producer,) for key in channels):
@@ -293,10 +355,7 @@ class FineGraphController:
         self._results[task.key] = result
         if result.status in _SUCCESS:
             self._states[task.key] = "succeeded"
-            if type(task) is RoundPreparationTask:
-                self._register(tuple(chunk_tasks(result)))
-            elif type(task) in {ChunkAssemblyTask, WholeImageRegistrationTask}:
-                self._register(tuple(channel_tasks(result)))
+            self._register(_expand_successors(task, result))
         elif result.status == "failed":
             self._states[task.key] = "failed"
             self._block_descendants(task.key)

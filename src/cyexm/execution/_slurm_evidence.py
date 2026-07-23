@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -17,7 +18,7 @@ from cyexm.execution.preflight import (
     validate_slurm_worker_identities,
 )
 from cyexm.workflow.fine_models import FineTaskResult
-from cyexm.workflow.models import RoundTask
+from cyexm.workflow.models import RoundFailure, RoundTask
 
 _GRAPH_KEYS = frozenset(
     {
@@ -70,6 +71,29 @@ def _integer(value: object, location: str, minimum: int = 0) -> int:
     return value
 
 
+def _optional_string(value: object, location: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, location)
+
+
+def _optional_integer(value: object, location: str) -> int | None:
+    if value is None:
+        return None
+    return _integer(value, location, 1)
+
+
+def _number(value: object, location: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise TypeError(f"{location} must be a finite non-negative number")
+    return float(value)
+
+
 def _timestamp(value: object, location: str) -> datetime:
     encoded = _string(value, location)
     if not encoded.endswith("Z"):
@@ -90,6 +114,18 @@ def _strings(value: object, location: str) -> tuple[str, ...]:
     )
     if result != tuple(sorted(set(result))):
         raise ValueError(f"{location} must be unique and canonically sorted")
+    return result
+
+
+def _fine_keys(value: object, location: str) -> tuple[str, ...]:
+    result = tuple(
+        _string(item, f"{location}[{index}]")
+        for index, item in enumerate(_array(value, location))
+    )
+    if len(result) != len(set(result)):
+        raise ValueError(f"{location} must contain unique task keys")
+    if result != tuple(sorted(result, key=canonical_fine_task_key)):
+        raise ValueError(f"{location} must use canonical fine-task ordering")
     return result
 
 
@@ -141,6 +177,44 @@ class PreControllerTerminal:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class FinePlacementAttempt:
+    """Detached claim and admission decision for one actual task attempt."""
+
+    task_key: str
+    attempt: int
+    status: str
+    dask_task_key: str
+    started_at: str
+    ended_at: str
+    duration_seconds: float
+    worker_address: str | None
+    hostname: str | None
+    pid: int | None
+    slurm_job_id: str | None
+    placement_accepted: bool
+    rejection_reason: str | None
+    failure: RoundFailure | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "task_key": self.task_key,
+            "attempt": self.attempt,
+            "status": self.status,
+            "dask_task_key": self.dask_task_key,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "duration_seconds": self.duration_seconds,
+            "worker_address": self.worker_address,
+            "hostname": self.hostname,
+            "pid": self.pid,
+            "slurm_job_id": self.slurm_job_id,
+            "placement_accepted": self.placement_accepted,
+            "rejection_reason": self.rejection_reason,
+            "failure": None if self.failure is None else self.failure.to_dict(),
+        }
+
+
 @dataclass(slots=True)
 class FineSlurmEvidence:
     """Mutable coordinator state with detached JSON snapshots."""
@@ -153,6 +227,7 @@ class FineSlurmEvidence:
     attempts: tuple[tuple[str, int], ...] = ()
     results: tuple[FineTaskResult, ...] = ()
     probes: dict[str, WorkerProbe] = field(default_factory=dict)
+    placement_attempts: list[FinePlacementAttempt] = field(default_factory=list)
     cancelled: bool = False
     pre_controller_terminal: PreControllerTerminal | None = None
 
@@ -173,34 +248,22 @@ class FineSlurmEvidence:
         self.results = results
         self.probes = dict(probes)
 
+    def record_attempt(self, attempt: FinePlacementAttempt) -> None:
+        self.placement_attempts.append(attempt)
+
     def to_dict(self) -> dict[str, object]:
         graph = () if self.controller is None else self.controller.graph_description
+        attempt_counts: dict[str, int] = {}
+        for attempt in self.placement_attempts:
+            attempt_counts[attempt.task_key] = max(
+                attempt_counts.get(attempt.task_key, 0),
+                attempt.attempt,
+            )
         blocked = (
             ()
             if self.controller is None
             else tuple(key.encoded for key in self.controller.blocked_keys)
         )
-        worker_by_job: dict[str, str] = {}
-        for address, probe in self.probes.items():
-            if probe.slurm_job_id is not None:
-                worker_by_job[probe.slurm_job_id] = address
-
-        def worker_address(result: FineTaskResult) -> str:
-            if result.slurm_job_id is None:
-                return ""
-            return worker_by_job.get(result.slurm_job_id, "")
-
-        def placement_accepted(result: FineTaskResult) -> bool:
-            address = worker_address(result)
-            probe = self.probes.get(address)
-            return (
-                address in self.validated
-                and probe is not None
-                and result.hostname == probe.hostname
-                and result.pid == probe.pid
-                and result.slurm_job_id == probe.slurm_job_id
-            )
-
         return {
             "mode": "fine_grained",
             "worker_cap": self.worker_cap,
@@ -212,20 +275,18 @@ class FineSlurmEvidence:
                 for key, dependencies in graph
             ],
             "attempt_counts": [
-                {"task_key": key, "attempts": count} for key, count in self.attempts
+                {"task_key": key, "attempts": attempt_counts[key]}
+                for key in sorted(attempt_counts, key=canonical_fine_task_key)
             ],
             "placements": [
-                {
-                    "task_key": result.key.encoded,
-                    "status": result.status,
-                    "dask_task_key": result.dask_task_key,
-                    "worker_address": worker_address(result),
-                    "hostname": result.hostname,
-                    "pid": result.pid,
-                    "slurm_job_id": result.slurm_job_id,
-                    "placement_accepted": placement_accepted(result),
-                }
-                for result in self.results
+                attempt.to_dict()
+                for attempt in sorted(
+                    self.placement_attempts,
+                    key=lambda item: (
+                        canonical_fine_task_key(item.task_key),
+                        item.attempt,
+                    ),
+                )
             ],
             "blocked_descendants": sorted(blocked, key=canonical_fine_task_key),
             "cancelled": self.cancelled,
@@ -274,6 +335,7 @@ def validate_fine_slurm_evidence(
     startup_outcome: str,
     reference_attempted: bool,
     round_tasks: tuple[RoundTask, ...],
+    observed_workers: Sequence[str],
     observed_probes: Sequence[WorkerProbe],
 ) -> None:
     """Strictly validate one version-2 fine SLURM evidence object."""
@@ -321,12 +383,12 @@ def validate_fine_slurm_evidence(
         connected.update(event_connected)
         probed_workers.update(probed)
         activated.extend(event_activated)
-        for failure_index, failure in enumerate(
+        for failure_index, failure_value in enumerate(
             _array(event["failed"], f"{location}.failed")
         ):
             scale_failed = True
             error = _object(
-                failure,
+                failure_value,
                 f"{location}.failed[{failure_index}]",
                 frozenset({"type", "message"}),
             )
@@ -339,6 +401,10 @@ def validate_fine_slurm_evidence(
             raise ValueError("fine scale event ended before it started")
     if tuple(sorted(connected)) != candidates:
         raise ValueError("scale-event candidates must match candidate_workers")
+    if tuple(sorted(connected)) != tuple(observed_workers):
+        raise ValueError(
+            "scale-event candidates must exactly match observed connected workers"
+        )
     if tuple(sorted(activated)) != validated:
         raise ValueError("scale-event activations must match validated_workers")
 
@@ -417,8 +483,16 @@ def validate_fine_slurm_evidence(
     probe_by_address = {probe.worker_address: probe for probe in probes}
     if tuple(sorted(probe_by_address)) != tuple(sorted(probed_workers)):
         raise ValueError("worker probes must exactly match successfully probed workers")
+    if any(not probe.ok for probe in probes) and not scale_failed:
+        raise ValueError("failed worker probe requires a failed scale event")
+    if any(
+        not probe_by_address[address].ok
+        for address in validated
+        if address in probe_by_address
+    ):
+        raise ValueError("activated workers must have successful probe evidence")
     statuses: dict[str, str] = {}
-    placement_keys: list[str] = []
+    placement_identities: list[tuple[str, int]] = []
     for index, raw in enumerate(_array(graph["placements"], "fine_graph.placements")):
         location = f"fine_graph.placements[{index}]"
         placement = _object(
@@ -427,56 +501,112 @@ def validate_fine_slurm_evidence(
             frozenset(
                 {
                     "task_key",
+                    "attempt",
                     "status",
                     "dask_task_key",
+                    "started_at",
+                    "ended_at",
+                    "duration_seconds",
                     "worker_address",
                     "hostname",
                     "pid",
                     "slurm_job_id",
                     "placement_accepted",
+                    "rejection_reason",
+                    "failure",
                 }
             ),
         )
         key = _string(placement["task_key"], f"{location}.task_key")
-        if key in placement_keys or key not in attempts:
-            raise ValueError("fine placement must uniquely name an attempted task")
-        placement_keys.append(key)
+        if key not in attempts:
+            raise ValueError("fine placement must name an attempted task")
+        attempt = _integer(placement["attempt"], f"{location}.attempt", 1)
+        placement_identities.append((key, attempt))
         status = _string(placement["status"], f"{location}.status")
         if status not in {"completed", "reused", "failed", "cancelled"}:
             raise ValueError("fine placement status is unsupported")
         statuses[key] = status
-        attempt = attempts[key]
         expected_dask = f"cyexm-{key.replace(':', '-')}"
         if attempt > 1:
             expected_dask += f"-attempt-{attempt:03d}"
         observed_dask = _string(placement["dask_task_key"], f"{location}.dask_task_key")
         if observed_dask != expected_dask:
             raise ValueError("fine placement Dask key must match terminal attempt")
-        worker = placement["worker_address"]
-        if type(worker) is not str:
-            raise TypeError(f"{location}.worker_address must be an exact string")
-        _integer(placement["pid"], f"{location}.pid", 1)
+        started_at = _timestamp(placement["started_at"], f"{location}.started_at")
+        ended_at = _timestamp(placement["ended_at"], f"{location}.ended_at")
+        if ended_at < started_at:
+            raise ValueError("fine placement attempt ended before it started")
+        _number(placement["duration_seconds"], f"{location}.duration_seconds")
+        worker = _optional_string(
+            placement["worker_address"],
+            f"{location}.worker_address",
+        )
+        hostname = _optional_string(placement["hostname"], f"{location}.hostname")
+        pid = _optional_integer(placement["pid"], f"{location}.pid")
+        slurm_job_id = _optional_string(
+            placement["slurm_job_id"],
+            f"{location}.slurm_job_id",
+        )
         accepted = placement["placement_accepted"]
         if type(accepted) is not bool:
             raise TypeError(f"{location}.placement_accepted must be an exact boolean")
-        probe = probe_by_address.get(worker)
+        probe = None if worker is None else probe_by_address.get(worker)
         exact_identity = (
-            worker in validated
+            worker is not None
+            and worker in validated
             and probe is not None
-            and placement["hostname"] == probe.hostname
-            and placement["pid"] == probe.pid
-            and placement["slurm_job_id"] == probe.slurm_job_id
+            and hostname == probe.hostname
+            and pid == probe.pid
+            and slurm_job_id == probe.slurm_job_id
         )
         if accepted and not exact_identity:
             raise ValueError("fine placement does not match worker probe identity")
-        if not accepted and (status != "failed" or exact_identity):
+        reason = _optional_string(
+            placement["rejection_reason"],
+            f"{location}.rejection_reason",
+        )
+        if not accepted and (status != "failed" or exact_identity or reason is None):
             raise ValueError(
-                "rejected fine placement must be a failed nonmatching identity"
+                "rejected fine placement must be failed nonmatching evidence with "
+                "a reason"
             )
-    if set(placement_keys) != set(attempts):
-        raise ValueError("fine placements must match attempted terminal tasks")
+        if reason is not None and status != "failed":
+            raise ValueError("fine attempt rejection reason requires failed status")
+        raw_failure = placement["failure"]
+        failure: dict[str, object] | None = None
+        if raw_failure is not None:
+            failure = _object(
+                raw_failure,
+                f"{location}.failure",
+                frozenset({"stage", "exception_type", "message"}),
+            )
+            _string(failure["stage"], f"{location}.failure.stage")
+            exception_type = _string(
+                failure["exception_type"],
+                f"{location}.failure.exception_type",
+            )
+            if type(failure["message"]) is not str:
+                raise TypeError(f"{location}.failure.message must be a string")
+            if reason is not None and reason != (
+                f"{exception_type}: {failure['message']}"
+            ):
+                raise ValueError(
+                    "fine attempt rejection reason must match failure evidence"
+                )
+        if (status == "failed") != (failure is not None):
+            raise ValueError("fine failed status and failure evidence must agree")
+    expected_placements = tuple(
+        (key, attempt)
+        for key in task_keys
+        if key in attempts
+        for attempt in range(1, attempts[key] + 1)
+    )
+    if tuple(placement_identities) != expected_placements:
+        raise ValueError(
+            "fine placements must exactly and canonically match every attempt"
+        )
 
-    blocked = _strings(graph["blocked_descendants"], "fine_graph.blocked")
+    blocked = _fine_keys(graph["blocked_descendants"], "fine_graph.blocked")
     if not set(blocked) <= set(task_keys) or set(blocked) & set(attempts):
         raise ValueError("blocked descendants must be unattempted graph tasks")
     failed = {

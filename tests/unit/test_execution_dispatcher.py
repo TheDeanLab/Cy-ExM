@@ -11,7 +11,11 @@ from cyexm.config.models import (
     RegistrationSpec,
     RegistrationStageSpec,
 )
-from cyexm.execution.dispatcher import FineGraphController, canonical_fine_task_key
+from cyexm.execution.dispatcher import (
+    FineGraphController,
+    canonical_fine_task_key,
+    validate_fine_graph_description,
+)
 from cyexm.workflow.fine_models import (
     FineTaskKey,
     FineTaskResult,
@@ -34,6 +38,66 @@ def test_canonical_fine_task_key_orders_indices_numerically_above_9999() -> None
         "round-002:chunk:9999",
         "round-002:chunk:10000",
     ]
+
+
+def test_partial_graph_cannot_omit_children_of_successful_whole_image(
+    tmp_path: Path,
+) -> None:
+    round_task = replace(
+        _round_task(tmp_path, 2),
+        strategy="whole_image",
+        chunk_size_zyx=None,
+        overlap_fraction=None,
+    )
+
+    with pytest.raises(ValueError, match="channels/validation"):
+        validate_fine_graph_description(
+            (("round-002:whole-image:main", ()),),
+            (round_task,),
+            allow_partial=True,
+            terminal_statuses={"round-002:whole-image:main": "completed"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("allow_partial", "status", "accepted"),
+    (
+        (True, None, True),
+        (False, None, False),
+        (False, "failed", True),
+    ),
+)
+def test_partial_graph_omission_requires_external_or_producer_stop(
+    tmp_path: Path,
+    allow_partial: bool,
+    status: str | None,
+    accepted: bool,
+) -> None:
+    round_task = replace(
+        _round_task(tmp_path, 2),
+        strategy="whole_image",
+        chunk_size_zyx=None,
+        overlap_fraction=None,
+    )
+    statuses = {} if status is None else {"round-002:whole-image:main": status}
+    arguments = (
+        (("round-002:whole-image:main", ()),),
+        (round_task,),
+    )
+
+    if accepted:
+        validate_fine_graph_description(
+            *arguments,
+            allow_partial=allow_partial,
+            terminal_statuses=statuses,
+        )
+    else:
+        with pytest.raises(ValueError, match="channels/validation"):
+            validate_fine_graph_description(
+                *arguments,
+                allow_partial=allow_partial,
+                terminal_statuses=statuses,
+            )
 
 
 def _round_task(tmp_path: Path, round_number: int) -> RoundTask:

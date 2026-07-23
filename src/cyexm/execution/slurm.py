@@ -24,6 +24,7 @@ from cyexm.errors import (
 )
 from cyexm.execution._dask_common import (
     ROUND_RESOURCE,
+    FineAttemptObservation,
     collect_distributed_fine_results,
     collect_distributed_results,
     dask_scheduler_config_overlay,
@@ -32,6 +33,7 @@ from cyexm.execution._dask_common import (
     validate_distributed_tasks,
 )
 from cyexm.execution._slurm_evidence import (
+    FinePlacementAttempt,
     FineScaleEvent,
     FineSlurmEvidence,
     PreControllerTerminal,
@@ -390,6 +392,7 @@ def _validate_observed(
     worker_count: int,
     startup_phase: str,
     startup_outcome: str,
+    fine_mode: bool,
 ) -> tuple[bool, int | None]:
     observed = _evidence_object(
         value,
@@ -446,9 +449,12 @@ def _validate_observed(
         validated_workers = _STARTUP_PHASES.index(
             startup_phase
         ) >= _STARTUP_PHASES.index("worker_stability_check")
-        if validated_workers and addresses != connected:
+        if validated_workers and (
+            (fine_mode and not set(addresses) <= set(connected))
+            or (not fine_mode and addresses != connected)
+        ):
             raise ValueError(
-                "validated worker probe addresses must exactly match connected_workers"
+                "worker probe addresses must be a valid subset of connected_workers"
             )
         if validated_workers and versions is not None:
             expected_versions = tuple(sorted(versions.items()))
@@ -456,7 +462,11 @@ def _validate_observed(
                 raise ValueError(
                     "validated worker package versions must match coordinator_versions"
                 )
-        if validated_workers and any(not probe.ok for probe in probes):
+        if (
+            validated_workers
+            and not fine_mode
+            and any(not probe.ok for probe in probes)
+        ):
             raise ValueError(
                 "worker probes must all be ok after successful worker validation"
             )
@@ -782,6 +792,7 @@ def _canonical_execution_evidence(
         worker_count=workers,
         startup_phase=phase,
         startup_outcome=outcome,
+        fine_mode=fine_mode,
     )
     attempt_identities = (
         tuple(expected_identities[:1]) if fine_mode else tuple(expected_identities)
@@ -816,6 +827,18 @@ def _canonical_execution_evidence(
                 )
             ),
             round_tasks=tuple(cast(RoundTask, task) for task in expected_tasks[1:]),
+            observed_workers=tuple(
+                cast(
+                    list[str],
+                    _evidence_array(
+                        cast(Mapping[str, object], evidence["observed"]).get(
+                            "connected_workers",
+                            [],
+                        ),
+                        "execution_evidence.observed.connected_workers",
+                    ),
+                )
+            ),
             observed_probes=tuple(
                 WorkerProbe.from_dict(
                     _evidence_object(
@@ -1182,20 +1205,20 @@ def _returned_probe_addresses(probes: object) -> tuple[str, ...]:
     return tuple(addresses)
 
 
-def _decodable_probe_evidence(
-    probes: Mapping[object, object],
-) -> list[dict[str, object]]:
-    evidence: list[tuple[str, dict[str, object]]] = []
+def _decodable_probe_batch(probes: object) -> dict[str, WorkerProbe]:
+    if not isinstance(probes, Mapping):
+        return {}
+    decoded: dict[str, WorkerProbe] = {}
     for address, payload in probes.items():
         if type(address) is not str or not isinstance(payload, Mapping):
             continue
         try:
-            decoded = WorkerProbe.from_dict(cast(Mapping[str, object], payload))
+            decoded[address] = WorkerProbe.from_dict(
+                cast(Mapping[str, object], payload)
+            )
         except (TypeError, ValueError):
             continue
-        evidence.append((address, decoded.to_dict()))
-    evidence.sort(key=lambda item: item[0])
-    return [payload for _address, payload in evidence]
+    return decoded
 
 
 def _validated_probe_batch(
@@ -1422,6 +1445,7 @@ class SlurmExecutor:
         active: set[Any] = set()
         validated_workers: set[str] = set()
         validated_probes: dict[str, WorkerProbe] = {}
+        observed_probes: dict[str, WorkerProbe] = {}
         requested_workers = worker_count
         controller: FineGraphController | None = None
         self._fine_task_results = ()
@@ -1525,7 +1549,20 @@ class SlurmExecutor:
                     probe_arguments["workers"] = list(connected)
                 raw_probes = opened_client.run(probe_worker, **probe_arguments)
                 if isinstance(raw_probes, Mapping):
-                    observed["worker_probes"] = _decodable_probe_evidence(raw_probes)
+                    initial_decoded = _decodable_probe_batch(raw_probes)
+                    if fine_mode:
+                        initial_decoded = {
+                            address: probe
+                            for address, probe in initial_decoded.items()
+                            if probe.worker_address == address
+                        }
+                    observed_probes.update(initial_decoded)
+                    observed["worker_probes"] = [
+                        observed_probes[address].to_dict()
+                        for address in sorted(observed_probes)
+                    ]
+                    if initial_scale_event is not None:
+                        initial_scale_event.probed.extend(sorted(initial_decoded))
                 startup["phase"] = "worker_validation"
                 if fine_mode:
                     batch = _validated_probe_batch(
@@ -1534,7 +1571,6 @@ class SlurmExecutor:
                     )
                     probes = tuple(batch[address] for address in connected)
                     assert initial_scale_event is not None
-                    initial_scale_event.probed.extend(connected)
                 else:
                     returned = _returned_probe_addresses(raw_probes)
                     if returned != connected:
@@ -1658,6 +1694,17 @@ class SlurmExecutor:
                             execution_client,
                             expected_workers=desired,
                         )
+                        cast(dict[str, object], evidence["requested"])["workers"] = (
+                            requested_workers
+                        )
+                        observed["connected_workers"] = list(next_connected)
+                        newcomers = tuple(
+                            address
+                            for address in next_connected
+                            if address not in validated_workers
+                        )
+                        event.connected.extend(newcomers)
+                        fine_state.candidates.update(newcomers)
                         if next_scheduler != scheduler_address:
                             raise WorkerPreflightError(
                                 "SLURM scheduler identity changed during scale-up"
@@ -1667,13 +1714,6 @@ class SlurmExecutor:
                                 "SLURM worker scale-up did not preserve every "
                                 "validated worker and add a new candidate"
                             )
-                        newcomers = tuple(
-                            address
-                            for address in next_connected
-                            if address not in validated_workers
-                        )
-                        event.connected.extend(newcomers)
-                        fine_state.candidates.update(newcomers)
                         _validate_scheduler_resources(
                             execution_client,
                             expected_scheduler=scheduler_address,
@@ -1691,17 +1731,25 @@ class SlurmExecutor:
                             expected_threads=_native_thread_values(self.profile),
                             workers=list(newcomers),
                         )
+                        decoded_new = {
+                            address: probe
+                            for address, probe in _decodable_probe_batch(
+                                raw_new
+                            ).items()
+                            if probe.worker_address == address
+                        }
+                        observed_probes.update(decoded_new)
+                        event.probed.extend(sorted(decoded_new))
+                        observed["worker_probes"] = [
+                            observed_probes[address].to_dict()
+                            for address in sorted(observed_probes)
+                        ]
                         new_batch = _validated_probe_batch(
                             raw_new,
                             expected_addresses=newcomers,
                             prior_probes=validated_probes,
                         )
-                        event.probed.extend(newcomers)
                         validated_probes.update(new_batch)
-                        observed["worker_probes"] = [
-                            validated_probes[address].to_dict()
-                            for address in sorted(validated_probes)
-                        ]
                         for address in newcomers:
                             execution_client.run_on_scheduler(
                                 _activate_round_slot,
@@ -1716,10 +1764,6 @@ class SlurmExecutor:
                             candidates=(),
                             validated=tuple(sorted(validated_workers)),
                         )
-                        cast(dict[str, object], evidence["requested"])["workers"] = (
-                            requested_workers
-                        )
-                        observed["connected_workers"] = sorted(validated_workers)
                     except BaseException as error:
                         event.fail(error, utc_now())
                         raise
@@ -1760,6 +1804,52 @@ class SlurmExecutor:
                         )
                     return result
 
+                def record_attempt(observation: FineAttemptObservation) -> None:
+                    raw = observation.raw_result
+                    matches = (
+                        ()
+                        if raw is None
+                        else tuple(
+                            address
+                            for address, probe in validated_probes.items()
+                            if probe.slurm_job_id == raw.slurm_job_id
+                        )
+                    )
+                    probe = (
+                        validated_probes[matches[0]]
+                        if raw is not None
+                        and len(matches) == 1
+                        and matches[0] in validated_workers
+                        else None
+                    )
+                    placement_accepted = (
+                        raw is not None
+                        and probe is not None
+                        and raw.hostname == probe.hostname
+                        and raw.pid == probe.pid
+                        and raw.slurm_job_id == probe.slurm_job_id
+                    )
+                    fine_state.record_attempt(
+                        FinePlacementAttempt(
+                            task_key=observation.task.key.encoded,
+                            attempt=observation.attempt,
+                            status=observation.settled_result.status,
+                            dask_task_key=observation.dask_task_key,
+                            started_at=observation.settled_result.started_at,
+                            ended_at=observation.settled_result.ended_at,
+                            duration_seconds=(
+                                observation.settled_result.duration_seconds
+                            ),
+                            worker_address=(matches[0] if len(matches) == 1 else None),
+                            hostname=None if raw is None else raw.hostname,
+                            pid=None if raw is None else raw.pid,
+                            slurm_job_id=None if raw is None else raw.slurm_job_id,
+                            placement_accepted=placement_accepted,
+                            rejection_reason=observation.rejection_reason,
+                            failure=observation.settled_result.failure,
+                        )
+                    )
+
                 moving_results, task_results, attempts = (
                     collect_distributed_fine_results(
                         controller,
@@ -1771,6 +1861,7 @@ class SlurmExecutor:
                         active=active,
                         capacity_provider=eligible_capacity,
                         result_validator=validate_placement,
+                        attempt_observer=record_attempt,
                     )
                 )
                 self._fine_task_results = task_results
@@ -1789,6 +1880,9 @@ class SlurmExecutor:
                     startup_outcome="succeeded",
                     reference_attempted=True,
                     round_tasks=round_tasks,
+                    observed_workers=tuple(
+                        cast(list[str], observed["connected_workers"])
+                    ),
                     observed_probes=tuple(validated_probes.values()),
                 )
             else:

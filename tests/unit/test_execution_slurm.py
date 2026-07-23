@@ -513,7 +513,13 @@ class _FakeClient:
         worker_address: str,
     ) -> object:
         self._modules.events.append(f"activate:{worker_address}")
-        if self._modules.activation_error is not None:
+        activation_count = sum(
+            event.startswith("activate:") for event in self._modules.events
+        )
+        if self._modules.activation_error is not None and (
+            self._modules.activation_error_call is None
+            or activation_count == self._modules.activation_error_call
+        ):
             raise self._modules.activation_error
         return function(
             worker_address=worker_address,
@@ -603,6 +609,7 @@ class _FakeSlurmModules:
         self.scheduler_resources: dict[str, dict[str, int]] = {}
         self.scheduler_resource_calls: list[tuple[str, dict[str, int]]] = []
         self.activation_error: BaseException | None = None
+        self.activation_error_call: int | None = None
         self.fake_scheduler = _FakeScheduler(self)
         self.probe_results: Mapping[str, Mapping[str, object]] | None = None
         self.scheduler_address = "tcp://scheduler:8786"
@@ -879,14 +886,53 @@ def test_fine_slurm_rechecks_scheduler_identity_after_dynamic_activation(
     modules.dynamic_workers = True
     modules.scheduler_flip_after_resource_calls = 2
     tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    executor = _executor(tmp_path, modules, workers=2, mode="fine_grained")
+    reference = _reference_task(tmp_path)
 
     with pytest.raises(WorkerPreflightError, match="scheduler identity"):
-        _executor(tmp_path, modules, workers=2, mode="fine_grained").execute(
-            _reference_task(tmp_path), tasks
-        )
+        executor.execute(reference, tasks)
 
     assert [call.task.round for call in modules.submit_calls] == [1]
     assert modules.events[-2:] == ["client.close", "cluster.close"]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, *tasks),
+        task_retries=0,
+    )
+
+
+@pytest.mark.parametrize("failure_phase", ("preflight", "activation"))
+def test_fine_slurm_dynamic_failure_emits_canonical_partial_scale_evidence(
+    tmp_path: Path,
+    failure_phase: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    first, second = modules.connected_workers[:2]
+    if failure_phase == "preflight":
+        modules.probe_results = {
+            first: _probe(first),
+            second: _probe(second, ok=False),
+        }
+    else:
+        modules.activation_error = RuntimeError("injected dynamic activation failure")
+        modules.activation_error_call = 2
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    executor = _executor(tmp_path, modules, workers=2, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+
+    with pytest.raises(
+        (WorkerPreflightError, RuntimeError),
+        match=r"preflight|activation",
+    ):
+        executor.execute(reference, tasks)
+
+    assert [call.task.round for call in modules.submit_calls] == [1]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, *tasks),
+        task_retries=0,
+    )
 
 
 def test_fine_slurm_retries_exact_task_with_deterministic_attempt_identity(
@@ -910,7 +956,8 @@ def test_fine_slurm_retries_exact_task_with_deterministic_attempt_identity(
         retries=1,
         mode="fine_grained",
     )
-    results = executor.execute(_reference_task(tmp_path), (task,))
+    reference = _reference_task(tmp_path)
+    results = executor.execute(reference, (task,))
 
     assert results[1].status == "completed"
     assert [call.key for call in modules.submit_calls[1:3]] == [
@@ -974,12 +1021,14 @@ def test_fine_slurm_bad_placement_retries_before_releasing_descendants(
         _fine_result(initial),
     ]
 
-    results = _executor(
+    executor = _executor(
         tmp_path,
         modules,
         retries=1,
         mode="fine_grained",
-    ).execute(_reference_task(tmp_path), (task,))
+    )
+    reference = _reference_task(tmp_path)
+    results = executor.execute(reference, (task,))
 
     assert results[1].status == "completed"
     assert [call.key for call in modules.submit_calls[1:]] == [
@@ -988,6 +1037,128 @@ def test_fine_slurm_bad_placement_retries_before_releasing_descendants(
         "cyexm-round-002-channel-0000",
         "cyexm-round-002-validation-main",
     ]
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    placements = cast(list[dict[str, object]], fine["placements"])
+    initial_placements = [
+        placement
+        for placement in placements
+        if placement["task_key"] == initial.key.encoded
+    ]
+    assert [
+        (
+            placement["attempt"],
+            placement["dask_task_key"],
+            placement["placement_accepted"],
+        )
+        for placement in initial_placements
+    ] == [
+        (1, "cyexm-round-002-whole-image-main", False),
+        (2, "cyexm-round-002-whole-image-main-attempt-002", True),
+    ]
+    assert "address/hostname/pid/job identity" in cast(
+        str,
+        initial_placements[0]["rejection_reason"],
+    )
+    assert initial_placements[1]["rejection_reason"] is None
+    assert cast(str, initial_placements[0]["started_at"]).endswith("Z")
+    assert cast(float, initial_placements[0]["duration_seconds"]) >= 0
+    first_failure = cast(dict[str, object], initial_placements[0]["failure"])
+    assert first_failure["exception_type"] == "RoundExecutionError"
+    assert initial_placements[1]["failure"] is None
+
+    missing_attempt = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    missing_fine = cast(dict[str, object], missing_attempt["fine_graph"])
+    missing_placements = cast(list[dict[str, object]], missing_fine["placements"])
+    missing_placements.remove(
+        next(
+            placement
+            for placement in missing_placements
+            if placement["task_key"] == initial.key.encoded
+            and placement["attempt"] == 1
+        )
+    )
+    with pytest.raises(ValueError, match="exactly and canonically match every attempt"):
+        slurm_module._canonical_execution_evidence(
+            missing_attempt,
+            expected_tasks=(reference, task),
+            task_retries=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "duplicate",
+        "reordered",
+        "wrong_attempt",
+        "wrong_key",
+        "accepted_bad_identity",
+        "rejected_without_reason",
+        "accepted_with_reason",
+        "reversed_interval",
+        "missing_failure",
+        "reason_failure_mismatch",
+    ),
+)
+def test_fine_slurm_evidence_rejects_corrupt_per_attempt_placement_history(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    task = _task(tmp_path, 2)
+    initial = initial_fine_tasks((task,))[0]
+    modules.outcomes[initial.key.encoded] = [
+        _fine_result(initial, pid=999999),
+        _fine_result(initial),
+    ]
+    reference = _reference_task(tmp_path)
+    executor = _executor(
+        tmp_path,
+        modules,
+        retries=1,
+        mode="fine_grained",
+    )
+    executor.execute(reference, (task,))
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    fine = cast(dict[str, object], evidence["fine_graph"])
+    placements = cast(list[dict[str, object]], fine["placements"])
+    indices = [
+        index
+        for index, placement in enumerate(placements)
+        if placement["task_key"] == initial.key.encoded
+    ]
+    first, second = indices
+
+    if corruption == "duplicate":
+        placements.insert(second, deepcopy(placements[first]))
+    elif corruption == "reordered":
+        placements[first], placements[second] = placements[second], placements[first]
+    elif corruption == "wrong_attempt":
+        placements[first]["attempt"] = 2
+    elif corruption == "wrong_key":
+        placements[first]["task_key"] = "round-999:whole-image:main"
+    elif corruption == "accepted_bad_identity":
+        placements[first]["placement_accepted"] = True
+    elif corruption == "rejected_without_reason":
+        placements[first]["rejection_reason"] = None
+    elif corruption == "accepted_with_reason":
+        placements[second]["rejection_reason"] = "forged rejection"
+    elif corruption == "reversed_interval":
+        placements[first]["ended_at"] = "2026-07-19T10:00:00Z"
+    elif corruption == "missing_failure":
+        placements[first]["failure"] = None
+    else:
+        placements[first]["rejection_reason"] = "ValueError: forged"
+
+    with pytest.raises((TypeError, ValueError)):
+        slurm_module._canonical_execution_evidence(
+            evidence,
+            expected_tasks=(reference, task),
+            task_retries=1,
+        )
 
 
 def test_fine_slurm_activation_failure_closes_every_owned_resource(
@@ -1022,15 +1193,20 @@ def test_fine_slurm_dynamic_probe_address_mismatch_never_activates_candidate(
         second_address: _probe("tcp://impostor:1234"),
     }
     tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+    executor = _executor(tmp_path, modules, workers=2, mode="fine_grained")
+    reference = _reference_task(tmp_path)
 
     with pytest.raises(WorkerPreflightError, match="reported worker address"):
-        _executor(tmp_path, modules, workers=2, mode="fine_grained").execute(
-            _reference_task(tmp_path), tasks
-        )
+        executor.execute(reference, tasks)
 
     assert modules.scheduler_resource_calls == [(first_address, {"round_slot": 1})]
     assert [call.task.round for call in modules.submit_calls] == [1]
     assert modules.events[-2:] == ["client.close", "cluster.close"]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, *tasks),
+        task_retries=0,
+    )
 
 
 def test_fine_slurm_preflight_failure_never_activates_or_submits(
@@ -1137,6 +1313,7 @@ def test_fine_slurm_records_versioned_scale_graph_and_placement_evidence(
         startup_outcome="succeeded",
         reference_attempted=True,
         round_tasks=tasks,
+        observed_workers=tuple(cast(list[str], observed["connected_workers"])),
         observed_probes=tuple(
             WorkerProbe.from_dict(item)
             for item in cast(list[dict[str, object]], observed["worker_probes"])

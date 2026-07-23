@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
-from fakes import FakeBackend, fake_image
+from fakes import FakeBackend, FakeImage, fake_image
 
 import cyexm.registration.whole_image as whole_image
 from cyexm.errors import CacheValidationError, RegistrationStageError
@@ -25,6 +26,7 @@ from cyexm.registration.prepared import (
 )
 from cyexm.registration.whole_image import ImageRegistration
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS, ResolvedNativeThreads
+from cyexm.spatial import ImageGeometry
 
 pytestmark = pytest.mark.unit
 
@@ -158,6 +160,45 @@ def test_source_mutation_during_array_commit_stales_partial_bundle(
     assert ArtifactStore().stale_path(paths.fixed_scalar).is_file()
 
 
+class _PreparedArrayMutatingStore(ArtifactStore):
+    def __init__(self) -> None:
+        self.fixed_scalar: Path | None = None
+
+    def commit(
+        self,
+        artifact: Path,
+        request: StageRequest,
+        writer: Callable[[Path], None],
+        validator: Callable[[Path], bool],
+    ) -> None:
+        super().commit(artifact, request, writer, validator)
+        if artifact.name == "fixed_scalar.npy":
+            self.fixed_scalar = artifact
+        elif artifact.name == "moving_linear_mask.npy":
+            if self.fixed_scalar is None:
+                raise RuntimeError("fixed scalar was not committed first")
+            array = np.load(self.fixed_scalar, allow_pickle=False)
+            np.save(
+                self.fixed_scalar,
+                np.asarray(array) + np.float32(1.0),
+                allow_pickle=False,
+            )
+
+
+def test_array_mutation_before_manifest_capture_fails_closed_and_stales(
+    tmp_path: Path,
+) -> None:
+    registration = _registration(tmp_path)
+    registration._artifact_store = _PreparedArrayMutatingStore()
+    paths = PreparedRoundPaths.for_round(tmp_path / "output", 3)
+
+    with pytest.raises(CacheValidationError, match="fixed scalar identity changed"):
+        commit_prepared_round(registration)
+
+    assert not paths.manifest.exists()
+    assert ArtifactStore().stale_path(paths.fixed_scalar).is_file()
+
+
 def test_commit_rejects_nonfinite_prepared_values_without_manifest(
     tmp_path: Path,
 ) -> None:
@@ -233,6 +274,60 @@ def test_regional_read_copies_owned_regions_and_uses_direction_aware_origin(
     assert region.geometry.spacing == manifest.geometry.spacing
     assert region.geometry.direction == direction
     assert region.geometry.origin == (10.0, 22.0, 34.0)
+
+
+def test_regional_read_rechecks_all_array_generations_after_copying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cyexm.registration.prepared as prepared
+
+    manifest = commit_prepared_round(_registration(tmp_path))
+    original_copy_region = prepared._copy_region
+
+    def mutate_after_later_copy(
+        np_runtime: Any,
+        identity: FileIdentity,
+        role: str,
+        geometry: ImageGeometry,
+        chunk: ChunkInfo,
+    ) -> object:
+        copied = original_copy_region(
+            np_runtime,
+            identity,
+            role,
+            geometry,
+            chunk,
+        )
+        if role == "moving linear scalar":
+            fixed_path = Path(manifest.fixed_scalar.path)
+            fixed = np.load(fixed_path, allow_pickle=False)
+            np.save(
+                fixed_path,
+                np.asarray(fixed) + np.float32(1.0),
+                allow_pickle=False,
+            )
+        return copied
+
+    monkeypatch.setattr(prepared, "_copy_region", mutate_after_later_copy)
+
+    with pytest.raises(CacheValidationError, match="fixed scalar identity mismatch"):
+        read_prepared_region(manifest, _chunk())
+
+
+class _NearlyMismatchedAffineBackend(FakeBackend):
+    def linear(self, **kwargs: object) -> tuple[object, object | None, object]:
+        moving, moving_mask, affine = super().linear(**kwargs)
+        assert isinstance(moving, FakeImage)
+        moving.origin = (np.float64(5e-8), 0.0, 0.0)
+        return moving, moving_mask, affine
+
+
+def test_prepared_inputs_require_exact_fixed_geometry(tmp_path: Path) -> None:
+    backend = _NearlyMismatchedAffineBackend()
+
+    with pytest.raises(ValueError, match="moving scalar geometry"):
+        commit_prepared_round(_registration(tmp_path, backend=backend))
 
 
 def test_regional_read_rejects_identity_changes_before_mapping(tmp_path: Path) -> None:

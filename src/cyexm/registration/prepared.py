@@ -17,7 +17,7 @@ from cyexm.registration._request_policy import (
     common_parameters,
 )
 from cyexm.registration.artifacts import FileIdentity, StageRequest
-from cyexm.spatial import ImageGeometry, geometry_compatible
+from cyexm.spatial import ImageGeometry
 
 if TYPE_CHECKING:
     from cyexm.registration.backend import RegistrationBackend
@@ -361,11 +361,12 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
     backend = state.backend
     geometry = backend.geometry(state.fixed)
     for role, image in (
+        ("fixed scalar", state.fixed),
         ("moving scalar", state.moving_linear),
         ("fixed mask", state.fixed_mask),
         ("moving mask", state.moving_linear_mask),
     ):
-        if not geometry_compatible(backend.geometry(image), geometry):
+        if backend.geometry(image) != geometry:
             raise ValueError(f"{role} geometry does not match the fixed geometry")
 
     np = _scientific_runtime()
@@ -383,6 +384,7 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
     moving_crop = (
         FileIdentity.from_path(state.paths.moving_crop) if registration.crop else None
     )
+    array_identities: list[FileIdentity] = []
     for role, path, array in zip(
         (
             "fixed_scalar",
@@ -423,17 +425,34 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
                     expected=value,
                 ),
             )
+        array_identities.append(FileIdentity.from_path(path))
         _require_identity(affine, "affine")
         if moving_crop is not None:
             _require_identity(moving_crop, "moving crop")
 
     native_fixed, native_moving = registration._input_identity_snapshot()
+    for identity, path, role in zip(
+        array_identities,
+        paths.array_paths,
+        (
+            "fixed scalar",
+            "moving linear scalar",
+            "fixed mask",
+            "moving linear mask",
+        ),
+        strict=True,
+    ):
+        try:
+            _require_identity(identity, role)
+        except Exception:
+            registration._store().mark_stale(path)
+            raise
     manifest = PreparedManifest(
         format_version=_FORMAT_VERSION,
-        fixed_scalar=FileIdentity.from_path(paths.fixed_scalar),
-        moving_linear_scalar=FileIdentity.from_path(paths.moving_linear_scalar),
-        fixed_mask=FileIdentity.from_path(paths.fixed_mask),
-        moving_linear_mask=FileIdentity.from_path(paths.moving_linear_mask),
+        fixed_scalar=array_identities[0],
+        moving_linear_scalar=array_identities[1],
+        fixed_mask=array_identities[2],
+        moving_linear_mask=array_identities[3],
         native_fixed=native_fixed,
         native_moving=native_moving,
         moving_crop=moving_crop,
@@ -592,6 +611,17 @@ def read_prepared_region(
             strict=True,
         )
     )
+    for identity, role in zip(
+        manifest.array_identities,
+        (
+            "fixed scalar",
+            "moving linear scalar",
+            "fixed mask",
+            "moving linear mask",
+        ),
+        strict=True,
+    ):
+        _verify_identity(identity, role)
     start_xyz = (chunk.x_start_ext, chunk.y_start_ext, chunk.z_start_ext)
     scaled = tuple(
         spacing * index

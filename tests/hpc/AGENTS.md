@@ -118,6 +118,12 @@
   Aggregate every nonlinear call in each stable `round-XXX-coarse-main` record using
   one worker-monotonic first-start/last-end span, or explicitly fall back to summed
   call durations when monotonic bounds are unavailable; never take one maximum call.
+- Treat each owned-workflow `*-outcome.json` as the complete job-ID and cleanup
+  outcome authority, and its checksum-bound `*-queue-after.json[jobs]` as the
+  post-cleanup queue authority. Executor `cleanup` proves only ordered
+  client/cluster/configuration closure; never infer SLURM ownership from it or from
+  task placements. Lineage and placement job IDs must be subsets of the complete
+  outcome-owned set so additional initial workers remain visible.
 - Keep fine-only report schemas and audit decoders in
   `fine_workflow_acceptance.py`. Keep shared submission, cleanup, fresh-coordinator,
   and acceptance-only worker-runner machinery in `workflow_acceptance.py`.

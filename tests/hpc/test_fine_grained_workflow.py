@@ -20,6 +20,8 @@ from hpc.environment import HpcAcceptanceContext, write_evidence_json
 from hpc.fine_workflow_acceptance import (
     _coarse_nonlinear_lower_bound,
     _derive_primary_evidence,
+    _validate_empty_owned_queue,
+    _validated_owned_outcome,
     build_fine_acceptance_report,
     fine_acceptance_manifest,
 )
@@ -46,6 +48,35 @@ def _file_sha256(path: Path) -> str:
         while chunk := stream.read(16 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _owned_cleanup_sources(
+    *,
+    outcome_path: Path,
+    queue_after_path: Path,
+    operation: str,
+    status: str,
+) -> dict[str, object]:
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    queue_after = json.loads(queue_after_path.read_text(encoding="utf-8"))
+    owned = _validated_owned_outcome(
+        outcome,
+        operation=operation,
+        status=status,
+    )
+    _validate_empty_owned_queue(queue_after, operation=operation)
+    return {
+        "outcome_file": {
+            "relative_path": outcome_path.name,
+            "sha256": _file_sha256(outcome_path),
+        },
+        "queue_after_file": {
+            "relative_path": queue_after_path.name,
+            "sha256": _file_sha256(queue_after_path),
+        },
+        "owned_job_ids": list(owned),
+        "cleanup_outcome": "empty",
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +549,7 @@ def _replacement_lineage(
     evidence: dict[str, object],
     *,
     evidence_path: Path,
+    outcome_path: Path,
     queue_after_path: Path,
     loss_marker_path: Path,
     target_key: str,
@@ -589,11 +621,22 @@ def _replacement_lineage(
             key=lambda item: cast(str, item["coordinator_ready_at"]),
         )
     )
-    queue_after = json.loads(queue_after_path.read_text(encoding="utf-8"))
-    cleanup = cast(dict[str, object], evidence["cleanup"])
-    if queue_after.get("jobs") != []:
+    cleanup_sources = _owned_cleanup_sources(
+        outcome_path=outcome_path,
+        queue_after_path=queue_after_path,
+        operation="fine-worker-replacement",
+        status="completed",
+    )
+    owned_ids = set(cast(list[str], cleanup_sources["owned_job_ids"]))
+    lineage_ids = {
+        cast(str, loss_identity["slurm_job_id"]),
+        cast(str, replacement_identity["slurm_job_id"]),
+        cast(str, retry_identity["slurm_job_id"]),
+        *(() if liveness is None else (cast(str, identity(liveness)["slurm_job_id"]),)),
+    }
+    if not lineage_ids <= owned_ids:
         raise HpcWorkflowAcceptanceError(
-            "replacement trial retains an owned named job after cleanup"
+            "replacement lineage contains a job absent from owned outcome evidence"
         )
     loss_summary = {"task_key": target_key, **loss_identity}
     return {
@@ -601,10 +644,7 @@ def _replacement_lineage(
             "relative_path": evidence_path.name,
             "sha256": _file_sha256(evidence_path),
         },
-        "queue_after_file": {
-            "relative_path": queue_after_path.name,
-            "sha256": _file_sha256(queue_after_path),
-        },
+        **cleanup_sources,
         "loss_marker_file": {
             "relative_path": loss_marker_path.name,
             "sha256": _file_sha256(loss_marker_path),
@@ -633,8 +673,6 @@ def _replacement_lineage(
                 **identity(liveness),
             }
         ),
-        "owned_job_ids": sorted(cast(list[str], cleanup["recorded_job_ids"])),
-        "remaining_owned_job_ids": cleanup["remaining_owned_job_ids"],
     }
 
 
@@ -928,6 +966,12 @@ def _run_fine_acceptance(
     cancellation_results = cast(
         list[dict[str, object]], cancellation_graph["task_results"]
     )
+    cancellation_cleanup_sources = _owned_cleanup_sources(
+        outcome_path=context.evidence_dir / "fine-cancellation-outcome.json",
+        queue_after_path=(context.evidence_dir / "fine-cancellation-queue-after.json"),
+        operation="fine-cancellation",
+        status="cancelled",
+    )
     cancellation_reused = sorted(
         cast(str, item["key"])
         for item in json.loads(cancellation_resume.execution_evidence_json)[
@@ -955,6 +999,7 @@ def _run_fine_acceptance(
         evidence_path=(
             context.evidence_dir / "fine-worker-replacement-slurm-execution.json"
         ),
+        outcome_path=(context.evidence_dir / "fine-worker-replacement-outcome.json"),
         queue_after_path=(
             context.evidence_dir / "fine-worker-replacement-queue-after.json"
         ),
@@ -1054,12 +1099,13 @@ def _run_fine_acceptance(
                         context.evidence_dir / "fine-cancellation-trigger.json"
                     ),
                 },
-                "queue_after_file": {
-                    "relative_path": "fine-cancellation-queue-after.json",
+                "execution_evidence_file": {
+                    "relative_path": "fine-cancellation-slurm-execution.json",
                     "sha256": _file_sha256(
-                        context.evidence_dir / "fine-cancellation-queue-after.json"
+                        context.evidence_dir / "fine-cancellation-slurm-execution.json"
                     ),
                 },
+                **cancellation_cleanup_sources,
                 "preserved_artifacts": _artifact_path_entries(
                     [
                         cast(str, path)
@@ -1071,17 +1117,6 @@ def _run_fine_acceptance(
                 ),
                 "resume_reused_keys": [targets["chunk_peer"]],
                 "resume_recomputed_keys": [targets["chunk_target"]],
-                "owned_job_ids": sorted(
-                    {
-                        cast(str, item["slurm_job_id"])
-                        for item in cast(
-                            list[dict[str, object]],
-                            cancellation_graph["placements"],
-                        )
-                        if item["slurm_job_id"]
-                    }
-                ),
-                "remaining_owned_job_ids": [],
             },
             "worker_replacement": replacement_lineage,
         },

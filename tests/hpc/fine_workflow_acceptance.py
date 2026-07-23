@@ -752,6 +752,93 @@ def _coarse_nonlinear_lower_bound(
     return max(round_totals), policies.pop()
 
 
+def _validated_owned_outcome(
+    value: object,
+    *,
+    operation: str,
+    status: str,
+) -> tuple[str, ...]:
+    """Decode the exact outcome schema emitted by the owned workflow helper."""
+    base_keys = {
+        "schema_version",
+        "operation",
+        "status",
+        "owned_job_ids",
+        "cleanup_outcome",
+        "workflow_result",
+    }
+    expected_keys = base_keys | ({"error"} if status == "cancelled" else set())
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {operation} outcome has an invalid exact schema"
+        )
+    if (
+        value.get("schema_version") != 1
+        or value.get("operation") != operation
+        or value.get("status") != status
+        or value.get("cleanup_outcome") != "empty"
+    ):
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {operation} cleanup outcome is not successful"
+        )
+    owned = value.get("owned_job_ids")
+    if (
+        not isinstance(owned, list)
+        or not owned
+        or any(type(item) is not str or not item for item in owned)
+        or owned != sorted(set(owned))
+    ):
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {operation} owned job IDs are not canonical"
+        )
+    if status == "completed":
+        if not isinstance(value.get("workflow_result"), Mapping):
+            raise HpcWorkflowAcceptanceError(
+                f"fine acceptance {operation} lacks its completed workflow result"
+            )
+    else:
+        error = value.get("error")
+        if (
+            value.get("workflow_result") is not None
+            or not isinstance(error, dict)
+            or set(error) != {"exception_type", "message"}
+            or error.get("exception_type") != "KeyboardInterrupt"
+            or not isinstance(error.get("message"), str)
+            or not error["message"]
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"fine acceptance {operation} cancellation outcome is malformed"
+            )
+    return tuple(cast(list[str], owned))
+
+
+def _validate_empty_owned_queue(value: object, *, operation: str) -> None:
+    if not isinstance(value, Mapping) or value.get("jobs") != []:
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {operation} queue is not empty after cleanup"
+        )
+
+
+def _validate_executor_cleanup(value: object, *, operation: str) -> None:
+    if not isinstance(value, Mapping):
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {operation} execution evidence lacks cleanup"
+        )
+    expected_order = ["client", "cluster", "configuration"]
+    if value.get("order") != expected_order or set(value) != {
+        *expected_order,
+        "order",
+    }:
+        raise HpcWorkflowAcceptanceError(
+            f"fine acceptance {operation} executor cleanup order is invalid"
+        )
+    for name in expected_order:
+        if value.get(name) != {"attempted": True, "succeeded": True}:
+            raise HpcWorkflowAcceptanceError(
+                f"fine acceptance {operation} executor {name} cleanup failed"
+            )
+
+
 def _maximum_metric_difference(value: object) -> float:
     differences: list[float] = []
 
@@ -995,6 +1082,7 @@ def _validate_worker_replacement(
             {
                 "loss_marker",
                 "evidence_file",
+                "outcome_file",
                 "queue_after_file",
                 "loss_marker_file",
                 "failed_attempt",
@@ -1004,7 +1092,7 @@ def _validate_worker_replacement(
                 "retry",
                 "liveness",
                 "owned_job_ids",
-                "remaining_owned_job_ids",
+                "cleanup_outcome",
             }
         ),
         location=location,
@@ -1018,6 +1106,11 @@ def _validate_worker_replacement(
         replacement["queue_after_file"],
         owned_root=owned_root,
         location=f"{location}.queue_after_file",
+    )
+    outcome_relative, outcome_sha, raw_outcome = _evidence_reference(
+        replacement["outcome_file"],
+        owned_root=owned_root,
+        location=f"{location}.outcome_file",
     )
     marker_relative, marker_sha, raw_marker = _evidence_reference(
         replacement["loss_marker_file"],
@@ -1125,9 +1218,10 @@ def _validate_worker_replacement(
     owned = _fine_exact_strings(
         replacement["owned_job_ids"], f"{location}.owned_job_ids"
     )
-    remaining = _fine_exact_strings(
-        replacement["remaining_owned_job_ids"],
-        f"{location}.remaining_owned_job_ids",
+    outcome_owned = _validated_owned_outcome(
+        raw_outcome,
+        operation="fine-worker-replacement",
+        status="completed",
     )
     expected_owned = {
         cast(str, departed["slurm_job_id"]),
@@ -1145,8 +1239,9 @@ def _validate_worker_replacement(
         or retry["task_key"] != loss_key
         or retry["attempt"] != 2
         or retry["status"] != "completed"
-        or set(owned) != expected_owned
-        or remaining
+        or tuple(owned) != outcome_owned
+        or replacement["cleanup_outcome"] != "empty"
+        or not expected_owned <= set(owned)
         or (liveness_path == "retry" and retry_identity != activated)
         or (
             liveness_path == "later-task"
@@ -1251,11 +1346,6 @@ def _validate_worker_replacement(
         or target_placements[1].get("status") != "completed"
         or target_placements[1].get("placement_accepted") is not True
         or raw_identity(target_placements[1]) != retry_identity
-        or raw_queue.get("jobs") != []
-        or not isinstance(cleanup, Mapping)
-        or set(cast(list[object], cleanup.get("recorded_job_ids", [])))
-        != expected_owned
-        or cleanup.get("remaining_owned_job_ids") != []
         or (
             liveness_path == "retry" and raw_identity(target_placements[1]) != activated
         )
@@ -1275,8 +1365,17 @@ def _validate_worker_replacement(
             "fine acceptance replacement report is not derived from canonical "
             "probe, scale, attempt, placement, liveness, and queue evidence"
         )
+    _validate_empty_owned_queue(
+        raw_queue,
+        operation="fine-worker-replacement",
+    )
+    _validate_executor_cleanup(
+        cleanup,
+        operation="fine-worker-replacement",
+    )
     return (
         (evidence_relative, evidence_sha),
+        (outcome_relative, outcome_sha),
         (queue_relative, queue_sha),
         (marker_relative, marker_sha),
     )
@@ -1880,12 +1979,14 @@ def validate_fine_acceptance_report(
                 "committed_peer_file",
                 "ready_marker_file",
                 "trigger_file",
+                "execution_evidence_file",
+                "outcome_file",
                 "queue_after_file",
                 "preserved_artifacts",
                 "resume_reused_keys",
                 "resume_recomputed_keys",
                 "owned_job_ids",
-                "remaining_owned_job_ids",
+                "cleanup_outcome",
             }
         ),
         location="durability.cancellation_resume",
@@ -1893,10 +1994,6 @@ def validate_fine_acceptance_report(
     owned_jobs = _fine_exact_strings(
         cancellation["owned_job_ids"],
         "durability.cancellation_resume.owned_job_ids",
-    )
-    remaining_jobs = _fine_exact_strings(
-        cancellation["remaining_owned_job_ids"],
-        "durability.cancellation_resume.remaining_owned_job_ids",
     )
     blocked_task_key = _fine_nonempty_string(
         cancellation["blocked_task_key"],
@@ -1920,6 +2017,8 @@ def validate_fine_acceptance_report(
         "committed_peer_file",
         "ready_marker_file",
         "trigger_file",
+        "execution_evidence_file",
+        "outcome_file",
         "queue_after_file",
     ):
         relative, digest, payload = _evidence_reference(
@@ -1932,7 +2031,14 @@ def validate_fine_acceptance_report(
     committed_payload = cancellation_payloads["committed_peer_file"]
     ready_payload = cancellation_payloads["ready_marker_file"]
     trigger_payload = cancellation_payloads["trigger_file"]
+    cancellation_execution = cancellation_payloads["execution_evidence_file"]
+    cancellation_outcome = cancellation_payloads["outcome_file"]
     cancellation_queue_payload = cancellation_payloads["queue_after_file"]
+    outcome_owned = _validated_owned_outcome(
+        cancellation_outcome,
+        operation="fine-cancellation",
+        status="cancelled",
+    )
     if (
         cancellation["status"] != "cancelled"
         or cancellation["structured_cancellation"] is not True
@@ -1941,7 +2047,8 @@ def validate_fine_acceptance_report(
         or committed_peer_key not in reused_keys
         or blocked_task_key not in recomputed_keys
         or not owned_jobs
-        or remaining_jobs
+        or tuple(owned_jobs) != outcome_owned
+        or cancellation["cleanup_outcome"] != "empty"
         or not reused_keys
         or not recomputed_keys
         or not isinstance(committed_payload, Mapping)
@@ -1960,13 +2067,47 @@ def validate_fine_acceptance_report(
         or trigger_payload.get("status") != "interrupted"
         or trigger_payload.get("signal") != "SIGINT"
         or trigger_payload.get("exit_code") != 130
-        or not isinstance(cancellation_queue_payload, Mapping)
-        or cancellation_queue_payload.get("jobs") != []
     ):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance cancellation, replacement, liveness, resume, "
             "or cleanup gate failed"
         )
+    _validate_empty_owned_queue(
+        cancellation_queue_payload,
+        operation="fine-cancellation",
+    )
+    if (
+        not isinstance(cancellation_execution, Mapping)
+        or not isinstance(
+            cancellation_graph := cancellation_execution.get("fine_graph"),
+            Mapping,
+        )
+        or cancellation_graph.get("cancelled") is not True
+        or cancellation["structured_cancellation"] is not True
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance cancellation execution evidence is not structured"
+        )
+    raw_cancellation_placements = cancellation_graph.get("placements")
+    if not isinstance(raw_cancellation_placements, list):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance cancellation placements are malformed"
+        )
+    placement_job_ids = {
+        cast(str, item["slurm_job_id"])
+        for item in raw_cancellation_placements
+        if isinstance(item, Mapping)
+        and isinstance(item.get("slurm_job_id"), str)
+        and item["slurm_job_id"]
+    }
+    if not placement_job_ids <= set(owned_jobs):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance cancellation placement job is absent from owned outcome"
+        )
+    _validate_executor_cleanup(
+        cancellation_execution.get("cleanup"),
+        operation="fine-cancellation",
+    )
     _fine_artifacts(
         cancellation["preserved_artifacts"],
         "durability.cancellation_resume.preserved_artifacts",

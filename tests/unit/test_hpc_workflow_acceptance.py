@@ -28,6 +28,7 @@ from hpc.fine_workflow_acceptance import (
     fine_acceptance_profiles,
     validate_fine_acceptance_report,
 )
+from hpc.test_fine_grained_workflow import _owned_cleanup_sources
 from hpc.test_slurm_workflow import _assert_resume
 from hpc.workflow_acceptance import (
     HpcWorkflowAcceptanceError,
@@ -149,6 +150,12 @@ def _profile(tmp_path: Path, *, workers: int = 4) -> ExecutionProfile:
 
 
 def _fine_acceptance_report(root: Path) -> dict[str, object]:
+    executor_cleanup = {
+        "client": {"attempted": True, "succeeded": True},
+        "cluster": {"attempted": True, "succeeded": True},
+        "configuration": {"attempted": True, "succeeded": True},
+        "order": ["client", "cluster", "configuration"],
+    }
     evidence_path = root / "fine-execution.json"
     tier1_path = root / "tier1-equivalence.json"
     tier1_path.write_text(
@@ -272,10 +279,7 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                         },
                     ],
                 },
-                "cleanup": {
-                    "recorded_job_ids": ["101", "103"],
-                    "remaining_owned_job_ids": [],
-                },
+                "cleanup": executor_cleanup,
             },
             sort_keys=True,
         ),
@@ -284,6 +288,21 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
     replacement_queue_path = root / "fine-worker-replacement-queue-after.json"
     replacement_queue_path.write_text(
         json.dumps({"jobs": []}, sort_keys=True),
+        encoding="utf-8",
+    )
+    replacement_outcome_path = root / "fine-worker-replacement-outcome.json"
+    replacement_outcome_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "operation": "fine-worker-replacement",
+                "status": "completed",
+                "owned_job_ids": ["100", "101", "103"],
+                "cleanup_outcome": "empty",
+                "workflow_result": {"status": "completed"},
+            },
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     loss_marker_path = root / "worker-loss.json"
@@ -356,6 +375,42 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
     cancellation_queue_path = root / "fine-cancellation-queue-after.json"
     cancellation_queue_path.write_text(
         json.dumps({"jobs": []}, sort_keys=True),
+        encoding="utf-8",
+    )
+    cancellation_execution_path = root / "fine-cancellation-slurm-execution.json"
+    cancellation_execution_path.write_text(
+        json.dumps(
+            {
+                "fine_graph": {
+                    "cancelled": True,
+                    "placements": [
+                        {"slurm_job_id": "101"},
+                        {"slurm_job_id": "102"},
+                    ],
+                },
+                "cleanup": executor_cleanup,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    cancellation_outcome_path = root / "fine-cancellation-outcome.json"
+    cancellation_outcome_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "operation": "fine-cancellation",
+                "status": "cancelled",
+                "owned_job_ids": ["100", "101", "102"],
+                "cleanup_outcome": "empty",
+                "workflow_result": None,
+                "error": {
+                    "exception_type": "KeyboardInterrupt",
+                    "message": "Task 5 coordinator interruption",
+                },
+            },
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     prepared_path = root / "fine" / "schema-v1" / "sample" / "prepared" / "fixed.npy"
@@ -754,6 +809,18 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                         cancellation_trigger_path.read_bytes()
                     ).hexdigest(),
                 },
+                "execution_evidence_file": {
+                    "relative_path": cancellation_execution_path.name,
+                    "sha256": sha256(
+                        cancellation_execution_path.read_bytes()
+                    ).hexdigest(),
+                },
+                "outcome_file": {
+                    "relative_path": cancellation_outcome_path.name,
+                    "sha256": sha256(
+                        cancellation_outcome_path.read_bytes()
+                    ).hexdigest(),
+                },
                 "queue_after_file": {
                     "relative_path": cancellation_queue_path.name,
                     "sha256": sha256(cancellation_queue_path.read_bytes()).hexdigest(),
@@ -761,8 +828,8 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                 "preserved_artifacts": [artifact],
                 "resume_reused_keys": ["round-003:chunk:0000"],
                 "resume_recomputed_keys": ["round-002:chunk:0000"],
-                "owned_job_ids": ["101", "102"],
-                "remaining_owned_job_ids": [],
+                "owned_job_ids": ["100", "101", "102"],
+                "cleanup_outcome": "empty",
             },
             "worker_replacement": {
                 "evidence_file": {
@@ -772,6 +839,10 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                 "queue_after_file": {
                     "relative_path": replacement_queue_path.name,
                     "sha256": sha256(replacement_queue_path.read_bytes()).hexdigest(),
+                },
+                "outcome_file": {
+                    "relative_path": replacement_outcome_path.name,
+                    "sha256": sha256(replacement_outcome_path.read_bytes()).hexdigest(),
                 },
                 "loss_marker_file": {
                     "relative_path": loss_marker_path.name,
@@ -812,8 +883,8 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                     "slurm_job_id": "103",
                 },
                 "liveness": None,
-                "owned_job_ids": ["101", "103"],
-                "remaining_owned_job_ids": [],
+                "owned_job_ids": ["100", "101", "103"],
+                "cleanup_outcome": "empty",
             },
         },
         "performance": {
@@ -861,11 +932,14 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                         tier2_path,
                         evidence_path,
                         replacement_path,
+                        replacement_outcome_path,
                         replacement_queue_path,
                         loss_marker_path,
                         committed_peer_path,
                         cancellation_ready_path,
                         cancellation_trigger_path,
+                        cancellation_execution_path,
+                        cancellation_outcome_path,
                         cancellation_queue_path,
                         tier1_path,
                         *coarse_timing_paths,
@@ -1137,11 +1211,14 @@ def test_fine_acceptance_builder_hashes_only_owned_evidence(tmp_path: Path) -> N
                 "deterministic-executor-parity.json",
                 "fine-execution.json",
                 "fine-worker-replacement-slurm-execution.json",
+                "fine-worker-replacement-outcome.json",
                 "fine-worker-replacement-queue-after.json",
                 "worker-loss.json",
                 "committed-peer.json",
                 "cancellation-ready.json",
                 "fine-cancellation-trigger.json",
+                "fine-cancellation-slurm-execution.json",
+                "fine-cancellation-outcome.json",
                 "fine-cancellation-queue-after.json",
                 "tier1-equivalence.json",
                 "round-002-coarse-main.json",
@@ -1416,7 +1493,7 @@ def test_fine_profiler_writes_external_peak_memory_and_restores_backend(
         ),
         (
             lambda value: value["durability"]["cancellation_resume"].update(
-                {"remaining_owned_job_ids": ["101"]}
+                {"cleanup_outcome": "failed"}
             ),
             "cleanup",
         ),
@@ -1497,6 +1574,12 @@ def _refresh_report_evidence_digest(
         lambda value: value["fine_graph"]["placements"][1].update(
             {"worker_address": "tcp://node-a:1"}
         ),
+        lambda value: value["cleanup"].update(
+            {
+                "recorded_job_ids": ["101", "103"],
+                "remaining_owned_job_ids": [],
+            }
+        ),
     ),
 )
 def test_fine_acceptance_rejects_mutated_raw_replacement_lineage(
@@ -1538,7 +1621,6 @@ def test_fine_acceptance_accepts_later_replacement_liveness_without_retry_affini
             "slurm_job_id": "102",
         }
     )
-    payload["cleanup"]["recorded_job_ids"] = ["101", "102", "103"]
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     replacement = cast(
         dict[str, object],
@@ -1561,13 +1643,146 @@ def test_fine_acceptance_accepts_later_replacement_liveness_without_retry_affini
         "pid": 333,
         "slurm_job_id": "103",
     }
-    replacement["owned_job_ids"] = ["101", "102", "103"]
+    replacement["owned_job_ids"] = ["100", "101", "102", "103"]
+    outcome_path = tmp_path / "fine-worker-replacement-outcome.json"
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    outcome["owned_job_ids"] = ["100", "101", "102", "103"]
+    outcome_path.write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
     _refresh_report_evidence_digest(
         report,
         path,
         cast(dict[str, object], replacement["evidence_file"]),
     )
+    _refresh_report_evidence_digest(
+        report,
+        outcome_path,
+        cast(dict[str, object], replacement["outcome_file"]),
+    )
 
+    assert validate_fine_acceptance_report(report, evidence_root=tmp_path) == report
+
+
+def test_owned_cleanup_sources_preserve_complete_extra_owned_job_ids(
+    tmp_path: Path,
+) -> None:
+    outcome_path = tmp_path / "fine-worker-replacement-outcome.json"
+    queue_path = tmp_path / "fine-worker-replacement-queue-after.json"
+    outcome_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "operation": "fine-worker-replacement",
+                "status": "completed",
+                "owned_job_ids": ["100", "101", "102", "103"],
+                "cleanup_outcome": "empty",
+                "workflow_result": {"status": "completed"},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    queue_path.write_text(json.dumps({"jobs": []}), encoding="utf-8")
+
+    summary = _owned_cleanup_sources(
+        outcome_path=outcome_path,
+        queue_after_path=queue_path,
+        operation="fine-worker-replacement",
+        status="completed",
+    )
+
+    assert summary["owned_job_ids"] == ["100", "101", "102", "103"]
+    assert summary["cleanup_outcome"] == "empty"
+
+
+@pytest.mark.parametrize(
+    ("outcome_mutation", "queue_jobs", "message"),
+    (
+        (
+            lambda value: value.update(
+                {
+                    "cleanup": {
+                        "recorded_job_ids": value.pop("owned_job_ids"),
+                    }
+                }
+            ),
+            [],
+            "schema",
+        ),
+        (
+            lambda value: None,
+            [{"job_id": "103"}],
+            "queue",
+        ),
+        (
+            lambda value: value.update({"cleanup_outcome": "timeout"}),
+            [],
+            "cleanup outcome",
+        ),
+    ),
+)
+def test_owned_cleanup_sources_reject_invalid_authority(
+    tmp_path: Path,
+    outcome_mutation: object,
+    queue_jobs: list[dict[str, str]],
+    message: str,
+) -> None:
+    outcome_path = tmp_path / "fine-worker-replacement-outcome.json"
+    queue_path = tmp_path / "fine-worker-replacement-queue-after.json"
+    outcome = {
+        "schema_version": 1,
+        "operation": "fine-worker-replacement",
+        "status": "completed",
+        "owned_job_ids": ["100", "101", "103"],
+        "cleanup_outcome": "empty",
+        "workflow_result": {"status": "completed"},
+    }
+    assert callable(outcome_mutation)
+    outcome_mutation(outcome)
+    outcome_path.write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
+    queue_path.write_text(json.dumps({"jobs": queue_jobs}), encoding="utf-8")
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match=message):
+        _owned_cleanup_sources(
+            outcome_path=outcome_path,
+            queue_after_path=queue_path,
+            operation="fine-worker-replacement",
+            status="completed",
+        )
+
+
+def test_fine_acceptance_rejects_outcome_missing_replacement_lineage_job(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    replacement = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["worker_replacement"],
+    )
+    path = tmp_path / "fine-worker-replacement-outcome.json"
+    outcome = json.loads(path.read_text(encoding="utf-8"))
+    outcome["owned_job_ids"] = ["100", "101"]
+    path.write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
+    replacement["owned_job_ids"] = ["100", "101"]
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], replacement["outcome_file"]),
+    )
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="lineage"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_cancellation_outcome_preserves_owned_job_absent_from_placements(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    cancellation = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["cancellation_resume"],
+    )
+
+    assert cancellation["owned_job_ids"] == ["100", "101", "102"]
     assert validate_fine_acceptance_report(report, evidence_root=tmp_path) == report
 
 
@@ -1699,6 +1914,16 @@ def test_fine_acceptance_rejects_mutated_failure_resume_sources(
             "fine-cancellation-trigger.json",
             "trigger_file",
             lambda value: value.update({"status": "waiting"}),
+        ),
+        (
+            "fine-cancellation-outcome.json",
+            "outcome_file",
+            lambda value: value.update({"cleanup_outcome": "timeout"}),
+        ),
+        (
+            "fine-cancellation-slurm-execution.json",
+            "execution_evidence_file",
+            lambda value: value["cleanup"]["cluster"].update({"succeeded": False}),
         ),
         (
             "fine-cancellation-queue-after.json",

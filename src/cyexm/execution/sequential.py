@@ -7,9 +7,13 @@ from datetime import UTC, datetime
 
 from cyexm.config.execution import _validate_execution_profile
 from cyexm.config.models import ExecutionProfile
+from cyexm.execution._fine_common import failed_fine_task_result
 from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
 from cyexm.execution.dispatcher import FineGraphController
-from cyexm.workflow._execution_validation import _FineExecutionEvidence
+from cyexm.workflow._execution_validation import (
+    _FineExecutionEvidence,
+    _validate_fine_task_result,
+)
 from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask, WorkflowTask
 
@@ -208,6 +212,8 @@ class SequentialExecutor:
                 )
             task = ready[0]
             attempts.append((task.key.encoded, 1))
+            started_at = _utc_now()
+            started = time.monotonic()
             try:
                 result = self._run_fine(task)
             except KeyboardInterrupt as error:
@@ -222,6 +228,34 @@ class SequentialExecutor:
                     controller._settled_round_results(),
                     controller.task_results,
                 ) from error
+            except Exception as error:
+                result = failed_fine_task_result(
+                    task,
+                    error,
+                    started_at=started_at,
+                    ended_at=_utc_now(),
+                    duration_seconds=max(0.0, time.monotonic() - started),
+                    hostname=socket.gethostname(),
+                    pid=os.getpid(),
+                    dask_task_key=None,
+                    slurm_job_id=None,
+                )
+            else:
+                try:
+                    result = _validate_fine_task_result(task, result)
+                except Exception as error:
+                    result = failed_fine_task_result(
+                        task,
+                        error,
+                        started_at=started_at,
+                        ended_at=_utc_now(),
+                        duration_seconds=max(0.0, time.monotonic() - started),
+                        hostname=socket.gethostname(),
+                        pid=os.getpid(),
+                        dask_task_key=None,
+                        slurm_job_id=None,
+                    )
+            _validate_fine_task_result(task, result)
             controller.record(task, result)
         self._record_fine_evidence(
             reference_result,

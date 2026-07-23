@@ -298,3 +298,103 @@ def test_fine_result_is_strict_and_json_compatible(tmp_path: Path) -> None:
         replace(result, log_path="/tmp/shared.log")
     with pytest.raises(ValueError, match="prepared descriptor"):
         replace(result, prepared_descriptor={"shape": float("nan")})
+
+
+@pytest.mark.parametrize("invalid_round", (True, 2.0))
+def test_fine_result_json_decoder_requires_exact_integer_round(
+    invalid_round: object,
+    tmp_path: Path,
+) -> None:
+    task = RoundPreparationTask.create(_round_task(tmp_path))
+    result = FineTaskResult(
+        task=task,
+        status="completed",
+        started_at="2026-07-23T00:00:00Z",
+        ended_at="2026-07-23T00:00:01Z",
+        duration_seconds=1.0,
+        hostname="node-1",
+        pid=123,
+        dask_task_key=None,
+        slurm_job_id=None,
+        native_threads=(("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", 2),),
+        artifact_paths=tuple(str(path) for path in task.output_paths),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=None,
+        prepared_descriptor=_descriptor(),
+    )
+    payload = result.to_dict()
+    payload["round"] = invalid_round
+
+    with pytest.raises(TypeError, match="round must be an exact integer"):
+        FineTaskResult.from_dict(task, payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    (
+        ("pid", True),
+        ("pid", 123.0),
+        ("native_thread", True),
+        ("native_thread", 2.0),
+    ),
+)
+def test_fine_result_json_decoder_rejects_noninteger_numeric_evidence(
+    field: str,
+    invalid: object,
+    tmp_path: Path,
+) -> None:
+    task = RoundPreparationTask.create(_round_task(tmp_path))
+    result = FineTaskResult(
+        task=task,
+        status="completed",
+        started_at="2026-07-23T00:00:00Z",
+        ended_at="2026-07-23T00:00:01Z",
+        duration_seconds=1.0,
+        hostname="node-1",
+        pid=123,
+        dask_task_key=None,
+        slurm_job_id=None,
+        native_threads=(("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", 2),),
+        artifact_paths=tuple(str(path) for path in task.output_paths),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=None,
+        prepared_descriptor=_descriptor(),
+    )
+    payload = result.to_dict()
+    if field == "pid":
+        payload["pid"] = invalid
+    else:
+        payload["native_threads"] = [["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", invalid]]
+
+    with pytest.raises(TypeError):
+        FineTaskResult.from_dict(task, payload)
+
+
+def test_fine_result_json_decoder_requires_string_item_identity(
+    tmp_path: Path,
+) -> None:
+    task = RoundPreparationTask.create(_round_task(tmp_path))
+    result = FineTaskResult(
+        task=task,
+        status="completed",
+        started_at="2026-07-23T00:00:00Z",
+        ended_at="2026-07-23T00:00:01Z",
+        duration_seconds=1.0,
+        hostname="node-1",
+        pid=123,
+        dask_task_key=None,
+        slurm_job_id=None,
+        native_threads=(("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", 2),),
+        artifact_paths=tuple(str(path) for path in task.output_paths),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=None,
+        prepared_descriptor=_descriptor(),
+    )
+    payload = result.to_dict()
+    payload["item"] = 1
+
+    with pytest.raises(TypeError, match="item must be an exact string"):
+        FineTaskResult.from_dict(task, payload)

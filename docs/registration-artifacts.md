@@ -39,15 +39,15 @@ under `round_{round}_chunks/`:
 | Artifact | Purpose | Completion record |
 | --- | --- | --- |
 | `chunk_{chunk:04d}_warp.nii.gz` | one readable local forward displacement field | `chunk_{chunk:04d}_warp.nii.gz.complete.json` |
+| `chunk_{chunk:04d}_registered_core.npy` | float32 registered scalar core shared by coarse and fine assembly | `chunk_{chunk:04d}_registered_core.npy.complete.json` |
 | `manifest.json` | canonical ordered grid and identities of every local warp | `manifest.json.complete.json` |
 
 The round-level `nonlinear_warp_{round}.nii.gz` remains a separate artifact. It is the
 full displacement field stitched from all local chunk cores; it is not an alias for a
-local warp. In coarse serial execution, registered scalar chunk data is reconstructed
-from each committed local warp and stitched in memory. Fine-grained execution
-persists an additional internal
-`chunk_{chunk:04d}_registered_core.npy` plus its completion record so assembly can
-resume without repeating successful worker-local reconstruction.
+local warp. Scalar cores are shared coarse/fine serial-chunk artifacts; prepared
+arrays are fine-only. The shared chunk stage commits both each local warp and its
+registered scalar core in either execution mode, so a later coarse or fine assembly
+can resume without repeating successful reconstruction.
 
 ## Fine-grained internal artifacts
 
@@ -68,17 +68,20 @@ extended region. Unequal native source shapes along Z, Y, and X are supported be
 affine application is the first exact fixed-grid boundary, matching legacy
 ClearEx/ANTs behavior.
 
-Each fine chunk commits both its local warp and scalar core. Assembly ignores worker
-completion order: it processes canonical chunks in ascending numeric ID and, in
-expected overlapping legacy output slices, later IDs overwrite earlier values.
-Every fixed-grid voxel must be covered at least once.
+Each serial chunk commits both its local warp and scalar core. Fine scheduling can
+run those shared chunk stages independently; coarse scheduling invokes the same
+stage serially. Assembly ignores worker completion order: it processes canonical
+chunks in ascending numeric ID and, in expected overlapping legacy output slices,
+later IDs overwrite earlier values. Every fixed-grid voxel must be covered at least
+once.
 
 Prepared arrays, scalar cores, and local warps are internal progress. They do not
 make a workflow round complete. Public completion still requires the affine, full
 warp, diagnostic TIFF, metrics, and every declared transformed channel to pass
 ordinary artifact/completion-record validation. The internal `.npy` files remain
-retained for restart and can add four full float32 volumes plus scalar cores to disk
-usage; they do not change the public TIFF export policy.
+retained for restart. Fine mode can add four full float32 prepared volumes, while
+either serial-chunk mode retains scalar cores; these files do not change the public
+TIFF export policy.
 
 Scalar reconstruction is an explicit, versioned part of the request:
 

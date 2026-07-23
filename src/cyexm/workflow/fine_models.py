@@ -776,6 +776,11 @@ class FineTaskResult:
                 "fine task result keys must be exactly "
                 f"{sorted(_FINE_TASK_RESULT_KEYS)!r}"
             )
+        if type(raw["round"]) is not int:
+            raise TypeError("fine task result round must be an exact integer")
+        for name in ("key", "stage", "item"):
+            if type(raw[name]) is not str:
+                raise TypeError(f"fine task result {name} must be an exact string")
         if (
             raw["key"] != task.key.encoded
             or raw["round"] != task.round

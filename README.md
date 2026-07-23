@@ -557,6 +557,8 @@ append to that shared round log; each uses
         round_2_chunks/                            # serial_chunked only
           chunk_0000_warp.nii.gz
           chunk_0000_warp.nii.gz.complete.json
+          chunk_0000_registered_core.npy
+          chunk_0000_registered_core.npy.complete.json
           ...
           manifest.json
           manifest.json.complete.json
@@ -569,6 +571,13 @@ append to that shared round log; each uses
         round-002.log                              # coarse moving round only
         round-002-<stage>-<item>.log               # each fine moving task
 ```
+
+Scalar cores are shared coarse/fine serial-chunk artifacts; prepared arrays are
+fine-only. Both coarse and fine serial chunk execution commit each scalar core and
+its completion record through the shared chunk-stage request, allowing either mode
+to reuse valid chunk reconstruction. Fine execution additionally creates the
+fixed-grid prepared bundle described in
+[Fine-grained execution](docs/fine-grained-execution.md).
 
 Every reusable artifact has its own matching `.complete.json`. A file alone, a
 completion record alone, an invalid identity, or incompatible request evidence is not
@@ -704,11 +713,14 @@ cancel other submitted rounds; all submitted work settles, successful artifacts 
 committed, a failed operational summary is written, and the workflow reports the
 failed round numbers.
 
-Post-execution SLURM evidence validation is a separate exit-3 path. After submitted
-rounds return, Cy-ExM validates the executor's operational evidence before reporting
-success. If that validation fails, it preserves the round results in the operational
-run record, the CLI exits `3`, and a later ordinary run can reuse those valid
-artifacts through normal completion-record validation.
+Invalid fine execution evidence is a separate exit-3 path for sequential, Local
+Dask, and SLURM. After submitted tasks return, Cy-ExM authenticates the executor's
+operational evidence before merging new summaries into the run record.
+Unauthenticated current-run summaries are omitted from durable `rounds`; only
+pre-run authenticated reuse remains, together with the execution-evidence error.
+Valid Phase 1 artifacts committed before rejection remain restartable through
+ordinary completion-record validation even though their unauthenticated operational
+summaries are absent.
 
 Automatic retries default to zero. A positive `task_retries` value is an
 executor-managed resubmission; Dask's opaque future retry count remains zero, and
@@ -726,7 +738,7 @@ artifact validation.
 | --- | --- |
 | `0` | Every round completed or was validly reused. |
 | `2` | Argument, YAML, configuration, input, plan, output, or fingerprint validation failed. |
-| `3` | Executor startup, worker connection, or preflight failure; also invalid SLURM operational evidence, including validation after round execution. Valid committed artifacts remain restartable. |
+| `3` | Executor startup, worker connection, or preflight failure; also invalid fine execution evidence for sequential, Local Dask, or SLURM, including validation after task execution. Unauthenticated current-run summaries are omitted, while valid committed artifacts remain restartable. |
 | `4` | At least one round failed after execution began. |
 | `130` | Operator interruption or termination through the CLI run handler. |
 

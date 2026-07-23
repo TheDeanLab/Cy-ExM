@@ -204,12 +204,14 @@ status command uses that public authority rather than scheduler evidence.
 
 Coarse and fine-grained modes share scientific fingerprints, public filenames,
 ordinary `ArtifactStore` validation, and `StageRequest` identities for their common
-scientific/public artifacts. Fine-only prepared arrays and scalar cores have
-additional requests in that same artifact/provenance schema; coarse execution does
-not create or share those internal requests. A valid coarse full warp and downstream
-output can be reused in fine mode, and a fine result can be reused after switching
-back to coarse. `--force-round` and `--force-all` suppress reuse only within an
-otherwise compatible scientific plan; force never bypasses a fingerprint mismatch.
+scientific/public artifacts. Scalar cores are shared coarse/fine serial-chunk
+artifacts; prepared arrays are fine-only. Coarse serial execution invokes the same
+chunk stage and commits the same scalar-core request that fine workers use, while
+only fine preparation creates the four full-volume arrays and strict prepared
+manifest. A valid coarse chunk, full warp, and downstream output can be reused in
+fine mode, and a fine result can be reused after switching back to coarse.
+`--force-round` and `--force-all` suppress reuse only within an otherwise compatible
+scientific plan; force never bypasses a fingerprint mismatch.
 
 Every fine task writes a unique deterministic log under its round `logs/` directory.
 These are unique per-task logs rather than a concurrently shared round log.

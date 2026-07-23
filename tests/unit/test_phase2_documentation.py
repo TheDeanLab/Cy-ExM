@@ -343,18 +343,20 @@ def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> No
         "| `2` | Argument, YAML, configuration, input, plan, output, or "
         "fingerprint validation failed. |",
         "| `3` | Executor startup, worker connection, or preflight failure; also "
-        "invalid SLURM operational evidence, including validation after round "
-        "execution. Valid committed artifacts remain restartable. |",
+        "invalid fine execution evidence for sequential, Local Dask, or SLURM, "
+        "including validation after task execution. Unauthenticated current-run "
+        "summaries are omitted, while valid committed artifacts remain "
+        "restartable. |",
         "| `4` | At least one round failed after execution began. |",
         "| `130` | Operator interruption or termination through the CLI run handler. |",
     ):
         assert exact_row in readme
 
     for required in (
-        "post-execution slurm evidence validation",
-        "preserves the round results in the operational run record",
-        "the cli exits `3`",
-        "a later ordinary run can reuse those valid artifacts",
+        "invalid fine execution evidence",
+        "unauthenticated current-run summaries are omitted from durable `rounds`",
+        "pre-run authenticated reuse remains",
+        "valid phase 1 artifacts committed before rejection remain restartable",
     ):
         assert required in normalized
 
@@ -456,6 +458,37 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
         "fails closed",
     ):
         assert required in guide
+
+
+def test_maintained_docs_distinguish_shared_cores_and_rejected_evidence() -> None:
+    readme = " ".join(_readme().split()).lower()
+    artifacts = " ".join(
+        (REPOSITORY_ROOT / "docs/registration-artifacts.md")
+        .read_text(encoding="utf-8")
+        .split()
+    ).lower()
+    guide = " ".join(
+        (REPOSITORY_ROOT / "docs/fine-grained-execution.md")
+        .read_text(encoding="utf-8")
+        .split()
+    ).lower()
+
+    for text in (readme, artifacts, guide):
+        assert "scalar cores are shared coarse/fine serial-chunk artifacts" in text
+        assert "prepared arrays are fine-only" in text
+    for required in (
+        "unauthenticated current-run summaries are omitted from durable `rounds`",
+        "pre-run authenticated reuse remains",
+        "invalid fine execution evidence",
+        "sequential, local dask, and slurm",
+    ):
+        assert required in readme
+    for stale in (
+        "coarse serial execution, registered scalar chunk data is reconstructed",
+        "fine-only prepared arrays and scalar cores",
+        "it preserves the round results in the operational run record",
+    ):
+        assert stale not in f"{readme} {artifacts} {guide}"
 
 
 def test_phase_two_acceptance_is_coarse_history_not_fine_slurm_acceptance() -> None:

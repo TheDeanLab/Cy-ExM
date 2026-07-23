@@ -12,9 +12,9 @@ from types import TracebackType
 from typing import Any, cast
 
 from cyexm.errors import RoundExecutionError
+from cyexm.execution._fine_common import failed_fine_task_result
 from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
 from cyexm.execution.dispatcher import FineGraphController
-from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow._execution_validation import (
     _validate_executor_reference_task,
     _validate_executor_round_task,
@@ -138,9 +138,9 @@ def fine_exception_result(
     started: float,
     placement: FineTaskResult | None = None,
 ) -> FineTaskResult:
-    return FineTaskResult(
-        task=task,
-        status="failed",
+    return failed_fine_task_result(
+        task,
+        error,
         started_at=started_at,
         ended_at=utc_now(),
         duration_seconds=max(0.0, time.monotonic() - started),
@@ -148,25 +148,6 @@ def fine_exception_result(
         pid=os.getpid() if placement is None else placement.pid,
         dask_task_key=key,
         slurm_job_id=None if placement is None else placement.slurm_job_id,
-        native_threads=tuple(
-            (
-                name,
-                (
-                    task.native_threads.itk
-                    if name == NATIVE_THREAD_ENV_VARS[0]
-                    else task.native_threads.blas
-                ),
-            )
-            for name in NATIVE_THREAD_ENV_VARS
-        ),
-        artifact_paths=(),
-        reused_artifacts=(),
-        log_path=str(task.log_path),
-        failure=RoundFailure(
-            stage=task.key.stage,
-            exception_type=type(error).__name__,
-            message=str(error),
-        ),
     )
 
 

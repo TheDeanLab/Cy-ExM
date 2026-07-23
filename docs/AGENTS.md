@@ -17,6 +17,10 @@
 - Artifact and restart claims must follow the implementation: a data file alone is
   not a valid cache entry, each artifact has its own completion record, and stale
   records authorize recomputation rather than reuse.
+- Prepared fixed-grid arrays are fine-only, while registered scalar cores are shared
+  coarse/fine serial-chunk artifacts committed by the common chunk stage. Rejected
+  fine execution evidence omits unauthenticated current-run summaries from durable
+  rounds while retaining pre-run authenticated reuse and restartable Phase 1 commits.
 - Treat transform order, interpolation, axes, masks, schedules, and tolerance values
   as scientific statements. Link evidence or explain the characterization behind
   them instead of simplifying them into ambiguous prose.

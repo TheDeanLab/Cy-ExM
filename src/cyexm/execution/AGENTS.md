@@ -54,11 +54,13 @@
   deterministic public summary: validation supplies successful scalar evidence,
   while the earliest canonical failed stage supplies failure evidence. Final-output
   reuse comes from producing tasks, not validation's read-only artifact scan.
-- Validate exact fine task/result identity, configured expanded native-thread
-  evidence, timezone-aware intervals, artifact/log/failure structure, and the
-  adapter's current attempt identity before recording a distributed result. Convert
-  invalid worker evidence into a failed result for the submitted task before applying
-  executor retries; malformed evidence must never release descendants.
+- Every adapter, including sequential, validates exact fine task/result identity,
+  configured expanded native-thread evidence, timezone-aware intervals,
+  artifact/log/failure structure, and current attempt identity before
+  `FineGraphController.record`. Convert invalid or raised worker evidence through the
+  shared scheduler-neutral failed-result constructor before applying any configured
+  executor retries; malformed evidence must never release descendants. Sequential
+  has no retry setting and records one terminal attempt.
 - Fine round wall duration is the interval from the earliest actual task start to
   the latest actual task end. All actual results for one round must agree on native
   thread evidence. Full multi-host, process, scheduler, and log provenance remains

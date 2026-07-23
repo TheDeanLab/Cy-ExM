@@ -1248,6 +1248,55 @@ def test_run_workflow_accepts_the_fine_validation_summary_log(
     assert json.loads(Path(result.run_record).read_text())["execution"] == evidence
 
 
+def test_run_workflow_records_rejected_sequential_fine_evidence_as_round_failure(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, rounds=(2,))
+    plan = replace(
+        plan,
+        execution=replace(
+            plan.execution,
+            parallelism=replace(plan.execution.parallelism, mode="fine_grained"),
+        ),
+    )
+
+    def fine_runner(task: FineWorkflowTask) -> FineTaskResult:
+        result = _fine_task_result(task)
+        if task.key.stage == "whole-image":
+            return replace(
+                result,
+                native_threads=tuple(reversed(result.native_threads)),
+            )
+        return result
+
+    executor = SequentialExecutor(
+        plan.execution,
+        runner=lambda task: _reference_result(cast(ReferenceTask, task)),
+        fine_runner=fine_runner,
+    )
+
+    with pytest.raises(WorkflowExecutionError) as captured:
+        run_workflow(
+            plan,
+            _executor_factory=lambda _profile: executor,
+        )
+
+    record = json.loads(Path(captured.value.run_record).read_text())
+    assert [item["status"] for item in record["rounds"]] == [
+        "completed",
+        "failed",
+    ]
+    assert record["rounds"][1]["failure"]["stage"] == "whole-image"
+    assert record["rounds"][1]["failure"]["exception_type"] == "RoundExecutionError"
+    assert record["execution"]["task_graph"] == [
+        {"key": "round-002:whole-image:main", "dependencies": []}
+    ]
+    assert record["execution"]["attempt_counts"] == [
+        {"task_key": "round-002:whole-image:main", "attempts": 1}
+    ]
+    assert record["execution"]["task_results"][0]["status"] == "failed"
+
+
 def test_parallelism_mode_is_operational_not_scientific_identity(
     tmp_path: Path,
 ) -> None:

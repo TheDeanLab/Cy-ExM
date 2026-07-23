@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import get_type_hints
@@ -19,11 +20,13 @@ from cyexm.config.models import (
 )
 from cyexm.errors import ConfigurationValidationError
 from cyexm.execution import SequentialExecutor, WorkflowExecutor, WorkflowTaskRunner
+from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow._execution_validation import _FineExecutionEvidence
 from cyexm.workflow.fine_models import (
     FineTaskResult,
     FineWorkflowTask,
     RoundPreparationTask,
+    WholeImageRegistrationTask,
 )
 from cyexm.workflow.models import (
     ChannelTask,
@@ -204,7 +207,17 @@ def _fine_result(
         pid=1,
         dask_task_key=None,
         slurm_job_id=None,
-        native_threads=(("itk", 2), ("blas", 3)),
+        native_threads=tuple(
+            (
+                name,
+                (
+                    task.native_threads.itk
+                    if name == NATIVE_THREAD_ENV_VARS[0]
+                    else task.native_threads.blas
+                ),
+            )
+            for name in NATIVE_THREAD_ENV_VARS
+        ),
         artifact_paths=(
             tuple(str(path) for path in task.output_paths)
             if status in {"completed", "reused"}
@@ -471,6 +484,175 @@ def test_sequential_fine_mode_settles_ready_siblings_after_failure(
         "round-002:chunk:0000",
         "round-002:chunk:0001",
     ]
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    (
+        lambda result: replace(
+            result,
+            native_threads=tuple(reversed(result.native_threads)),
+        ),
+        lambda result: replace(
+            result,
+            native_threads=(
+                ("NOT_A_NATIVE_THREAD_VARIABLE", 2),
+                *result.native_threads[1:],
+            ),
+        ),
+        lambda result: replace(
+            result,
+            native_threads=(
+                (result.native_threads[0][0], 99),
+                *result.native_threads[1:],
+            ),
+        ),
+        lambda result: replace(result, started_at="not-a-timestamp"),
+    ),
+    ids=("thread-order", "thread-name", "thread-value", "timestamp"),
+)
+def test_sequential_fine_mode_rejects_malformed_result_before_descendants(
+    corrupt: Callable[[FineTaskResult], FineTaskResult],
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
+
+    def fine_runner(task: FineWorkflowTask) -> FineTaskResult:
+        calls.append(task.key.encoded)
+        result = _fine_result(task)
+        if task.round == 2 and type(task) is WholeImageRegistrationTask:
+            return corrupt(result)
+        return result
+
+    executor = SequentialExecutor(
+        _profile(tmp_path, "fine_grained"),
+        runner=_successful_result,
+        fine_runner=fine_runner,
+    )
+    reference, rejected, sibling = executor.execute(
+        _reference_task(tmp_path),
+        tasks,
+    )
+
+    assert (reference.status, rejected.status, sibling.status) == (
+        "completed",
+        "failed",
+        "completed",
+    )
+    assert rejected.failure is not None
+    assert rejected.failure.stage == "whole-image"
+    assert rejected.failure.exception_type == "RoundExecutionError"
+    assert not any(call.startswith("round-002:channel") for call in calls)
+    assert not any(call.startswith("round-002:validation") for call in calls)
+    assert "round-003:validation:main" in calls
+    assert executor.execution_evidence.attempt_counts[0] == (
+        "round-002:whole-image:main",
+        1,
+    )
+    rejected_evidence = executor.execution_evidence.task_results[0]
+    assert rejected_evidence.status == "failed"
+    assert rejected_evidence.native_threads == tuple(
+        (
+            name,
+            (
+                tasks[0].native_threads.itk
+                if name == NATIVE_THREAD_ENV_VARS[0]
+                else tasks[0].native_threads.blas
+            ),
+        )
+        for name in NATIVE_THREAD_ENV_VARS
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("artifact", "log", "wrong-task", "wrong-result", "raised"),
+)
+def test_sequential_fine_mode_converts_invalid_or_raised_evidence_to_failure(
+    defect: str,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    task = _task(tmp_path, 2)
+
+    def fine_runner(fine_task: FineWorkflowTask) -> FineTaskResult:
+        calls.append(fine_task.key.encoded)
+        if type(fine_task) is not WholeImageRegistrationTask:
+            return _fine_result(fine_task)
+        if defect == "raised":
+            raise RuntimeError("injected runner failure")
+        if defect == "wrong-result":
+            return object()  # type: ignore[return-value]
+        if defect == "wrong-task":
+            return _fine_result(WholeImageRegistrationTask.create(_task(tmp_path, 99)))
+        result = _fine_result(fine_task)
+        if defect == "artifact":
+            object.__setattr__(result, "artifact_paths", ("/forged/artifact",))
+        else:
+            object.__setattr__(result, "log_path", "/forged/log")
+        return result
+
+    executor = SequentialExecutor(
+        _profile(tmp_path, "fine_grained"),
+        runner=_successful_result,
+        fine_runner=fine_runner,
+    )
+    reference, rejected = executor.execute(_reference_task(tmp_path), (task,))
+
+    assert reference.status == "completed"
+    assert rejected.status == "failed"
+    assert rejected.failure is not None
+    assert rejected.failure.stage == "whole-image"
+    assert calls == ["round-002:whole-image:main"]
+    evidence = executor.execution_evidence
+    assert evidence.task_graph == (("round-002:whole-image:main", ()),)
+    assert evidence.attempt_counts == (("round-002:whole-image:main", 1),)
+    assert evidence.task_results[0].status == "failed"
+
+
+def test_sequential_fine_mode_rejects_malformed_prepared_manifest_as_task_failure(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    chunked = replace(
+        _task(tmp_path, 2),
+        strategy="serial_chunked",
+        chunk_size_zyx=(4, 8, 8),
+        overlap_fraction=0.0,
+    )
+    sibling = _task(tmp_path, 3)
+
+    def fine_runner(task: FineWorkflowTask) -> FineTaskResult:
+        calls.append(task.key.encoded)
+        result = _fine_result(task)
+        if type(task) is RoundPreparationTask:
+            return replace(result, prepared_descriptor={"bad": "descriptor"})
+        return result
+
+    executor = SequentialExecutor(
+        _profile(tmp_path, "fine_grained"),
+        runner=_successful_result,
+        fine_runner=fine_runner,
+    )
+    reference, rejected, completed = executor.execute(
+        _reference_task(tmp_path),
+        (chunked, sibling),
+    )
+
+    assert (reference.status, rejected.status, completed.status) == (
+        "completed",
+        "failed",
+        "completed",
+    )
+    assert rejected.failure is not None
+    assert rejected.failure.stage == "preparation"
+    assert rejected.failure.exception_type == "RoundExecutionError"
+    assert not any(call.startswith("round-002:chunk") for call in calls)
+    assert "round-003:validation:main" in calls
+    preparation = executor.execution_evidence.task_results[0]
+    assert preparation.status == "failed"
+    assert preparation.prepared_descriptor is None
 
 
 def test_sequential_fine_interruption_retains_actual_task_evidence(

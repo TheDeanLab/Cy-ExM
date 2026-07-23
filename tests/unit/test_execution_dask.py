@@ -25,7 +25,11 @@ from cyexm.errors import ExecutorStartupError, RoundExecutionError
 from cyexm.execution import dask as dask_module
 from cyexm.execution.dask import LocalDaskExecutor
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
-from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
+from cyexm.workflow.fine_models import (
+    FineTaskResult,
+    FineWorkflowTask,
+    RoundPreparationTask,
+)
 from cyexm.workflow.models import (
     ChannelTask,
     ReferenceChannelTask,
@@ -152,6 +156,45 @@ def _reference_task(tmp_path: Path) -> ReferenceTask:
     )
 
 
+def _chunked_task(tmp_path: Path, round_number: int) -> RoundTask:
+    return replace(
+        _task(tmp_path, round_number),
+        strategy="serial_chunked",
+        chunk_size_zyx=(2, 8, 8),
+        overlap_fraction=0.25,
+    )
+
+
+def _prepared_descriptor() -> dict[str, object]:
+    identity = {"path": "/tmp/item", "st_size": 1, "st_mtime_ns": 2}
+    return {
+        "format_version": 1,
+        "fixed_scalar": identity,
+        "moving_linear_scalar": identity,
+        "fixed_mask": identity,
+        "moving_linear_mask": identity,
+        "native_fixed": identity,
+        "native_moving": identity,
+        "moving_crop": None,
+        "affine": identity,
+        "geometry": {
+            "shape": [4, 8, 8],
+            "origin": [0.0, 0.0, 0.0],
+            "spacing": [1.0, 1.0, 1.0],
+            "direction": [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        },
+        "scalar_policy": "float32-preserve-registration-values-v1",
+        "mask_policy": (
+            "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
+        ),
+        "native_threads": {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 2},
+    }
+
+
 def _result(task: RoundTask, *, status: str = "completed") -> RoundResult:
     failure = (
         RoundFailure("round", "RuntimeError", "injected failed result")
@@ -253,6 +296,11 @@ def _fine_result(
         reused_artifacts=(),
         log_path=str(task.log_path),
         failure=failure,
+        prepared_descriptor=(
+            _prepared_descriptor()
+            if type(task) is RoundPreparationTask and status in {"completed", "reused"}
+            else None
+        ),
     )
 
 
@@ -755,6 +803,96 @@ def test_fine_local_executor_retries_malformed_evidence_before_descendants(
     ]
     assert executor._fine_attempt_counts[0] == (
         initial.key.encoded,
+        2,
+    )
+
+
+def test_fine_local_executor_rejects_bad_prep_descriptor_and_settles_sibling(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    chunked = _chunked_task(tmp_path, 2)
+    sibling = _task(tmp_path, 3)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    preparation = initial_fine_tasks((chunked,))[0]
+    assert type(preparation) is RoundPreparationTask
+    modules.outcomes[preparation.key.encoded] = [
+        replace(
+            _fine_result(preparation),
+            prepared_descriptor={"bad": "descriptor"},
+        )
+    ]
+
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
+    reference, chunked_result, sibling_result = executor.execute(
+        _reference_task(tmp_path),
+        (chunked, sibling),
+    )
+
+    assert reference.status == "completed"
+    assert chunked_result.status == "failed"
+    assert sibling_result.status == "completed"
+    assert chunked_result.failure is not None
+    assert chunked_result.failure.stage == "preparation"
+    assert len(executor._fine_task_results) == 4
+    preparation_result = next(
+        result
+        for result in executor._fine_task_results
+        if result.task.key == preparation.key
+    )
+    assert preparation_result.status == "failed"
+    assert preparation_result.dask_task_key == "cyexm-round-002-preparation-main"
+    assert not any(
+        hasattr(call.task, "key")
+        and call.task.round == 2
+        and call.task.key.stage == "chunk"
+        for call in modules.submit_calls
+    )
+
+
+def test_fine_local_executor_retries_malformed_preparation_descriptor_before_chunks(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    chunked = _chunked_task(tmp_path, 2)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    preparation = initial_fine_tasks((chunked,))[0]
+    assert type(preparation) is RoundPreparationTask
+    modules.outcomes[preparation.key.encoded] = [
+        replace(
+            _fine_result(preparation),
+            prepared_descriptor={"bad": "descriptor"},
+        ),
+        _fine_result(preparation),
+    ]
+
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, retries=1, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
+    result = executor.execute(_reference_task(tmp_path), (chunked,))[1]
+
+    assert result.status == "completed"
+    round_calls = [
+        call for call in modules.submit_calls if call.task.round == chunked.round
+    ]
+    assert [call.task.key.stage for call in round_calls[:2]] == [  # type: ignore[union-attr]
+        "preparation",
+        "preparation",
+    ]
+    assert all(  # type: ignore[union-attr]
+        call.task.key.stage != "chunk" for call in round_calls[:2]
+    )
+    assert any(  # type: ignore[union-attr]
+        call.task.key.stage == "chunk" for call in round_calls[2:]
+    )
+    assert executor._fine_attempt_counts[0] == (
+        preparation.key.encoded,
         2,
     )
 

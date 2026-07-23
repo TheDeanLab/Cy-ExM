@@ -17,6 +17,10 @@
   exactly one immutable stage, and never create clients, workers, or descendant
   tasks. Concurrent stages use deterministic per-task logs rather than the coarse
   round log.
+- Validate successful preparation evidence with the authoritative
+  `PreparedManifest` parser before graph expansion. Malformed worker descriptors
+  must become ordinary current-attempt failures so configured retries and
+  independent-sibling settlement remain intact.
 - Fine failure results may retain only task-planned artifacts explicitly accepted by
   the current delegate through the exact Phase 1 artifact-store request boundary and
   still backed by the identical canonical completion record. Never infer partial

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from cyexm.config.models import (
     RegistrationStageSpec,
 )
 from cyexm.errors import RoundExecutionError, WorkflowPlanError
+from cyexm.registration.prepared import PreparedManifest
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow.fine_models import (
     FineTaskResult,
@@ -653,6 +655,18 @@ def _validate_fine_task_result(
             raise RoundExecutionError(
                 f"{location} successful preparation requires its descriptor"
             )
+        if result.status in {"completed", "reused"}:
+            descriptor = result.to_dict()["prepared_descriptor"]
+            if not isinstance(descriptor, Mapping):
+                raise RoundExecutionError(
+                    f"{location} prepared descriptor must be a JSON object"
+                )
+            try:
+                PreparedManifest.from_dict(descriptor)
+            except (TypeError, ValueError) as error:
+                raise RoundExecutionError(
+                    f"{location} prepared descriptor violates PreparedManifest: {error}"
+                ) from error
     elif result.prepared_descriptor is not None:
         raise RoundExecutionError(
             f"{location} prepared descriptor belongs only to preparation"

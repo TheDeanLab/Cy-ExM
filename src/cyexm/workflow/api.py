@@ -100,7 +100,7 @@ def _default_executor_factory(profile: ExecutionProfile) -> WorkflowExecutor:
     if profile.executor == "sequential":
         from cyexm.workflow.task import run_workflow_task
 
-        return SequentialExecutor(runner=run_workflow_task)
+        return SequentialExecutor(profile, runner=run_workflow_task)
     if profile.executor == "local_dask":
         from cyexm.execution.dask import LocalDaskExecutor
 

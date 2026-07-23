@@ -32,6 +32,20 @@
 - Default retries are zero. Any configured retry is an executor-managed resubmission
   through ordinary artifact validation. A post-preflight round failure does not
   cancel independent round tasks; settle them before reporting aggregate failure.
+- Fine-grained execution uses the scheduler-neutral `FineGraphController`. Admit
+  ready work round-robin across rounds, remain work-conserving when only one round is
+  ready, and never release a task before every exact dependency succeeds. Failed
+  tasks block only their descendants; already admitted siblings and independent
+  rounds must settle.
+- Preserve every actual fine-task result in canonical task order. Never synthesize a
+  result for blocked or never-submitted descendants. The ordinary `RoundResult` is a
+  deterministic public summary: validation supplies successful scalar evidence,
+  while the earliest canonical failed stage supplies failure evidence. Final-output
+  reuse comes from producing tasks, not validation's read-only artifact scan.
+- Fine round wall duration is the interval from the earliest actual task start to
+  the latest actual task end. All actual results for one round must agree on native
+  thread evidence. Full multi-host, process, scheduler, and log provenance remains
+  per-task evidence; never concatenate it into singular `RoundResult` fields.
 - Allow no nested tasks. Permit no nested chunk scheduling or silent fallback.
 - On operator cancellation, stop submission and cancel unfinished futures. Always
   close the client before its owned cluster on success, failure, and cancellation,

@@ -2816,7 +2816,9 @@ def test_run_workflow_cancelled_summary_preserves_completed_sequential_rounds(
     with pytest.raises(KeyboardInterrupt, match="injected"):
         run_workflow(
             plan,
-            _executor_factory=_factory(SequentialExecutor(runner=runner)),
+            _executor_factory=_factory(
+                SequentialExecutor(plan.execution, runner=runner)
+            ),
         )
 
     records = tuple(

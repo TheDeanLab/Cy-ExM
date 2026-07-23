@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
+from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
 from cyexm.workflow.models import (
     ReferenceTask,
     RoundResult,
@@ -12,6 +13,7 @@ from cyexm.workflow.models import (
 )
 
 type WorkflowTaskRunner = Callable[[WorkflowTask], WorkflowTaskResult]
+type FineWorkflowTaskRunner = Callable[[FineWorkflowTask], FineTaskResult]
 
 
 class WorkflowExecutor(Protocol):
@@ -25,4 +27,4 @@ class WorkflowExecutor(Protocol):
         raise NotImplementedError
 
 
-__all__ = ["WorkflowExecutor", "WorkflowTaskRunner"]
+__all__ = ["FineWorkflowTaskRunner", "WorkflowExecutor", "WorkflowTaskRunner"]

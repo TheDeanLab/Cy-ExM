@@ -57,8 +57,10 @@ Tasks:
   nonlinear chunks, three moving channels, completion-order-independent legacy
   assembly, and two-stage exact restart are green. A RED-exposed prepared regional
   pixeltype defect is fixed with format-version-2 manifest/request identity and
-  exact ANTs reconstruction; full gates: 2,266 unit, 61 integration, repository
-  Ruff/BasedPyright/pre-commit clean.
+  exact ANTs reconstruction. Review remediation now proves bitwise scalar-core
+  parity plus authoritative requests and exact only-missing restart status/identity
+  across the full accepted chain; full gates: 2,266 unit, 61 integration,
+  repository Ruff/BasedPyright/pre-commit clean.
 - Task 11: pending
 - Task 12: pending
 - Task 13: pending

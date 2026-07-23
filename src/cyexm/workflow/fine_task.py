@@ -794,7 +794,8 @@ def _run_validation(task: RoundValidationTask) -> _StageOutcome:
         raise RuntimeError(f"round completion validation failed: {missing!r}")
     return _StageOutcome(
         artifact_paths=task.output_paths,
-        reused_artifacts=task.output_paths,
+        # Validation executes afresh even when every accepted artifact is reused.
+        reused_artifacts=(),
         prepared_descriptor=None,
     )
 

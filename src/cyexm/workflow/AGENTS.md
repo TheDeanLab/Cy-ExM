@@ -46,6 +46,9 @@
   overlapping output slices. Scheduling and completion order must not change the
   canonical assembly order or scientific artifact identity.
 - Phase 1 completion records remain the only restart authority.
+- Round validation always executes the accepted full-chain check and therefore
+  reports `completed`; reused upstream artifacts remain identified by their
+  producer-task results and completion records.
 - Status must reconstruct moving-round provenance from the prepared reference TIFF's
   persisted geometry, not the native reference source grid. An unreadable prepared
   reference cannot authorize any moving-round completion chain.

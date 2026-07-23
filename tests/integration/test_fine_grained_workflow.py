@@ -26,6 +26,7 @@ from cyexm.config.models import (
 from cyexm.execution.sequential import SequentialExecutor
 from cyexm.io.tiff import read_tiff_geometry
 from cyexm.metrics import read_metrics
+from cyexm.registration._request_policy import CHUNK_SCALAR_POLICY
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
 from cyexm.registration.backend import AntsRegistrationBackend
 from cyexm.registration.prepared import (
@@ -229,6 +230,19 @@ def _artifact_identities(
         )
         for path in paths
     )
+
+
+def _assert_artifacts_absent(paths: tuple[Path, ...]) -> None:
+    store = ArtifactStore()
+    for path in paths:
+        assert not path.exists()
+        assert not store.record_path(path).exists()
+
+
+def _result_statuses(
+    results: list[FineTaskResult],
+) -> tuple[tuple[str, str], ...]:
+    return tuple((result.key.encoded, result.status) for result in results)
 
 
 def _assert_warp_equal(
@@ -450,22 +464,51 @@ def test_seeded_real_ants_coarse_and_fine_outputs_match_on_fixed_grid(
     for chunk in chunks:
         region = read_prepared_region(prepared_manifest, chunk)
         assert region.geometry.shape == chunk.extended_shape
-        local_warp = (
+        coarse_warp = (
+            coarse_paths.output
+            / f"round_{_ROUND}_chunks"
+            / f"chunk_{chunk.chunk_id:04d}_warp.nii.gz"
+        )
+        fine_warp = (
             fine_paths.output
             / f"round_{_ROUND}_chunks"
             / f"chunk_{chunk.chunk_id:04d}_warp.nii.gz"
         )
         assert geometry_compatible(
-            backend.geometry(backend.read_warp(local_warp)),
+            backend.geometry(backend.read_warp(fine_warp)),
             region.geometry,
         )
-        core = np.load(
-            local_warp.with_name(f"chunk_{chunk.chunk_id:04d}_registered_core.npy"),
+        coarse_core_path = coarse_warp.with_name(
+            f"chunk_{chunk.chunk_id:04d}_registered_core.npy"
+        )
+        fine_core_path = fine_warp.with_name(
+            f"chunk_{chunk.chunk_id:04d}_registered_core.npy"
+        )
+        coarse_core = np.load(
+            coarse_core_path,
             allow_pickle=False,
         )
-        assert core.shape == chunk.core_shape
-        assert core.dtype == np.dtype(np.float32)
-        assert np.isfinite(core).all()
+        fine_core = np.load(fine_core_path, allow_pickle=False)
+        assert coarse_core.shape == fine_core.shape == chunk.core_shape
+        assert coarse_core.dtype == fine_core.dtype == np.dtype(np.float32)
+        assert np.isfinite(coarse_core).all()
+        assert np.isfinite(fine_core).all()
+        np.testing.assert_array_equal(coarse_core, fine_core)
+        for core_path, warp_path in (
+            (coarse_core_path, coarse_warp),
+            (fine_core_path, fine_warp),
+        ):
+            record = _assert_completion(core_path)
+            assert record.request.stage == (
+                f"nonlinear-chunk-scalar-core:{chunk.chunk_id}"
+            )
+            assert record.request.method == "local-warp-reconstruction"
+            assert record.request.accuracy == "exact"
+            assert record.request.geometry == region.geometry
+            assert record.request.upstream == FileIdentity.from_path(warp_path)
+            assert record.request.parameters == {
+                "scalar_postprocessing_policy": CHUNK_SCALAR_POLICY
+            }
 
 
 def test_fine_restart_preserves_two_chunks_then_one_channel_exactly(
@@ -483,11 +526,19 @@ def test_fine_restart_preserves_two_chunks_then_one_channel_exactly(
     plan = build_workflow_plan(fine_scientific_case.manifest, profile)
     task = plan.tasks[0]
     paths = _registration_paths(plan)
+    prepared = PreparedRoundPaths.for_round(paths.output, _ROUND)
     chunks = compute_chunk_grid(_FIXED_SHAPE, _CHUNK_SIZE, _OVERLAP)
     assert len(chunks) == 4
-    chunk_outputs = tuple(
+    preparation_outputs = (
+        paths.affine,
+        paths.pre_metrics,
+        paths.linear_metrics,
+        *prepared.array_paths,
+        prepared.manifest,
+    )
+    all_chunk_outputs = tuple(
         path
-        for chunk in chunks[:2]
+        for chunk in chunks
         for path in (
             paths.output
             / f"round_{_ROUND}_chunks"
@@ -497,6 +548,15 @@ def test_fine_restart_preserves_two_chunks_then_one_channel_exactly(
             / f"chunk_{chunk.chunk_id:04d}_registered_core.npy",
         )
     )
+    first_two_chunk_outputs = all_chunk_outputs[:4]
+    remaining_chunk_outputs = all_chunk_outputs[4:]
+    assembly_outputs = (
+        paths.warp,
+        paths.registered,
+        paths.nonlinear_metrics,
+        paths.output / f"round_{_ROUND}_chunks" / "manifest.json",
+    )
+    channel_outputs = tuple(channel.output for channel in task.channels)
 
     first_results: list[FineTaskResult] = []
     committed_chunks = 0
@@ -519,8 +579,17 @@ def test_fine_restart_preserves_two_chunks_then_one_channel_exactly(
     with pytest.raises(KeyboardInterrupt, match="after two committed chunks"):
         first.execute(plan.reference_task, plan.tasks)
     assert committed_chunks == 2
-    assert all(path.is_file() for path in chunk_outputs)
-    chunk_identities = _artifact_identities(chunk_outputs)
+    assert _result_statuses(first_results) == (
+        ("round-002:preparation:main", "completed"),
+        ("round-002:chunk:0000", "completed"),
+        ("round-002:chunk:0001", "completed"),
+    )
+    assert all(path.is_file() for path in first_two_chunk_outputs)
+    _assert_artifacts_absent(
+        (*remaining_chunk_outputs, *assembly_outputs, *channel_outputs)
+    )
+    first_chain = (*preparation_outputs, *first_two_chunk_outputs)
+    first_chain_identities = _artifact_identities(first_chain)
 
     second_results: list[FineTaskResult] = []
     committed_channels = 0
@@ -542,18 +611,26 @@ def test_fine_restart_preserves_two_chunks_then_one_channel_exactly(
     )
     with pytest.raises(KeyboardInterrupt, match="after one committed channel"):
         second.execute(plan.reference_task, plan.tasks)
-    assert _artifact_identities(chunk_outputs) == chunk_identities
-    first_two_resumed = tuple(
-        result
-        for result in second_results
-        if type(result.task) is NonlinearChunkTask
-        and result.task.chunk.chunk_id in {0, 1}
+    assert _result_statuses(second_results) == (
+        ("round-002:preparation:main", "reused"),
+        ("round-002:chunk:0000", "reused"),
+        ("round-002:chunk:0001", "reused"),
+        ("round-002:chunk:0002", "completed"),
+        ("round-002:chunk:0003", "completed"),
+        ("round-002:assembly:main", "completed"),
+        ("round-002:channel:0000", "completed"),
     )
-    assert len(first_two_resumed) == 2
-    assert {result.status for result in first_two_resumed} == {"reused"}
+    assert _artifact_identities(first_chain) == first_chain_identities
+    _assert_artifacts_absent(channel_outputs[1:])
 
     first_channel = task.channels[0].output
-    first_channel_identities = _artifact_identities((first_channel,))
+    second_chain = (
+        *preparation_outputs,
+        *all_chunk_outputs,
+        *assembly_outputs,
+        first_channel,
+    )
+    second_chain_identities = _artifact_identities(second_chain)
     final_results: list[FineTaskResult] = []
 
     def recording_runner(fine_task: FineWorkflowTask) -> FineTaskResult:
@@ -571,15 +648,17 @@ def test_fine_restart_preserves_two_chunks_then_one_channel_exactly(
         "completed",
         "completed",
     )
-    assert _artifact_identities(chunk_outputs) == chunk_identities
-    assert _artifact_identities((first_channel,)) == first_channel_identities
-    channel_results = tuple(
-        result for result in final_results if type(result.task) is ChannelTransformTask
+    assert _result_statuses(final_results) == (
+        ("round-002:preparation:main", "reused"),
+        ("round-002:chunk:0000", "reused"),
+        ("round-002:chunk:0001", "reused"),
+        ("round-002:chunk:0002", "reused"),
+        ("round-002:chunk:0003", "reused"),
+        ("round-002:assembly:main", "reused"),
+        ("round-002:channel:0000", "reused"),
+        ("round-002:channel:0001", "completed"),
+        ("round-002:channel:0002", "completed"),
+        ("round-002:validation:main", "completed"),
     )
-    assert len(channel_results) == 3
-    assert tuple(result.status for result in channel_results) == (
-        "reused",
-        "completed",
-        "completed",
-    )
+    assert _artifact_identities(second_chain) == second_chain_identities
     assert all(path.is_file() for path in plan.expected_artifacts)

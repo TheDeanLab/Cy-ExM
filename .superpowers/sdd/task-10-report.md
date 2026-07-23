@@ -64,9 +64,15 @@ ascending canonical chunk IDs still overwrite earlier IDs in overlaps.
   and deterministic `(2, 0, 3, 1)` completion order. Full warp and diagnostic
   arrays are identical under the approved ascending-ID overwrite rule.
 - A staged interruption after two committed chunks preserves all artifact and
-  completion-record identities. Resume reports those chunks reused, then interruption
-  after one committed channel preserves that channel exactly. Final resume reuses
-  it and executes only the two missing channels.
+  completion-record identities across affine/metrics, the prepared bundle, and both
+  chunks. Resume pins preparation and chunks 0/1 as reused, chunks 2/3 and assembly
+  as completed, and interruption after completed channel 0 preserves the entire
+  accepted chain exactly. Final resume pins preparation, all chunks, assembly, and
+  channel 0 as reused; only channels 1/2 and fresh full-chain validation complete.
+- Every corresponding coarse/fine scalar-core array is bitwise identical with exact
+  float32 dtype and canonical core shape. Its completion request is bound to the
+  exact local warp identity, regional fixed geometry, scalar policy, and native
+  thread evidence.
 - Process Local Dask compares sequential affine, every local warp/core, full warp,
   all prepared arrays, metrics, diagnostic, transformed channels, geometry, and
   authoritative requests. Two chunk workers have distinct PIDs, each uses one slot,
@@ -83,9 +89,9 @@ identity requirements.
 
 ## Verification
 
-- Focused Task 10 real-ANTs suite: 10 passed in 37.28 seconds.
-- Full portable unit suite: 2,266 passed in 31.15 seconds.
-- Full portable integration suite: 61 passed in 46.81 seconds.
+- Focused Task 10 real-ANTs suite: 9 passed in 39.08 seconds.
+- Full portable unit suite: 2,266 passed in 29.62 seconds.
+- Full portable integration suite: 61 passed in 48.88 seconds.
 - `uv lock --check`: passed.
 - Repository Ruff check and format check: passed.
 - Repository BasedPyright: 0 errors, warnings, or notes.

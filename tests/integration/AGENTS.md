@@ -36,8 +36,11 @@
   without weakening the established deterministic tolerance.
 - Fine scientific regressions use at least four real nonlinear chunks and three
   moving channels overall, compare every affine/warp/core/metric/channel artifact,
-  permute valid chunk completion order, and interrupt after committed chunk and
-  channel boundaries to prove exact ArtifactStore-authorized restart identities.
+  including scalar-core arrays and their authoritative completion requests, permute
+  valid chunk completion order, and interrupt after committed chunk and channel
+  boundaries. Restart tests must pin canonical task keys/statuses, absence of
+  not-yet-run work, and artifact plus completion-record identities across the full
+  accepted upstream/output chain.
 - `legacy_baseline.py` is executed only from the pinned ClearEx environment at commit
   `2311a873b783477add7391ff00245f76490147f0`. It may write only to its explicit
   `--output` directory and must never modify the ClearEx checkout.

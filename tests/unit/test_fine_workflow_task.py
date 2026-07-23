@@ -961,7 +961,10 @@ def test_validation_adapter_requires_and_returns_exact_outputs(
         ),
     )
 
-    assert worker._run_validation(task).artifact_paths == task.output_paths
+    outcome = worker._run_validation(task)
+
+    assert outcome.artifact_paths == task.output_paths
+    assert outcome.reused_artifacts == ()
 
 
 def test_exact_dispatch_rejects_fine_task_subclasses(tmp_path: Path) -> None:

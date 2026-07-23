@@ -115,6 +115,15 @@
   closed if replacement validation does not complete. Reconciliation at the current
   cap must not issue another scale request. Local Dask retains its scheduler-native
   blocking completion behavior.
+- Use one absolute coordinator-owned startup-timeout deadline for the complete
+  replacement transaction: health/arrival snapshots, worker arrival, probe
+  broadcast, candidate resource checks, every scheduler activation, and the final
+  identity/resource snapshot. Run the remote probe through a bounded daemon worker
+  thread so blocking filesystem or import checks do not block the Dask worker event
+  loop; guard synchronous client/scheduler calls with daemon coordinator threads.
+  On deadline failure, record the exact stage, best-effort force-cancel active work,
+  and close client before cluster. Never apply this control-plane deadline to the
+  scientific future itself.
 - Scheduler-neutral cancellation evidence must bind the exact caught interruption
   type/message and the actual cancellation outcome. Sequential cancellation is
   explicitly `not_applicable`; distributed cancellation distinguishes no unfinished

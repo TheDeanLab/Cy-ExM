@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -473,11 +475,17 @@ class _FakeClient:
 
     def wait_for_workers(self, workers: int, *, timeout: float) -> None:
         self._modules.wait_for_workers_calls.append((workers, timeout))
+        if self._modules.hang_wait_for_workers:
+            time.sleep(self._modules.hang_seconds)
         if self._modules.wait_error is not None:
             raise self._modules.wait_error
 
     def scheduler_info(self) -> dict[str, object]:
         self._modules.scheduler_info_calls += 1
+        if self._modules.hang_next_scheduler_info_seconds is not None:
+            duration = self._modules.hang_next_scheduler_info_seconds
+            self._modules.hang_next_scheduler_info_seconds = None
+            time.sleep(duration)
         if self._modules.scheduler_info_hook is not None:
             self._modules.scheduler_info_hook(self._modules.scheduler_info_calls)
         addresses = self._modules.connected_workers
@@ -514,6 +522,8 @@ class _FakeClient:
     ) -> Mapping[str, Mapping[str, object]]:
         self._modules.events.append("client.run")
         self._modules.run_calls.append((function, kwargs))
+        if self._modules.hang_run_call == len(self._modules.run_calls):
+            time.sleep(self._modules.hang_seconds)
         if self._modules.run_error is not None:
             raise self._modules.run_error
         selected = kwargs.get("workers")
@@ -544,15 +554,23 @@ class _FakeClient:
         activation_count = sum(
             event.startswith("activate:") for event in self._modules.events
         )
+        if self._modules.hang_activation_call == activation_count:
+            time.sleep(self._modules.hang_seconds)
         if self._modules.activation_error is not None and (
             self._modules.activation_error_call is None
             or activation_count == self._modules.activation_error_call
         ):
             raise self._modules.activation_error
-        return function(
+        result = function(
             worker_address=worker_address,
             dask_scheduler=self._modules.fake_scheduler,
         )
+        if (
+            self._modules.hang_post_activation_call is not None
+            and activation_count == self._modules.hang_post_activation_call
+        ):
+            self._modules.hang_next_scheduler_info_seconds = self._modules.hang_seconds
+        return result
 
     def submit(
         self,
@@ -641,6 +659,13 @@ class _FakeSlurmModules:
         self.run_calls: list[tuple[Callable[..., object], dict[str, object]]] = []
         self.scheduler_info_calls = 0
         self.scheduler_info_hook: Callable[[int], None] | None = None
+        self.hang_seconds = 0.15
+        self.hang_run_call: int | None = None
+        self.hang_wait_for_workers = False
+        self.hang_activation_call: int | None = None
+        self.hang_post_activation_call: int | None = None
+        self.hang_next_scheduler_info_seconds: float | None = None
+        self.parsed_timeout_seconds = 900.0
         self.events: list[str] = []
         self.cancel_call: tuple[tuple[_FakeFuture, ...], bool] | None = None
         self.outcomes: dict[int | str, list[object]] = {}
@@ -800,7 +825,7 @@ class _FakeSlurmModules:
 
     def parse_timedelta(self, value: str) -> float:
         assert value == "15m"
-        return 900.0
+        return self.parsed_timeout_seconds
 
 
 def _executor(
@@ -845,6 +870,36 @@ def test_real_module_loader_gets_timeout_parser_from_pinned_dask_utils(
 
     assert modules.parse_timedelta is timeout_parser
     assert modules.config_set is config_set
+
+
+def test_replacement_probe_timeout_does_not_block_worker_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def hung_probe(**_kwargs: object) -> dict[str, object]:
+        time.sleep(0.15)
+        return {}
+
+    monkeypatch.setattr(slurm_module, "probe_worker", hung_probe)
+    started = time.monotonic()
+
+    with pytest.raises(WorkerPreflightError, match="worker probe"):
+        slurm_module._probe_worker_before_timeout(
+            timeout_seconds=0.03,
+            dataset_root="/dataset",
+            output_root="/output",
+            worker_local_directory="/scratch",
+            expected_versions={"cy-exm": "test"},
+            expected_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": "1"},
+        )
+
+    assert time.monotonic() - started < 0.13
+    probe_threads = [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == "cyexm-slurm-worker-probe"
+    ]
+    assert probe_threads
+    assert all(thread.daemon for thread in probe_threads)
 
 
 def test_slurm_executor_builds_one_process_jobs_with_round_resource(
@@ -1301,6 +1356,202 @@ def test_fine_slurm_departure_without_replacement_fails_closed(
         executor.execute(reference, (task,))
 
     assert modules.scale_calls == [{"jobs": 1}]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "hung_stage",
+    ("probe", "activation", "post_snapshot"),
+)
+def test_fine_slurm_connected_replacement_gate_has_one_bounded_deadline(
+    tmp_path: Path,
+    hung_stage: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.pending_rounds = {2}
+    modules.parsed_timeout_seconds = 0.03
+    if hung_stage == "probe":
+        modules.hang_run_call = 2
+    elif hung_stage == "activation":
+        modules.hang_activation_call = 2
+    else:
+        modules.hang_post_activation_call = 2
+
+    def replace_then_complete(
+        futures: tuple[_FakeFuture, ...],
+        call_number: int,
+    ) -> None:
+        if call_number == 1:
+            modules.connected_workers = ("tcp://node-b:1234",)
+        else:
+            for future in futures:
+                future._done = True
+
+    modules.wait_hook = replace_then_complete
+    executor = _executor(tmp_path, modules, workers=1, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+    started = time.monotonic()
+
+    with pytest.raises(WorkerPreflightError, match="deadline"):
+        executor.execute(reference, (task,))
+
+    assert time.monotonic() - started < 0.13
+    assert len(modules.submit_calls) == 2
+    assert modules.cancel_call is not None
+    assert modules.cancel_call[1] is True
+    assert modules.events[-2:] == ["client.close", "cluster.close"]
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    failed = cast(list[dict[str, object]], fine["scale_events"])[-1]["failed"]
+    failure = cast(list[dict[str, str]], failed)[0]
+    assert failure["type"] == "WorkerPreflightError"
+    expected_stage = {
+        "probe": "replacement worker probe broadcast",
+        "activation": "replacement activation tcp://node-b:1234",
+        "post_snapshot": "post-activation scheduler snapshot",
+    }[hung_stage]
+    assert expected_stage in failure["message"]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
+
+
+def test_fine_slurm_replacement_stages_share_one_deadline(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.pending_rounds = {2}
+    modules.parsed_timeout_seconds = 0.03
+    modules.hang_seconds = 0.02
+    modules.hang_run_call = 2
+    modules.hang_activation_call = 2
+
+    def replace(
+        _futures: tuple[_FakeFuture, ...],
+        _call_number: int,
+    ) -> None:
+        modules.connected_workers = ("tcp://node-b:1234",)
+
+    modules.wait_hook = replace
+    executor = _executor(tmp_path, modules, workers=1, mode="fine_grained")
+    started = time.monotonic()
+
+    with pytest.raises(
+        WorkerPreflightError,
+        match="replacement activation tcp://node-b:1234",
+    ):
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+
+    assert time.monotonic() - started < 0.13
+
+
+@pytest.mark.parametrize(
+    ("hung_stage", "active_snapshot_ordinal"),
+    (("worker snapshot", 1), ("healthy worker resource snapshot", 2)),
+)
+def test_fine_slurm_health_snapshot_timeout_is_exact_and_canonical(
+    tmp_path: Path,
+    hung_stage: str,
+    active_snapshot_ordinal: int,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.parsed_timeout_seconds = 0.03
+    active_snapshot_calls = 0
+
+    def hang_selected_snapshot(_call_number: int) -> None:
+        nonlocal active_snapshot_calls
+        if len(modules.submit_calls) < 2:
+            return
+        active_snapshot_calls += 1
+        if active_snapshot_calls == active_snapshot_ordinal:
+            time.sleep(0.15)
+
+    modules.scheduler_info_hook = hang_selected_snapshot
+    executor = _executor(tmp_path, modules, workers=1, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+
+    with pytest.raises(WorkerPreflightError, match=hung_stage):
+        executor.execute(reference, (task,))
+
+    assert modules.cancel_call is not None
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    failure = cast(
+        list[dict[str, str]],
+        cast(list[dict[str, object]], fine["scale_events"])[-1]["failed"],
+    )[0]
+    assert hung_stage in failure["message"]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("hung_stage", "worker_change"),
+    (
+        ("worker identity resource snapshot", "stable"),
+        ("replacement worker arrival", "lost"),
+        ("replacement worker snapshot", "lost"),
+        ("replacement candidate resource snapshot", "replaced"),
+    ),
+)
+def test_fine_slurm_periodic_snapshot_timeout_is_exact_and_canonical(
+    tmp_path: Path,
+    hung_stage: str,
+    worker_change: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.pending_rounds = {2}
+    modules.parsed_timeout_seconds = 0.03
+    active_snapshot_calls = 0
+
+    def hang_second_active_snapshot(_call_number: int) -> None:
+        nonlocal active_snapshot_calls
+        if len(modules.submit_calls) < 2:
+            return
+        active_snapshot_calls += 1
+        if active_snapshot_calls == 2 and hung_stage != "replacement worker arrival":
+            time.sleep(0.15)
+
+    def update_workers(
+        _futures: tuple[_FakeFuture, ...],
+        _call_number: int,
+    ) -> None:
+        if worker_change == "lost":
+            modules.connected_workers = ()
+        elif worker_change == "replaced":
+            modules.connected_workers = ("tcp://node-b:1234",)
+
+    modules.scheduler_info_hook = hang_second_active_snapshot
+    modules.wait_hook = update_workers
+    modules.hang_wait_for_workers = hung_stage == "replacement worker arrival"
+    executor = _executor(tmp_path, modules, workers=1, mode="fine_grained")
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+
+    with pytest.raises(WorkerPreflightError, match=hung_stage):
+        executor.execute(reference, (task,))
+
+    assert modules.cancel_call is not None
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    failure = cast(
+        list[dict[str, str]],
+        cast(list[dict[str, object]], fine["scale_events"])[-1]["failed"],
+    )[0]
+    assert failure["type"] == "WorkerPreflightError"
+    assert hung_stage in failure["message"]
     slurm_module._canonical_execution_evidence(
         executor.execution_evidence,
         expected_tasks=(reference, task),

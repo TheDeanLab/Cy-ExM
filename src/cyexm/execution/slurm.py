@@ -6,6 +6,8 @@ import copy
 import logging
 import shlex
 import sys
+import threading
+import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -79,6 +81,78 @@ _COORDINATOR_PACKAGES = (
     "scipy",
     "tifffile",
 )
+
+
+class _ReplacementDeadlineError(WorkerPreflightError):
+    """One replacement control-plane operation exceeded the shared deadline."""
+
+
+def _call_before_deadline(
+    deadline: float,
+    *,
+    stage: str,
+    operation: Callable[[], Any],
+) -> Any:
+    """Run one blocking control-plane call without extending its deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+        raise _ReplacementDeadlineError(
+            f"SLURM replacement deadline exceeded before {stage}"
+        )
+    completed = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def invoke() -> None:
+        try:
+            outcome["result"] = operation()
+        except BaseException as error:
+            outcome["error"] = error
+        finally:
+            completed.set()
+
+    thread = threading.Thread(
+        target=invoke,
+        name=f"cyexm-slurm-{stage.replace(' ', '-')}",
+        daemon=True,
+    )
+    thread.start()
+    if not completed.wait(remaining):
+        raise _ReplacementDeadlineError(
+            f"SLURM replacement deadline exceeded during {stage}"
+        )
+    error = outcome.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    return outcome.get("result")
+
+
+def _probe_worker_before_timeout(
+    *,
+    timeout_seconds: float,
+    dataset_root: str,
+    output_root: str,
+    worker_local_directory: str,
+    expected_versions: Mapping[str, str],
+    expected_threads: Mapping[str, str],
+) -> dict[str, object]:
+    """Keep a blocking worker probe off the Dask worker event-loop thread."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    return cast(
+        dict[str, object],
+        _call_before_deadline(
+            deadline,
+            stage="worker probe",
+            operation=lambda: probe_worker(
+                dataset_root=dataset_root,
+                output_root=output_root,
+                worker_local_directory=worker_local_directory,
+                expected_versions=expected_versions,
+                expected_threads=expected_threads,
+            ),
+        ),
+    )
+
+
 _CONFIG_NAME = "cyexm-slurm"
 _DEATH_TIMEOUT_SECONDS = 60
 _SHEBANG = "#!/usr/bin/env bash"
@@ -2119,15 +2193,62 @@ class SlurmExecutor:
                         )
                         if wait_result.done:
                             return
-                    next_scheduler, next_connected = _scheduler_snapshot(
-                        execution_client,
-                        expected_workers=None,
-                    )
+                    replacement_timeout = modules.parse_timedelta(spec.startup_timeout)
+                    replacement_deadline = time.monotonic() + replacement_timeout
+
+                    event: FineScaleEvent | None = None
+
+                    def evidence_error(error: BaseException) -> BaseException:
+                        if isinstance(error, _ReplacementDeadlineError):
+                            return WorkerPreflightError(str(error))
+                        return error
+
+                    def record_health_failure(error: BaseException) -> None:
+                        nonlocal event
+                        if event is None:
+                            event = fine_state.begin_scale(
+                                requested_workers,
+                                utc_now(),
+                            )
+                        if not event.failed:
+                            event.fail(evidence_error(error), utc_now())
+
+                    def before_deadline(
+                        stage: str,
+                        operation: Callable[[], Any],
+                    ) -> Any:
+                        try:
+                            return _call_before_deadline(
+                                replacement_deadline,
+                                stage=stage,
+                                operation=operation,
+                            )
+                        except _ReplacementDeadlineError as error:
+                            public_error = WorkerPreflightError(str(error))
+                            record_health_failure(public_error)
+                            raise public_error from error
+
+                    try:
+                        next_scheduler, next_connected = cast(
+                            tuple[str, tuple[str, ...]],
+                            before_deadline(
+                                "worker snapshot",
+                                lambda: _scheduler_snapshot(
+                                    execution_client,
+                                    expected_workers=None,
+                                ),
+                            ),
+                        )
+                    except BaseException as error:
+                        if not isinstance(error, KeyboardInterrupt):
+                            record_health_failure(error)
+                        raise
                     if next_scheduler != scheduler_address:
-                        raise WorkerPreflightError(
+                        scheduler_error = WorkerPreflightError(
                             "SLURM scheduler identity changed during active work"
                         )
-                    event: FineScaleEvent | None = None
+                        record_health_failure(scheduler_error)
+                        raise scheduler_error
 
                     def observe_connected_workers(
                         addresses: tuple[str, ...],
@@ -2155,21 +2276,36 @@ class SlurmExecutor:
                         validated_workers
                     ):
                         try:
-                            _validate_scheduler_resources(
-                                execution_client,
-                                expected_scheduler=scheduler_address,
-                                candidates=(),
-                                validated=tuple(sorted(validated_workers)),
+                            before_deadline(
+                                "healthy worker resource snapshot",
+                                lambda: _validate_scheduler_resources(
+                                    execution_client,
+                                    expected_scheduler=scheduler_address,
+                                    candidates=(),
+                                    validated=tuple(sorted(validated_workers)),
+                                ),
                             )
-                        except WorkerPreflightError:
+                        except WorkerPreflightError as error:
+                            if isinstance(
+                                error.__cause__,
+                                _ReplacementDeadlineError,
+                            ):
+                                raise
                             pass
                         else:
                             return
                     if len(next_connected) < requested_workers:
                         try:
-                            execution_client.wait_for_workers(
-                                requested_workers,
-                                timeout=modules.parse_timedelta(spec.startup_timeout),
+                            remaining = max(
+                                0.0,
+                                replacement_deadline - time.monotonic(),
+                            )
+                            before_deadline(
+                                "replacement worker arrival",
+                                lambda: execution_client.wait_for_workers(
+                                    requested_workers,
+                                    timeout=remaining,
+                                ),
                             )
                         except BaseException as error:
                             if isinstance(error, KeyboardInterrupt):
@@ -2179,12 +2315,17 @@ class SlurmExecutor:
                                 f"{spec.startup_timeout}: {type(error).__name__}: "
                                 f"{error}"
                             )
-                            if event is not None:
-                                event.fail(replacement_error, utc_now())
+                            record_health_failure(replacement_error)
                             raise replacement_error from error
-                        next_scheduler, next_connected = _scheduler_snapshot(
-                            execution_client,
-                            expected_workers=requested_workers,
+                        next_scheduler, next_connected = cast(
+                            tuple[str, tuple[str, ...]],
+                            before_deadline(
+                                "replacement worker snapshot",
+                                lambda: _scheduler_snapshot(
+                                    execution_client,
+                                    expected_workers=requested_workers,
+                                ),
+                            ),
                         )
                         if next_scheduler != scheduler_address:
                             raise WorkerPreflightError(
@@ -2192,17 +2333,30 @@ class SlurmExecutor:
                                 "replacement"
                             )
                         observe_connected_workers(next_connected)
-                    raw_current = execution_client.run(
-                        probe_worker,
-                        dataset_root=str(self.profile.paths.dataset_root),
-                        output_root=str(self.profile.paths.output_root),
-                        worker_local_directory=str(
-                            self.profile.paths.worker_local_directory
-                        ),
-                        expected_versions=dict(versions),
-                        expected_threads=_native_thread_values(self.profile),
-                        workers=list(next_connected),
-                    )
+                    try:
+                        probe_timeout = max(
+                            0.0,
+                            replacement_deadline - time.monotonic(),
+                        )
+                        raw_current = before_deadline(
+                            "replacement worker probe broadcast",
+                            lambda: execution_client.run(
+                                _probe_worker_before_timeout,
+                                timeout_seconds=probe_timeout,
+                                dataset_root=str(self.profile.paths.dataset_root),
+                                output_root=str(self.profile.paths.output_root),
+                                worker_local_directory=str(
+                                    self.profile.paths.worker_local_directory
+                                ),
+                                expected_versions=dict(versions),
+                                expected_threads=_native_thread_values(self.profile),
+                                workers=list(next_connected),
+                            ),
+                        )
+                    except BaseException as error:
+                        if not isinstance(error, KeyboardInterrupt):
+                            record_health_failure(error)
+                        raise
                     try:
                         current_batch = _validated_probe_batch(
                             raw_current,
@@ -2228,7 +2382,7 @@ class SlurmExecutor:
                             event.connected.extend(next_connected)
                             fine_state.validated.clear()
                         event.probed.extend(sorted(decoded_current))
-                        event.fail(error, utc_now())
+                        record_health_failure(error)
                         observed["connected_workers"] = list(next_connected)
                         observed["worker_probes"] = [
                             probe.to_dict() for probe in observed_probes
@@ -2242,11 +2396,14 @@ class SlurmExecutor:
                     if unchanged == set(validated_workers) and set(
                         next_connected
                     ) == set(validated_workers):
-                        _validate_scheduler_resources(
-                            execution_client,
-                            expected_scheduler=scheduler_address,
-                            candidates=(),
-                            validated=tuple(sorted(validated_workers)),
+                        before_deadline(
+                            "worker identity resource snapshot",
+                            lambda: _validate_scheduler_resources(
+                                execution_client,
+                                expected_scheduler=scheduler_address,
+                                candidates=(),
+                                validated=tuple(sorted(validated_workers)),
+                            ),
                         )
                         return
                     departed = tuple(sorted(set(validated_workers) - unchanged))
@@ -2259,11 +2416,14 @@ class SlurmExecutor:
                         fine_state.candidates.update(newcomers)
                         fine_state.validated.difference_update(departed)
                     try:
-                        _validate_scheduler_resources(
-                            execution_client,
-                            expected_scheduler=scheduler_address,
-                            candidates=newcomers,
-                            validated=tuple(sorted(unchanged)),
+                        before_deadline(
+                            "replacement candidate resource snapshot",
+                            lambda: _validate_scheduler_resources(
+                                execution_client,
+                                expected_scheduler=scheduler_address,
+                                candidates=newcomers,
+                                validated=tuple(sorted(unchanged)),
+                            ),
                         )
                         prior = {
                             address: validated_probes[address] for address in unchanged
@@ -2288,9 +2448,14 @@ class SlurmExecutor:
                             probe.to_dict() for probe in observed_probes
                         ]
                         for address in newcomers:
-                            execution_client.run_on_scheduler(
-                                _activate_round_slot,
-                                worker_address=address,
+                            before_deadline(
+                                f"replacement activation {address}",
+                                lambda address=address: (
+                                    execution_client.run_on_scheduler(
+                                        _activate_round_slot,
+                                        worker_address=address,
+                                    )
+                                ),
                             )
                             event.activated.append(address)
                             event.activated_probes.append(replacement_batch[address])
@@ -2298,17 +2463,54 @@ class SlurmExecutor:
                             validated_workers.add(address)
                             validated_probes[address] = replacement_batch[address]
                             fine_state.validated.add(address)
-                        _validate_scheduler_resources(
-                            execution_client,
-                            expected_scheduler=scheduler_address,
-                            candidates=(),
-                            validated=tuple(sorted(validated_workers)),
+                        before_deadline(
+                            "post-activation scheduler snapshot",
+                            lambda: _validate_scheduler_resources(
+                                execution_client,
+                                expected_scheduler=scheduler_address,
+                                candidates=(),
+                                validated=tuple(sorted(validated_workers)),
+                            ),
                         )
                     except BaseException as error:
-                        event.fail(error, utc_now())
+                        if not isinstance(error, KeyboardInterrupt):
+                            record_health_failure(error)
                         raise
                     finally:
                         event.ended_at = utc_now()
+
+                def reconcile_or_cancel(
+                    active_futures: tuple[Any, ...],
+                    *,
+                    wait_for_completion: bool,
+                ) -> None:
+                    try:
+                        wait_and_reconcile_workers(
+                            active_futures,
+                            wait_for_completion=wait_for_completion,
+                        )
+                    except BaseException as error:
+                        if not isinstance(error, KeyboardInterrupt):
+                            try:
+                                cancellation_deadline = (
+                                    time.monotonic()
+                                    + modules.parse_timedelta(spec.startup_timeout)
+                                )
+                                _call_before_deadline(
+                                    cancellation_deadline,
+                                    stage="replacement failure cancellation",
+                                    operation=lambda: execution_client.cancel(
+                                        active_futures,
+                                        force=True,
+                                    ),
+                                )
+                            except BaseException as cancellation_error:
+                                _LOGGER.warning(
+                                    "Failed to cancel active work after SLURM "
+                                    "replacement failure: %s",
+                                    cancellation_error,
+                                )
+                        raise
 
                 fine_runner = self._fine_runner
                 if fine_runner is None:
@@ -2463,8 +2665,11 @@ class SlurmExecutor:
                         capacity=spec.workers,
                         active=active,
                         capacity_provider=eligible_capacity,
-                        active_wait=wait_and_reconcile_workers,
-                        before_settle=lambda futures: wait_and_reconcile_workers(
+                        active_wait=lambda futures: reconcile_or_cancel(
+                            futures,
+                            wait_for_completion=True,
+                        ),
+                        before_settle=lambda futures: reconcile_or_cancel(
                             futures,
                             wait_for_completion=False,
                         ),

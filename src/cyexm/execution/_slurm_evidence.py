@@ -462,10 +462,16 @@ def validate_fine_slurm_evidence(
             raise ValueError("fine scale event ended before it started")
         departed = _strings(event["departed"], f"{location}.departed")
         replacement = bool(departed)
+        event_failures = _array(event["failed"], f"{location}.failed")
+        health_failure = (
+            requested == previous_request and not replacement and bool(event_failures)
+        )
         if (
             requested > configured_workers
             or requested < previous_request
-            or (requested == previous_request and not replacement)
+            or (
+                requested == previous_request and not replacement and not health_failure
+            )
         ):
             raise ValueError(
                 "fine scale requests must increase, except explicit replacement"
@@ -496,6 +502,10 @@ def validate_fine_slurm_evidence(
             )
         if not set(event_activated) <= set(probed) <= set(event_connected):
             raise ValueError("fine scale activation must be a subset of probed workers")
+        if health_failure and (
+            event_connected or probed or event_activated or event_activated_probes
+        ):
+            raise ValueError("fine health failure cannot claim a worker transition")
         if not set(departed) <= connected:
             raise ValueError("fine replacement can only remove connected workers")
         connected.difference_update(departed)
@@ -530,7 +540,6 @@ def validate_fine_slurm_evidence(
             current_activated_probes[probe.worker_address] = probe
             historical_activated_probes.append(probe)
             active_intervals[identity] = (event_ended, None)
-        event_failures = _array(event["failed"], f"{location}.failed")
         for failure_index, failure_value in enumerate(event_failures):
             scale_failed = True
             error = _object(

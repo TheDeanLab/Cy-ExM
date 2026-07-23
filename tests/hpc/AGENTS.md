@@ -108,10 +108,16 @@
   cross-round task keys. Every summarized claim must cross-check checksum-bound raw
   attempt, placement, probe, scale, marker, deterministic, comparison, and queue
   evidence; a summary boolean is never acceptance authority.
-- Cross-worker placement ordering uses coordinator submission/readiness timestamps,
-  never worker wall clocks. The performance gate compares a conservative fine
-  coordinator upper bound through assembly against a coarse worker-monotonic lower
-  bound so clock skew cannot manufacture a speedup.
+- Cross-worker placement ordering and fairness use only checksum-bound primary-graph
+  coordinator submission/readiness timestamps, including preparation readiness;
+  never compare worker wall clocks. Cross-derive exact task worker/job/host fields,
+  scale sequence, activated-worker cap, concurrency, and fair dispatch from that raw
+  graph.
+- The performance gate compares a conservative fine coordinator upper bound through
+  assembly against the maximum complete per-round coarse nonlinear lower bound.
+  Aggregate every nonlinear call in each stable `round-XXX-coarse-main` record using
+  one worker-monotonic first-start/last-end span, or explicitly fall back to summed
+  call durations when monotonic bounds are unavailable; never take one maximum call.
 - Keep fine-only report schemas and audit decoders in
   `fine_workflow_acceptance.py`. Keep shared submission, cleanup, fresh-coordinator,
   and acceptance-only worker-runner machinery in `workflow_acceptance.py`.

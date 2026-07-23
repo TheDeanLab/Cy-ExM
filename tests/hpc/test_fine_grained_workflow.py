@@ -18,6 +18,8 @@ from cyexm.workflow.planning import build_workflow_plan
 from cyexm.workflow.task import run_workflow_task
 from hpc.environment import HpcAcceptanceContext, write_evidence_json
 from hpc.fine_workflow_acceptance import (
+    _coarse_nonlinear_lower_bound,
+    _derive_primary_evidence,
     build_fine_acceptance_report,
     fine_acceptance_manifest,
 )
@@ -135,76 +137,16 @@ def _artifact_path_entries(
     ]
 
 
-def _placement(evidence: dict[str, object]) -> dict[str, object]:
-    fine = cast(dict[str, object], evidence["fine_graph"])
-    raw_placements = cast(list[dict[str, object]], fine["placements"])
-    tasks: list[dict[str, object]] = []
-    for item in raw_placements:
-        key = cast(str, item["task_key"])
-        kind = key.split(":")[1]
-        if kind not in {"chunk", "channel"} or not item["placement_accepted"]:
-            continue
-        tasks.append(
-            {
-                "task_key": key,
-                "kind": kind,
-                "round": int(key.split(":")[0].removeprefix("round-")),
-                "job_id": item["slurm_job_id"],
-                "hostname": item["hostname"],
-                "worker": item["worker_address"],
-                "coordinator_submitted_at": item["coordinator_submitted_at"],
-                "coordinator_ready_at": item["coordinator_ready_at"],
-                "duration_seconds": item["duration_seconds"],
-                "_submitted": item["coordinator_submitted_at"],
-            }
-        )
-    preparations = [
-        item
-        for item in raw_placements
-        if ":preparation:" in cast(str, item["task_key"])
-        and item["placement_accepted"]
-        and item["status"] in {"completed", "reused"}
-    ]
-    if len({cast(str, item["task_key"]).split(":")[0] for item in preparations}) < 2:
-        raise HpcWorkflowAcceptanceError(
-            "fine acceptance lacks two completed round preparations for fairness"
-        )
-    both_rounds_ready = max(cast(str, item["ended_at"]) for item in preparations)
-    fair_candidates = sorted(
-        (
-            item
-            for item in tasks
-            if item["kind"] == "chunk"
-            and cast(str, item["_submitted"]) >= both_rounds_ready
-        ),
-        key=lambda item: cast(str, item["_submitted"]),
-    )
-    if len(fair_candidates) < 2 or (
-        fair_candidates[0]["round"] == fair_candidates[1]["round"]
-    ):
-        raise HpcWorkflowAcceptanceError(
-            "fine acceptance lacks a round-robin opportunity after two rounds "
-            "were ready"
-        )
-    fair_rounds = [
-        cast(int, fair_candidates[0]["round"]),
-        cast(int, fair_candidates[1]["round"]),
-    ]
-    fair_order = [
-        cast(str, fair_candidates[0]["task_key"]),
-        cast(str, fair_candidates[1]["task_key"]),
-    ]
-    for item in tasks:
-        item.pop("_submitted")
-    scale_events = cast(list[dict[str, object]], fine["scale_events"])
-    requests = sorted({cast(int, item["requested"]) for item in scale_events})
+def _placement(
+    evidence: dict[str, object], *, evidence_path: Path
+) -> dict[str, object]:
+    placement, _fine_wall = _derive_primary_evidence(evidence)
     return {
-        "worker_cap": fine["worker_cap"],
-        "maximum_connected_workers": max(requests),
-        "scale_events": requests,
-        "fair_ready_rounds": fair_rounds,
-        "fair_dispatch_order": fair_order,
-        "tasks": tasks,
+        "evidence_file": {
+            "relative_path": evidence_path.name,
+            "sha256": _file_sha256(evidence_path),
+        },
+        **placement,
     }
 
 
@@ -230,22 +172,6 @@ def _duration_summary(
     }
 
 
-def _fine_wall_seconds(placement: dict[str, object]) -> float:
-    from datetime import datetime
-
-    tasks = cast(list[dict[str, object]], placement["tasks"])
-    nonlinear = [item for item in tasks if item["kind"] == "chunk"]
-    starts = [
-        datetime.fromisoformat(cast(str, item["started_at"]).replace("Z", "+00:00"))
-        for item in nonlinear
-    ]
-    ends = [
-        datetime.fromisoformat(cast(str, item["ended_at"]).replace("Z", "+00:00"))
-        for item in nonlinear
-    ]
-    return (max(ends) - min(starts)).total_seconds()
-
-
 def _profiled_performance(
     *,
     coarse_timing: Path,
@@ -253,6 +179,7 @@ def _profiled_performance(
     fine_evidence: dict[str, object],
     fine_result: WorkflowResult,
     placement: dict[str, object],
+    evidence_root: Path,
 ) -> dict[str, object]:
     from datetime import datetime
 
@@ -264,10 +191,15 @@ def _profiled_performance(
 
     coarse_records = records(coarse_timing)
     fine_records = records(fine_timing)
-    coarse_calls = [
-        cast(dict[str, object], call)
-        for record in coarse_records
-        for call in cast(list[dict[str, object]], record["nonlinear_calls"])
+    coarse_record_paths = sorted(coarse_timing.glob("round-*-coarse-main.json"))
+    coarse_timing_records = [
+        (
+            path.resolve(strict=True)
+            .relative_to(evidence_root.resolve(strict=True))
+            .as_posix(),
+            cast(dict[str, object], json.loads(path.read_text(encoding="utf-8"))),
+        )
+        for path in coarse_record_paths
     ]
     fine_calls = [
         cast(dict[str, object], call)
@@ -279,7 +211,7 @@ def _profiled_performance(
         for record in fine_records
         if ":assembly:" in cast(str, record["task_key"])
     ]
-    if not coarse_calls or not fine_calls or not assemblies:
+    if not coarse_timing_records or not fine_calls or not assemblies:
         raise HpcWorkflowAcceptanceError(
             "profiled acceptance lacks coarse/fine nonlinear timing boundaries"
         )
@@ -288,9 +220,7 @@ def _profiled_performance(
         return datetime.fromisoformat(cast(str, value).replace("Z", "+00:00"))
 
     fine_graph = cast(dict[str, object], fine_evidence["fine_graph"])
-    coarse_wall = max(
-        float(cast(int | float, item["duration_seconds"])) for item in coarse_calls
-    )
+    coarse_wall, coarse_policy = _coarse_nonlinear_lower_bound(coarse_timing_records)
     raw_placements = cast(list[dict[str, object]], fine_graph["placements"])
     chunk_attempts = [
         item
@@ -352,6 +282,14 @@ def _profiled_performance(
         )
     return {
         "coarse_nonlinear_wall_seconds": coarse_wall,
+        "coarse_timing_policy": coarse_policy,
+        "coarse_timing_files": [
+            {
+                "relative_path": relative,
+                "sha256": _file_sha256(evidence_root / relative),
+            }
+            for relative, _record in coarse_timing_records
+        ],
         "fine_nonlinear_wall_seconds": fine_wall,
         "clock_policy": (
             "coordinator-fine-upper-bound-vs-worker-monotonic-coarse-lower-bound"
@@ -546,10 +484,12 @@ def _tier2_summary(
 
     channel_records = [
         (
-            f"deterministic/round-{round_index:04d}/channel-{channel_index:04d}",
+            f"round-{cast(int, round_record['round']):03d}/"
+            f"channel-{channel_index:04d}/"
+            f"{Path(cast(str, item['source'])).name}",
             item,
         )
-        for round_index, round_record in enumerate(rounds)
+        for round_record in rounds
         for channel_index, item in enumerate(
             cast(list[dict[str, object]], round_record["channels"])
         )
@@ -624,24 +564,33 @@ def _replacement_lineage(
         or target_attempts[0]["status"] != "failed"
         or target_attempts[1]["attempt"] != 2
         or target_attempts[1]["status"] != "completed"
-        or identity(target_attempts[1]) != replacement_identity
     ):
         raise HpcWorkflowAcceptanceError(
             "replacement trial lacks the exact failed/retried target lineage"
         )
     retry_ready = cast(str, target_attempts[1]["coordinator_ready_at"])
-    liveness = min(
-        (
-            item
-            for item in placements
-            if item["task_key"] != target_key
-            and item["placement_accepted"]
-            and item["status"] in {"completed", "reused"}
-            and cast(str, item["coordinator_ready_at"]) > retry_ready
-        ),
-        key=lambda item: cast(str, item["coordinator_ready_at"]),
+    retry_identity = identity(target_attempts[1])
+    replacement_liveness_path = (
+        "retry" if retry_identity == replacement_identity else "later-task"
+    )
+    liveness = (
+        None
+        if replacement_liveness_path == "retry"
+        else min(
+            (
+                item
+                for item in placements
+                if item["task_key"] != target_key
+                and item["placement_accepted"]
+                and item["status"] in {"completed", "reused"}
+                and identity(item) == replacement_identity
+                and cast(str, item["coordinator_ready_at"]) > retry_ready
+            ),
+            key=lambda item: cast(str, item["coordinator_ready_at"]),
+        )
     )
     queue_after = json.loads(queue_after_path.read_text(encoding="utf-8"))
+    cleanup = cast(dict[str, object], evidence["cleanup"])
     if queue_after.get("jobs") != []:
         raise HpcWorkflowAcceptanceError(
             "replacement trial retains an owned named job after cleanup"
@@ -668,24 +617,24 @@ def _replacement_lineage(
         },
         "departed_worker": loss_identity,
         "replacement_worker": replacement_identity,
+        "replacement_liveness_path": replacement_liveness_path,
         "retry": {
             "task_key": target_key,
             "attempt": 2,
             "status": "completed",
-            **replacement_identity,
+            **retry_identity,
         },
-        "liveness": {
-            "task_key": liveness["task_key"],
-            "status": liveness["status"],
-            **identity(liveness),
-        },
-        "owned_job_ids": sorted(
-            {
-                cast(str, loss_identity["slurm_job_id"]),
-                cast(str, replacement_identity["slurm_job_id"]),
+        "liveness": (
+            None
+            if liveness is None
+            else {
+                "task_key": liveness["task_key"],
+                "status": liveness["status"],
+                **identity(liveness),
             }
         ),
-        "remaining_owned_job_ids": [],
+        "owned_job_ids": sorted(cast(list[str], cleanup["recorded_job_ids"])),
+        "remaining_owned_job_ids": cleanup["remaining_owned_job_ids"],
     }
 
 
@@ -829,7 +778,13 @@ def _run_fine_acceptance(
     tier1_evidence_path = context.evidence_dir / "fine-tier1-equivalence.json"
     write_evidence_json(tier1_evidence_path, equivalence)
     fine_evidence = cast(dict[str, object], json.loads(fine.execution_evidence_json))
-    placement = _placement(fine_evidence)
+    primary_evidence_path = (
+        context.evidence_dir / "fine-acceptance-primary-slurm-execution.json"
+    )
+    placement = _placement(
+        fine_evidence,
+        evidence_path=primary_evidence_path,
+    )
 
     failure_records: dict[str, tuple[dict[str, object], WorkflowResult]] = {}
     for stage in ("chunk", "channel"):
@@ -965,6 +920,7 @@ def _run_fine_acceptance(
         fine_evidence=fine_evidence,
         fine_result=fine,
         placement=placement,
+        evidence_root=context.evidence_dir,
     )
     cancellation_graph = cast(
         dict[str, object], cast(dict[str, object], cancelled_evidence)["fine_graph"]

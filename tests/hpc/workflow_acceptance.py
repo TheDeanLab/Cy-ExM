@@ -688,6 +688,341 @@ def scientific_parity_evidence(
     )
 
 
+def _validated_scientific_comparison_evidence(
+    value: object,
+    *,
+    require_close: bool,
+    metric_absolute_tolerance: float,
+) -> dict[str, object]:
+    """Strictly decode the complete scientific-comparison evidence schema."""
+    import math
+
+    from cyexm.spatial import ImageGeometry
+
+    def exact_object(node: object, keys: set[str], location: str) -> dict[str, object]:
+        if not isinstance(node, dict) or set(node) != keys:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} has an invalid exact schema"
+            )
+        return cast(dict[str, object], node)
+
+    def finite_number(node: object, location: str) -> float:
+        if isinstance(node, bool) or not isinstance(node, int | float):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} is not a finite number"
+            )
+        number = float(node)
+        if not math.isfinite(number):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} is not finite"
+            )
+        return number
+
+    def numeric(
+        node: object, location: str, *, expected_shape: object | None = None
+    ) -> dict[str, object]:
+        payload = exact_object(
+            node,
+            {
+                "shape",
+                "reference_dtype",
+                "candidate_dtype",
+                "array_equal",
+                "close_required",
+                "maximum_absolute_difference",
+                "mean_absolute_difference",
+                "p99_9_absolute_difference",
+                "rtol",
+                "atol",
+            },
+            location,
+        )
+        shape = payload["shape"]
+        if (
+            not isinstance(shape, list)
+            or any(type(item) is not int or item < 1 for item in shape)
+            or (expected_shape is not None and shape != expected_shape)
+            or not isinstance(payload["reference_dtype"], str)
+            or not payload["reference_dtype"]
+            or payload["reference_dtype"] != payload["candidate_dtype"]
+            or type(payload["array_equal"]) is not bool
+            or payload["close_required"] is not require_close
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} shape/dtype contract changed"
+            )
+        for name in (
+            "maximum_absolute_difference",
+            "mean_absolute_difference",
+            "p99_9_absolute_difference",
+        ):
+            if finite_number(payload[name], f"{location}.{name}") < 0.0:
+                raise HpcWorkflowAcceptanceError(
+                    f"scientific comparison {location}.{name} is negative"
+                )
+        if require_close:
+            if (
+                payload["rtol"] != 0.0
+                or payload["atol"] != 0.0
+                or payload["array_equal"] is not True
+                or payload["maximum_absolute_difference"] != 0.0
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    f"scientific comparison {location} is not exactly equal"
+                )
+        elif payload["rtol"] != 1e-4 or payload["atol"] != 1e-5:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} tolerance changed"
+            )
+        return payload
+
+    def geometry(node: object, location: str) -> dict[str, object]:
+        payload = exact_object(
+            node, {"shape", "origin", "spacing", "direction"}, location
+        )
+        try:
+            ImageGeometry.from_dict(payload)
+        except (TypeError, ValueError) as error:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} is malformed"
+            ) from error
+        return payload
+
+    def tiff(node: object, location: str) -> None:
+        payload = exact_object(
+            node,
+            {"reference", "candidate", "dtype", "shape", "geometry", "numeric"},
+            location,
+        )
+        if (
+            not isinstance(payload["reference"], str)
+            or not payload["reference"]
+            or not isinstance(payload["candidate"], str)
+            or not payload["candidate"]
+            or not isinstance(payload["dtype"], str)
+            or not payload["dtype"]
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} artifact identity is malformed"
+            )
+        image_geometry = geometry(payload["geometry"], f"{location}.geometry")
+        if payload["shape"] != image_geometry["shape"]:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} shape differs from geometry"
+            )
+        comparison = numeric(
+            payload["numeric"], f"{location}.numeric", expected_shape=payload["shape"]
+        )
+        if comparison["reference_dtype"] != payload["dtype"]:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} dtype differs from numeric data"
+            )
+
+    expected_policy = (
+        "strict-deterministic-numeric-parity"
+        if require_close
+        else "stochastic-scientific-equivalence"
+    )
+    payload = exact_object(
+        value,
+        {
+            "schema_version",
+            "scientific_fingerprint",
+            "rtol",
+            "atol",
+            "comparison_policy",
+            "metric_absolute_tolerance",
+            "voxel_differences_are_characterization",
+            "rounds",
+        },
+        "root",
+    )
+    if (
+        payload["schema_version"] != 1
+        or not isinstance(payload["scientific_fingerprint"], str)
+        or not payload["scientific_fingerprint"]
+        or payload["comparison_policy"] != expected_policy
+        or payload["rtol"] != (0.0 if require_close else 1e-4)
+        or payload["atol"] != (0.0 if require_close else 1e-5)
+        or payload["metric_absolute_tolerance"] != metric_absolute_tolerance
+        or payload["voxel_differences_are_characterization"] is not (not require_close)
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "scientific comparison policy or tolerance contract changed"
+        )
+    rounds = payload["rounds"]
+    if not isinstance(rounds, list) or not rounds:
+        raise HpcWorkflowAcceptanceError(
+            "scientific comparison contains no round evidence"
+        )
+    observed_rounds: list[int] = []
+    for round_index, raw_round in enumerate(rounds):
+        location = f"rounds[{round_index}]"
+        round_payload = exact_object(
+            raw_round,
+            {
+                "round",
+                "strategy",
+                "affine",
+                "warp",
+                "registered",
+                "metrics",
+                "channels",
+            },
+            location,
+        )
+        round_number = round_payload["round"]
+        if (
+            type(round_number) is not int
+            or round_number < 1
+            or round_payload["strategy"] not in {"whole_image", "serial_chunked"}
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} identity is malformed"
+            )
+        observed_rounds.append(round_number)
+        affine = exact_object(
+            round_payload["affine"],
+            {"transform_type", "dimension", "fixed_parameters_exact", "parameters"},
+            f"{location}.affine",
+        )
+        if (
+            not isinstance(affine["transform_type"], str)
+            or not affine["transform_type"]
+            or affine["dimension"] != 3
+            or affine["fixed_parameters_exact"] is not True
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} affine metadata changed"
+            )
+        numeric(affine["parameters"], f"{location}.affine.parameters")
+        warp = exact_object(
+            round_payload["warp"], {"geometry", "numeric"}, f"{location}.warp"
+        )
+        warp_geometry = exact_object(
+            warp["geometry"],
+            {"shape", "origin", "spacing", "direction", "has_components"},
+            f"{location}.warp.geometry",
+        )
+        if (
+            not isinstance(warp_geometry["shape"], list)
+            or any(
+                type(item) is not int or item < 1
+                for item in cast(list[object], warp_geometry["shape"])
+            )
+            or warp_geometry["has_components"] is not True
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} warp geometry changed"
+            )
+        geometry(
+            {
+                name: warp_geometry[name]
+                for name in ("shape", "origin", "spacing", "direction")
+            },
+            f"{location}.warp.geometry",
+        )
+        numeric(warp["numeric"], f"{location}.warp.numeric")
+        tiff(round_payload["registered"], f"{location}.registered")
+        metrics = exact_object(
+            round_payload["metrics"],
+            {"pre-registration", "linearly-registered", "nonlinear-registered"},
+            f"{location}.metrics",
+        )
+        stage_values: dict[str, tuple[dict[str, float], dict[str, float]]] = {}
+        for stage, raw_metric in metrics.items():
+            metric = exact_object(
+                raw_metric,
+                {
+                    "reference",
+                    "candidate",
+                    "absolute_differences",
+                    "absolute_tolerance",
+                },
+                f"{location}.metrics.{stage}",
+            )
+            reference = exact_object(
+                metric["reference"],
+                {"Correlation", "MattesMutualInformation"},
+                f"{location}.metrics.{stage}.reference",
+            )
+            candidate = exact_object(
+                metric["candidate"],
+                {"Correlation", "MattesMutualInformation"},
+                f"{location}.metrics.{stage}.candidate",
+            )
+            differences = exact_object(
+                metric["absolute_differences"],
+                {"Correlation", "MattesMutualInformation"},
+                f"{location}.metrics.{stage}.absolute_differences",
+            )
+            if metric["absolute_tolerance"] != metric_absolute_tolerance:
+                raise HpcWorkflowAcceptanceError(
+                    f"scientific comparison {location} metric tolerance changed"
+                )
+            reference_numbers: dict[str, float] = {}
+            candidate_numbers: dict[str, float] = {}
+            for name in ("Correlation", "MattesMutualInformation"):
+                reference_numbers[name] = finite_number(
+                    reference[name], f"{location}.{stage}.reference.{name}"
+                )
+                candidate_numbers[name] = finite_number(
+                    candidate[name], f"{location}.{stage}.candidate.{name}"
+                )
+                observed_difference = finite_number(
+                    differences[name], f"{location}.{stage}.difference.{name}"
+                )
+                if (
+                    abs(
+                        observed_difference
+                        - abs(candidate_numbers[name] - reference_numbers[name])
+                    )
+                    > 1e-12
+                    or observed_difference > metric_absolute_tolerance
+                ):
+                    raise HpcWorkflowAcceptanceError(
+                        f"scientific comparison {location} metric evidence is forged"
+                    )
+            stage_values[stage] = (reference_numbers, candidate_numbers)
+        for execution_index in (0, 1):
+            for name in ("Correlation", "MattesMutualInformation"):
+                if (
+                    stage_values["nonlinear-registered"][execution_index][name]
+                    < stage_values["pre-registration"][execution_index][name]
+                ):
+                    raise HpcWorkflowAcceptanceError(
+                        f"scientific comparison {location} nonlinear metric degraded"
+                    )
+        channels = round_payload["channels"]
+        if not isinstance(channels, list) or not channels:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} contains no channels"
+            )
+        for channel_index, raw_channel in enumerate(channels):
+            channel = exact_object(
+                raw_channel,
+                {"source", "interpolation", "comparison"},
+                f"{location}.channels[{channel_index}]",
+            )
+            if (
+                not isinstance(channel["source"], str)
+                or not channel["source"]
+                or channel["interpolation"] not in {"linear", "nearest"}
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    f"scientific comparison {location} channel contract changed"
+                )
+            tiff(
+                channel["comparison"],
+                f"{location}.channels[{channel_index}].comparison",
+            )
+    if observed_rounds != sorted(set(observed_rounds)):
+        raise HpcWorkflowAcceptanceError(
+            "scientific comparison rounds are duplicate or noncanonical"
+        )
+    return payload
+
+
 def bounded_slurm_profile(
     profile: ExecutionProfile,
     output_root: Path,
@@ -1416,11 +1751,14 @@ def _profiled_task_call(
         try:
             return original(self, **kwargs)
         finally:
+            ended = time.monotonic()
             nonlinear_calls.append(
                 {
                     "started_at": started_at,
                     "ended_at": _utc_now(),
-                    "duration_seconds": float(max(0.0, time.monotonic() - started)),
+                    "duration_seconds": float(max(0.0, ended - started)),
+                    "monotonic_started_seconds": float(started),
+                    "monotonic_ended_seconds": float(ended),
                 }
             )
 

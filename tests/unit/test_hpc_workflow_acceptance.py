@@ -150,25 +150,9 @@ def _profile(tmp_path: Path, *, workers: int = 4) -> ExecutionProfile:
 
 def _fine_acceptance_report(root: Path) -> dict[str, object]:
     evidence_path = root / "fine-execution.json"
-    evidence_path.write_bytes(b'{"fine":"evidence"}\n')
     tier1_path = root / "tier1-equivalence.json"
     tier1_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "rounds": [
-                    {
-                        "metrics": {
-                            "absolute_differences": {
-                                "Correlation": 0.009,
-                                "MattesMutualInformation": 0.004,
-                            }
-                        }
-                    }
-                ],
-            },
-            sort_keys=True,
-        ),
+        json.dumps(_scientific_equivalence_payload(), sort_keys=True),
         encoding="utf-8",
     )
     tier2_path = root / "deterministic-executor-parity.json"
@@ -430,6 +414,129 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
             "duration_seconds": 6.0,
         },
     ]
+    raw_placements = [
+        {
+            "task_key": f"round-{round_number:03d}:preparation:main",
+            "attempt": 1,
+            "status": "completed",
+            "placement_accepted": True,
+            "coordinator_submitted_at": f"2026-07-22T09:59:5{round_number}Z",
+            "coordinator_ready_at": (
+                "2026-07-22T09:59:59Z" if round_number == 2 else "2026-07-22T10:00:00Z"
+            ),
+            "worker_address": f"tcp://node-{'a' if round_number == 2 else 'b'}:1",
+            "hostname": f"node-{'a' if round_number == 2 else 'b'}",
+            "pid": 100 + round_number,
+            "slurm_job_id": str(99 + round_number),
+            "duration_seconds": 1.0,
+        }
+        for round_number in (2, 3)
+    ]
+    raw_placements.extend(
+        {
+            "task_key": item["task_key"],
+            "attempt": 1,
+            "status": "completed",
+            "placement_accepted": True,
+            "coordinator_submitted_at": item["coordinator_submitted_at"],
+            "coordinator_ready_at": item["coordinator_ready_at"],
+            "worker_address": item["worker"],
+            "hostname": item["hostname"],
+            "pid": 111 if item["hostname"] == "node-a" else 222,
+            "slurm_job_id": item["job_id"],
+            "duration_seconds": item["duration_seconds"],
+        }
+        for item in task_times
+    )
+    raw_placements.extend(
+        [
+            {
+                "task_key": f"round-{round_number:03d}:assembly:main",
+                "attempt": 1,
+                "status": "completed",
+                "placement_accepted": True,
+                "coordinator_submitted_at": "2026-07-22T10:01:00Z",
+                "coordinator_ready_at": "2026-07-22T10:01:20Z",
+                "worker_address": f"tcp://node-{'a' if round_number == 2 else 'b'}:1",
+                "hostname": f"node-{'a' if round_number == 2 else 'b'}",
+                "pid": 100 + round_number,
+                "slurm_job_id": str(99 + round_number),
+                "duration_seconds": 20.0,
+            }
+            for round_number in (2, 3)
+        ]
+    )
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "fine_graph": {
+                    "worker_cap": 4,
+                    "scale_events": [
+                        {
+                            "requested": 1,
+                            "activated": ["tcp://node-a:1"],
+                            "departed": [],
+                        },
+                        {
+                            "requested": 2,
+                            "activated": ["tcp://node-b:1"],
+                            "departed": [],
+                        },
+                        {
+                            "requested": 4,
+                            "activated": ["tcp://node-c:1", "tcp://node-d:1"],
+                            "departed": [],
+                        },
+                    ],
+                    "placements": raw_placements,
+                }
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    coarse_timing_paths = []
+    for round_number, calls in (
+        (
+            2,
+            [
+                {
+                    "duration_seconds": 60.0,
+                    "monotonic_started_seconds": 10.0,
+                    "monotonic_ended_seconds": 70.0,
+                },
+                {
+                    "duration_seconds": 40.0,
+                    "monotonic_started_seconds": 70.0,
+                    "monotonic_ended_seconds": 110.0,
+                },
+            ],
+        ),
+        (
+            3,
+            [
+                {
+                    "duration_seconds": 70.0,
+                    "monotonic_started_seconds": 20.0,
+                    "monotonic_ended_seconds": 90.0,
+                }
+            ],
+        ),
+    ):
+        timing_path = root / f"round-{round_number:03d}-coarse-main.json"
+        timing_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_key": f"round-{round_number:03d}:coarse:main",
+                    "status": "completed",
+                    "nonlinear_calls": calls,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        coarse_timing_paths.append(timing_path)
     identity = FileIdentity.from_path(input_path).to_dict()
     artifact = {
         "relative_path": "schema-v1/sample/rounds/round-002/channels/result.tif",
@@ -587,7 +694,9 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                 "metrics_exact": True,
                 "channels": [
                     {
-                        "relative_path": artifact["relative_path"],
+                        "relative_path": (
+                            "round-002/channel-0000/round-002-channel.tif"
+                        ),
                         "exact": True,
                     }
                 ],
@@ -602,6 +711,10 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
             "owned_roots": [str(root / "fine")],
         },
         "placement": {
+            "evidence_file": {
+                "relative_path": evidence_path.name,
+                "sha256": sha256(evidence_path.read_bytes()).hexdigest(),
+            },
             "worker_cap": 4,
             "maximum_connected_workers": 4,
             "scale_events": [1, 2, 4],
@@ -688,6 +801,7 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                     "pid": 333,
                     "slurm_job_id": "103",
                 },
+                "replacement_liveness_path": "retry",
                 "retry": {
                     "task_key": "round-002:chunk:0000",
                     "attempt": 2,
@@ -697,14 +811,7 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                     "pid": 333,
                     "slurm_job_id": "103",
                 },
-                "liveness": {
-                    "task_key": "round-003:chunk:0000",
-                    "status": "completed",
-                    "worker_address": "tcp://node-c:1",
-                    "hostname": "node-c",
-                    "pid": 333,
-                    "slurm_job_id": "103",
-                },
+                "liveness": None,
                 "owned_job_ids": ["101", "103"],
                 "remaining_owned_job_ids": [],
             },
@@ -714,6 +821,14 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                 "coordinator-fine-upper-bound-vs-worker-monotonic-coarse-lower-bound"
             ),
             "coarse_nonlinear_wall_seconds": 100.0,
+            "coarse_timing_policy": "per-round-monotonic-kernel-span",
+            "coarse_timing_files": [
+                {
+                    "relative_path": path.name,
+                    "sha256": sha256(path.read_bytes()).hexdigest(),
+                }
+                for path in coarse_timing_paths
+            ],
             "fine_nonlinear_wall_seconds": 80.0,
             "end_to_end_wall_seconds": 140.0,
             "task_seconds": 32.0,
@@ -753,6 +868,7 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                         cancellation_trigger_path,
                         cancellation_queue_path,
                         tier1_path,
+                        *coarse_timing_paths,
                         *(
                             root / f"{kind}-{suffix}.json"
                             for kind in ("chunk", "channel")
@@ -1028,6 +1144,8 @@ def test_fine_acceptance_builder_hashes_only_owned_evidence(tmp_path: Path) -> N
                 "fine-cancellation-trigger.json",
                 "fine-cancellation-queue-after.json",
                 "tier1-equivalence.json",
+                "round-002-coarse-main.json",
+                "round-003-coarse-main.json",
                 "chunk-failure-execution.json",
                 "chunk-resume-execution.json",
                 "chunk-failure-marker.json",
@@ -1269,15 +1387,15 @@ def test_fine_profiler_writes_external_peak_memory_and_restores_backend(
         ),
         (
             lambda value: value["placement"]["tasks"][1].update({"job_id": "101"}),
-            "chunk",
+            "primary",
         ),
         (
             lambda value: value["placement"]["tasks"][3].update({"hostname": "node-a"}),
-            "channel",
+            "primary",
         ),
         (
             lambda value: value["placement"].update({"maximum_connected_workers": 5}),
-            "worker cap",
+            "primary",
         ),
         (
             lambda value: value["placement"].update(
@@ -1288,7 +1406,7 @@ def test_fine_profiler_writes_external_peak_memory_and_restores_backend(
                     ]
                 }
             ),
-            "fair",
+            "primary",
         ),
         (
             lambda value: value["durability"]["chunk_failure_resume"].update(
@@ -1306,7 +1424,7 @@ def test_fine_profiler_writes_external_peak_memory_and_restores_backend(
             lambda value: value["performance"].update(
                 {"fine_nonlinear_wall_seconds": 80.0001}
             ),
-            "20%",
+            "fine timing",
         ),
         (
             lambda value: value["evidence_files"].append(
@@ -1379,9 +1497,6 @@ def _refresh_report_evidence_digest(
         lambda value: value["fine_graph"]["placements"][1].update(
             {"worker_address": "tcp://node-a:1"}
         ),
-        lambda value: value["fine_graph"]["placements"][2].update(
-            {"coordinator_ready_at": "2026-07-22T10:00:01Z"}
-        ),
     ),
 )
 def test_fine_acceptance_rejects_mutated_raw_replacement_lineage(
@@ -1404,6 +1519,75 @@ def test_fine_acceptance_rejects_mutated_raw_replacement_lineage(
         cast(dict[str, object], replacement["evidence_file"]),
     )
 
+    with pytest.raises(HpcWorkflowAcceptanceError, match="replacement"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_accepts_later_replacement_liveness_without_retry_affinity(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / "fine-worker-replacement-slurm-execution.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    retry = payload["fine_graph"]["placements"][1]
+    retry.update(
+        {
+            "worker_address": "tcp://node-b:1",
+            "hostname": "node-b",
+            "pid": 222,
+            "slurm_job_id": "102",
+        }
+    )
+    payload["cleanup"]["recorded_job_ids"] = ["101", "102", "103"]
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    replacement = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["worker_replacement"],
+    )
+    cast(dict[str, object], replacement["retry"]).update(
+        {
+            "worker_address": "tcp://node-b:1",
+            "hostname": "node-b",
+            "pid": 222,
+            "slurm_job_id": "102",
+        }
+    )
+    replacement["replacement_liveness_path"] = "later-task"
+    replacement["liveness"] = {
+        "task_key": "round-003:chunk:0000",
+        "status": "completed",
+        "worker_address": "tcp://node-c:1",
+        "hostname": "node-c",
+        "pid": 333,
+        "slurm_job_id": "103",
+    }
+    replacement["owned_job_ids"] = ["101", "102", "103"]
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], replacement["evidence_file"]),
+    )
+
+    assert validate_fine_acceptance_report(report, evidence_root=tmp_path) == report
+
+
+def test_fine_acceptance_rejects_replacement_without_either_liveness_path(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    replacement = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["worker_replacement"],
+    )
+    replacement["replacement_liveness_path"] = "later-task"
+    replacement["liveness"] = {
+        "task_key": "round-003:chunk:0000",
+        "status": "completed",
+        "worker_address": "tcp://node-b:1",
+        "hostname": "node-b",
+        "pid": 222,
+        "slurm_job_id": "102",
+    }
     with pytest.raises(HpcWorkflowAcceptanceError, match="replacement"):
         validate_fine_acceptance_report(report, evidence_root=tmp_path)
 
@@ -1559,13 +1743,36 @@ def test_fine_acceptance_rejects_cancellation_resume_key_drift(tmp_path: Path) -
         validate_fine_acceptance_report(report, evidence_root=tmp_path)
 
 
-def test_fine_acceptance_rejects_tier_content_drift_with_refreshed_checksums(
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: value["rounds"][0]["channels"].clear(),
+        lambda value: value["rounds"][0]["registered"]["geometry"].update(
+            {"spacing": [0.2, 0.2, 0.3]}
+        ),
+        lambda value: value["rounds"][0]["registered"].update({"dtype": "uint16"}),
+        lambda value: (
+            value["rounds"][0]["metrics"]["nonlinear-registered"]["reference"].update(
+                {"Correlation": 0.4}
+            ),
+            value["rounds"][0]["metrics"]["nonlinear-registered"]["candidate"].update(
+                {"Correlation": 0.409}
+            ),
+            value["rounds"][0]["metrics"]["nonlinear-registered"][
+                "absolute_differences"
+            ].update({"Correlation": 0.009}),
+        ),
+    ),
+)
+def test_fine_acceptance_rejects_tier1_contract_drift_with_refreshed_checksums(
     tmp_path: Path,
+    mutation: object,
 ) -> None:
     report = _fine_acceptance_report(tmp_path)
     path = tmp_path / "tier1-equivalence.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["rounds"][0]["metrics"]["absolute_differences"]["Correlation"] = 0.008
+    assert callable(mutation)
+    mutation(payload)
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     tier1 = cast(
         dict[str, object],
@@ -1576,8 +1783,76 @@ def test_fine_acceptance_rejects_tier_content_drift_with_refreshed_checksums(
         path,
         cast(dict[str, object], tier1["evidence_file"]),
     )
-    with pytest.raises(HpcWorkflowAcceptanceError, match="Tier 1 summary"):
+    with pytest.raises(HpcWorkflowAcceptanceError, match="scientific comparison"):
         validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: value["placement"]["tasks"][0].update({"job_id": "forged"}),
+        lambda value: value["placement"].update({"maximum_connected_workers": 2}),
+        lambda value: value["placement"]["fair_dispatch_order"].reverse(),
+    ),
+)
+def test_fine_acceptance_rejects_primary_placement_summary_forgery(
+    tmp_path: Path,
+    mutation: object,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    assert callable(mutation)
+    mutation(report)
+    with pytest.raises(HpcWorkflowAcceptanceError, match="primary"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_rejects_refreshed_primary_preparation_clock_forgery(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / "fine-execution.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    preparation = payload["fine_graph"]["placements"][1]
+    preparation["coordinator_ready_at"] = "2026-07-22T10:00:02Z"
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    placement = cast(dict[str, object], report["placement"])
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], placement["evidence_file"]),
+    )
+    with pytest.raises(HpcWorkflowAcceptanceError, match="primary"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_coarse_bound_aggregates_all_calls_per_round(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    cast(dict[str, object], report["performance"])["coarse_nonlinear_wall_seconds"] = (
+        60.0
+    )
+    with pytest.raises(HpcWorkflowAcceptanceError, match="coarse"):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+
+def test_fine_acceptance_records_summed_duration_fallback_for_all_calls(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    performance = cast(dict[str, object], report["performance"])
+    references = cast(list[dict[str, object]], performance["coarse_timing_files"])
+    for reference in references:
+        path = tmp_path / cast(str, reference["relative_path"])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for call in payload["nonlinear_calls"]:
+            call.pop("monotonic_started_seconds")
+            call.pop("monotonic_ended_seconds")
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        _refresh_report_evidence_digest(report, path, reference)
+    performance["coarse_timing_policy"] = "per-round-summed-kernel-durations"
+
+    assert validate_fine_acceptance_report(report, evidence_root=tmp_path) == report
 
 
 def test_fine_acceptance_requires_tier_source_in_evidence_checksum_set(
@@ -1747,6 +2022,109 @@ def _exact_numeric_payload() -> dict[str, object]:
     }
 
 
+def _scientific_equivalence_payload() -> dict[str, object]:
+    numeric = {
+        "shape": [16, 32, 48],
+        "reference_dtype": "float32",
+        "candidate_dtype": "float32",
+        "array_equal": False,
+        "close_required": False,
+        "maximum_absolute_difference": 0.01,
+        "mean_absolute_difference": 0.001,
+        "p99_9_absolute_difference": 0.009,
+        "rtol": 1e-4,
+        "atol": 1e-5,
+    }
+    geometry = {
+        "shape": [16, 32, 48],
+        "origin": [1.0, 2.0, 3.0],
+        "spacing": [0.2, 0.2, 0.5],
+        "direction": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    }
+
+    def image(name: str) -> dict[str, object]:
+        return {
+            "reference": f"/coarse/{name}.tif",
+            "candidate": f"/fine/{name}.tif",
+            "dtype": "float32",
+            "shape": [16, 32, 48],
+            "geometry": geometry,
+            "numeric": numeric,
+        }
+
+    def metric(reference: float, candidate: float) -> dict[str, object]:
+        return {
+            "reference": {
+                "Correlation": reference,
+                "MattesMutualInformation": reference,
+            },
+            "candidate": {
+                "Correlation": candidate,
+                "MattesMutualInformation": candidate,
+            },
+            "absolute_differences": {
+                "Correlation": abs(candidate - reference),
+                "MattesMutualInformation": abs(candidate - reference),
+            },
+            "absolute_tolerance": 0.01,
+        }
+
+    return {
+        "schema_version": 1,
+        "scientific_fingerprint": "2" * 64,
+        "rtol": 1e-4,
+        "atol": 1e-5,
+        "comparison_policy": "stochastic-scientific-equivalence",
+        "metric_absolute_tolerance": 0.01,
+        "voxel_differences_are_characterization": True,
+        "rounds": [
+            {
+                "round": 2,
+                "strategy": "serial_chunked",
+                "affine": {
+                    "transform_type": "AffineTransform",
+                    "dimension": 3,
+                    "fixed_parameters_exact": True,
+                    "parameters": {
+                        **numeric,
+                        "shape": [12],
+                    },
+                },
+                "warp": {
+                    "geometry": {
+                        "shape": [2, 3, 4],
+                        "origin": [0.0, 0.0, 0.0],
+                        "spacing": [0.2, 0.2, 0.5],
+                        "direction": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "has_components": True,
+                    },
+                    "numeric": {
+                        **numeric,
+                        "shape": [2, 3, 4, 3],
+                    },
+                },
+                "registered": image("registered"),
+                "metrics": {
+                    "pre-registration": metric(0.50, 0.509),
+                    "linearly-registered": metric(0.60, 0.609),
+                    "nonlinear-registered": metric(0.70, 0.709),
+                },
+                "channels": [
+                    {
+                        "source": "/inputs/round-002-channel.tif",
+                        "interpolation": "linear",
+                        "comparison": image("channel"),
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def _strict_parity_payload() -> dict[str, object]:
     metric = {
         "absolute_tolerance": 0.0,
@@ -1765,6 +2143,8 @@ def _strict_parity_payload() -> dict[str, object]:
         "voxel_differences_are_characterization": False,
         "rounds": [
             {
+                "round": 2,
+                "strategy": "serial_chunked",
                 "affine": {"parameters": _exact_numeric_payload()},
                 "warp": {"numeric": _exact_numeric_payload()},
                 "registered": {"numeric": _exact_numeric_payload()},
@@ -1773,7 +2153,12 @@ def _strict_parity_payload() -> dict[str, object]:
                     "linearly-registered": metric,
                     "nonlinear-registered": metric,
                 },
-                "channels": [{"comparison": {"numeric": _exact_numeric_payload()}}],
+                "channels": [
+                    {
+                        "source": "/inputs/round-002-channel.tif",
+                        "comparison": {"numeric": _exact_numeric_payload()},
+                    }
+                ],
             }
         ],
     }

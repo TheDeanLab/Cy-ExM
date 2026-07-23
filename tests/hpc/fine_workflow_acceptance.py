@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -445,6 +446,312 @@ def _evidence_reference(
     return relative, claimed, payload
 
 
+def _derive_primary_evidence(value: object) -> tuple[dict[str, object], float]:
+    """Derive placement, fairness, cap, and fine timing from primary raw evidence."""
+    if not isinstance(value, Mapping) or not isinstance(
+        graph := value.get("fine_graph"), Mapping
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary evidence lacks a fine graph"
+        )
+    placements = graph.get("placements")
+    scale_events = graph.get("scale_events")
+    cap = graph.get("worker_cap")
+    if (
+        not isinstance(placements, list)
+        or not isinstance(scale_events, list)
+        or type(cap) is not int
+        or cap < 2
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary graph placement/scale schema is malformed"
+        )
+
+    def accepted(item: object) -> bool:
+        return (
+            isinstance(item, Mapping)
+            and item.get("placement_accepted") is True
+            and item.get("status") in {"completed", "reused"}
+        )
+
+    task_summaries: list[dict[str, object]] = []
+    preparations: list[Mapping[str, object]] = []
+    assemblies: list[Mapping[str, object]] = []
+    for raw in placements:
+        if not accepted(raw):
+            continue
+        item = cast(Mapping[str, object], raw)
+        key = item.get("task_key")
+        if not isinstance(key, str):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance primary placement task key is malformed"
+            )
+        if ":preparation:" in key:
+            preparations.append(item)
+            continue
+        if ":assembly:" in key:
+            assemblies.append(item)
+            continue
+        parts = key.split(":")
+        if len(parts) != 3 or parts[1] not in {"chunk", "channel"}:
+            continue
+        try:
+            round_number = int(parts[0].removeprefix("round-"))
+            submitted = _timestamp(cast(str, item["coordinator_submitted_at"]))
+            ready = _timestamp(cast(str, item["coordinator_ready_at"]))
+            duration = _fine_number(
+                item["duration_seconds"], f"primary placement {key}.duration"
+            )
+            job_id = _fine_nonempty_string(
+                item["slurm_job_id"], f"primary placement {key}.slurm_job_id"
+            )
+            hostname = _fine_nonempty_string(
+                item["hostname"], f"primary placement {key}.hostname"
+            )
+            worker = _fine_nonempty_string(
+                item["worker_address"], f"primary placement {key}.worker_address"
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance primary placement record is malformed"
+            ) from error
+        if ready < submitted:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance primary placement readiness predates submission"
+            )
+        task_summaries.append(
+            {
+                "task_key": key,
+                "kind": parts[1],
+                "round": round_number,
+                "job_id": job_id,
+                "hostname": hostname,
+                "worker": worker,
+                "coordinator_submitted_at": cast(str, item["coordinator_submitted_at"]),
+                "coordinator_ready_at": cast(str, item["coordinator_ready_at"]),
+                "duration_seconds": duration,
+            }
+        )
+    if not task_summaries:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary graph has no accepted granular tasks"
+        )
+    if (
+        len({item["job_id"] for item in task_summaries}) < 2
+        or len({item["hostname"] for item in task_summaries}) < 2
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary graph lacks two jobs and hosts"
+        )
+    ready_by_round: dict[int, datetime] = {}
+    for item in preparations:
+        try:
+            key = cast(str, item["task_key"])
+            round_number = int(key.split(":", 1)[0].removeprefix("round-"))
+            ready = _timestamp(cast(str, item["coordinator_ready_at"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance primary preparation record is malformed"
+            ) from error
+        ready_by_round[round_number] = ready
+    if len(ready_by_round) < 2:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary lacks two coordinator-ready preparations"
+        )
+    both_ready = max(ready_by_round.values())
+    fair_candidates = sorted(
+        (
+            item
+            for item in task_summaries
+            if item["kind"] == "chunk"
+            and _timestamp(cast(str, item["coordinator_submitted_at"])) >= both_ready
+        ),
+        key=lambda item: cast(str, item["coordinator_submitted_at"]),
+    )
+    if len(fair_candidates) < 2 or (
+        fair_candidates[0]["round"] == fair_candidates[1]["round"]
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary lacks fair cross-round chunk dispatch"
+        )
+    active: set[str] = set()
+    maximum_active = 0
+    requests: list[int] = []
+    for raw_event in scale_events:
+        if not isinstance(raw_event, Mapping):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance primary scale event is malformed"
+            )
+        requested = raw_event.get("requested")
+        activated = raw_event.get("activated")
+        departed = raw_event.get("departed")
+        if (
+            type(requested) is not int
+            or requested < 1
+            or not isinstance(activated, list)
+            or not isinstance(departed, list)
+            or any(not isinstance(item, str) or not item for item in activated)
+            or any(not isinstance(item, str) or not item for item in departed)
+        ):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance primary scale event fields are malformed"
+            )
+        active.difference_update(cast(list[str], departed))
+        active.update(cast(list[str], activated))
+        maximum_active = max(maximum_active, len(active))
+        requests.append(requested)
+    if maximum_active < 2 or maximum_active > cap:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary activated worker maximum violates cap"
+        )
+    chunk_attempts = [item for item in task_summaries if item["kind"] == "chunk"]
+    if not assemblies:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary has no accepted assembly readiness"
+        )
+    try:
+        fine_wall = (
+            max(
+                _timestamp(cast(str, item["coordinator_ready_at"]))
+                for item in assemblies
+            )
+            - min(
+                _timestamp(cast(str, item["coordinator_submitted_at"]))
+                for item in chunk_attempts
+            )
+        ).total_seconds()
+    except (KeyError, TypeError, ValueError) as error:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary timing boundaries are malformed"
+        ) from error
+    if fine_wall <= 0.0:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary fine upper bound is not positive"
+        )
+    return (
+        {
+            "worker_cap": cap,
+            "maximum_connected_workers": maximum_active,
+            "scale_events": requests,
+            "fair_ready_rounds": [
+                cast(int, fair_candidates[0]["round"]),
+                cast(int, fair_candidates[1]["round"]),
+            ],
+            "fair_dispatch_order": [
+                cast(str, fair_candidates[0]["task_key"]),
+                cast(str, fair_candidates[1]["task_key"]),
+            ],
+            "tasks": task_summaries,
+        },
+        fine_wall,
+    )
+
+
+def _coarse_nonlinear_lower_bound(
+    records: Sequence[tuple[str, object]],
+) -> tuple[float, str]:
+    """Return the maximum per-round serial nonlinear interval."""
+    round_totals: list[float] = []
+    policies: set[str] = set()
+    seen_rounds: set[int] = set()
+    for relative, raw in records:
+        expected_name = PurePosixPath(relative).name
+        if not (
+            expected_name.startswith("round-")
+            and expected_name.endswith("-coarse-main.json")
+            and isinstance(raw, Mapping)
+            and raw.get("schema_version") == 1
+            and raw.get("status") == "completed"
+        ):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance coarse timing record is not a stable completed "
+                "round-XXX-coarse-main record"
+            )
+        try:
+            round_token = expected_name.removeprefix("round-").removesuffix(
+                "-coarse-main.json"
+            )
+            round_number = int(round_token)
+        except ValueError as error:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance coarse timing filename has no round identity"
+            ) from error
+        if round_number in seen_rounds:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance coarse timing repeats a round record"
+            )
+        seen_rounds.add(round_number)
+        if raw.get("task_key") != f"round-{round_number:03d}:coarse:main":
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance coarse timing task identity differs from filename"
+            )
+        calls = raw.get("nonlinear_calls")
+        if not isinstance(calls, list) or not calls:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance coarse timing round has no nonlinear calls"
+            )
+        durations: list[float] = []
+        boundaries: list[tuple[float, float]] = []
+        for index, call in enumerate(calls):
+            if not isinstance(call, Mapping):
+                raise HpcWorkflowAcceptanceError(
+                    "fine acceptance coarse timing call is malformed"
+                )
+            duration = _fine_number(
+                call.get("duration_seconds"),
+                f"coarse timing round {round_number} call {index}.duration",
+            )
+            durations.append(duration)
+            has_start = "monotonic_started_seconds" in call
+            has_end = "monotonic_ended_seconds" in call
+            if has_start != has_end:
+                raise HpcWorkflowAcceptanceError(
+                    "fine acceptance coarse timing call has partial monotonic bounds"
+                )
+            if has_start:
+                started = _fine_number(
+                    call["monotonic_started_seconds"],
+                    f"coarse timing round {round_number} call {index}.start",
+                )
+                ended = _fine_number(
+                    call["monotonic_ended_seconds"],
+                    f"coarse timing round {round_number} call {index}.end",
+                )
+                if ended < started or duration > ended - started + 1e-9:
+                    raise HpcWorkflowAcceptanceError(
+                        "fine acceptance coarse timing monotonic interval is invalid"
+                    )
+                boundaries.append((started, ended))
+        if boundaries and len(boundaries) != len(calls):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance coarse timing mixes monotonic and duration-only calls"
+            )
+        if boundaries:
+            if any(
+                current[0] < previous[1] for previous, current in pairwise(boundaries)
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    "fine acceptance coarse timing calls are not monotonic and ordered"
+                )
+            total = max(end for _, end in boundaries) - min(
+                start for start, _ in boundaries
+            )
+            policies.add("per-round-monotonic-kernel-span")
+        else:
+            total = sum(durations)
+            policies.add("per-round-summed-kernel-durations")
+        if total <= 0.0:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance coarse timing lower bound is not positive"
+            )
+        round_totals.append(total)
+    if not round_totals or len(policies) != 1:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance coarse timing records use no single lower-bound policy"
+        )
+    return max(round_totals), policies.pop()
+
+
 def _maximum_metric_difference(value: object) -> float:
     differences: list[float] = []
 
@@ -693,6 +1000,7 @@ def _validate_worker_replacement(
                 "failed_attempt",
                 "departed_worker",
                 "replacement_worker",
+                "replacement_liveness_path",
                 "retry",
                 "liveness",
                 "owned_job_ids",
@@ -780,27 +1088,40 @@ def _validate_worker_replacement(
         },
         f"{location}.retry.identity",
     )
-    liveness = _fine_object(
-        replacement["liveness"],
-        keys=frozenset(
+    liveness_path = replacement["replacement_liveness_path"]
+    if liveness_path not in {"retry", "later-task"}:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance replacement liveness path is not canonical"
+        )
+    liveness: dict[str, object] | None = None
+    liveness_identity: dict[str, object] | None = None
+    if liveness_path == "retry":
+        if replacement["liveness"] is not None:
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance retry liveness path must not claim another task"
+            )
+    else:
+        liveness = _fine_object(
+            replacement["liveness"],
+            keys=frozenset(
+                {
+                    "task_key",
+                    "status",
+                    "worker_address",
+                    "hostname",
+                    "pid",
+                    "slurm_job_id",
+                }
+            ),
+            location=f"{location}.liveness",
+        )
+        liveness_identity = _fine_worker_identity(
             {
-                "task_key",
-                "status",
-                "worker_address",
-                "hostname",
-                "pid",
-                "slurm_job_id",
-            }
-        ),
-        location=f"{location}.liveness",
-    )
-    liveness_identity = _fine_worker_identity(
-        {
-            name: liveness[name]
-            for name in ("worker_address", "hostname", "pid", "slurm_job_id")
-        },
-        f"{location}.liveness.identity",
-    )
+                name: liveness[name]
+                for name in ("worker_address", "hostname", "pid", "slurm_job_id")
+            },
+            f"{location}.liveness.identity",
+        )
     owned = _fine_exact_strings(
         replacement["owned_job_ids"], f"{location}.owned_job_ids"
     )
@@ -808,6 +1129,13 @@ def _validate_worker_replacement(
         replacement["remaining_owned_job_ids"],
         f"{location}.remaining_owned_job_ids",
     )
+    expected_owned = {
+        cast(str, departed["slurm_job_id"]),
+        cast(str, activated["slurm_job_id"]),
+        cast(str, retry_identity["slurm_job_id"]),
+    }
+    if liveness_identity is not None:
+        expected_owned.add(cast(str, liveness_identity["slurm_job_id"]))
     if (
         failed["task_key"] != loss_key
         or failed["attempt"] != 1
@@ -817,15 +1145,18 @@ def _validate_worker_replacement(
         or retry["task_key"] != loss_key
         or retry["attempt"] != 2
         or retry["status"] != "completed"
-        or retry_identity != activated
-        or liveness["task_key"] == loss_key
-        or liveness["status"] not in {"completed", "reused"}
-        or set(owned)
-        != {
-            cast(str, departed["slurm_job_id"]),
-            cast(str, activated["slurm_job_id"]),
-        }
+        or set(owned) != expected_owned
         or remaining
+        or (liveness_path == "retry" and retry_identity != activated)
+        or (
+            liveness_path == "later-task"
+            and (
+                liveness is None
+                or liveness_identity != activated
+                or liveness["task_key"] == loss_key
+                or liveness["status"] not in {"completed", "reused"}
+            )
+        )
     ):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance worker loss, departure, replacement activation, "
@@ -843,6 +1174,7 @@ def _validate_worker_replacement(
     events = graph.get("scale_events")
     attempts = graph.get("attempt_counts")
     placements = graph.get("placements")
+    cleanup = raw_evidence.get("cleanup")
     if not all(isinstance(item, list) for item in (events, attempts, placements)):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance replacement evidence lacks canonical event records"
@@ -897,11 +1229,17 @@ def _validate_worker_replacement(
         for item in cast(list[dict[str, object]], placements)
         if isinstance(item, dict) and item.get("task_key") == loss_key
     ]
-    liveness_placements = [
-        item
-        for item in cast(list[dict[str, object]], placements)
-        if isinstance(item, dict) and item.get("task_key") == liveness["task_key"]
-    ]
+    liveness_placements = (
+        [
+            item
+            for item in cast(list[dict[str, object]], placements)
+            if isinstance(item, dict)
+            and liveness is not None
+            and item.get("task_key") == liveness["task_key"]
+        ]
+        if liveness_path == "later-task"
+        else []
+    )
     if (
         activation_index is None
         or departure_index is None
@@ -912,14 +1250,26 @@ def _validate_worker_replacement(
         or target_placements[0].get("placement_accepted") is not False
         or target_placements[1].get("status") != "completed"
         or target_placements[1].get("placement_accepted") is not True
-        or raw_identity(target_placements[1]) != activated
-        or not liveness_placements
-        or liveness_placements[-1].get("status") not in {"completed", "reused"}
-        or liveness_placements[-1].get("placement_accepted") is not True
-        or raw_identity(liveness_placements[-1]) != liveness_identity
-        or cast(str, liveness_placements[-1].get("coordinator_ready_at", ""))
-        <= cast(str, target_placements[1].get("coordinator_ready_at", ""))
+        or raw_identity(target_placements[1]) != retry_identity
         or raw_queue.get("jobs") != []
+        or not isinstance(cleanup, Mapping)
+        or set(cast(list[object], cleanup.get("recorded_job_ids", [])))
+        != expected_owned
+        or cleanup.get("remaining_owned_job_ids") != []
+        or (
+            liveness_path == "retry" and raw_identity(target_placements[1]) != activated
+        )
+        or (
+            liveness_path == "later-task"
+            and (
+                not liveness_placements
+                or liveness_placements[-1].get("status") not in {"completed", "reused"}
+                or liveness_placements[-1].get("placement_accepted") is not True
+                or raw_identity(liveness_placements[-1]) != activated
+                or cast(str, liveness_placements[-1].get("coordinator_ready_at", ""))
+                <= cast(str, target_placements[1].get("coordinator_ready_at", ""))
+            )
+        )
     ):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance replacement report is not derived from canonical "
@@ -1135,6 +1485,13 @@ def validate_fine_acceptance_report(
         owned_root=owned_root,
         location="scientific.tier1.evidence_file",
     )
+    from hpc.workflow_acceptance import _validated_scientific_comparison_evidence
+
+    validated_tier1 = _validated_scientific_comparison_evidence(
+        tier1_payload,
+        require_close=False,
+        metric_absolute_tolerance=0.01,
+    )
     if abs(_maximum_metric_difference(tier1_payload) - maximum_difference) > 1e-12:
         raise HpcWorkflowAcceptanceError(
             "fine acceptance Tier 1 summary does not match full equivalence evidence"
@@ -1143,6 +1500,8 @@ def validate_fine_acceptance_report(
         tier1["metric_absolute_tolerance"] != 0.01
         or maximum_difference > 0.01
         or tier1["structure_equal"] is not True
+        or validated_tier1["scientific_fingerprint"]
+        != identities["scientific_fingerprint"]
     ):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance Tier 1 metric or structure gate failed"
@@ -1194,9 +1553,25 @@ def validate_fine_acceptance_report(
     )
     strict = cast(dict[str, object], deterministic["strict_parity"])
     strict_rounds = cast(list[dict[str, object]], strict["rounds"])
-    expected_channel_count = sum(
-        len(cast(list[object], item["channels"])) for item in strict_rounds
-    )
+    expected_channel_paths: list[str] = []
+    for round_item in strict_rounds:
+        round_number = round_item.get("round")
+        raw_channels = round_item.get("channels")
+        if type(round_number) is not int or not isinstance(raw_channels, list):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance Tier 2 raw round/channel identities are malformed"
+            )
+        for channel_index, raw_channel in enumerate(raw_channels):
+            if not isinstance(raw_channel, Mapping) or not isinstance(
+                source := raw_channel.get("source"), str
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    "fine acceptance Tier 2 raw channel source is malformed"
+                )
+            expected_channel_paths.append(
+                f"round-{round_number:03d}/channel-{channel_index:04d}/"
+                f"{PurePosixPath(source).name}"
+            )
     channels = _fine_array(tier2["channels"], "scientific.tier2.channels")
     if not channels:
         raise HpcWorkflowAcceptanceError(
@@ -1223,9 +1598,9 @@ def validate_fine_acceptance_report(
         raise HpcWorkflowAcceptanceError(
             "fine acceptance Tier 2 channels are duplicate or noncanonical"
         )
-    if len(channels) != expected_channel_count:
+    if channel_paths != sorted(expected_channel_paths):
         raise HpcWorkflowAcceptanceError(
-            "fine acceptance Tier 2 channels do not match deterministic evidence"
+            "fine acceptance Tier 2 channels do not match raw deterministic identities"
         )
 
     fixed = _fine_object(
@@ -1310,11 +1685,32 @@ def validate_fine_acceptance_report(
             raise HpcWorkflowAcceptanceError(
                 "fine acceptance prepared path escapes every owned root"
             )
+    fixed_geometry = {
+        "shape": shape,
+        "origin": origin,
+        "spacing": spacing,
+        "direction": direction,
+    }
+    for round_item in cast(list[dict[str, object]], validated_tier1["rounds"]):
+        registered = cast(dict[str, object], round_item["registered"])
+        comparisons = [
+            registered,
+            *[
+                cast(dict[str, object], channel["comparison"])
+                for channel in cast(list[dict[str, object]], round_item["channels"])
+            ],
+        ]
+        if any(item["geometry"] != fixed_geometry for item in comparisons):
+            raise HpcWorkflowAcceptanceError(
+                "fine acceptance scientific comparison geometry differs from "
+                "the declared fixed grid"
+            )
 
     placement = _fine_object(
         report["placement"],
         keys=frozenset(
             {
+                "evidence_file",
                 "worker_cap",
                 "maximum_connected_workers",
                 "scale_events",
@@ -1325,6 +1721,19 @@ def validate_fine_acceptance_report(
         ),
         location="placement",
     )
+    primary_reference, primary_sha256, primary_payload = _evidence_reference(
+        placement["evidence_file"],
+        owned_root=owned_root,
+        location="placement.evidence_file",
+    )
+    derived_placement, derived_fine_wall = _derive_primary_evidence(primary_payload)
+    placement_without_reference = {
+        name: value for name, value in placement.items() if name != "evidence_file"
+    }
+    if placement_without_reference != derived_placement:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance primary placement summary differs from raw evidence"
+        )
     cap = placement["worker_cap"]
     maximum_workers = placement["maximum_connected_workers"]
     if (
@@ -1338,12 +1747,8 @@ def validate_fine_acceptance_report(
             "fine acceptance placement exceeds or fails to reach the worker cap"
         )
     scale_events = _fine_array(placement["scale_events"], "placement.scale_events")
-    scale_requests = [cast(int, item) for item in scale_events]
-    if (
-        not scale_events
-        or any(type(item) is not int or cast(int, item) < 1 for item in scale_events)
-        or scale_requests != sorted(set(scale_requests))
-        or cast(int, scale_events[-1]) != maximum_workers
+    if not scale_events or any(
+        type(item) is not int or cast(int, item) < 1 for item in scale_events
     ):
         raise HpcWorkflowAcceptanceError(
             "fine acceptance demand scale events are not canonical"
@@ -1575,6 +1980,8 @@ def validate_fine_acceptance_report(
         keys=frozenset(
             {
                 "coarse_nonlinear_wall_seconds",
+                "coarse_timing_policy",
+                "coarse_timing_files",
                 "fine_nonlinear_wall_seconds",
                 "clock_policy",
                 "end_to_end_wall_seconds",
@@ -1599,6 +2006,35 @@ def validate_fine_acceptance_report(
         "performance.fine_nonlinear_wall_seconds",
         minimum=1e-300,
     )
+    timing_references: list[tuple[str, str]] = []
+    timing_records: list[tuple[str, object]] = []
+    for index, reference in enumerate(
+        _fine_array(
+            performance["coarse_timing_files"],
+            "performance.coarse_timing_files",
+        )
+    ):
+        relative, digest, payload = _evidence_reference(
+            reference,
+            owned_root=owned_root,
+            location=f"performance.coarse_timing_files[{index}]",
+        )
+        timing_references.append((relative, digest))
+        timing_records.append((relative, payload))
+    derived_coarse_wall, derived_coarse_policy = _coarse_nonlinear_lower_bound(
+        timing_records
+    )
+    if (
+        abs(coarse_wall - derived_coarse_wall) > 1e-9
+        or performance["coarse_timing_policy"] != derived_coarse_policy
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance coarse timing summary differs from all per-round calls"
+        )
+    if abs(fine_wall - derived_fine_wall) > 1e-9:
+        raise HpcWorkflowAcceptanceError(
+            "fine acceptance fine timing summary differs from primary evidence"
+        )
     if performance["clock_policy"] != (
         "coordinator-fine-upper-bound-vs-worker-monotonic-coarse-lower-bound"
     ):
@@ -1678,6 +2114,8 @@ def validate_fine_acceptance_report(
     for relative, digest in (
         (tier1_reference, tier1_sha256),
         (tier2_reference, tier2_sha256),
+        (primary_reference, primary_sha256),
+        *timing_references,
         *replacement_references,
         *cancellation_references,
         *chunk_resume_references,

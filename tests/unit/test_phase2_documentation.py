@@ -272,6 +272,7 @@ def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
         "nonlinear_registered_2.tif",
         "rounds/round-002/channels/",
         "rounds/round-002/logs/round-002.log",
+        "round-002-<stage>-<item>.log",
         ".complete.json",
     ):
         assert output in readme
@@ -292,8 +293,12 @@ def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
         "do not create a per-round `fixed_reference.tif`",
         "forcing the reference round invalidates all moving descendants",
         "reference preparation as its declared round",
+        "coarse moving rounds use the shared `round-nnn.log`",
+        "fine moving tasks never append to that shared round log",
+        "reference task retains its ordinary `round-nnn.log`",
     ):
         assert required in normalized
+    assert "stderr and per-round shared logs" not in normalized
 
 
 def test_readme_documents_success_only_json_output() -> None:
@@ -318,7 +323,10 @@ def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> No
         "min(pending tasks, configured workers)",
         "one `round_slot`",
         "one process per job",
-        "every connected worker must pass preflight",
+        "coarse mode, every connected worker must pass preflight before any "
+        "registration submission",
+        "every later newcomer must pass preflight and activation before that worker "
+        "is eligible for scientific submission",
         "independent round failures",
         "automatic retries default to zero",
         "executor-managed resubmission",
@@ -384,12 +392,13 @@ def test_fine_grained_guide_documents_the_exact_graph_and_resource_contract() ->
         "prepared fixed-grid bundle",
         "nonlinear chunk",
         "deterministic assembly",
-        "dependent channel",
+        "every declared moving channel",
         "round validation",
         "`serial_chunked`",
         "ascending chunk id",
         "later ids overwrite earlier values",
-        "one scientific task per worker slot",
+        "one immutable scientific task at a time",
+        "worker may execute multiple tasks sequentially",
         "one candidate worker",
         "preflight",
         "`round_slot`",
@@ -416,8 +425,6 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
         "`moving_linear_scalar.npy`",
         "`fixed_mask.npy`",
         "`moving_linear_mask.npy`",
-        "manifest version 2",
-        "ants pixel type",
         "memory-mapped",
         "fixed-reference grid",
         "`chunk_0000_registered_core.npy`",
@@ -435,5 +442,36 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
         "legacy clearex/ants behavior",
         "portable real-ants/local-dask evidence is complete",
         "real slurm production acceptance remains pending",
+        "`format_version` is exactly `2`",
+        "`pixeltypes`",
+        "`fixed_mask`",
+        "`fixed_scalar`",
+        "`moving_linear_mask`",
+        "`moving_linear_scalar`",
+        "`unsigned char`",
+        "`unsigned int`",
+        "`float`",
+        "`double`",
+        "not a user-selected execution option",
+        "fails closed",
     ):
         assert required in guide
+
+
+def test_phase_two_acceptance_is_coarse_history_not_fine_slurm_acceptance() -> None:
+    acceptance = " ".join(
+        (REPOSITORY_ROOT / "docs/phase-2-acceptance.md")
+        .read_text(encoding="utf-8")
+        .split()
+    ).lower()
+    for required in (
+        "historical coarse round-level phase 2e baseline",
+        "[fine-grained registration](fine-grained-execution.md)",
+        "fine chunk and declared-channel execution is implemented",
+        "fine-grained real slurm production acceptance remains pending tasks 12-13",
+    ):
+        assert required in acceptance
+    assert (
+        "per-chunk dask parallelism, parallel channel transformation, and resource "
+        "auto-optimization remain future work"
+    ) not in acceptance

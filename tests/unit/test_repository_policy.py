@@ -98,7 +98,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "never registration algorithms or artifact-validity decisions",
         "scheduler imports occur only inside the selected operation",
         "process-isolated workers",
-        "min(pending tasks, configured workers)",
+        "coarse slurm scales to `min(pending tasks, configured workers)`",
         "one coarse task per moving round",
         "each worker advertises one `round_slot`",
         "every submitted workflow task requests and consumes one",
@@ -106,8 +106,9 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "without submitting descendants",
         "default retries are zero",
         "no nested chunk scheduling or silent fallback",
-        "all connected workers pass preflight before any registration task is "
-        "submitted",
+        "coarse mode requires all connected workers to pass preflight before any "
+        "registration task is submitted",
+        "before that worker is eligible for scientific submission",
         "post-preflight round failure does not cancel independent round tasks",
         "cancel unfinished futures",
         "client before its owned cluster",
@@ -132,9 +133,9 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "forcing the reference task forces every moving descendant",
         "status includes the reference round",
         "no module-scope scientific or scheduler imports",
-        "only real registration execution boundary in workflow",
-        "configures the task's native threads before its lazy "
-        "registration/scientific imports",
+        "`round_task.py` is the coarse registration execution boundary",
+        "`fine_task.py` is the fine scientific worker boundary",
+        "both configure native threads before lazy registration/scientific imports",
         "must not create a dask client, submit child tasks, schedule other rounds, "
         "or start multiprocessing",
     ),
@@ -522,6 +523,20 @@ def test_fine_grained_agent_guidance_owns_each_layer_without_production_claims()
         guidance = _normalized_repository_file(path)
         for fragment in fragments:
             assert fragment in guidance, (path, fragment)
+
+    execution = _normalized_repository_file("src/cyexm/execution/AGENTS.md")
+    assert "- slurm scales to `min(pending tasks, configured workers)`" not in execution
+    workflow = _normalized_repository_file("src/cyexm/workflow/AGENTS.md")
+    assert (
+        "`round_task.py` is the only real registration execution boundary"
+        not in workflow
+    )
+    for required in (
+        "`round_task.py` is the coarse registration execution boundary",
+        "`fine_task.py` is the fine scientific worker boundary",
+        "coordinator remains the only scheduler owner",
+    ):
+        assert required in workflow
 
 
 def test_test_guidance_separates_boundary_objects_local_schedulers_and_hpc() -> None:

@@ -74,7 +74,9 @@
   ordinary workflow failure semantics; do not require results for unsubmitted moving
   descendants or mask the failure with a result-cardinality error.
 - Use no module-scope scientific or scheduler imports.
-- `round_task.py` is the only real registration execution boundary in workflow. It
-  configures the task's native threads before its lazy registration/scientific
-  imports, executes channels serially, and must not create a Dask client, submit
-  child tasks, schedule other rounds, or start multiprocessing.
+- `round_task.py` is the coarse registration execution boundary and executes channels
+  serially. `fine_task.py` is the fine scientific worker boundary and executes
+  exactly one immutable stage per call. Both configure native threads before lazy
+  registration/scientific imports and must not create a Dask client, submit child
+  tasks, schedule other rounds, or start multiprocessing. The coordinator remains
+  the only scheduler owner.

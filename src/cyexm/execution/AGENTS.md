@@ -20,9 +20,11 @@
   same owned worker pool. Moving-round futures may be submitted only after the
   reference result is successful; a failed reference result ends the execution
   without submitting descendants.
-- SLURM scales to `min(pending tasks, configured workers)` with one worker process
-  and one advertised `round_slot` per job; every submitted workflow task requests that
-  slot. The reference barrier must not construct or scale a second cluster.
+- Coarse SLURM scales to `min(pending tasks, configured workers)` with one worker
+  process and one advertised `round_slot` per job; every submitted coarse task
+  requests that slot. Fine SLURM instead uses the one-reference-candidate and
+  demand-driven newcomer preflight/activation rule below. The reference barrier must
+  not construct or scale a second cluster.
   Round semantic profile memory upward to whole binary GiB, pass the `G` spelling to
   SLURM and the matching `GiB` spelling to Dask, and record both semantic and
   scheduler-normalized facts. Never copy a decimal `GB` suffix into `#SBATCH`.
@@ -32,9 +34,13 @@
   Serialize the configured runner directly before scheduler module loading and carry
   its bytes in a production-owned callable. Reconstruct it inside ordinary task
   execution so nested non-production runners do not become worker imports.
-  Require that all connected workers pass preflight before any registration task is
-  submitted. Construction, worker probes, and job-script templates are portable
-  evidence only, not proof that a scheduler accepted or ran a job.
+  Coarse mode requires all connected workers to pass preflight before any
+  registration task is submitted. In fine mode, each initial or newly connected
+  candidate must pass complete preflight and activation before that worker is
+  eligible for scientific submission; activated workers may already be executing
+  work while a newcomer is validated. Construction, worker probes, and job-script
+  templates are portable evidence only, not proof that a scheduler accepted or ran
+  a job.
 - Default retries are zero. Any configured retry is an executor-managed resubmission
   through ordinary artifact validation. A post-preflight round failure does not
   cancel independent round tasks; settle them before reporting aggregate failure.

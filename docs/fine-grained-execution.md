@@ -109,7 +109,7 @@ reference barrier
   -> prepared fixed-grid bundle
   -> nonlinear chunk tasks
   -> deterministic assembly
-  -> independent dependent-channel tasks
+  -> independent task for every declared moving channel
   -> round validation
 ```
 
@@ -120,8 +120,9 @@ policy, and scalar stitching semantics. In fine-grained mode the executor schedu
 those canonical chunks independently; this is not a new scientific strategy.
 
 Affine estimation is still a whole-image operation inside preparation. Chunked or
-parallel affine estimation is out of scope. Workers execute exactly one immutable
-scientific task. Workers never create schedulers, submit descendants, or start nested
+parallel affine estimation is out of scope. Each eligible worker slot executes one
+immutable scientific task at a time; a worker may execute multiple tasks
+sequentially. Workers never create schedulers, submit descendants, or start nested
 multiprocessing.
 
 Ready tasks are admitted fairly in round-robin order across rounds. If only one round
@@ -156,11 +157,19 @@ For a moving round `{round}`, fine preparation commits this internal bundle bene
 
 The arrays are uncompressed, C-contiguous, non-object float32 data. Workers open them
 read-only with memory-mapped regional access and copy only an extended chunk into
-process-owned memory. The strict prepared manifest version 2 binds each array
-identity, fixed-reference grid shape, public XYZ spacing, origin, direction, affine
-and source identities, scalar and mask policies, native threads, and the exact
-supported ANTs pixel type for every prepared role. Spatial metadata comes from that
-manifest; `.npy` alone is not a scientific image format.
+process-owned memory. The strict prepared manifest's `format_version` is exactly `2`.
+Its `pixeltypes` mapping has exactly four canonical roles: `fixed_mask`,
+`fixed_scalar`, `moving_linear_mask`, and `moving_linear_scalar`. Each value is the
+actual accepted ANTs image type for that role and must be exactly `unsigned char`,
+`unsigned int`, `float`, or `double`. It is recorded scientific/cache evidence, not a
+user-selected execution option. Missing, extra, unsupported, or request-mismatched
+pixel-type evidence fails closed so fine reconstruction cannot silently change
+legacy scalar resampling.
+
+The manifest also binds each array identity, fixed-reference grid shape, public XYZ
+spacing, origin, direction, affine and source identities, scalar and mask policies,
+and native threads. Spatial metadata comes from that manifest; `.npy` alone is not a
+scientific image format.
 
 Each chunk commits both
 `round_{round}_chunks/chunk_0000_warp.nii.gz` and
@@ -193,12 +202,14 @@ ordinary accepted outputs and their exact completion records: affine and full wa
 diagnostic TIFF, metrics, and every declared transformed channel. The read-only
 status command uses that public authority rather than scheduler evidence.
 
-Coarse and fine-grained modes share scientific fingerprints, StageRequest identities,
-public filenames, and `ArtifactStore` validation. A valid coarse full warp and
-downstream output can be reused in fine mode, and a fine result can be reused after
-switching back to coarse. `--force-round` and `--force-all` suppress reuse only
-within an otherwise compatible scientific plan; force never bypasses a fingerprint
-mismatch.
+Coarse and fine-grained modes share scientific fingerprints, public filenames,
+ordinary `ArtifactStore` validation, and `StageRequest` identities for their common
+scientific/public artifacts. Fine-only prepared arrays and scalar cores have
+additional requests in that same artifact/provenance schema; coarse execution does
+not create or share those internal requests. A valid coarse full warp and downstream
+output can be reused in fine mode, and a fine result can be reused after switching
+back to coarse. `--force-round` and `--force-all` suppress reuse only within an
+otherwise compatible scientific plan; force never bypasses a fingerprint mismatch.
 
 Every fine task writes a unique deterministic log under its round `logs/` directory.
 These are unique per-task logs rather than a concurrently shared round log.

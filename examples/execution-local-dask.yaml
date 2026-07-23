@@ -1,7 +1,7 @@
 schema_version: 1
 executor: local_dask
 
-# Opt-in fine graph: chunks and dependent channels become independent worker tasks.
+# Opt-in fine graph: chunks and every declared moving channel become worker tasks.
 parallelism:
   mode: fine_grained
 

@@ -513,7 +513,13 @@ Reference sources are copied, never moved or modified. The current export bounda
 TIFF; the shared channel directory and task model keep output-format selection separate
 so a future schema can add formats without changing registration semantics.
 The moving-round directories are `rounds/round-002/registration/`,
-`rounds/round-002/channels/`, and `rounds/round-002/logs/round-002.log`.
+`rounds/round-002/channels/`, and `rounds/round-002/logs/`. Coarse moving rounds use
+the shared `round-NNN.log` (for example `round-002.log`). Fine moving tasks never
+append to that shared round log; each uses
+`round-NNN-<stage>-<item>.log` (for example
+`round-002-<stage>-<item>.log`). The reference task retains its ordinary
+`round-NNN.log` in either mode. The full coarse example path is
+`rounds/round-002/logs/round-002.log`.
 
 ```text
 <output-root>/<dataset-id>/
@@ -560,7 +566,8 @@ The moving-round directories are `rounds/round-002/registration/`,
         <each-other-source-basename>
         <each-other-source-basename>.complete.json
       logs/
-        round-002.log
+        round-002.log                              # coarse moving round only
+        round-002-<stage>-<item>.log               # each fine moving task
 ```
 
 Every reusable artifact has its own matching `.complete.json`. A file alone, a
@@ -582,7 +589,9 @@ forcing only a moving round leaves valid reference artifacts reusable.
 execution profile, force selection, round results, timestamps, and available SLURM
 evidence. Operational summaries never authorize artifact reuse; they can be deleted
 without invalidating scientific artifacts. The current CLI writes diagnostics to
-stderr and per-round shared logs; it does not currently create the reserved root
+stderr. Coarse moving rounds and the reference task use an ordinary shared round log;
+fine moving tasks use deterministic unique task logs and never append concurrently to
+the coarse log. The CLI does not currently create the reserved root
 `logs/<run-id>.log` path.
 
 The read-only status command validates the scientific plan and authoritative
@@ -646,7 +655,10 @@ multiple workers per node remain a future optimization. Dedicated-node truth sti
 depends on site allocation/exclusivity policy and must be confirmed by exact-commit
 real-SLURM acceptance.
 
-Before any registration submission, every connected worker must pass preflight.
+In coarse mode, every connected worker must pass preflight before any registration
+submission. In fine mode, the initial candidate and every later newcomer must pass
+preflight and activation before that worker is eligible for scientific submission;
+already activated workers may continue their admitted tasks during scale-up.
 Preflight checks exact Cy-ExM/dependency versions, hostname and SLURM job identity,
 dataset/output visibility, scratch creation and cleanup, all six native-thread
 values, memory evidence, and scheduler/worker network identity. A timeout or mismatch

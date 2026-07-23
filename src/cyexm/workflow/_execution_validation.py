@@ -14,6 +14,11 @@ from cyexm.config.models import (
 )
 from cyexm.errors import RoundExecutionError, WorkflowPlanError
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
+from cyexm.workflow.fine_models import (
+    FineTaskResult,
+    FineWorkflowTask,
+    RoundPreparationTask,
+)
 from cyexm.workflow.models import (
     ChannelTask,
     ReferenceChannelTask,
@@ -481,6 +486,178 @@ def _validate_round_result(task: WorkflowTask, result: RoundResult) -> None:
         raise RoundExecutionError(
             f"{location} reused status must identify every artifact as reused"
         )
+
+
+def _parse_aware_timestamp(value: object, location: str) -> datetime:
+    if type(value) is not str or "T" not in value:
+        raise RoundExecutionError(
+            f"{location} must be a timezone-aware ISO 8601 timestamp"
+        )
+    encoded = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(encoded)
+    except ValueError as error:
+        raise RoundExecutionError(
+            f"{location} must be a timezone-aware ISO 8601 timestamp"
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RoundExecutionError(
+            f"{location} must be a timezone-aware ISO 8601 timestamp"
+        )
+    return parsed
+
+
+def _validate_fine_task_result(
+    task: FineWorkflowTask,
+    result: object,
+) -> FineTaskResult:
+    """Validate scheduler-neutral evidence for one exact fine task result."""
+    location = f"Fine executor result for {task.key.encoded}"
+    if type(result) is not FineTaskResult:
+        raise RoundExecutionError(f"{location} must be an exact FineTaskResult")
+    if type(result.task) is not type(task) or result.task != task:
+        raise RoundExecutionError(f"{location} does not match the submitted task")
+    try:
+        FineTaskResult(
+            task=result.task,
+            status=result.status,
+            started_at=result.started_at,
+            ended_at=result.ended_at,
+            duration_seconds=result.duration_seconds,
+            hostname=result.hostname,
+            pid=result.pid,
+            dask_task_key=result.dask_task_key,
+            slurm_job_id=result.slurm_job_id,
+            native_threads=result.native_threads,
+            artifact_paths=result.artifact_paths,
+            reused_artifacts=result.reused_artifacts,
+            log_path=result.log_path,
+            failure=result.failure,
+            prepared_descriptor=result.prepared_descriptor,
+        )
+    except (TypeError, ValueError) as error:
+        raise RoundExecutionError(
+            f"{location} violates the exact FineTaskResult structure: {error}"
+        ) from error
+    if type(result.status) is not str or result.status not in {
+        "reused",
+        "completed",
+        "failed",
+        "cancelled",
+    }:
+        raise RoundExecutionError(f"{location} has an unsupported status")
+    if type(result.hostname) is not str or not result.hostname:
+        raise RoundExecutionError(f"{location} hostname must be nonempty")
+    if type(result.pid) is not int or result.pid < 1:
+        raise RoundExecutionError(f"{location} pid must be a positive integer")
+    if (
+        type(result.duration_seconds) is not float
+        or not math.isfinite(result.duration_seconds)
+        or result.duration_seconds < 0.0
+    ):
+        raise RoundExecutionError(
+            f"{location} duration_seconds must be finite and non-negative"
+        )
+    for field_name, value in (
+        ("dask_task_key", result.dask_task_key),
+        ("slurm_job_id", result.slurm_job_id),
+    ):
+        if value is not None and (type(value) is not str or not value):
+            raise RoundExecutionError(
+                f"{location} {field_name} must be null or nonempty"
+            )
+
+    expected_threads = tuple(
+        (
+            name,
+            (
+                task.native_threads.itk
+                if name == NATIVE_THREAD_ENV_VARS[0]
+                else task.native_threads.blas
+            ),
+        )
+        for name in NATIVE_THREAD_ENV_VARS
+    )
+    if result.native_threads != expected_threads:
+        raise RoundExecutionError(
+            f"{location} native_threads must exactly match configured expanded "
+            "thread evidence"
+        )
+
+    started = _parse_aware_timestamp(result.started_at, f"{location} started_at")
+    ended = _parse_aware_timestamp(result.ended_at, f"{location} ended_at")
+    if ended < started:
+        raise RoundExecutionError(f"{location} ended_at precedes started_at")
+    if result.log_path != str(task.log_path):
+        raise RoundExecutionError(f"{location} log_path does not match the task")
+
+    planned = tuple(str(path) for path in task.output_paths)
+    if type(result.artifact_paths) is not tuple or len(
+        set(result.artifact_paths)
+    ) != len(result.artifact_paths):
+        raise RoundExecutionError(
+            f"{location} artifact_paths must be a unique exact tuple"
+        )
+    if any(
+        type(path) is not str or path not in planned for path in result.artifact_paths
+    ):
+        raise RoundExecutionError(
+            f"{location} artifact_paths must contain only planned outputs"
+        )
+    if result.status in {"completed", "reused"} and result.artifact_paths != planned:
+        raise RoundExecutionError(
+            f"{location} successful artifact_paths must equal planned outputs"
+        )
+    if (
+        type(result.reused_artifacts) is not tuple
+        or len(set(result.reused_artifacts)) != len(result.reused_artifacts)
+        or any(
+            type(path) is not str or path not in result.artifact_paths
+            for path in result.reused_artifacts
+        )
+    ):
+        raise RoundExecutionError(
+            f"{location} reused_artifacts must be a unique artifact subset"
+        )
+    if result.status == "reused" and result.reused_artifacts != planned:
+        raise RoundExecutionError(
+            f"{location} reused status must identify every output as reused"
+        )
+
+    failure = result.failure
+    if result.status == "failed":
+        if type(failure) is not RoundFailure:
+            raise RoundExecutionError(f"{location} requires exact failure evidence")
+        if failure.stage != task.key.stage:
+            raise RoundExecutionError(
+                f"{location} failure stage does not match the task"
+            )
+        if type(failure.exception_type) is not str or not failure.exception_type:
+            raise RoundExecutionError(
+                f"{location} failure exception_type must be nonempty"
+            )
+        if type(failure.message) is not str:
+            raise RoundExecutionError(
+                f"{location} failure message must be a built-in string"
+            )
+    elif failure is not None:
+        raise RoundExecutionError(
+            f"{location} failure must be absent unless status is failed"
+        )
+
+    if type(task) is RoundPreparationTask:
+        if (
+            result.status in {"completed", "reused"}
+            and result.prepared_descriptor is None
+        ):
+            raise RoundExecutionError(
+                f"{location} successful preparation requires its descriptor"
+            )
+    elif result.prepared_descriptor is not None:
+        raise RoundExecutionError(
+            f"{location} prepared descriptor belongs only to preparation"
+        )
+    return result
 
 
 __all__ = []

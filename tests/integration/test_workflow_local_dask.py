@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -196,19 +197,66 @@ def _authoritative_records(task: RoundTask) -> dict[str, CompletionRecord]:
 def _assert_record_semantics_match(
     sequential: dict[str, CompletionRecord],
     local: dict[str, CompletionRecord],
+    *,
+    sequential_output_root: Path,
+    local_output_root: Path,
 ) -> None:
     assert set(sequential) == set(local)
     for name in sequential:
-        sequential_request = sequential[name].request
-        local_request = local[name].request
-        assert sequential_request.stage == local_request.stage
-        assert sequential_request.geometry == local_request.geometry
-        assert sequential_request.method == local_request.method
-        assert sequential_request.accuracy == local_request.accuracy
-        assert sequential_request.native_threads == local_request.native_threads
-        assert set(sequential_request.parameters) == set(local_request.parameters)
-        if name.startswith("channel:"):
-            assert sequential_request.parameters == local_request.parameters
+        sequential_request = _normalized_request(
+            sequential[name],
+            output_root=sequential_output_root,
+        )
+        local_request = _normalized_request(
+            local[name],
+            output_root=local_output_root,
+        )
+        assert sequential_request == local_request, name
+
+
+def _normalized_request(
+    record: CompletionRecord,
+    *,
+    output_root: Path,
+) -> object:
+    """Normalize only output-root-specific request identities.
+
+    Dataset inputs remain exact, including path, size, and modification time.
+    For identities of generated artifacts beneath the executor's distinct output
+    root, the path becomes one shared relative token and stat fields become explicit
+    generated-output tokens. Plain output-root paths are normalized the same way.
+    Every other nested parameter value remains unchanged and is compared recursively.
+    """
+
+    def normalize(value: object) -> object:
+        if isinstance(value, Mapping):
+            normalized = {str(key): normalize(item) for key, item in value.items()}
+            if set(value) == {"path", "st_size", "st_mtime_ns"}:
+                identity_path = value["path"]
+                if type(identity_path) is str:
+                    relative = _relative_output_path(identity_path, output_root)
+                    if relative is not None:
+                        return {
+                            "path": f"<OUTPUT_ROOT>/{relative}",
+                            "st_size": "<GENERATED_OUTPUT_STAT>",
+                            "st_mtime_ns": "<GENERATED_OUTPUT_STAT>",
+                        }
+            return normalized
+        if isinstance(value, list | tuple):
+            return [normalize(item) for item in value]
+        if type(value) is str:
+            relative = _relative_output_path(value, output_root)
+            return value if relative is None else f"<OUTPUT_ROOT>/{relative}"
+        return value
+
+    return normalize(record.request.to_dict())
+
+
+def _relative_output_path(value: str, output_root: Path) -> str | None:
+    path = Path(value)
+    if not path.is_absolute() or not path.is_relative_to(output_root):
+        return None
+    return path.relative_to(output_root).as_posix()
 
 
 def _assert_tiff_equivalent(sequential: Path, local: Path) -> None:
@@ -248,7 +296,12 @@ def _assert_round_outputs_equivalent(
     assert sequential.strategy == local.strategy
     sequential_records = _authoritative_records(sequential)
     local_records = _authoritative_records(local)
-    _assert_record_semantics_match(sequential_records, local_records)
+    _assert_record_semantics_match(
+        sequential_records,
+        local_records,
+        sequential_output_root=sequential.registration_directory.parents[3],
+        local_output_root=local.registration_directory.parents[3],
+    )
 
     sequential_paths = RegistrationArtifactPaths.for_round(
         sequential.registration_directory,

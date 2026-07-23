@@ -18,6 +18,7 @@ from cyexm.runtime import NATIVE_THREAD_ENV_VARS
 from cyexm.workflow._execution_validation import (
     _validate_executor_reference_task,
     _validate_executor_round_task,
+    _validate_fine_task_result,
     _validate_round_result,
 )
 from cyexm.workflow.fine_models import (
@@ -362,18 +363,22 @@ def collect_distributed_fine_results(
             active.discard(future)
             submission = submissions[future]
             task = submission.task
-            if type(outcome) is FineTaskResult and outcome.task == task:
-                result = outcome
-            elif type(outcome) is FineTaskResult:
-                result = fine_exception_result(
-                    task,
-                    RoundExecutionError(
-                        "Dask fine task returned a result for a different exact task"
-                    ),
-                    key=submission.key,
-                    started_at=submission.started_at,
-                    started=submission.started,
-                )
+            if type(outcome) is FineTaskResult:
+                try:
+                    result = _validate_fine_task_result(task, outcome)
+                    if result.dask_task_key != submission.key:
+                        raise RoundExecutionError(
+                            "Dask fine task result key does not match the current "
+                            "submitted attempt"
+                        )
+                except RoundExecutionError as error:
+                    result = fine_exception_result(
+                        task,
+                        error,
+                        key=submission.key,
+                        started_at=submission.started_at,
+                        started=submission.started,
+                    )
             else:
                 error = (
                     distributed_error(outcome)

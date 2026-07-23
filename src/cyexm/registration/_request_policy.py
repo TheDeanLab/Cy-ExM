@@ -15,6 +15,10 @@ WHOLE_SCALAR_POLICY = "whole-global-histogram-match-v1"
 CHUNK_SCALAR_POLICY = "serial-chunk-local-histogram-match-core-stitch-v1"
 OUTPUT_FORMAT_POLICY = "ome-compatible-tiff-uint16-v1"
 CHANNEL_POSTPROCESSING_POLICY = "clip-uint16-no-normalization-v1"
+PREPARED_SCALAR_POLICY = "float32-preserve-registration-values-v1"
+PREPARED_MASK_POLICY = (
+    "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
+)
 
 _LINEAR_ITERATIONS = {
     "high": [1000, 500, 250, 100],
@@ -433,6 +437,8 @@ __all__ = [
     "CHANNEL_POSTPROCESSING_POLICY",
     "CHUNK_SCALAR_POLICY",
     "OUTPUT_FORMAT_POLICY",
+    "PREPARED_MASK_POLICY",
+    "PREPARED_SCALAR_POLICY",
     "WHOLE_SCALAR_POLICY",
     "affine_parameters",
     "canonical_compact_json",

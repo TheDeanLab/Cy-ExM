@@ -29,6 +29,8 @@
 - Failure injection may replace only the expensive stage boundary under test. Keep
   artifact persistence, reconstruction, and the remaining ANTs operations real, and
   prove restart from the committed upstream record.
+- Prepared-array integration tests must exercise real ANTs fixed-grid conversion and
+  one bounded regional reconstruction; full-volume worker reads are not acceptable.
 - `legacy_baseline.py` is executed only from the pinned ClearEx environment at commit
   `2311a873b783477add7391ff00245f76490147f0`. It may write only to its explicit
   `--output` directory and must never modify the ClearEx checkout.

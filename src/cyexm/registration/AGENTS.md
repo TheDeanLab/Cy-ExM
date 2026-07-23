@@ -41,6 +41,9 @@
   affine preparation, and linear metrics. Consumers must preserve that stage order
   and use its accepted fixed-grid scalar, mask, affine, paths, backend, and resolved
   native-thread state without repeating preparation.
+- `prepared.py` owns the internal fixed-grid float32 NPY bundle. Commit each array
+  through the ordinary artifact store, promote the strict manifest last, and let
+  workers copy only one extended region from validated read-only memory maps.
 - Pre-registration metrics resample unequal moving scalar and mask grids to the fixed
   grid for diagnosis only; this must not replace or pre-resample the native moving
   inputs supplied to affine estimation.

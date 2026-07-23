@@ -26,6 +26,7 @@ def test_registration_backend_declares_every_required_operation() -> None:
         "geometry": ("self", "image"),
         "to_array": ("self", "image"),
         "from_array": ("self", "array", "reference", "has_components"),
+        "from_geometry": ("self", "array", "geometry", "has_components"),
         "crop_image": ("self", "image", "bounds_zyx"),
         "linear": ("self", "kwargs"),
         "nonlinear": ("self", "kwargs"),
@@ -256,6 +257,23 @@ def test_from_array_preserves_reference_geometry_and_components(
     assert call["direction"] == reference.direction
     assert call["has_components"] is True
     assert result.has_components is True
+
+
+def test_from_geometry_uses_exact_supplied_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    geometry = ImageGeometry(
+        shape=(2, 3, 4),
+        origin=(1.0, 2.0, 3.0),
+        spacing=(0.4, 0.5, 0.6),
+        direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    source = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+
+    result = AntsRegistrationBackend().from_geometry(source, geometry=geometry)
+
+    assert AntsRegistrationBackend().geometry(result) == geometry
+    assert np.array_equal(AntsRegistrationBackend().to_array(result), source)
 
 
 def test_crop_image_maps_zyx_start_to_ants_xyz_physical_index(

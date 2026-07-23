@@ -100,7 +100,7 @@ def _prepared_result(task: RoundPreparationTask) -> FineTaskResult:
         dask_task_key=None,
         slurm_job_id=None,
         native_threads=(("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", 1),),
-        artifact_paths=("/tmp/manifest.json",),
+        artifact_paths=tuple(str(path) for path in task.output_paths),
         reused_artifacts=(),
         log_path=str(task.log_path),
         failure=None,

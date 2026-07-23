@@ -96,6 +96,9 @@ def test_fine_task_key_has_stable_encoding() -> None:
 
     assert key.encoded == "round-002:chunk:0007"
     assert key.log_name == "round-002-chunk-0007.log"
+    assert FineTaskKey(2, "chunk", "10000").item == "10000"
+    with pytest.raises(ValueError):
+        FineTaskKey(2, "chunk", "00007")
 
 
 @pytest.mark.parametrize(
@@ -186,7 +189,10 @@ def test_all_exact_task_types_embed_the_authoritative_round(tmp_path: Path) -> N
     assembly = ChunkAssemblyTask.create(
         chunked,
         prepared_descriptor=descriptor,
-        dependencies=(chunk.key,),
+        dependencies=tuple(
+            FineTaskKey(2, "chunk", f"{item.chunk_id:04d}")
+            for item in compute_chunk_grid((9, 17, 19), (4, 8, 8), 0.25)
+        ),
     )
     whole_task = WholeImageRegistrationTask.create(whole)
     channel = ChannelTransformTask.create(
@@ -196,7 +202,10 @@ def test_all_exact_task_types_embed_the_authoritative_round(tmp_path: Path) -> N
     )
     validation = RoundValidationTask.create(
         whole,
-        dependencies=(channel.key,),
+        dependencies=tuple(
+            FineTaskKey(2, "channel", f"{index:04d}")
+            for index in range(len(whole.channels))
+        ),
     )
 
     for task in (preparation, chunk, assembly):
@@ -219,7 +228,7 @@ def test_fine_result_is_strict_and_json_compatible(tmp_path: Path) -> None:
         dask_task_key="worker-key",
         slurm_job_id="42",
         native_threads=(("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", 2),),
-        artifact_paths=("/tmp/manifest.json",),
+        artifact_paths=tuple(str(path) for path in task.output_paths),
         reused_artifacts=(),
         log_path=str(task.log_path),
         failure=None,
@@ -229,6 +238,17 @@ def test_fine_result_is_strict_and_json_compatible(tmp_path: Path) -> None:
     payload = result.to_dict()
     assert payload["key"] == "round-002:preparation:main"
     assert json.loads(json.dumps(payload, allow_nan=False)) == payload
+    with pytest.raises(TypeError):
+        result.prepared_descriptor["geometry"] = {}  # type: ignore[index]
+    geometry = result.prepared_descriptor["geometry"]  # type: ignore[index]
+    with pytest.raises(TypeError):
+        geometry["shape"][0] = 99  # type: ignore[index]
+    with pytest.raises(TypeError):
+        geometry["direction"][0][0] = 99  # type: ignore[index]
+    copied = result.to_dict()["prepared_descriptor"]
+    assert isinstance(copied, dict)
+    copied["geometry"] = {}  # type: ignore[index]
+    assert result.to_dict()["prepared_descriptor"] != copied
     with pytest.raises(ValueError, match="log_path"):
         replace(result, log_path="/tmp/shared.log")
     with pytest.raises(ValueError, match="prepared descriptor"):

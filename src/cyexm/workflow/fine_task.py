@@ -129,6 +129,46 @@ def _unchanged(
     )
 
 
+def _durable_progress(
+    task: FineWorkflowTask,
+    actual_threads: dict[str, int],
+    before: dict[Path, object],
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    from cyexm.registration.artifacts import (
+        ArtifactStore,
+        CompletionRecord,
+        FileIdentity,
+    )
+    from cyexm.workflow._round_provenance import completion_snapshot
+
+    store = ArtifactStore()
+    accepted: list[Path] = []
+    reused: list[Path] = []
+    for path in task.output_paths:
+        try:
+            record = CompletionRecord.read(store.record_path(path))
+            if (
+                record.artifact != FileIdentity.from_path(path)
+                or record.request.native_threads != actual_threads
+                or any(
+                    FileIdentity.from_path(Path(identity.path)) != identity
+                    for identity in record.request.inputs
+                )
+                or (
+                    record.request.upstream is not None
+                    and FileIdentity.from_path(Path(record.request.upstream.path))
+                    != record.request.upstream
+                )
+            ):
+                continue
+        except Exception:
+            continue
+        accepted.append(path)
+        if path in before and completion_snapshot(path) == before[path]:
+            reused.append(path)
+    return tuple(accepted), tuple(reused)
+
+
 def _run_preparation(task: RoundPreparationTask) -> _StageOutcome:
     from cyexm.registration.prepared import commit_prepared_round
     from cyexm.registration.whole_image import ImageRegistration
@@ -170,24 +210,164 @@ def _whole_chunk(shape: tuple[int, int, int]) -> object:
     return ChunkInfo(0, 0, z, 0, y, 0, x, 0, z, 0, y, 0, x)
 
 
+def _validated_prepared_manifest(
+    task: RoundTask,
+    descriptor: object,
+    actual_threads: dict[str, int],
+) -> Any:
+    import json
+
+    from cyexm.registration._request_policy import (
+        PREPARED_MASK_POLICY,
+        PREPARED_SCALAR_POLICY,
+        common_parameters,
+    )
+    from cyexm.registration.artifacts import (
+        ArtifactStore,
+        CompletionRecord,
+        FileIdentity,
+        StageRequest,
+    )
+    from cyexm.registration.prepared import PreparedManifest, PreparedRoundPaths
+    from cyexm.workflow._round_provenance import RegistrationArtifactPaths
+    from cyexm.workflow.round_task import _inspect_image_geometry
+
+    if not isinstance(descriptor, dict):
+        descriptor = json.loads(
+            json.dumps(descriptor, allow_nan=False, default=lambda value: dict(value))
+        )
+    if not isinstance(descriptor, dict):
+        raise TypeError("prepared descriptor must be a JSON object")
+    manifest = PreparedManifest.from_dict(descriptor)
+    fixed = FileIdentity.from_path(task.fixed_image)
+    moving = FileIdentity.from_path(task.moving_image)
+    if (manifest.native_fixed, manifest.native_moving) != (fixed, moving):
+        raise ValueError("prepared manifest sources do not match the embedded round")
+    prepared = PreparedRoundPaths.for_round(task.registration_directory, task.round)
+    for identity, path in zip(
+        manifest.array_identities, prepared.array_paths, strict=True
+    ):
+        if Path(identity.path) != path.resolve(strict=True):
+            raise ValueError("prepared array path is not canonical for the round")
+    registration = RegistrationArtifactPaths.for_round(
+        task.registration_directory, task.round
+    )
+    if Path(manifest.affine.path) != registration.affine.resolve(strict=True):
+        raise ValueError("prepared affine path is not canonical for the round")
+    if FileIdentity.from_path(registration.affine) != manifest.affine:
+        raise ValueError("prepared affine identity does not match the round")
+    if task.registration.crop:
+        if manifest.moving_crop is None:
+            raise ValueError("cropped preparation requires moving-crop evidence")
+        if (
+            Path(manifest.moving_crop.path)
+            != registration.moving_crop.resolve(strict=True)
+            or FileIdentity.from_path(registration.moving_crop) != manifest.moving_crop
+        ):
+            raise ValueError("prepared moving crop does not match the round")
+    elif manifest.moving_crop is not None:
+        raise ValueError("uncropped preparation must not declare a moving crop")
+    if manifest.native_threads != dict(sorted(actual_threads.items())):
+        raise ValueError(
+            "prepared native threads do not match the configured worker runtime"
+        )
+    if (
+        _inspect_image_geometry(task.fixed_image, task.voxel_spacing_xyz)
+        != manifest.geometry
+    ):
+        raise ValueError("prepared geometry does not match the fixed round geometry")
+    common = common_parameters(
+        crop=task.registration.crop,
+        imaging_round=task.round,
+        pixel_size_xyz=task.voxel_spacing_xyz,
+    )
+    store = ArtifactStore()
+    for role, identity, path in zip(
+        (
+            "fixed_scalar",
+            "moving_linear_scalar",
+            "fixed_mask",
+            "moving_linear_mask",
+        ),
+        manifest.array_identities,
+        prepared.array_paths,
+        strict=True,
+    ):
+        parameters = {
+            **common,
+            "format_version": manifest.format_version,
+            "prepared_role": role,
+            "scalar_policy": PREPARED_SCALAR_POLICY,
+            "mask_policy": PREPARED_MASK_POLICY,
+        }
+        expected = StageRequest.for_identities(
+            stage=f"prepared:{role}",
+            inputs=(fixed, moving),
+            geometry=manifest.geometry,
+            method=task.registration.linear.type,
+            accuracy=task.registration.linear.accuracy,
+            native_threads=actual_threads,
+            upstream=manifest.affine,
+            parameters=parameters,
+        )
+        record = CompletionRecord.read(store.record_path(path))
+        if (
+            record.artifact != identity
+            or FileIdentity.from_path(path) != identity
+            or record.request != expected
+        ):
+            raise ValueError("prepared completion evidence does not match runtime")
+    manifest_identity = FileIdentity.from_path(prepared.manifest)
+    manifest_inputs = (
+        fixed,
+        moving,
+        *manifest.array_identities,
+        *(() if manifest.moving_crop is None else (manifest.moving_crop,)),
+    )
+    expected_manifest = StageRequest.for_identities(
+        stage="prepared:manifest",
+        inputs=manifest_inputs,
+        geometry=manifest.geometry,
+        method=task.registration.linear.type,
+        accuracy=task.registration.linear.accuracy,
+        native_threads=actual_threads,
+        upstream=manifest.affine,
+        parameters={
+            "format_version": manifest.format_version,
+            "scalar_policy": PREPARED_SCALAR_POLICY,
+            "mask_policy": PREPARED_MASK_POLICY,
+        },
+    )
+    manifest_record = CompletionRecord.read(store.record_path(prepared.manifest))
+    if (
+        manifest_record.artifact != manifest_identity
+        or manifest_record.request != expected_manifest
+    ):
+        raise ValueError("prepared manifest completion evidence does not match runtime")
+    payload = json.loads(prepared.manifest.read_text(encoding="utf-8"))
+    if PreparedManifest.from_dict(payload) != manifest:
+        raise ValueError("committed prepared manifest does not match the descriptor")
+    return manifest
+
+
 def _chunk_context(
     task: NonlinearChunkTask | ChunkAssemblyTask,
     *,
     assembly: bool,
+    actual_threads: dict[str, int],
 ) -> tuple[Any, Any | None, tuple[Any, ...]]:
     from cyexm.chunking import compute_chunk_grid
     from cyexm.registration.artifacts import ArtifactStore
     from cyexm.registration.backend import AntsRegistrationBackend
     from cyexm.registration.chunk_stages import ChunkRegion, ChunkStageContext
-    from cyexm.registration.prepared import (
-        PreparedManifest,
-        read_prepared_region,
-    )
+    from cyexm.registration.prepared import read_prepared_region
 
     round_task = task.round_task
     if round_task.chunk_size_zyx is None or round_task.overlap_fraction is None:
         raise ValueError("chunk task requires complete chunk geometry")
-    manifest = PreparedManifest.from_dict(task.prepared_descriptor)
+    manifest = _validated_prepared_manifest(
+        round_task, task.prepared_descriptor, actual_threads
+    )
     chunks = compute_chunk_grid(
         manifest.geometry.shape,
         round_task.chunk_size_zyx,
@@ -230,59 +410,40 @@ def _chunk_context(
             chunk_root / f"chunk_{chunk_id:04d}_warp.nii.gz",
             chunk_root / f"chunk_{chunk_id:04d}_registered_core.npy",
             chunk_root / "manifest.json",
-            *ChunkAssemblyTask.create(
-                round_task,
-                prepared_descriptor=task.prepared_descriptor,
-                dependencies=tuple(
-                    NonlinearChunkTask.create(
-                        round_task,
-                        chunk,
-                        prepared_descriptor=task.prepared_descriptor,
-                        dependencies=(),
-                    ).key
-                    for chunk in chunks
-                ),
-            ).output_paths[:3],
+            round_task.registration_directory
+            / f"nonlinear_warp_{round_task.round}.nii.gz",
+            round_task.registration_directory
+            / f"nonlinear_registered_{round_task.round}.tif",
+            round_task.registration_directory
+            / "image_metrics_nonlinear-registered.txt",
         ):
             store.mark_stale(path)
 
-    fixed = backend.load_image(round_task.fixed_image, round_task.voxel_spacing_xyz)
-    if backend.geometry(fixed) != manifest.geometry:
-        raise ValueError("prepared fixed TIFF geometry does not match the manifest")
     if assembly:
+        fixed = backend.load_image(round_task.fixed_image, round_task.voxel_spacing_xyz)
+        if backend.geometry(fixed) != manifest.geometry:
+            raise ValueError("prepared fixed TIFF geometry does not match the manifest")
         selected = _whole_chunk(manifest.geometry.shape)
     else:
         if type(task) is not NonlinearChunkTask:
             raise TypeError("regional chunk context requires a nonlinear chunk task")
         selected = task.chunk
     region = read_prepared_region(manifest, selected)  # type: ignore[arg-type]
-    if assembly:
-        reference = fixed
-    else:
-        if type(task) is not NonlinearChunkTask:
-            raise TypeError("regional chunk context requires a nonlinear chunk task")
-        reference = backend.crop_image(
-            fixed,
-            (
-                task.chunk.z_start_ext,
-                task.chunk.z_end_ext,
-                task.chunk.y_start_ext,
-                task.chunk.y_end_ext,
-                task.chunk.x_start_ext,
-                task.chunk.x_end_ext,
-            ),
-        )
-    fixed_region = backend.from_array(region.fixed_scalar, reference=reference)
-    moving_region = backend.from_array(region.moving_linear_scalar, reference=reference)
-    fixed_mask_region = backend.from_array(region.fixed_mask, reference=reference)
-    moving_mask_region = backend.from_array(
-        region.moving_linear_mask, reference=reference
+    fixed_region = backend.from_geometry(region.fixed_scalar, geometry=region.geometry)
+    moving_region = backend.from_geometry(
+        region.moving_linear_scalar, geometry=region.geometry
+    )
+    fixed_mask_region = backend.from_geometry(
+        region.fixed_mask, geometry=region.geometry
+    )
+    moving_mask_region = backend.from_geometry(
+        region.moving_linear_mask, geometry=region.geometry
     )
     context = ChunkStageContext(
         source_identities=source_identities,
         affine_identity=manifest.affine,
         fixed_geometry=manifest.geometry,
-        fixed=fixed_region if assembly else fixed,
+        fixed=fixed if assembly else fixed_region,
         moving_linear=moving_region,
         fixed_mask=fixed_mask_region,
         moving_linear_mask=moving_mask_region,
@@ -293,7 +454,7 @@ def _chunk_context(
         chunks=chunks,
         chunk_size=round_task.chunk_size_zyx,
         overlap_fraction=round_task.overlap_fraction,
-        native_threads=dict(manifest.native_threads),
+        native_threads=dict(actual_threads),
         force=round_task.force,
         output_directory=round_task.registration_directory,
         round_number=round_task.round,
@@ -322,10 +483,14 @@ def _chunk_context(
     return context, chunk_region, chunks
 
 
-def _run_chunk(task: NonlinearChunkTask) -> _StageOutcome:
+def _run_chunk(
+    task: NonlinearChunkTask, actual_threads: dict[str, int]
+) -> _StageOutcome:
     from cyexm.registration.chunk_stages import run_nonlinear_chunk
 
-    context, region, _chunks = _chunk_context(task, assembly=False)
+    context, region, _chunks = _chunk_context(
+        task, assembly=False, actual_threads=actual_threads
+    )
     if region is None:
         raise RuntimeError("chunk region was not constructed")
     artifact = run_nonlinear_chunk(context, region, task.chunk)
@@ -337,14 +502,18 @@ def _run_chunk(task: NonlinearChunkTask) -> _StageOutcome:
     )
 
 
-def _run_assembly(task: ChunkAssemblyTask) -> _StageOutcome:
+def _run_assembly(
+    task: ChunkAssemblyTask, actual_threads: dict[str, int]
+) -> _StageOutcome:
     from cyexm.registration.artifacts import FileIdentity
     from cyexm.registration.chunk_stages import (
         ChunkStageArtifacts,
         assemble_nonlinear_chunks,
     )
 
-    context, _region, chunks = _chunk_context(task, assembly=True)
+    context, _region, chunks = _chunk_context(
+        task, assembly=True, actual_threads=actual_threads
+    )
     artifacts = tuple(
         ChunkStageArtifacts(
             warp_path=context.warp_path(chunk.chunk_id),
@@ -495,13 +664,16 @@ def _run_validation(task: RoundValidationTask) -> _StageOutcome:
     )
 
 
-def _execute_fine_task(task: FineWorkflowTask) -> _StageOutcome:
+def _execute_fine_task(
+    task: FineWorkflowTask,
+    resolved: ResolvedNativeThreads,
+) -> _StageOutcome:
     if type(task) is RoundPreparationTask:
         return _run_preparation(task)
     if type(task) is NonlinearChunkTask:
-        return _run_chunk(task)
+        return _run_chunk(task, dict(resolved.values))
     if type(task) is ChunkAssemblyTask:
-        return _run_assembly(task)
+        return _run_assembly(task, dict(resolved.values))
     if type(task) is WholeImageRegistrationTask:
         return _run_whole_image(task)
     if type(task) is ChannelTransformTask:
@@ -530,6 +702,7 @@ def run_fine_task(task: FineWorkflowTask) -> FineTaskResult:
     pid = 1
     dask_key: str | None = None
     slurm_job: str | None = None
+    before = _snapshots(task.output_paths)
     try:
         hostname = socket.gethostname()
         pid = os.getpid()
@@ -541,7 +714,11 @@ def run_fine_task(task: FineWorkflowTask) -> FineTaskResult:
         )
         resolved = configure_native_threads(threads)
         _write_log(task.log_path, f"{task.key.encoded} started")
-        outcome = _execute_fine_task(task)
+        outcome = _execute_fine_task(task, resolved)
+        if outcome.artifact_paths != task.output_paths:
+            raise RuntimeError(
+                "fine task stage returned artifacts other than exact planned outputs"
+            )
         _write_log(task.log_path, f"{task.key.encoded} completed")
         status = (
             "reused"
@@ -567,6 +744,18 @@ def run_fine_task(task: FineWorkflowTask) -> FineTaskResult:
             prepared_descriptor=outcome.prepared_descriptor,
         )
     except Exception as error:
+        actual_threads = (
+            {
+                NATIVE_THREAD_ENV_VARS[0]: task.round_task.native_threads.itk,
+                **{
+                    name: task.round_task.native_threads.blas
+                    for name in NATIVE_THREAD_ENV_VARS[1:]
+                },
+            }
+            if resolved is None
+            else dict(resolved.values)
+        )
+        completed, reused = _durable_progress(task, actual_threads, before)
         _best_effort_log(
             task.log_path,
             f"{task.key.encoded} failed: {type(error).__name__}: {error}\n"
@@ -583,8 +772,8 @@ def run_fine_task(task: FineWorkflowTask) -> FineTaskResult:
             dask_task_key=dask_key,
             slurm_job_id=slurm_job,
             native_threads=_thread_evidence(task, resolved),
-            artifact_paths=(),
-            reused_artifacts=(),
+            artifact_paths=tuple(str(path) for path in completed),
+            reused_artifacts=tuple(str(path) for path in reused),
             log_path=str(task.log_path),
             failure=RoundFailure(
                 stage=task.key.stage,

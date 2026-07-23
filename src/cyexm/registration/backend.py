@@ -57,6 +57,15 @@ class RegistrationBackend(Protocol):
     ) -> object:
         raise NotImplementedError
 
+    def from_geometry(
+        self,
+        array: object,
+        *,
+        geometry: ImageGeometry,
+        has_components: bool = False,
+    ) -> object:
+        raise NotImplementedError
+
     def crop_image(
         self,
         image: object,
@@ -206,6 +215,23 @@ class AntsRegistrationBackend:
             origin=runtime_reference.origin,
             spacing=runtime_reference.spacing,
             direction=runtime_reference.direction,
+            has_components=has_components,
+        )
+
+    def from_geometry(
+        self,
+        array: object,
+        *,
+        geometry: ImageGeometry,
+        has_components: bool = False,
+    ) -> object:
+        self._prepare()
+        ants, np = _scientific_runtime()
+        return ants.from_numpy(
+            external_to_ants_array(np.asarray(array)),
+            origin=geometry.origin,
+            spacing=geometry.spacing,
+            direction=geometry.direction,
             has_components=has_components,
         )
 

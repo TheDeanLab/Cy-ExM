@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from cyexm.chunking import compute_chunk_grid
 from cyexm.registration.prepared import PreparedManifest
 from cyexm.workflow.fine_models import (
@@ -45,9 +47,11 @@ def chunk_tasks(
         raise ValueError("chunk expansion requires a completed preparation result")
     if prepared_result.status not in {"completed", "reused"}:
         raise ValueError("chunk expansion requires a completed preparation result")
-    descriptor = prepared_result.prepared_descriptor
+    descriptor = prepared_result.to_dict()["prepared_descriptor"]
     if descriptor is None:
         raise ValueError("chunk expansion requires a prepared descriptor")
+    if not isinstance(descriptor, Mapping):
+        raise TypeError("prepared descriptor must be a JSON object")
     manifest = PreparedManifest.from_dict(descriptor)
     round_task = prepared_result.task.round_task
     if round_task.chunk_size_zyx is None or round_task.overlap_fraction is None:

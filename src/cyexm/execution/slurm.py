@@ -114,8 +114,15 @@ class _SerializedWorkflowTaskRunner:
     def __call__(self, task: WorkflowTask) -> RoundResult:
         import cloudpickle
 
-        runner = cast(WorkflowTaskRunner, cloudpickle.loads(self.payload))
-        return cast(RoundResult, runner(task))
+        if type(task) not in {ReferenceTask, RoundTask}:
+            raise TypeError("serialized coarse task must use an exact task type")
+        runner = cloudpickle.loads(self.payload)
+        if not callable(runner):
+            raise TypeError("serialized coarse runner payload must be callable")
+        result = runner(task)
+        if type(result) is not RoundResult:
+            raise TypeError("serialized coarse runner must return an exact RoundResult")
+        return result
 
 
 def _serialize_workflow_task_runner(

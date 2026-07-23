@@ -4,7 +4,6 @@ import os
 import socket
 import time
 from datetime import UTC, datetime
-from typing import cast
 
 from cyexm.execution.base import WorkflowTaskRunner
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask, WorkflowTask
@@ -38,6 +37,8 @@ class SequentialExecutor:
     ) -> tuple[RoundResult, ...]:
         results: list[RoundResult] = []
         for task in tasks:
+            if type(task) not in {ReferenceTask, RoundTask}:
+                raise TypeError("coarse sequential tasks must use exact task types")
             started_at = _utc_now()
             started = time.monotonic()
             try:
@@ -79,7 +80,11 @@ class SequentialExecutor:
                     )
                 )
             else:
-                results.append(cast(RoundResult, result))
+                if type(result) is not RoundResult:
+                    raise TypeError(
+                        "coarse sequential runner must return an exact RoundResult"
+                    )
+                results.append(result)
         return tuple(results)
 
     def execute(

@@ -145,6 +145,13 @@ def test_sequential_executor_runs_every_task_in_order(tmp_path: Path) -> None:
     assert tuple(result.round for result in results) == (1, 2, 3)
 
 
+def test_sequential_executor_rejects_a_noncoarse_result(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="exact RoundResult"):
+        SequentialExecutor(runner=lambda _task: object()).execute(  # type: ignore[arg-type,return-value]
+            _reference_task(tmp_path), ()
+        )
+
+
 def test_sequential_executor_records_failure_and_continues(tmp_path: Path) -> None:
     calls: list[int] = []
 

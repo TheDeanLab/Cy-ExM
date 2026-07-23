@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self
@@ -31,13 +32,43 @@ _STAGES = frozenset(
     {"preparation", "chunk", "assembly", "whole-image", "channel", "validation"}
 )
 _INDEXED_STAGES = frozenset({"chunk", "channel"})
-_INDEX_PATTERN = re.compile(r"[0-9]{4}")
+_INDEX_PATTERN = re.compile(r"(?:[0-9]{4}|[1-9][0-9]{4,})")
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple | list):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+class _FrozenJsonObject(Mapping[str, object]):
+    def __init__(self, value: Mapping[str, object]) -> None:
+        self._values = {key: _freeze_json(item) for key, item in value.items()}
+
+    def __getitem__(self, key: str) -> object:
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+def _freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return _FrozenJsonObject(value)
+    if isinstance(value, tuple | list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
 
 
 def _json_object(value: object, name: str) -> dict[str, object]:
     try:
         encoded = json.dumps(
-            value,
+            _thaw_json(value),
             allow_nan=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -149,6 +180,11 @@ def _validate_task(
         raise ValueError("fine tasks must not share the coarse round log")
 
 
+def _require_outputs(task: _FineTask, expected: tuple[Path, ...]) -> None:
+    if task.output_paths != expected:
+        raise ValueError("task output_paths must equal the exact canonical outputs")
+
+
 def _prepared_paths(round_task: RoundTask) -> PreparedRoundPaths:
     from cyexm.registration.prepared import PreparedRoundPaths
 
@@ -162,6 +198,40 @@ def _registration_paths(round_task: RoundTask) -> RegistrationArtifactPaths:
 
     return RegistrationArtifactPaths.for_round(
         round_task.registration_directory, round_task.round
+    )
+
+
+def _preparation_outputs(round_task: RoundTask) -> tuple[Path, ...]:
+    prepared = _prepared_paths(round_task)
+    registration = _registration_paths(round_task)
+    return (
+        registration.affine,
+        registration.pre_metrics,
+        registration.linear_metrics,
+        *((registration.moving_crop,) if round_task.registration.crop else ()),
+        *prepared.array_paths,
+        prepared.manifest,
+    )
+
+
+def _whole_outputs(round_task: RoundTask) -> tuple[Path, ...]:
+    paths = _registration_paths(round_task)
+    return (
+        paths.affine,
+        paths.warp,
+        paths.registered,
+        paths.pre_metrics,
+        paths.linear_metrics,
+        paths.nonlinear_metrics,
+        *((paths.moving_crop,) if round_task.registration.crop else ()),
+    )
+
+
+def _validation_outputs(round_task: RoundTask) -> tuple[Path, ...]:
+    paths = _registration_paths(round_task)
+    return (
+        *paths.public_registration_artifacts,
+        *(channel.output for channel in round_task.channels),
     )
 
 
@@ -182,24 +252,18 @@ class RoundPreparationTask(_FineTask):
             item="main",
             strategy="serial_chunked",
         )
+        if self.dependencies:
+            raise ValueError("preparation task must not have dependencies")
+        _require_outputs(self, _preparation_outputs(self.round_task))
 
     @classmethod
     def create(cls, round_task: RoundTask) -> Self:
         key = FineTaskKey(round_task.round, "preparation", "main")
-        prepared = _prepared_paths(round_task)
-        registration = _registration_paths(round_task)
         return cls(
             round_task=round_task,
             key=key,
             dependencies=(),
-            output_paths=(
-                registration.affine,
-                registration.pre_metrics,
-                registration.linear_metrics,
-                *((registration.moving_crop,) if round_task.registration.crop else ()),
-                *prepared.array_paths,
-                prepared.manifest,
-            ),
+            output_paths=_preparation_outputs(round_task),
             log_path=round_task.log_path.parent / key.log_name,
         )
 
@@ -224,6 +288,19 @@ class NonlinearChunkTask(_FineTask):
             stage="chunk",
             item=f"{self.chunk.chunk_id:04d}",
             strategy="serial_chunked",
+        )
+        expected_dependency = FineTaskKey(self.round, "preparation", "main")
+        if self.dependencies != (expected_dependency,):
+            raise ValueError("chunk task must depend exactly on round preparation")
+        chunk_root = (
+            self.round_task.registration_directory / f"round_{self.round}_chunks"
+        )
+        _require_outputs(
+            self,
+            (
+                chunk_root / f"chunk_{self.chunk.chunk_id:04d}_warp.nii.gz",
+                chunk_root / f"chunk_{self.chunk.chunk_id:04d}_registered_core.npy",
+            ),
         )
         _json_object(json.loads(self.prepared_descriptor_json), "prepared descriptor")
 
@@ -284,11 +361,46 @@ class ChunkAssemblyTask(_FineTask):
             item="main",
             strategy="serial_chunked",
         )
-        if not self.dependencies or any(
-            key.stage != "chunk" for key in self.dependencies
+        descriptor = _json_object(
+            json.loads(self.prepared_descriptor_json), "prepared descriptor"
+        )
+        from cyexm.chunking import compute_chunk_grid
+        from cyexm.registration.prepared import PreparedManifest
+
+        manifest = PreparedManifest.from_dict(descriptor)
+        if (
+            self.round_task.chunk_size_zyx is None
+            or self.round_task.overlap_fraction is None
         ):
-            raise ValueError("assembly dependencies must be nonlinear chunk keys")
-        _json_object(json.loads(self.prepared_descriptor_json), "prepared descriptor")
+            raise ValueError("assembly requires chunk geometry")
+        chunks = compute_chunk_grid(
+            manifest.geometry.shape,
+            self.round_task.chunk_size_zyx,
+            self.round_task.overlap_fraction,
+        )
+        expected = tuple(
+            FineTaskKey(self.round, "chunk", f"{chunk.chunk_id:04d}")
+            for chunk in chunks
+        )
+        if self.dependencies != expected:
+            raise ValueError(
+                "assembly dependencies must equal every canonical chunk key"
+            )
+        paths = _registration_paths(self.round_task)
+        chunk_manifest = (
+            self.round_task.registration_directory
+            / f"round_{self.round}_chunks"
+            / "manifest.json"
+        )
+        _require_outputs(
+            self,
+            (
+                paths.warp,
+                paths.registered,
+                paths.nonlinear_metrics,
+                chunk_manifest,
+            ),
+        )
 
     @property
     def prepared_descriptor(self) -> dict[str, object]:
@@ -349,24 +461,18 @@ class WholeImageRegistrationTask(_FineTask):
             item="main",
             strategy="whole_image",
         )
+        if self.dependencies:
+            raise ValueError("whole-image task must not have dependencies")
+        _require_outputs(self, _whole_outputs(self.round_task))
 
     @classmethod
     def create(cls, round_task: RoundTask) -> Self:
         key = FineTaskKey(round_task.round, "whole-image", "main")
-        paths = _registration_paths(round_task)
         return cls(
             round_task=round_task,
             key=key,
             dependencies=(),
-            output_paths=(
-                paths.affine,
-                paths.warp,
-                paths.registered,
-                paths.pre_metrics,
-                paths.linear_metrics,
-                paths.nonlinear_metrics,
-                *((paths.moving_crop,) if round_task.registration.crop else ()),
-            ),
+            output_paths=_whole_outputs(round_task),
             log_path=round_task.log_path.parent / key.log_name,
         )
 
@@ -399,6 +505,14 @@ class ChannelTransformTask(_FineTask):
             self.output_paths[0] != self.round_task.channels[self.channel_index].output
         ):
             raise ValueError("channel task output must match its declared channel")
+        expected_stage = (
+            "assembly"
+            if self.round_task.strategy == "serial_chunked"
+            else "whole-image"
+        )
+        expected = FineTaskKey(self.round, expected_stage, "main")
+        if self.dependencies != (expected,):
+            raise ValueError("channel task dependency does not match round strategy")
 
     @classmethod
     def create(
@@ -435,10 +549,15 @@ class RoundValidationTask(_FineTask):
 
     def __post_init__(self) -> None:
         _validate_task(self, stage="validation", item="main")
-        if not self.dependencies or any(
-            key.stage != "channel" for key in self.dependencies
-        ):
-            raise ValueError("validation dependencies must be channel keys")
+        expected = tuple(
+            FineTaskKey(self.round, "channel", f"{index:04d}")
+            for index in range(len(self.round_task.channels))
+        )
+        if self.dependencies != expected:
+            raise ValueError(
+                "validation dependencies must equal every declared channel"
+            )
+        _require_outputs(self, _validation_outputs(self.round_task))
 
     @classmethod
     def create(
@@ -448,15 +567,11 @@ class RoundValidationTask(_FineTask):
         dependencies: tuple[FineTaskKey, ...],
     ) -> Self:
         key = FineTaskKey(round_task.round, "validation", "main")
-        paths = _registration_paths(round_task)
         return cls(
             round_task=round_task,
             key=key,
             dependencies=dependencies,
-            output_paths=(
-                *paths.public_registration_artifacts,
-                *(channel.output for channel in round_task.channels),
-            ),
+            output_paths=_validation_outputs(round_task),
             log_path=round_task.log_path.parent / key.log_name,
         )
 
@@ -489,7 +604,7 @@ class FineTaskResult:
     reused_artifacts: tuple[str, ...]
     log_path: str
     failure: RoundFailure | None
-    prepared_descriptor: dict[str, object] | None = None
+    prepared_descriptor: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if type(self.task) not in (
@@ -527,7 +642,18 @@ class FineTaskResult:
             raise ValueError("only failed fine task results may contain a failure")
         if self.prepared_descriptor is not None:
             descriptor = _json_object(self.prepared_descriptor, "prepared descriptor")
-            object.__setattr__(self, "prepared_descriptor", descriptor)
+            object.__setattr__(
+                self, "prepared_descriptor", _FrozenJsonObject(descriptor)
+            )
+        planned = tuple(str(path) for path in self.task.output_paths)
+        if self.status in {"completed", "reused"} and self.artifact_paths != planned:
+            raise ValueError(
+                "successful artifact_paths must equal exact planned outputs"
+            )
+        if self.status in {"failed", "cancelled"} and not set(
+            self.artifact_paths
+        ).issubset(planned):
+            raise ValueError("partial artifact_paths must be planned outputs")
         if type(self.task) is RoundPreparationTask:
             if (
                 self.status in {"completed", "reused"}
@@ -568,7 +694,11 @@ class FineTaskResult:
             "reused_artifacts": list(self.reused_artifacts),
             "log_path": self.log_path,
             "failure": None if self.failure is None else self.failure.to_dict(),
-            "prepared_descriptor": self.prepared_descriptor,
+            "prepared_descriptor": (
+                None
+                if self.prepared_descriptor is None
+                else _json_object(self.prepared_descriptor, "prepared descriptor")
+            ),
         }
 
 

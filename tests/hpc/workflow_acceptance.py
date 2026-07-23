@@ -918,7 +918,11 @@ def _write_text_evidence(path: Path, value: str) -> None:
     atomic_write(path, writer, validator)
 
 
-def _validated_deterministic_parity_evidence(value: object) -> dict[str, object]:
+def _validated_deterministic_parity_evidence(
+    value: object,
+    *,
+    require_fine_internal: bool = False,
+) -> dict[str, object]:
     expected_keys = {
         "schema_version",
         "status",
@@ -930,6 +934,8 @@ def _validated_deterministic_parity_evidence(value: object) -> dict[str, object]
         "strict_parity",
         "final_queue",
     }
+    if require_fine_internal:
+        expected_keys.add("strict_internal_parity")
     if not isinstance(value, dict) or set(value) != expected_keys:
         raise HpcWorkflowAcceptanceError(
             "deterministic parity evidence has an invalid exact schema"
@@ -1049,12 +1055,80 @@ def _validated_deterministic_parity_evidence(value: object) -> dict[str, object]
                 numeric,
                 f"round {round_index} channel {channel_index}",
             )
+    if require_fine_internal:
+        internal = value.get("strict_internal_parity")
+        if (
+            not isinstance(internal, Mapping)
+            or set(internal)
+            != {
+                "schema_version",
+                "local_warp_exact",
+                "diagnostic_exact",
+                "rounds",
+            }
+            or internal.get("schema_version") != 1
+            or internal.get("local_warp_exact") is not True
+            or internal.get("diagnostic_exact") is not True
+        ):
+            raise HpcWorkflowAcceptanceError(
+                "deterministic fine internal parity schema or summary is invalid"
+            )
+        internal_rounds = internal.get("rounds")
+        if not isinstance(internal_rounds, list) or not internal_rounds:
+            raise HpcWorkflowAcceptanceError(
+                "deterministic fine internal parity contains no chunk rounds"
+            )
+        seen_rounds: list[int] = []
+        for round_evidence in internal_rounds:
+            if (
+                not isinstance(round_evidence, Mapping)
+                or set(round_evidence) != {"round", "local_warps", "diagnostics"}
+                or type(round_evidence.get("round")) is not int
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    "deterministic fine internal round evidence is malformed"
+                )
+            seen_rounds.append(cast(int, round_evidence["round"]))
+            for role in ("local_warps", "diagnostics"):
+                artifacts = round_evidence.get(role)
+                if not isinstance(artifacts, list) or not artifacts:
+                    raise HpcWorkflowAcceptanceError(
+                        f"deterministic fine internal {role} evidence is empty"
+                    )
+                names: list[str] = []
+                for artifact in artifacts:
+                    if (
+                        not isinstance(artifact, Mapping)
+                        or set(artifact) != {"name", "shape", "dtype", "exact"}
+                        or type(artifact.get("name")) is not str
+                        or type(artifact.get("dtype")) is not str
+                        or not isinstance(artifact.get("shape"), list)
+                        or not artifact["shape"]
+                        or any(
+                            type(item) is not int or item < 1
+                            for item in cast(list[object], artifact["shape"])
+                        )
+                        or artifact.get("exact") is not True
+                    ):
+                        raise HpcWorkflowAcceptanceError(
+                            f"deterministic fine internal {role} artifact is malformed"
+                        )
+                    names.append(cast(str, artifact["name"]))
+                if names != sorted(set(names)):
+                    raise HpcWorkflowAcceptanceError(
+                        f"deterministic fine internal {role} names are noncanonical"
+                    )
+        if seen_rounds != sorted(set(seen_rounds)):
+            raise HpcWorkflowAcceptanceError(
+                "deterministic fine internal rounds are noncanonical"
+            )
     return cast(dict[str, object], value)
 
 
 def execute_deterministic_parity_subprocess(
     *,
     execution_path: Path,
+    fine_execution_path: Path | None = None,
     owned_root: Path,
     evidence_dir: Path,
     timeout_seconds: float,
@@ -1069,6 +1143,10 @@ def execute_deterministic_parity_subprocess(
     if not execution_path.is_file():
         raise HpcWorkflowAcceptanceError(
             f"deterministic parity execution profile is not a file: {execution_path}"
+        )
+    if fine_execution_path is not None and not fine_execution_path.is_file():
+        raise HpcWorkflowAcceptanceError(
+            f"deterministic fine execution profile is not a file: {fine_execution_path}"
         )
     if owned_root.is_symlink() or not owned_root.is_dir():
         raise HpcWorkflowAcceptanceError(
@@ -1089,6 +1167,11 @@ def execute_deterministic_parity_subprocess(
         "hpc.deterministic_parity",
         "--execution",
         str(execution_path),
+        *(
+            ()
+            if fine_execution_path is None
+            else ("--fine-execution", str(fine_execution_path))
+        ),
         "--owned-root",
         str(owned_root),
         "--evidence",
@@ -1144,7 +1227,10 @@ def execute_deterministic_parity_subprocess(
         raise HpcWorkflowAcceptanceError(
             "deterministic parity subprocess did not write valid evidence"
         ) from error
-    return _validated_deterministic_parity_evidence(evidence)
+    return _validated_deterministic_parity_evidence(
+        evidence,
+        require_fine_internal=fine_execution_path is not None,
+    )
 
 
 @contextmanager
@@ -1299,7 +1385,262 @@ def _production_round_task(task: RoundTask) -> RoundResult:
 def _production_workflow_task(task: WorkflowTask) -> RoundResult:
     from cyexm.workflow.task import run_workflow_task
 
-    return run_workflow_task(task)
+    return cast(RoundResult, run_workflow_task(task))
+
+
+def _production_fine_task(task: Any) -> Any:
+    from cyexm.workflow.fine_task import run_fine_task
+
+    return run_fine_task(task)
+
+
+def _profiled_task_call(
+    task: Any,
+    *,
+    timing_root: Path,
+    key: str,
+    operation: Callable[[Any], Any],
+) -> Any:
+    import resource
+
+    from cyexm.registration.backend import AntsRegistrationBackend
+
+    nonlinear_calls: list[dict[str, object]] = []
+    original = AntsRegistrationBackend.nonlinear
+
+    def timed_nonlinear(self: Any, **kwargs: object) -> tuple[object, Path]:
+        started_at = _utc_now()
+        started = time.monotonic()
+        try:
+            return original(self, **kwargs)
+        finally:
+            nonlinear_calls.append(
+                {
+                    "started_at": started_at,
+                    "ended_at": _utc_now(),
+                    "duration_seconds": float(max(0.0, time.monotonic() - started)),
+                }
+            )
+
+    started_at = _utc_now()
+    started = time.monotonic()
+    status = "completed"
+    AntsRegistrationBackend.nonlinear = timed_nonlinear
+    try:
+        return operation(task)
+    except BaseException:
+        status = "failed"
+        raise
+    finally:
+        AntsRegistrationBackend.nonlinear = original
+        peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_memory_bytes = int(peak_rss * 1024)
+        _write_marker(
+            timing_root / f"{key.replace(':', '-')}.json",
+            {
+                "schema_version": 1,
+                "task_key": key,
+                "status": status,
+                "started_at": started_at,
+                "ended_at": _utc_now(),
+                "duration_seconds": float(max(0.0, time.monotonic() - started)),
+                "peak_memory_bytes": peak_memory_bytes,
+                "nonlinear_calls": nonlinear_calls,
+            },
+        )
+
+
+def run_profiled_workflow_task(
+    task: WorkflowTask,
+    *,
+    timing_root: Path,
+    _run_workflow_task: Callable[
+        [WorkflowTask], RoundResult
+    ] = _production_workflow_task,
+) -> RoundResult:
+    """Run one coarse task with acceptance-only kernel timing and peak RSS."""
+    key = (
+        f"round-{task.round:03d}:reference:main"
+        if type(task) is ReferenceTask
+        else f"round-{task.round:03d}:coarse:main"
+    )
+    return cast(
+        RoundResult,
+        _profiled_task_call(
+            task,
+            timing_root=timing_root,
+            key=key,
+            operation=_run_workflow_task,
+        ),
+    )
+
+
+def run_profiled_fine_task(
+    task: Any,
+    *,
+    timing_root: Path,
+    _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+) -> Any:
+    """Run one fine task with acceptance-only kernel timing and peak RSS."""
+    key = getattr(getattr(task, "key", None), "encoded", None)
+    if type(key) is not str:
+        raise HpcWorkflowAcceptanceError(
+            "profiled fine task lacks an exact task identity"
+        )
+    return _profiled_task_call(
+        task,
+        timing_root=timing_root,
+        key=key,
+        operation=_run_fine_task,
+    )
+
+
+def run_injected_fine_failure_task(
+    task: Any,
+    *,
+    target_round: int,
+    target_stage: str,
+    failure_marker: Path,
+    settled_marker: Path | None = None,
+    timeout_seconds: float = 1_800.0,
+    _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+) -> Any:
+    """Inject one exact chunk or channel failure after ordinary siblings may settle."""
+    if target_stage not in {"chunk", "channel"}:
+        raise HpcWorkflowAcceptanceError(
+            "fine failure injection stage must be chunk or channel"
+        )
+    key = getattr(task, "key", None)
+    is_target = (
+        getattr(task, "round", None) == target_round
+        and getattr(key, "stage", None) == target_stage
+    )
+    if is_target:
+        encoded = getattr(key, "encoded", None)
+        if type(encoded) is not str:
+            raise HpcWorkflowAcceptanceError(
+                "fine failure target lacks an exact task identity"
+            )
+        if settled_marker is not None:
+            deadline = time.monotonic() + timeout_seconds
+            while not settled_marker.is_file():
+                if time.monotonic() >= deadline:
+                    raise HpcWorkflowAcceptanceError(
+                        "fine failure injection timed out waiting for a settled sibling"
+                    )
+                time.sleep(0.25)
+        _write_marker(
+            failure_marker,
+            {
+                "schema_version": 1,
+                "task_key": encoded,
+                "round": target_round,
+                "stage": target_stage,
+                "status": "injected",
+                "injected_at": _utc_now(),
+            },
+        )
+        raise RuntimeError(f"injected fine acceptance failure for {encoded}")
+    result = _run_fine_task(task)
+    if (
+        settled_marker is not None
+        and getattr(key, "stage", None) == target_stage
+        and getattr(result, "status", None) in {"completed", "reused"}
+    ):
+        _write_marker(
+            settled_marker,
+            {
+                "schema_version": 1,
+                "task_key": getattr(key, "encoded", ""),
+                "status": getattr(result, "status", None),
+                "settled_at": _utc_now(),
+            },
+        )
+    return result
+
+
+def run_fine_cancellation_task(
+    task: Any,
+    *,
+    target_round: int,
+    target_stage: str,
+    ready_marker: Path,
+    timeout_seconds: float,
+    _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+    _monotonic: Callable[[], float] = time.monotonic,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Block one exact fine task until the coordinator cancellation settles it."""
+    if target_stage not in {"chunk", "channel"} or timeout_seconds <= 0.0:
+        raise HpcWorkflowAcceptanceError(
+            "fine cancellation requires a chunk/channel stage and positive timeout"
+        )
+    key = getattr(task, "key", None)
+    if not (
+        getattr(task, "round", None) == target_round
+        and getattr(key, "stage", None) == target_stage
+    ):
+        return _run_fine_task(task)
+    encoded = getattr(key, "encoded", None)
+    if type(encoded) is not str:
+        raise HpcWorkflowAcceptanceError(
+            "fine cancellation target lacks an exact task identity"
+        )
+    _write_marker(
+        ready_marker,
+        {
+            "blocked_round": target_round,
+            "committed_round": target_round,
+            "status": "waiting-for-coordinator-interruption",
+        },
+    )
+    deadline = _monotonic() + timeout_seconds
+    while _monotonic() < deadline:
+        _sleep(min(0.25, max(0.0, deadline - _monotonic())))
+    raise HpcWorkflowAcceptanceError(
+        f"fine cancellation task {encoded} exceeded its bounded wait"
+    )
+
+
+def run_fine_worker_loss_task(
+    task: Any,
+    *,
+    target_round: int,
+    target_stage: str,
+    loss_marker: Path,
+    _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+    _exit: Callable[[int], Any] = os._exit,
+) -> Any:
+    """Terminate one worker exactly once, then let the replacement retry succeed."""
+    if target_stage not in {"chunk", "channel"}:
+        raise HpcWorkflowAcceptanceError(
+            "fine worker-loss stage must be chunk or channel"
+        )
+    key = getattr(task, "key", None)
+    if (
+        not (
+            getattr(task, "round", None) == target_round
+            and getattr(key, "stage", None) == target_stage
+        )
+        or loss_marker.exists()
+    ):
+        return _run_fine_task(task)
+    encoded = getattr(key, "encoded", None)
+    if type(encoded) is not str:
+        raise HpcWorkflowAcceptanceError(
+            "fine worker-loss target lacks an exact task identity"
+        )
+    _write_marker(
+        loss_marker,
+        {
+            "schema_version": 1,
+            "task_key": encoded,
+            "status": "worker-loss-injected",
+            "injected_at": _utc_now(),
+        },
+    )
+    _exit(75)
+    raise AssertionError("worker-loss exit unexpectedly returned")
 
 
 def run_seeded_workflow_task(
@@ -1531,6 +1872,7 @@ def execute_cancellation_acceptance(
     successful_round: int,
     blocked_round: int,
     timeout_seconds: float,
+    fine_runner: Callable[[Any], Any] | None = None,
     _execute_owned: Callable[..., Any] | None = None,
     _send_signal: Callable[[int, int], None] = os.kill,
     _monotonic: Callable[[], float] = time.monotonic,
@@ -1610,6 +1952,7 @@ def execute_cancellation_acceptance(
                 evidence_dir=evidence_dir,
                 operation=operation,
                 user=user,
+                fine_runner=fine_runner,
             )
         except KeyboardInterrupt:
             exit_code = 130
@@ -1647,6 +1990,7 @@ def execute_owned_slurm_workflow(
     evidence_dir: Path,
     operation: str,
     user: str,
+    fine_runner: Callable[[Any], Any] | None = None,
     _executor_ctor: Callable[..., Any] = SlurmExecutor,
     _run_workflow: Callable[..., Any] = run_workflow,
     _collect_queue: Callable[..., dict[str, object]] = collect_queue_snapshot,
@@ -1672,7 +2016,10 @@ def execute_owned_slurm_workflow(
             f"the approved harness name {spec.job_name!r}"
         )
 
-    executor = _executor_ctor(plan.execution, _runner=runner)
+    executor_kwargs: dict[str, object] = {"_runner": runner}
+    if fine_runner is not None:
+        executor_kwargs["_fine_runner"] = fine_runner
+    executor = _executor_ctor(plan.execution, **executor_kwargs)
     result: Any = None
     execution_error: BaseException | None = None
     try:
@@ -1745,6 +2092,11 @@ __all__ = [
     "prepare_task5_output_roots",
     "run_cancellation_task",
     "run_failure_task",
+    "run_fine_cancellation_task",
+    "run_fine_worker_loss_task",
+    "run_injected_fine_failure_task",
+    "run_profiled_fine_task",
+    "run_profiled_workflow_task",
     "run_seeded_workflow_task",
     "scientific_equivalence_evidence",
     "scientific_parity_evidence",

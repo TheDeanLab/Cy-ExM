@@ -44,3 +44,7 @@
 - Documentation/example policy tests load every checked-in YAML through production
   loaders, enforce explicit coarse/fine modes, and keep layered AGENTS ownership and
   the fine-grained real-SLURM pending boundary synchronized.
+- Fine-HPC portable tests validate report builders and exact decoders with synthetic
+  external evidence only. Cover forged identities, checksums, paths, geometry,
+  placements, fairness, durability, cancellation, replacement, timing, and the 20%
+  nonlinear wall-time gate without contacting a scheduler or terminating a process.

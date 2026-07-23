@@ -91,3 +91,16 @@
   injected chunk/channel failure with resume, cancellation with resume, exact owned
   cleanup, and at least a 20% nonlinear-stage wall-time reduction. These real SLURM
   requirements remain pending until the exact-commit external gate is complete.
+- The fine harness reuses the Phase 2E caller-owned context and owned-job lifecycle.
+  Its test alone additionally requires exact `--cyexm-coarse-execution` and
+  `--cyexm-fine-execution` profiles; the former must identify the same file as the
+  legacy `--cyexm-execution` option. Never derive either operator approval silently.
+- Keep fine-only report schemas and audit decoders in
+  `fine_workflow_acceptance.py`. Keep shared submission, cleanup, fresh-coordinator,
+  and acceptance-only worker-runner machinery in `workflow_acceptance.py`.
+  Acceptance-only profiling may time the real ANTs nonlinear kernel and record
+  worker peak RSS externally, but it must restore patched runtime state in `finally`.
+- A worker-loss trial may terminate only the exact dedicated worker process after
+  durably writing its one-shot marker. It must never terminate the coordinator, and
+  acceptance requires production departure, replacement, retry, liveness, and exact
+  named-job cleanup evidence before making a claim.

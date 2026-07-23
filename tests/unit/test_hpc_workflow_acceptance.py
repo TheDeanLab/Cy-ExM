@@ -7,9 +7,12 @@ import subprocess
 import sys
 import threading
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from hpc.deterministic_parity import (
@@ -18,6 +21,11 @@ from hpc.deterministic_parity import (
 )
 from hpc.deterministic_parity import (
     main as deterministic_parity_main,
+)
+from hpc.fine_workflow_acceptance import (
+    build_fine_acceptance_report,
+    fine_acceptance_profiles,
+    validate_fine_acceptance_report,
 )
 from hpc.test_slurm_workflow import _assert_resume
 from hpc.workflow_acceptance import (
@@ -38,6 +46,10 @@ from hpc.workflow_acceptance import (
     prepare_task5_output_roots,
     run_cancellation_task,
     run_failure_task,
+    run_fine_cancellation_task,
+    run_fine_worker_loss_task,
+    run_injected_fine_failure_task,
+    run_profiled_fine_task,
     run_seeded_workflow_task,
     sequential_reference_profile,
     task5_output_roots,
@@ -54,6 +66,7 @@ from cyexm.config.models import (
     ExecutionProfile,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
+    ParallelismSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
     RegistrationSpec,
@@ -61,6 +74,7 @@ from cyexm.config.models import (
     RoundSpec,
     SlurmSpec,
 )
+from cyexm.registration.artifacts import FileIdentity
 from cyexm.workflow.models import (
     ReferenceChannelTask,
     ReferenceTask,
@@ -131,6 +145,497 @@ def _profile(tmp_path: Path, *, workers: int = 4) -> ExecutionProfile:
         ),
         source_path=tmp_path / "execution.yaml",
     )
+
+
+def _fine_acceptance_report(root: Path) -> dict[str, object]:
+    evidence_path = root / "fine-execution.json"
+    evidence_path.write_bytes(b'{"fine":"evidence"}\n')
+    prepared_path = root / "fine" / "schema-v1" / "sample" / "prepared" / "fixed.npy"
+    prepared_path.parent.mkdir(parents=True)
+    prepared_path.write_bytes(b"prepared")
+    input_path = root / "inputs" / "fixed.tif"
+    input_path.parent.mkdir()
+    input_path.write_bytes(b"fixed")
+    coarse_profile_path = root / "coarse.yaml"
+    fine_profile_path = root / "fine.yaml"
+    coarse_profile_path.write_bytes(b"parallelism: coarse\n")
+    fine_profile_path.write_bytes(b"parallelism: fine_grained\n")
+    task_times = [
+        {
+            "task_key": "round-002:chunk:0000",
+            "kind": "chunk",
+            "round": 2,
+            "job_id": "101",
+            "hostname": "node-a",
+            "worker": "tcp://node-a:1",
+            "started_at": "2026-07-22T10:00:00Z",
+            "ended_at": "2026-07-22T10:00:10Z",
+            "duration_seconds": 10.0,
+        },
+        {
+            "task_key": "round-003:chunk:0000",
+            "kind": "chunk",
+            "round": 3,
+            "job_id": "102",
+            "hostname": "node-b",
+            "worker": "tcp://node-b:1",
+            "started_at": "2026-07-22T10:00:01Z",
+            "ended_at": "2026-07-22T10:00:11Z",
+            "duration_seconds": 10.0,
+        },
+        {
+            "task_key": "round-002:channel:0000",
+            "kind": "channel",
+            "round": 2,
+            "job_id": "101",
+            "hostname": "node-a",
+            "worker": "tcp://node-a:1",
+            "started_at": "2026-07-22T10:00:12Z",
+            "ended_at": "2026-07-22T10:00:18Z",
+            "duration_seconds": 6.0,
+        },
+        {
+            "task_key": "round-003:channel:0000",
+            "kind": "channel",
+            "round": 3,
+            "job_id": "102",
+            "hostname": "node-b",
+            "worker": "tcp://node-b:1",
+            "started_at": "2026-07-22T10:00:13Z",
+            "ended_at": "2026-07-22T10:00:19Z",
+            "duration_seconds": 6.0,
+        },
+    ]
+    identity = FileIdentity.from_path(input_path).to_dict()
+    artifact = {
+        "relative_path": "schema-v1/sample/rounds/round-002/channels/result.tif",
+        "sha256": "b" * 64,
+    }
+    resume = {
+        "injected_task_key": "round-002:chunk:0000",
+        "failure_status": "failed",
+        "settled_sibling_keys": ["round-003:chunk:0000"],
+        "preserved_artifacts": [artifact],
+        "resume_reused_keys": ["round-003:chunk:0000"],
+        "resume_recomputed_keys": ["round-002:chunk:0000"],
+        "ordinary_artifact_store_reuse": True,
+    }
+    return {
+        "schema_version": 1,
+        "status": "completed",
+        "identities": {
+            "git_commit": "1" * 40,
+            "package_versions": {"cy-exm": "0.1.0", "distributed": "2026.1.0"},
+            "scientific_fingerprint": "2" * 64,
+            "coarse_execution_fingerprint": "3" * 64,
+            "fine_execution_fingerprint": "4" * 64,
+            "coarse_profile": FileIdentity.from_path(coarse_profile_path).to_dict(),
+            "fine_profile": FileIdentity.from_path(fine_profile_path).to_dict(),
+            "coarse_profile_sha256": sha256(
+                coarse_profile_path.read_bytes()
+            ).hexdigest(),
+            "fine_profile_sha256": sha256(fine_profile_path.read_bytes()).hexdigest(),
+            "inputs": [identity],
+            "input_checksums": [
+                {
+                    "path": identity["path"],
+                    "sha256": sha256(input_path.read_bytes()).hexdigest(),
+                }
+            ],
+        },
+        "scientific": {
+            "coarse_fingerprint": "2" * 64,
+            "fine_fingerprint": "2" * 64,
+            "public_artifacts_coarse": [artifact],
+            "public_artifacts_fine": [artifact],
+            "tier1": {
+                "metric_absolute_tolerance": 0.01,
+                "maximum_metric_absolute_difference": 0.009,
+                "structure_equal": True,
+            },
+            "tier2": {
+                "seed": "20260722",
+                "native_threads": 1,
+                "affine_exact": True,
+                "local_warp_exact": True,
+                "full_warp_exact": True,
+                "diagnostic_exact": True,
+                "metrics_exact": True,
+                "channels": [
+                    {
+                        "relative_path": artifact["relative_path"],
+                        "exact": True,
+                    }
+                ],
+            },
+        },
+        "fixed_grid": {
+            "shape_zyx": [16, 32, 48],
+            "origin_xyz": [1.0, 2.0, 3.0],
+            "spacing_xyz": [0.2, 0.2, 0.5],
+            "direction": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            "prepared_paths": [str(prepared_path)],
+            "owned_roots": [str(root / "fine")],
+        },
+        "placement": {
+            "worker_cap": 4,
+            "maximum_connected_workers": 4,
+            "scale_events": [1, 2, 4],
+            "fair_ready_rounds": [2, 3],
+            "fair_dispatch_order": [
+                "round-002:chunk:0000",
+                "round-003:chunk:0000",
+            ],
+            "tasks": task_times,
+        },
+        "durability": {
+            "chunk_failure_resume": resume,
+            "channel_failure_resume": {
+                **resume,
+                "injected_task_key": "round-002:channel:0000",
+                "settled_sibling_keys": ["round-003:channel:0000"],
+                "resume_reused_keys": ["round-003:channel:0000"],
+                "resume_recomputed_keys": ["round-002:channel:0000"],
+            },
+            "cancellation_resume": {
+                "status": "cancelled",
+                "structured_cancellation": True,
+                "preserved_artifacts": [artifact],
+                "resume_reused_keys": ["round-003:chunk:0000"],
+                "resume_recomputed_keys": ["round-002:chunk:0000"],
+                "replacement_events": 1,
+                "liveness_proven": True,
+                "owned_job_ids": ["101", "102"],
+                "remaining_owned_job_ids": [],
+            },
+        },
+        "performance": {
+            "coarse_nonlinear_wall_seconds": 100.0,
+            "fine_nonlinear_wall_seconds": 80.0,
+            "end_to_end_wall_seconds": 140.0,
+            "task_seconds": 32.0,
+            "node_hours": 0.02,
+            "peak_memory_bytes": 1_000_000,
+            "startup_overhead_seconds": 4.0,
+            "worker_utilization": 0.75,
+            "chunk_duration_seconds": {
+                "count": 2,
+                "minimum": 10.0,
+                "median": 10.0,
+                "maximum": 10.0,
+            },
+            "channel_duration_seconds": {
+                "count": 2,
+                "minimum": 6.0,
+                "median": 6.0,
+                "maximum": 6.0,
+            },
+        },
+        "owned_root": str(root),
+        "evidence_files": [
+            {
+                "relative_path": "fine-execution.json",
+                "sha256": sha256(evidence_path.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+
+
+def test_fine_acceptance_profiles_preserve_science_and_select_only_admission_mode(
+    tmp_path: Path,
+) -> None:
+    approved = _profile(tmp_path)
+    coarse_approved = replace(
+        approved,
+        paths=replace(approved.paths, output_root=tmp_path / "coarse"),
+        parallelism=ParallelismSpec(mode="coarse"),
+    )
+    fine_approved = replace(
+        approved,
+        paths=replace(approved.paths, output_root=tmp_path / "fine"),
+        parallelism=ParallelismSpec(mode="fine_grained"),
+    )
+
+    coarse, fine = fine_acceptance_profiles(coarse_approved, fine_approved)
+
+    assert coarse.parallelism.mode == "coarse"
+    assert fine.parallelism.mode == "fine_grained"
+    assert coarse.paths.output_root == tmp_path / "coarse"
+    assert fine.paths.output_root == tmp_path / "fine"
+    assert coarse is coarse_approved
+    assert fine is fine_approved
+
+
+def test_fine_acceptance_report_validates_every_portable_gate(tmp_path: Path) -> None:
+    report = _fine_acceptance_report(tmp_path)
+
+    validated = validate_fine_acceptance_report(report, evidence_root=tmp_path)
+
+    assert validated == report
+    assert validated is not report
+
+
+def test_fine_acceptance_builder_hashes_only_owned_evidence(tmp_path: Path) -> None:
+    payload = _fine_acceptance_report(tmp_path)
+
+    built = build_fine_acceptance_report(
+        identities=cast(dict[str, object], payload["identities"]),
+        scientific=cast(dict[str, object], payload["scientific"]),
+        fixed_grid=cast(dict[str, object], payload["fixed_grid"]),
+        placement=cast(dict[str, object], payload["placement"]),
+        durability=cast(dict[str, object], payload["durability"]),
+        performance=cast(dict[str, object], payload["performance"]),
+        evidence_root=tmp_path,
+        evidence_paths=(tmp_path / "fine-execution.json",),
+    )
+
+    assert built == payload
+    outside = tmp_path.parent / "outside-evidence.json"
+    outside.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(HpcWorkflowAcceptanceError, match="escapes"):
+        build_fine_acceptance_report(
+            identities=cast(dict[str, object], payload["identities"]),
+            scientific=cast(dict[str, object], payload["scientific"]),
+            fixed_grid=cast(dict[str, object], payload["fixed_grid"]),
+            placement=cast(dict[str, object], payload["placement"]),
+            durability=cast(dict[str, object], payload["durability"]),
+            performance=cast(dict[str, object], payload["performance"]),
+            evidence_root=tmp_path,
+            evidence_paths=(outside,),
+        )
+
+
+def test_fine_failure_and_cancellation_runners_target_only_exact_stage(
+    tmp_path: Path,
+) -> None:
+    target = SimpleNamespace(
+        round=2,
+        key=SimpleNamespace(stage="chunk", encoded="round-002:chunk:0000"),
+    )
+    sibling = SimpleNamespace(
+        round=3,
+        key=SimpleNamespace(stage="chunk", encoded="round-003:chunk:0000"),
+    )
+    observed: list[object] = []
+
+    assert (
+        run_injected_fine_failure_task(
+            sibling,
+            target_round=2,
+            target_stage="chunk",
+            failure_marker=tmp_path / "failure.json",
+            _run_fine_task=lambda task: observed.append(task) or "completed",
+        )
+        == "completed"
+    )
+    with pytest.raises(RuntimeError, match="round-002:chunk:0000"):
+        run_injected_fine_failure_task(
+            target,
+            target_round=2,
+            target_stage="chunk",
+            failure_marker=tmp_path / "failure.json",
+        )
+    marker = json.loads((tmp_path / "failure.json").read_text(encoding="utf-8"))
+    assert marker["task_key"] == "round-002:chunk:0000"
+    assert observed == [sibling]
+
+    times = iter((0.0, 0.5, 1.0, 1.0))
+    with pytest.raises(HpcWorkflowAcceptanceError, match="bounded wait"):
+        run_fine_cancellation_task(
+            target,
+            target_round=2,
+            target_stage="chunk",
+            ready_marker=tmp_path / "ready.json",
+            timeout_seconds=1.0,
+            _monotonic=lambda: next(times),
+            _sleep=lambda _seconds: None,
+        )
+    assert json.loads((tmp_path / "ready.json").read_text(encoding="utf-8")) == {
+        "blocked_round": 2,
+        "committed_round": 2,
+        "status": "waiting-for-coordinator-interruption",
+    }
+
+
+def test_fine_worker_loss_is_injected_once_before_replacement_retry(
+    tmp_path: Path,
+) -> None:
+    target = SimpleNamespace(
+        round=2,
+        key=SimpleNamespace(stage="chunk", encoded="round-002:chunk:0000"),
+    )
+    marker = tmp_path / "worker-loss.json"
+
+    def injected_exit(code: int) -> None:
+        raise SystemExit(code)
+
+    with pytest.raises(SystemExit, match="75"):
+        run_fine_worker_loss_task(
+            target,
+            target_round=2,
+            target_stage="chunk",
+            loss_marker=marker,
+            _exit=injected_exit,
+        )
+
+    assert (
+        run_fine_worker_loss_task(
+            target,
+            target_round=2,
+            target_stage="chunk",
+            loss_marker=marker,
+            _run_fine_task=lambda _task: "replacement-completed",
+        )
+        == "replacement-completed"
+    )
+    assert json.loads(marker.read_text(encoding="utf-8"))["task_key"] == (
+        "round-002:chunk:0000"
+    )
+
+
+def test_fine_profiler_writes_external_peak_memory_and_restores_backend(
+    tmp_path: Path,
+) -> None:
+    from cyexm.registration.backend import AntsRegistrationBackend
+
+    task = SimpleNamespace(key=SimpleNamespace(encoded="round-002:chunk:0000"))
+    original = AntsRegistrationBackend.nonlinear
+
+    assert (
+        run_profiled_fine_task(
+            task,
+            timing_root=tmp_path,
+            _run_fine_task=lambda _task: "completed",
+        )
+        == "completed"
+    )
+
+    assert AntsRegistrationBackend.nonlinear is original
+    timing = json.loads(
+        (tmp_path / "round-002-chunk-0000.json").read_text(encoding="utf-8")
+    )
+    assert timing["task_key"] == "round-002:chunk:0000"
+    assert timing["status"] == "completed"
+    assert timing["peak_memory_bytes"] > 0
+    assert timing["nonlinear_calls"] == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda value: value.pop("performance"), "schema"),
+        (
+            lambda value: value["scientific"].update({"fine_fingerprint": "f" * 64}),
+            "scientific fingerprint",
+        ),
+        (
+            lambda value: value["scientific"]["tier1"].update(
+                {"maximum_metric_absolute_difference": 0.0101}
+            ),
+            "Tier 1",
+        ),
+        (
+            lambda value: value["scientific"]["tier2"].update(
+                {"full_warp_exact": False}
+            ),
+            "Tier 2",
+        ),
+        (
+            lambda value: value["scientific"].update({"public_artifacts_fine": []}),
+            "public_artifacts",
+        ),
+        (
+            lambda value: value["fixed_grid"].update({"shape_zyx": [16, 32]}),
+            "fixed-grid",
+        ),
+        (
+            lambda value: value["fixed_grid"]["prepared_paths"].append(
+                "/tmp/forged.npy"
+            ),
+            "prepared path",
+        ),
+        (
+            lambda value: value["placement"]["tasks"][1].update({"job_id": "101"}),
+            "chunk",
+        ),
+        (
+            lambda value: value["placement"]["tasks"][3].update({"hostname": "node-a"}),
+            "channel",
+        ),
+        (
+            lambda value: value["placement"].update({"maximum_connected_workers": 5}),
+            "worker cap",
+        ),
+        (
+            lambda value: value["placement"].update(
+                {
+                    "fair_dispatch_order": [
+                        "round-002:chunk:0000",
+                        "round-002:chunk:0001",
+                    ]
+                }
+            ),
+            "fair",
+        ),
+        (
+            lambda value: value["durability"]["chunk_failure_resume"].update(
+                {"ordinary_artifact_store_reuse": False}
+            ),
+            "ArtifactStore",
+        ),
+        (
+            lambda value: value["durability"]["cancellation_resume"].update(
+                {"remaining_owned_job_ids": ["101"]}
+            ),
+            "cleanup",
+        ),
+        (
+            lambda value: value["performance"].update(
+                {"fine_nonlinear_wall_seconds": 80.0001}
+            ),
+            "20%",
+        ),
+        (
+            lambda value: value["evidence_files"].append(
+                deepcopy(value["evidence_files"][0])
+            ),
+            "duplicate",
+        ),
+        (
+            lambda value: value["evidence_files"][0].update(
+                {"relative_path": "../forged.json"}
+            ),
+            "canonical",
+        ),
+        (
+            lambda value: value["identities"].update({"git_commit": "bad"}),
+            "commit",
+        ),
+        (
+            lambda value: value["identities"].update(
+                {"coarse_profile_sha256": "f" * 64}
+            ),
+            "stale or forged",
+        ),
+        (
+            lambda value: value["identities"]["input_checksums"][0].update(
+                {"sha256": "f" * 64}
+            ),
+            "stale or forged",
+        ),
+    ],
+)
+def test_fine_acceptance_report_rejects_incomplete_or_forged_evidence(
+    tmp_path: Path,
+    mutation: object,
+    message: str,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    assert callable(mutation)
+    mutation(report)
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match=message):
+        validate_fine_acceptance_report(report, evidence_root=tmp_path)
 
 
 def test_bounded_manifest_selects_one_round_per_strategy_in_round_order() -> None:
@@ -297,6 +802,35 @@ def _strict_parity_payload() -> dict[str, object]:
     }
 
 
+def _strict_internal_parity_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "local_warp_exact": True,
+        "diagnostic_exact": True,
+        "rounds": [
+            {
+                "round": 3,
+                "local_warps": [
+                    {
+                        "name": "chunk_0000_warp.nii.gz",
+                        "shape": [16, 16, 16, 3],
+                        "dtype": "float32",
+                        "exact": True,
+                    }
+                ],
+                "diagnostics": [
+                    {
+                        "name": "chunk_0000_registered_core.npy",
+                        "shape": [8, 16, 16],
+                        "dtype": "float32",
+                        "exact": True,
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def test_deterministic_parity_evidence_rejects_nonexact_artifact_claim() -> None:
     strict = _strict_parity_payload()
     rounds = strict["rounds"]
@@ -410,6 +944,93 @@ def test_deterministic_parity_subprocess_is_fresh_one_thread_and_fail_closed(
     assert (evidence_dir / "deterministic-coordinator.stderr.txt").read_text(
         encoding="utf-8"
     ) == "child-err"
+
+
+def test_fine_deterministic_parity_passes_both_exact_profiles_to_child(
+    tmp_path: Path,
+) -> None:
+    coarse = tmp_path / "coarse.yaml"
+    fine = tmp_path / "fine.yaml"
+    coarse.write_text("schema_version: 1\n", encoding="utf-8")
+    fine.write_text("schema_version: 1\n", encoding="utf-8")
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    observed: dict[str, object] = {}
+
+    def complete(
+        command: tuple[str, ...], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        observed["command"] = command
+        (evidence / "deterministic-executor-parity.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "completed",
+                    "seed": "20260722",
+                    "native_threads": {
+                        "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1,
+                        "OMP_NUM_THREADS": 1,
+                        "OPENBLAS_NUM_THREADS": 1,
+                        "MKL_NUM_THREADS": 1,
+                        "NUMEXPR_NUM_THREADS": 1,
+                        "VECLIB_MAXIMUM_THREADS": 1,
+                    },
+                    "inputs": {},
+                    "parallel": {"status": "completed"},
+                    "sequential": {"status": "completed"},
+                    "strict_parity": _strict_parity_payload(),
+                    "strict_internal_parity": _strict_internal_parity_payload(),
+                    "final_queue": {"jobs": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    execute_deterministic_parity_subprocess(
+        execution_path=coarse,
+        fine_execution_path=fine,
+        owned_root=owned,
+        evidence_dir=evidence,
+        timeout_seconds=10.0,
+        _run=complete,
+    )
+
+    command = cast(tuple[str, ...], observed["command"])
+    assert command[command.index("--execution") + 1] == str(coarse)
+    assert command[command.index("--fine-execution") + 1] == str(fine)
+
+
+def test_fine_deterministic_parity_rejects_forged_local_chunk_claim() -> None:
+    payload = {
+        "schema_version": 1,
+        "status": "completed",
+        "seed": "20260722",
+        "native_threads": {
+            "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1,
+            "OMP_NUM_THREADS": 1,
+            "OPENBLAS_NUM_THREADS": 1,
+            "MKL_NUM_THREADS": 1,
+            "NUMEXPR_NUM_THREADS": 1,
+            "VECLIB_MAXIMUM_THREADS": 1,
+        },
+        "inputs": {},
+        "parallel": {"status": "completed"},
+        "sequential": {"status": "completed"},
+        "strict_parity": _strict_parity_payload(),
+        "strict_internal_parity": _strict_internal_parity_payload(),
+        "final_queue": {"jobs": []},
+    }
+    internal = cast(dict[str, object], payload["strict_internal_parity"])
+    internal["local_warp_exact"] = False
+
+    with pytest.raises(HpcWorkflowAcceptanceError, match="internal parity"):
+        _validated_deterministic_parity_evidence(
+            payload,
+            require_fine_internal=True,
+        )
 
 
 @pytest.mark.parametrize("failure", ["exit", "missing", "malformed"])

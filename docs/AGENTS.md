@@ -30,3 +30,11 @@
   documents. General guides and examples must remain portable and use Cy-ExM names.
 - Do not include credentials, private GitHub URLs with tokens, generated evidence,
   dataset-specific output, or large command transcripts.
+
+## API documentation synchronization
+
+When a user-callable API changes, follow `agentic-api-documentation.md`. Keep its
+module API map, `See Also` decision boundaries, canonical examples, and relevant
+user-facing pages synchronized with the implemented signature and behavior. Use
+examples that preserve Cy-ExM's fixed/moving roles, public XYZ spacing, and NumPy ZYX
+volume order.

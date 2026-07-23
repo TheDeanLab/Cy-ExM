@@ -16,7 +16,12 @@ from cyexm.registration._request_policy import (
     canonical_compact_json,
     common_parameters,
 )
-from cyexm.registration.artifacts import FileIdentity, StageRequest
+from cyexm.registration.artifacts import (
+    ArtifactStore,
+    CompletionRecord,
+    FileIdentity,
+    StageRequest,
+)
 from cyexm.spatial import ImageGeometry
 
 if TYPE_CHECKING:
@@ -355,6 +360,31 @@ def _require_identity(identity: FileIdentity, role: str) -> None:
         raise CacheValidationError(f"{role} identity changed during preparation")
 
 
+def _completion_identity(
+    store: ArtifactStore,
+    artifact: Path,
+    request: StageRequest,
+    role: str,
+) -> FileIdentity:
+    try:
+        record = CompletionRecord.read(store.record_path(artifact))
+    except Exception as error:
+        store.mark_stale(artifact)
+        raise CacheValidationError(f"{role} completion record is unreadable") from error
+    if record.request != request:
+        store.mark_stale(artifact)
+        raise CacheValidationError(f"{role} completion request mismatch")
+    try:
+        current = FileIdentity.from_path(artifact)
+    except OSError as error:
+        store.mark_stale(artifact)
+        raise CacheValidationError(f"{role} identity is unreadable") from error
+    if current != record.artifact:
+        store.mark_stale(artifact)
+        raise CacheValidationError(f"{role} completion identity mismatch")
+    return record.artifact
+
+
 def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
     """Prepare affine state and atomically persist its four fixed-grid arrays."""
     state = registration._prepare_linear_state()
@@ -425,7 +455,14 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
                     expected=value,
                 ),
             )
-        array_identities.append(FileIdentity.from_path(path))
+        array_identities.append(
+            _completion_identity(
+                registration._store(),
+                path,
+                request,
+                role.replace("_", " "),
+            )
+        )
         _require_identity(affine, "affine")
         if moving_crop is not None:
             _require_identity(moving_crop, "moving crop")

@@ -199,6 +199,38 @@ def test_array_mutation_before_manifest_capture_fails_closed_and_stales(
     assert ArtifactStore().stale_path(paths.fixed_scalar).is_file()
 
 
+class _PostCommitArtifactMutatingStore(ArtifactStore):
+    def commit(
+        self,
+        artifact: Path,
+        request: StageRequest,
+        writer: Callable[[Path], None],
+        validator: Callable[[Path], bool],
+    ) -> None:
+        super().commit(artifact, request, writer, validator)
+        if artifact.name == "fixed_scalar.npy":
+            array = np.load(artifact, allow_pickle=False)
+            np.save(
+                artifact,
+                np.asarray(array) + np.float32(1.0),
+                allow_pickle=False,
+            )
+
+
+def test_post_commit_array_mutation_cannot_replace_completion_identity(
+    tmp_path: Path,
+) -> None:
+    registration = _registration(tmp_path)
+    registration._artifact_store = _PostCommitArtifactMutatingStore()
+    paths = PreparedRoundPaths.for_round(tmp_path / "output", 3)
+
+    with pytest.raises(CacheValidationError, match="completion identity mismatch"):
+        commit_prepared_round(registration)
+
+    assert not paths.manifest.exists()
+    assert ArtifactStore().stale_path(paths.fixed_scalar).is_file()
+
+
 def test_commit_rejects_nonfinite_prepared_values_without_manifest(
     tmp_path: Path,
 ) -> None:

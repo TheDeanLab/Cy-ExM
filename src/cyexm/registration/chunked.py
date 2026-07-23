@@ -14,13 +14,18 @@ from cyexm.chunking import (
     extract_chunk,
     stitch_core,
 )
-from cyexm.errors import ChunkRegistrationError
+from cyexm.errors import (
+    CacheValidationError,
+    ChunkRegistrationError,
+    RegistrationStageError,
+)
 from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
 )
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity
 from cyexm.registration.backend import RegistrationBackend
 from cyexm.registration.chunk_stages import (
+    AssembledNonlinear,
     ChunkOutputValidationError,
     ChunkRegion,
     ChunkStageContext,
@@ -179,15 +184,31 @@ class ChunkedImageRegistration(ImageRegistration):
         ):
             self._store().mark_stale(artifact)
 
-    def _estimate_nonlinear(
+    def register(self) -> None:
+        state = self._prepare_linear_state()
+        try:
+            self._run_nonlinear_chunks(
+                state.backend,
+                state.fixed,
+                state.moving_linear,
+                state.fixed_mask,
+                state.moving_linear_mask,
+            )
+        except (CacheValidationError, ChunkRegistrationError, RegistrationStageError):
+            raise
+        except Exception as error:
+            raise RegistrationStageError(
+                f"nonlinear registration failed for round {self.imaging_round}"
+            ) from error
+
+    def _run_nonlinear_chunks(
         self,
         backend: RegistrationBackend,
         fixed: object,
         moving_linear: object,
         fixed_mask: object,
         moving_linear_mask: object,
-    ) -> tuple[object, Path]:
-        """Return a unique disposable full-warp candidate owned by the caller."""
+    ) -> AssembledNonlinear:
         self._nonlinear_request_evidence = {}
         resolved = configure_native_threads(self.native_threads)
         np = _scientific_runtime()
@@ -255,6 +276,9 @@ class ChunkedImageRegistration(ImageRegistration):
             force=self.force_override,
             output_directory=Path(self.save_directory),
             round_number=self.imaging_round,
+            pixel_size=self.pixel_size,
+            crop=self.crop,
+            prepared_fixed=self.prepared_fixed,
             backend=backend,
             store=self._store(),
             verify_sources=self._verify_source_identities,
@@ -295,17 +319,7 @@ class ChunkedImageRegistration(ImageRegistration):
                     self._mark_chunk_output_stale(chunk.chunk_id)
                 raise ChunkRegistrationError(chunk.chunk_id, str(error)) from error
 
-        assembled = assemble_nonlinear_chunks(context, artifacts)
-        warp_identities = tuple(item.warp_identity for item in artifacts)
-        manifest_identity = assembled._manifest_identity
-        self._nonlinear_request_evidence = {
-            "chunk_grid": [self._chunk_dict(chunk) for chunk in chunks],
-            "chunk_manifest": manifest_identity.to_dict(),
-            "chunk_size_zyx": self.chunk_size,
-            "local_warps": [identity.to_dict() for identity in warp_identities],
-            "overlap_fraction": self.overlap_fraction,
-        }
-        return assembled._registered_image, assembled._warp_candidate_path
+        return assemble_nonlinear_chunks(context, artifacts)
 
 
 __all__ = [

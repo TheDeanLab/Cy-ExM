@@ -534,11 +534,19 @@
 
 - [ ] **Step 6: Extract canonical assembly**
 
-  Read valid chunks in ascending ID order, prove one-write coverage, assemble scalar
-  and vector float32 arrays, commit the existing chunk manifest and full-warp request,
-  reconstruct the nonlinear mask, metrics, and registered TIFF through the accepted
-  helpers, and reject any gap, overlap, non-finite value, wrong component count, or
-  mixed request identity.
+  **Correction approved 2026-07-23:** The original exactly-once/non-overlap
+  requirement contradicted the canonical ClearEx grid and is replaced by the
+  compatibility-preserving rule below.
+
+  Read valid chunks in ascending ID order regardless of completion order, preserve
+  the canonical legacy grid including overlapping nominal core/output slices, and
+  let later chunk IDs deterministically overwrite earlier scalar and displacement
+  values in overlap regions. Prove every fixed-grid voxel is written at least once,
+  assemble scalar and vector float32 arrays, commit the existing chunk manifest and
+  full-warp request, reconstruct the nonlinear mask, metrics, and registered TIFF
+  through the accepted helpers, and reject any gap, malformed/missing/duplicate
+  artifact, mismatched ID or request, non-finite value, wrong shape, or wrong
+  component count. Expected canonical overlap is valid and must not be rejected.
 
 - [ ] **Step 7: Refactor the serial class to compose the primitives**
 

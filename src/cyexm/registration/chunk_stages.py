@@ -9,16 +9,24 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from cyexm.chunking import ChunkInfo
-from cyexm.errors import ChunkRegistrationError
+from cyexm.chunking import ChunkInfo, compute_chunk_grid
+from cyexm.errors import (
+    CacheValidationError,
+    ChunkRegistrationError,
+    RegistrationStageError,
+)
+from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration._native_paths import discard_path
 from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
     canonical_compact_json,
     chunk_manifest_parameters,
     chunk_manifest_payload,
+    common_parameters,
     crop_geometry,
     local_chunk_parameters,
+    nonlinear_stage_parameters,
+    registered_image_parameters,
 )
 from cyexm.registration.artifacts import (
     ArtifactStore,
@@ -27,7 +35,7 @@ from cyexm.registration.artifacts import (
     StageRequest,
 )
 from cyexm.registration.backend import RegistrationBackend
-from cyexm.spatial import ImageGeometry
+from cyexm.spatial import ImageGeometry, PixelSize, geometry_compatible
 
 
 class ChunkOutputValidationError(ValueError):
@@ -64,6 +72,9 @@ class ChunkStageContext:
     force: bool
     output_directory: Path
     round_number: int
+    pixel_size: PixelSize
+    crop: bool
+    prepared_fixed: bool
     backend: RegistrationBackend = field(repr=False, compare=False)
     store: ArtifactStore = field(repr=False, compare=False)
     verify_sources: Callable[[], None] = field(repr=False, compare=False)
@@ -75,6 +86,15 @@ class ChunkStageContext:
     ] = field(repr=False, compare=False)
     mark_chunk_stale: Callable[[int], None] = field(repr=False, compare=False)
     require_existing: bool = False
+
+    def __post_init__(self) -> None:
+        canonical = compute_chunk_grid(
+            self.fixed_geometry.shape,
+            self.chunk_size,
+            self.overlap_fraction,
+        )
+        if self.chunks != canonical:
+            raise ValueError("chunks must equal the canonical legacy chunk grid")
 
     @property
     def chunk_directory(self) -> Path:
@@ -107,8 +127,6 @@ class AssembledNonlinear:
     nonlinear_metrics_path: Path
     chunk_manifest_path: Path
     reused: bool
-    _registered_image: object = field(repr=False, compare=False)
-    _warp_candidate_path: Path = field(repr=False, compare=False)
     _manifest_identity: FileIdentity = field(repr=False, compare=False)
 
 
@@ -276,6 +294,8 @@ def run_nonlinear_chunk(
 ) -> ChunkStageArtifacts:
     import numpy as np
 
+    if chunk.chunk_id >= len(context.chunks) or context.chunks[chunk.chunk_id] != chunk:
+        raise ValueError("chunk must belong exactly to the canonical legacy grid")
     backend = context.backend
     context.chunk_directory.mkdir(parents=True, exist_ok=True)
     fixed_array = np.asarray(region.fixed_array)
@@ -575,6 +595,222 @@ def _validate_chunk_records(
         raise ValueError("scalar core completion evidence does not match assembly")
 
 
+def _stage_request(
+    context: ChunkStageContext,
+    image: object,
+    *,
+    stage: str,
+    method: str,
+    accuracy: str,
+    upstream: FileIdentity | None,
+    parameters: dict[str, object],
+) -> StageRequest:
+    context.verify_sources()
+    evidence = common_parameters(
+        crop=context.crop,
+        imaging_round=context.round_number,
+        pixel_size_xyz=context.pixel_size,
+    )
+    evidence["prepared_fixed"] = context.prepared_fixed
+    evidence.update(parameters)
+    return StageRequest.for_identities(
+        stage=stage,
+        inputs=context.source_identities,
+        geometry=context.backend.geometry(image),
+        method=method,
+        accuracy=accuracy,
+        native_threads=context.native_threads,
+        upstream=upstream,
+        parameters=evidence,
+    )
+
+
+def _finalize_assembled_nonlinear(
+    context: ChunkStageContext,
+    registered_image: object,
+    candidate: Path,
+    evidence: dict[str, object],
+) -> bool:
+    backend = context.backend
+    output = context.output_directory
+    warp_path = output / f"nonlinear_warp_{context.round_number}.nii.gz"
+    metrics_path = output / "image_metrics_nonlinear-registered.txt"
+    registered_path = output / f"nonlinear_registered_{context.round_number}.tif"
+    reused = False
+    committed = False
+    commit_attempted = False
+    try:
+        request = _stage_request(
+            context,
+            context.fixed,
+            stage="nonlinear",
+            method=context.nonlinear_type,
+            accuracy=context.nonlinear_accuracy,
+            upstream=context.affine_identity,
+            parameters=nonlinear_stage_parameters(
+                moving_geometry=context.backend.geometry(context.moving_linear),
+                registration_mode="serial-chunked",
+                nonlinear_accuracy=context.nonlinear_accuracy,
+                nonlinear_metric=context.nonlinear_metric,
+                nonlinear_radius=context.nonlinear_radius,
+                scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+                evidence=evidence,
+            ),
+        )
+        if not context.force:
+            reused = (
+                context.reuse_artifact(warp_path, request, backend.read_warp)
+                is not None
+            )
+        if not reused:
+
+            def write_warp(path: Path) -> None:
+                shutil.copyfile(candidate, path)
+
+            commit_attempted = True
+            context.commit_artifact(
+                warp_path,
+                request,
+                write_warp,
+                lambda path: _valid_reader(backend.read_warp, path),
+            )
+            committed = True
+        raw_mask = backend.apply_warp(
+            fixed=context.fixed,
+            moving=context.moving_linear_mask,
+            warp_path=warp_path,
+            interpolation="nearestNeighbor",
+        )
+        registered_mask = backend.threshold_mask(raw_mask)
+    except RegistrationStageError:
+        if committed:
+            context.store.mark_stale(warp_path)
+        raise
+    except CacheValidationError as error:
+        if committed:
+            context.store.mark_stale(warp_path)
+        if commit_attempted:
+            raise RegistrationStageError(
+                f"nonlinear registration failed for round {context.round_number}"
+            ) from error
+        raise
+    except Exception as error:
+        if committed:
+            context.store.mark_stale(warp_path)
+        raise RegistrationStageError(
+            f"nonlinear registration failed for round {context.round_number}"
+        ) from error
+    finally:
+        discard_path(candidate)
+
+    try:
+        metrics_request = _stage_request(
+            context,
+            context.fixed,
+            stage="metrics:nonlinear-registered",
+            method="Correlation+MattesMutualInformation",
+            accuracy="full",
+            upstream=FileIdentity.from_path(warp_path),
+            parameters={
+                "moving_geometry": backend.geometry(registered_image).to_dict(),
+                "source_moving_geometry": backend.geometry(registered_image).to_dict(),
+                "resampled_to_fixed": False,
+                "sampling": "regular",
+                "sampling_pct": 1.0,
+                "scalar_postprocessing_policy": CHUNK_SCALAR_POLICY,
+            },
+        )
+        metrics_cached = None
+        if not context.force:
+            metrics_cached = context.reuse_artifact(
+                metrics_path,
+                metrics_request,
+                read_metrics,
+            )
+        if metrics_cached is None:
+            metrics = backend.calculate_metrics(
+                context.fixed,
+                registered_image,
+                fixed_mask=context.fixed_mask,
+                moving_mask=registered_mask,
+                sampling="regular",
+                sampling_pct=1.0,
+            )
+
+            def write_nonlinear_metrics(path: Path) -> None:
+                write_metrics(metrics, path)
+
+            context.commit_artifact(
+                metrics_path,
+                metrics_request,
+                write_nonlinear_metrics,
+                lambda path: read_metrics(path) == metrics,
+            )
+    except RegistrationStageError:
+        raise
+    except Exception as error:
+        raise RegistrationStageError(
+            "nonlinear-registered metrics stage failed"
+        ) from error
+
+    try:
+        array: Any = backend.to_array(registered_image)
+        minimum, maximum = float(array.min()), float(array.max())
+        expected_geometry = backend.geometry(registered_image)
+        registered_request = _stage_request(
+            context,
+            registered_image,
+            stage="registered-image",
+            method=context.nonlinear_type,
+            accuracy=context.nonlinear_accuracy,
+            upstream=FileIdentity.from_path(warp_path),
+            parameters=registered_image_parameters(
+                minimum=minimum,
+                maximum=maximum,
+                scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+            ),
+        )
+
+        def read_registered(path: Path) -> object:
+            image = backend.load_image(path, context.pixel_size)
+            if not geometry_compatible(backend.geometry(image), expected_geometry):
+                raise ValueError(
+                    "registered TIFF geometry does not match the nonlinear image"
+                )
+            return image
+
+        registered_cached = None
+        if not context.force:
+            registered_cached = context.reuse_artifact(
+                registered_path,
+                registered_request,
+                read_registered,
+            )
+        if registered_cached is None:
+
+            def write_registered(path: Path) -> None:
+                backend.write_tiff(
+                    registered_image,
+                    path,
+                    min_value=minimum,
+                    max_value=maximum,
+                )
+
+            context.commit_artifact(
+                registered_path,
+                registered_request,
+                write_registered,
+                lambda path: _valid_reader(read_registered, path),
+            )
+    except RegistrationStageError:
+        raise
+    except Exception as error:
+        raise RegistrationStageError(
+            f"registered image persistence failed for round {context.round_number}"
+        ) from error
+    return reused
+
+
 def assemble_nonlinear_chunks(
     context: ChunkStageContext,
     manifest: Sequence[ChunkStageArtifacts],
@@ -613,8 +849,7 @@ def assemble_nonlinear_chunks(
         coverage[chunk.core_slices] += 1
         registered[chunk.core_slices] = scalar_core
         displacement[chunk.core_slices] = warp_core
-    if not bool(np.all(coverage >= 1)):
-        raise ValueError("chunk core coverage contains a gap")
+    _require_complete_coverage(coverage)
     manifest_identity = _commit_manifest(context, ordered)
     registered_image = context.backend.from_array(registered, reference=context.fixed)
     warp = context.backend.from_array(
@@ -645,17 +880,36 @@ def assemble_nonlinear_chunks(
     except BaseException:
         discard_path(candidate)
         raise
+    warp_identities = tuple(item.warp_identity for item in ordered)
+    evidence = {
+        "chunk_grid": [_chunk_dict(chunk) for chunk in context.chunks],
+        "chunk_manifest": manifest_identity.to_dict(),
+        "chunk_size_zyx": context.chunk_size,
+        "local_warps": [identity.to_dict() for identity in warp_identities],
+        "overlap_fraction": context.overlap_fraction,
+    }
+    reused = _finalize_assembled_nonlinear(
+        context,
+        registered_image,
+        candidate,
+        evidence,
+    )
     output = context.output_directory
     return AssembledNonlinear(
         warp_path=output / f"nonlinear_warp_{context.round_number}.nii.gz",
-        registered_path=output / f"registered_image_{context.round_number}.tif",
+        registered_path=output / f"nonlinear_registered_{context.round_number}.tif",
         nonlinear_metrics_path=output / "image_metrics_nonlinear-registered.txt",
         chunk_manifest_path=context.chunk_manifest_path,
-        reused=all(item.reused for item in ordered),
-        _registered_image=registered_image,
-        _warp_candidate_path=candidate,
+        reused=reused and all(item.reused for item in ordered),
         _manifest_identity=manifest_identity,
     )
+
+
+def _require_complete_coverage(coverage: object) -> None:
+    import numpy as np
+
+    if not bool(np.all(np.asarray(coverage) >= 1)):
+        raise ValueError("chunk core coverage contains a gap")
 
 
 def _chunk_id_for_path(path: Path) -> int:

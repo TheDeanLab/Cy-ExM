@@ -4,7 +4,7 @@ Cy-ExM provides reusable cyclic expansion microscopy registration without a runt
 dependency on ClearEx. Its Phase 1 API supports restartable whole-image registration
 and a restartable **serial** chunked nonlinear workflow. Its Phase 2 workflow adds
 strict YAML configuration, immutable round planning, sequential and local-Dask
-execution, and a SLURM adapter whose real-cluster acceptance is still pending. Both
+execution, and a SLURM adapter accepted on the audited lab `512GB` profile. Both
 registration strategies use affine registration before nonlinear registration and
 preserve physical image geometry. Nonlinear SyN supports either legacy Mattes mutual
 information or local cross-correlation (CC) with a configurable scalar voxel radius.
@@ -209,6 +209,8 @@ corrected legacy behavior. The numerical extraction evidence is recorded in the
 [legacy parity report](docs/legacy-parity-report.md).
 The complete portable gate and measured Phase 1 evidence are recorded in the
 [Phase 1 acceptance audit](docs/phase-1-acceptance.md).
+The real-cluster orchestration and scientific evidence are recorded in the
+[Phase 2 acceptance audit](docs/phase-2-acceptance.md).
 
 ## Phase 2 workflow
 
@@ -708,19 +710,22 @@ policy before submission.
 
 Portable fake-based SLURM construction, job-template rendering, preflight policy,
 failure mapping, evidence validation, cancellation, and cleanup are tested. Real
-SLURM submission and HPC acceptance remain pending. Only tests explicitly selected
-with `-m hpc` may contact a scheduler or use representative lab data; they require an
-explicit allocation and caller-approved dataset, execution profile, output root, and
-external evidence directory. Portable CI always selects `not hpc` and must never
-invoke scheduler clients. Do not use the separate active spheroid registration or
-its output as acceptance input.
+SLURM submission and HPC acceptance completed on the audited lab partition. Only
+tests explicitly selected with `-m hpc` may contact a scheduler or use representative
+lab data; they require an explicit allocation and caller-approved dataset, execution
+profile, output root, and external evidence directory. Portable CI always selects
+`not hpc` and must never invoke scheduler clients. Do not use an active scientific
+registration or its output as acceptance input.
 
 Real acceptance must demonstrate distinct jobs/hostnames for concurrent whole-image
 and serial-chunked rounds, dedicated allocation facts, shared-path and scratch
 behavior, package/thread identity, numerical parity with sequential execution,
 independent failure, bounded retry, cancellation, ordinary resume, and final job
-cleanup. Until that evidence is recorded, the SLURM adapter is available for
-controlled evaluation but is not advertised as production-accepted on this cluster.
+cleanup. The [Phase 2 acceptance audit](docs/phase-2-acceptance.md) records those
+results using a representative multithreaded scientific-equivalence gate and a
+seeded one-thread strict executor-parity gate. Acceptance is specific to the tested
+commit, approved manifest, and audited execution profile; it is not an unconditional
+guarantee for other clusters, resource profiles, datasets, or scientific policies.
 
 ### Remaining non-goals
 

@@ -24,4 +24,12 @@ The [brightness-dependence investigation](brightness-dependence-investigation.md
 documents why dim regions can be harder to register and the evidence supporting
 local cross-correlation for nonlinear SyN. The
 [CC SyN radius characterization](cc-syn-radius-characterization.md) is explicitly
-ongoing and is not a statement of an optimized default.
+a dataset-specific completed sweep and is not a statement of a universally
+optimized default.
+
+## Acceptance evidence
+
+The [Phase 1 acceptance audit](phase-1-acceptance.md) records the portable
+registration-library baseline. The [Phase 2 acceptance audit](phase-2-acceptance.md)
+records the real-cluster orchestration, scientific-equivalence, deterministic-parity,
+restart, cancellation, cleanup, and output-ownership gates.

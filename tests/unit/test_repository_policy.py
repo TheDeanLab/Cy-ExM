@@ -741,3 +741,76 @@ def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> Non
 
     ignored_paths = set(_read_repository_file(".gitignore").splitlines())
     assert {"__pycache__/", "*.py[cod]"} <= ignored_paths
+
+
+def test_phase_two_acceptance_audit_records_external_two_tier_evidence() -> None:
+    acceptance = _read_repository_file("docs/phase-2-acceptance.md")
+    normalized = " ".join(acceptance.split()).lower()
+
+    for required in (
+        "3bfe59b760d20f684446689324dc2074fa3dbcd0",
+        "cannot contain its own commit hash",
+        "| Python | 3.12.11 |",
+        "| Cy-ExM | 0.1.0 |",
+        "| ANTSpyX | 0.6.3 |",
+        "| Dask | 2025.1.0 |",
+        "| distributed | 2025.1.0 |",
+        "| dask-jobqueue | 0.9.0 |",
+        "| SLURM | 22.05.9 |",
+        "2042 passed, 1 deselected in",
+        "55 passed in",
+        "89e62968574d0644cf6ff7ef62389bfb32f5bfcf8dc359d67233c7dd4b373c0b",
+        "240b9a5084c665ba3b962d7a02ce5b3c37302edb293bafcbddc65754f8beaba2",
+        "512GB",
+        "97 nodes",
+        "6984 CPUs",
+        "stochastic scientific equivalence",
+        "0.01",
+        "0.001567840576171875",
+        "ANTS_RANDOM_SEED=20260722",
+        "one native thread",
+        "strict executor parity",
+        "maximum numeric difference was 0.0",
+        "10767265",
+        "NucleusB079",
+        "10767266",
+        "NucleusB092",
+        "injected failure",
+        "round 2 was reused",
+        "round 3 was recomputed",
+        "exit code 130",
+        "client, cluster, and configuration cleanup succeeded",
+        "final exact-name queues were empty",
+        "output ownership was confined",
+        "phase2e-multithreaded-registration-reproducibility.md",
+        "2026-07-22-phase2e-stochastic-parity-design.md",
+        "3142688f7e11df6d58a4464db8adf4b9dc7e707c8dd91278bd345855ada1eefc",
+        "8ffc175f6a15aa8a222f53da2b1bdaad0186dd4fce9336e9df2050b3eb9473a0",
+        "6599e59a5f1734e53dd81a52eb7548e8cd404fb6883ba26f3805a4c7630033ef",
+        "25145674fdfbaa162e2a1201fe0fc4204ced0c0bb76b40ab786bc3604823231b",
+        "97ef27e426d30791a6a95e38c10455f0ae6fc091534a30b20436066b2b1c5cb8",
+        "8115ac75d03d8f2008b0414392f2aadb9d9a8ce033f8b61e07d6d1bb96c45106",
+        "bddb53b2626ed504f40e1e2b1ce0690e0ed0eb72da4ae5b9d2f8c7f75025a695",
+    ):
+        assert required.lower() in normalized, required
+
+    for forbidden in (
+        "/archive/",
+        "/project/",
+        "slurm-107",
+        ".tif",
+        ".nii.gz",
+        "github_pat_",
+        "gho_",
+        "token=",
+    ):
+        assert forbidden not in normalized, forbidden
+
+    readme = _read_repository_file("README.md")
+    assert "[Phase 2 acceptance audit](docs/phase-2-acceptance.md)" in readme
+    for stale in (
+        "real-cluster acceptance is still pending",
+        "Real SLURM submission and HPC acceptance remain pending",
+        "Until that evidence is recorded",
+    ):
+        assert stale not in readme

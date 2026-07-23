@@ -350,7 +350,9 @@ def test_readme_states_hpc_acceptance_scope_and_remaining_non_goals() -> None:
     normalized = _normalized_readme()
     for required in (
         "portable fake-based slurm construction",
-        "real slurm submission and hpc acceptance remain pending",
+        "real slurm submission and hpc acceptance completed on the audited lab "
+        "partition",
+        "phase 2 acceptance audit",
         "`-m hpc`",
         "explicit allocation",
         "parallelchunkedimageregistration",

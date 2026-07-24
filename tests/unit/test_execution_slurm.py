@@ -1405,6 +1405,7 @@ def test_fine_slurm_health_poll_timeout_does_not_deadline_scientific_task(
     assert len(modules.wait_calls) >= 2
     assert modules.cancel_call is None
     assert modules.scale_calls == [{"jobs": 1}]
+    assert len(modules.run_calls) == 2
 
 
 def test_fine_slurm_departure_without_replacement_fails_closed(
@@ -1574,7 +1575,7 @@ def test_fine_slurm_health_snapshot_timeout_is_exact_and_canonical(
 @pytest.mark.parametrize(
     ("hung_stage", "worker_change"),
     (
-        ("worker identity resource snapshot", "stable"),
+        ("healthy worker resource snapshot", "stable"),
         ("replacement worker arrival", "lost"),
         ("replacement worker snapshot", "lost"),
         ("replacement candidate resource snapshot", "replaced"),

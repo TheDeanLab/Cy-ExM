@@ -116,6 +116,10 @@
   reconciling the exact scheduler/worker identities. Healthy long-running tasks have
   no execution deadline. Treat the Dask wait timeout at the health interval as a
   polling tick that triggers identity/resource reconciliation, not as task failure.
+  For an unchanged exact scheduler address and worker-address set, validate scheduler
+  resources without rebroadcasting the blocking filesystem/import probe to workers
+  running scientific kernels. Re-probe every changed or replacement address before
+  admitting it.
   If an activated worker departs, bound only the replacement wait by the configured
   startup timeout; preflight and resource-gate every
   replacement before retry or new admission, record the departed identity, and fail

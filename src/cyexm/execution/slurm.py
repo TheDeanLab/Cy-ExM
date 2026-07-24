@@ -2301,9 +2301,7 @@ class SlurmExecutor:
                         observed["connected_workers"] = list(addresses)
 
                     observe_connected_workers(next_connected)
-                    if not wait_for_completion and set(next_connected) == set(
-                        validated_workers
-                    ):
+                    if set(next_connected) == set(validated_workers):
                         try:
                             before_deadline(
                                 "healthy worker resource snapshot",

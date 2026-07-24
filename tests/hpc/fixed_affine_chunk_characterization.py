@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import math
 import os
@@ -15,10 +16,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
+from cyexm.chunking import compute_chunk_grid
 from cyexm.config._validation import built_in_int, require_exact_keys
 from cyexm.config._yaml import load_yaml_mapping
 from cyexm.config.models import DatasetManifest, ExecutionProfile
 from cyexm.errors import ConfigurationValidationError
+from cyexm.execution.slurm import SlurmExecutor
 from cyexm.registration.artifacts import (
     ArtifactStore,
     CompletionRecord,
@@ -39,6 +42,11 @@ from cyexm.workflow.models import (
     RoundTask,
     WorkflowTask,
     WorkflowTaskResult,
+)
+from hpc.environment import (
+    collect_queue_snapshot,
+    wait_for_queue_empty,
+    write_evidence_json,
 )
 
 APPROVED_CHUNK_SIZES = {
@@ -152,6 +160,7 @@ class CharacterizationCondition:
     condition_root: Path
     dataset_root: Path
     shared_root: Path
+    fixed_geometry: ImageGeometry
 
 
 @dataclass(frozen=True, slots=True)
@@ -958,7 +967,188 @@ def build_condition(
         condition_root=condition_root,
         dataset_root=dataset_root,
         shared_root=profile.paths.output_root / "shared-prepared",
+        fixed_geometry=source.rounds[0].fixed_geometry,
     )
+
+
+def build_shared_preparation_tasks(
+    condition: CharacterizationCondition,
+) -> tuple[RoundTask, ...]:
+    """Build the one caller-owned fixed-grid preparation seed per moving round."""
+    tasks: list[RoundTask] = []
+    for task in condition.round_tasks:
+        round_root = condition.shared_root / f"round-{task.round:03d}"
+        tasks.append(
+            replace(
+                task,
+                dataset_id="fixed-affine-shared-prepared",
+                registration_directory=round_root / "registration",
+                log_path=round_root / "logs" / "preparation.log",
+                channels=(),
+            )
+        )
+    return tuple(tasks)
+
+
+def expected_chunk_task_count(condition: CharacterizationCondition) -> int:
+    """Return the exact nonlinear chunk count across the condition's rounds."""
+    total = 0
+    for task in condition.round_tasks:
+        if task.chunk_size_zyx is None or task.overlap_fraction is None:
+            raise FixedAffineCharacterizationError(
+                "characterization round lacks chunk geometry"
+            )
+        total += len(
+            compute_chunk_grid(
+                condition.fixed_geometry.shape,
+                task.chunk_size_zyx,
+                task.overlap_fraction,
+            )
+        )
+    return total
+
+
+def _owned_job_ids(
+    results: tuple[RoundResult, ...],
+    fine_results: tuple[FineTaskResult, ...],
+    evidence: Mapping[str, object],
+) -> tuple[str, ...]:
+    values: set[str] = {
+        value
+        for value in (
+            *(result.slurm_job_id for result in results),
+            *(result.slurm_job_id for result in fine_results),
+        )
+        if isinstance(value, str) and value
+    }
+    observed = evidence.get("observed")
+    if isinstance(observed, Mapping):
+        probes = observed.get("worker_probes")
+        if isinstance(probes, list):
+            for probe in probes:
+                if isinstance(probe, Mapping):
+                    value = probe.get("slurm_job_id")
+                    if isinstance(value, str) and value:
+                        values.add(value)
+    return tuple(sorted(values))
+
+
+def execute_chunk_condition(
+    *,
+    condition: CharacterizationCondition,
+    source: ValidatedFixedAffineSource,
+    shared_rounds: tuple[SharedPreparedRound, ...],
+    evidence_dir: Path,
+    git_commit: str,
+    package_versions: Mapping[str, str],
+) -> dict[str, object]:
+    """Execute one owned fine-SLURM condition and durably record its outcome."""
+    spec = condition.profile.slurm
+    if spec is None:
+        raise FixedAffineCharacterizationError("condition lacks SLURM settings")
+    if validate_fixed_affine_source(source.workflow_root) != source:
+        raise FixedAffineCharacterizationError(
+            "validated source state changed before condition execution"
+        )
+    condition.condition_root.mkdir(parents=True, exist_ok=True)
+    scratch = condition.profile.paths.worker_local_directory
+    if scratch is None:
+        raise FixedAffineCharacterizationError("condition lacks worker scratch")
+    scratch.mkdir(parents=True, exist_ok=True)
+    condition_evidence = evidence_dir / f"chunk-{condition.label}"
+    condition_evidence.mkdir(parents=True, exist_ok=False)
+    user = getpass.getuser()
+    queue_before = collect_queue_snapshot(spec.job_name, user=user)
+    write_evidence_json(condition_evidence / "queue-before.json", queue_before)
+    if queue_before.get("jobs") != []:
+        raise FixedAffineCharacterizationError(
+            f"refusing to submit while {spec.job_name!r} jobs already exist"
+        )
+
+    executor = SlurmExecutor(
+        condition.profile,
+        _runner=ReadOnlyReferenceRunner(source),
+        _fine_runner=FixedAffineFineRunner(shared_rounds),
+    )
+    results: tuple[RoundResult, ...] = ()
+    execution_error: BaseException | None = None
+    started = time.monotonic()
+    started_at = _utc_now()
+    try:
+        results = executor.execute(condition.reference_task, condition.round_tasks)
+    except BaseException as error:
+        execution_error = error
+    finally:
+        elapsed = time.monotonic() - started
+        execution_evidence = dict(executor.execution_evidence)
+        fine_results = executor.fine_task_results
+        owned_ids = _owned_job_ids(results, fine_results, execution_evidence)
+        queue_after = wait_for_queue_empty(
+            spec.job_name,
+            user=user,
+            job_ids=owned_ids,
+        )
+        source_unchanged = validate_fixed_affine_source(source.workflow_root) == source
+        expected_chunks = expected_chunk_task_count(condition)
+        observed_chunks = sum(result.key.stage == "chunk" for result in fine_results)
+        summary: dict[str, object] = {
+            "schema_version": 1,
+            "condition": condition.label,
+            "chunk_size_zyx": list(condition.chunk_size_zyx),
+            "overlap_fraction": 0.15,
+            "cc_radius": 4,
+            "started_at": started_at,
+            "ended_at": _utc_now(),
+            "elapsed_seconds": elapsed,
+            "git_commit": git_commit,
+            "package_versions": dict(sorted(package_versions.items())),
+            "source_workflow_root": str(source.workflow_root),
+            "source_unchanged": source_unchanged,
+            "expected_chunk_tasks": expected_chunks,
+            "observed_chunk_results": observed_chunks,
+            "fine_task_count": len(executor.fine_tasks),
+            "fine_result_count": len(fine_results),
+            "fine_tasks": [task.to_dict() for task in executor.fine_tasks],
+            "fine_results": [result.to_dict() for result in fine_results],
+            "round_results": [result.to_dict() for result in results],
+            "owned_job_ids": list(owned_ids),
+            "queue_after": queue_after,
+            "execution_error": (
+                None
+                if execution_error is None
+                else {
+                    "type": type(execution_error).__name__,
+                    "message": str(execution_error),
+                }
+            ),
+        }
+        write_evidence_json(
+            condition_evidence / "slurm-execution-evidence.json",
+            execution_evidence,
+        )
+        write_evidence_json(condition_evidence / "condition-summary.json", summary)
+
+    if queue_after.get("outcome") != "empty":
+        raise FixedAffineCharacterizationError(
+            f"owned queue cleanup failed for condition {condition.label}"
+        ) from execution_error
+    if not source_unchanged:
+        raise FixedAffineCharacterizationError(
+            f"source identity changed during condition {condition.label}"
+        ) from execution_error
+    if execution_error is not None:
+        raise execution_error
+    if (
+        len(results) != 4
+        or any(result.status not in {"completed", "reused"} for result in results)
+        or observed_chunks != expected_chunks
+        or len(fine_results) != expected_chunks + 12
+        or any(result.status not in {"completed", "reused"} for result in fine_results)
+    ):
+        raise FixedAffineCharacterizationError(
+            f"condition {condition.label} produced an incomplete fine graph"
+        )
+    return summary
 
 
 def _integer(value: object, location: str) -> int:
@@ -1137,8 +1327,11 @@ __all__ = [
     "SourceRoundState",
     "ValidatedFixedAffineSource",
     "build_condition",
+    "build_shared_preparation_tasks",
     "clone_accepted_artifact",
     "clone_shared_prepared_state",
+    "execute_chunk_condition",
+    "expected_chunk_task_count",
     "load_characterization_spec",
     "materialize_shared_prepared_state",
     "validate_fixed_affine_source",

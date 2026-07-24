@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,9 @@ from hpc.fixed_affine_chunk_characterization import (
     ReadOnlyReferenceRunner,
     RoiYX,
     build_condition,
+    build_shared_preparation_tasks,
     clone_accepted_artifact,
+    expected_chunk_task_count,
     load_characterization_spec,
     validate_fixed_affine_source,
 )
@@ -446,6 +449,127 @@ def test_condition_builder_changes_only_chunk_geometry_and_owned_paths(
     assert all(task.chunk_size_zyx == (512, 256, 256) for task in condition.round_tasks)
     assert all(task.overlap_fraction == 0.15 for task in condition.round_tasks)
     assert all(len(task.channels) == 1 for task in condition.round_tasks)
+
+    shared = build_shared_preparation_tasks(condition)
+    assert tuple(task.round for task in shared) == (2, 3, 4)
+    assert all(
+        task.registration_directory.is_relative_to(condition.shared_root)
+        for task in shared
+    )
+    assert all(
+        not task.registration_directory.is_relative_to(condition.condition_root)
+        for task in shared
+    )
+    real_grid_condition = replace(
+        condition,
+        fixed_geometry=replace(condition.fixed_geometry, shape=(51, 2240, 2223)),
+    )
+    assert expected_chunk_task_count(real_grid_condition) == 363
+
+
+@pytest.mark.parametrize(
+    ("label", "chunk_size", "expected"),
+    [
+        ("1125", (512, 1125, 1125), 27),
+        ("512", (512, 512, 512), 108),
+        ("256", (512, 256, 256), 363),
+        ("128", (512, 128, 128), 1323),
+    ],
+)
+def test_condition_chunk_counts_match_the_approved_sweep(
+    tmp_path: Path,
+    label: str,
+    chunk_size: tuple[int, int, int],
+    expected: int,
+) -> None:
+    root, _fixed = _source_fixture(tmp_path)
+    source = validate_fixed_affine_source(root)
+    dataset_root = tmp_path / "dataset"
+    output_root = tmp_path / "output"
+    scratch_root = tmp_path / "scratch"
+    output_root.mkdir()
+    scratch_root.mkdir()
+    manifest = DatasetManifest(
+        schema_version=1,
+        dataset_id="source",
+        voxel_spacing_um=(0.324, 0.324, 0.9),
+        reference=ReferenceSpec(
+            round=1,
+            registration_channel=Path("fixed.tif"),  # type: ignore[arg-type]
+            channels=(
+                ReferenceChannelSpec(file=Path("fixed.tif")),  # type: ignore[arg-type]
+            ),
+        ),
+        registration=RegistrationSpec(
+            crop=True,
+            linear=RegistrationStageSpec(type="TRSAA", accuracy="high"),
+            nonlinear=NonlinearRegistrationStageSpec(
+                type="SyNOnly",
+                accuracy="high",
+                metric="CC",
+                radius=4,
+            ),
+        ),
+        rounds=tuple(
+            RoundSpec(
+                round=round_number,
+                strategy="serial_chunked",
+                registration_channel=Path(  # type: ignore[arg-type]
+                    f"moving-{round_number}.tif"
+                ),
+                channels=(
+                    ChannelSpec(  # type: ignore[arg-type]
+                        file=Path(f"moving-{round_number}.tif"),
+                        interpolation="linear",
+                    ),
+                ),
+                chunk_size_zyx=(512, 1125, 1125),
+                overlap_fraction=0.15,
+            )
+            for round_number in (2, 3, 4)
+        ),
+    )
+    profile = ExecutionProfile(
+        schema_version=1,
+        executor="slurm",
+        paths=ExecutionPaths(
+            dataset_root=dataset_root,
+            output_root=output_root,
+            worker_local_directory=scratch_root,
+        ),
+        native_threads=NativeThreadSpec(itk=30, blas=30),
+        local_dask=None,
+        slurm=SlurmSpec(
+            queue="512GB",
+            workers=4,
+            cores_per_worker=30,
+            processes_per_worker=1,
+            memory="500GB",
+            walltime="24:00:00",
+            interface="ib0",
+            scheduler_interface="ib0",
+            startup_timeout="15m",
+            task_retries=1,
+            job_name="fixed-affine",
+            job_extra_directives=("--exclusive",),
+        ),
+        source_path=tmp_path / "execution.yaml",
+        parallelism=ParallelismSpec(mode="fine_grained"),
+    )
+
+    condition = build_condition(
+        label=label,
+        chunk_size_zyx=chunk_size,
+        manifest=manifest,
+        profile=profile,
+        source=source,
+    )
+
+    real_grid_condition = replace(
+        condition,
+        fixed_geometry=replace(condition.fixed_geometry, shape=(51, 2240, 2223)),
+    )
+    assert expected_chunk_task_count(real_grid_condition) == expected
 
 
 def test_read_only_reference_runner_reports_reuse_without_touching_source(

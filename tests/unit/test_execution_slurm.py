@@ -913,6 +913,7 @@ def test_replacement_probe_timeout_does_not_block_worker_event_loop(
             worker_local_directory="/scratch",
             expected_versions={"cy-exm": "test"},
             expected_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": "1"},
+            dask_worker=object(),
         )
 
     assert time.monotonic() - started < 0.13
@@ -923,6 +924,33 @@ def test_replacement_probe_timeout_does_not_block_worker_event_loop(
     ]
     assert probe_threads
     assert all(thread.daemon for thread in probe_threads)
+
+
+def test_replacement_probe_timeout_forwards_injected_dask_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = object()
+    observed_workers: list[object] = []
+    expected = {"ok": True, "worker_address": "tcp://node-a:1234"}
+
+    def capture_probe(**kwargs: object) -> dict[str, object]:
+        observed_workers.append(kwargs["_worker"])
+        return expected
+
+    monkeypatch.setattr(slurm_module, "probe_worker", capture_probe)
+
+    actual = slurm_module._probe_worker_before_timeout(
+        timeout_seconds=1.0,
+        dataset_root="/dataset",
+        output_root="/output",
+        worker_local_directory="/scratch",
+        expected_versions={"cy-exm": "test"},
+        expected_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": "1"},
+        dask_worker=worker,
+    )
+
+    assert actual is expected
+    assert observed_workers == [worker]
 
 
 def test_slurm_executor_builds_one_process_jobs_with_round_resource(

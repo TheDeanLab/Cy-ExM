@@ -131,7 +131,10 @@
   broadcast, candidate resource checks, every scheduler activation, and the final
   identity/resource snapshot. Run the remote probe through a bounded daemon worker
   thread so blocking filesystem or import checks do not block the Dask worker event
-  loop; guard synchronous client/scheduler calls with daemon coordinator threads.
+  loop. The remote timeout wrapper must declare Dask's exact `dask_worker` injection
+  keyword and forward that object into the threaded probe so replacement address and
+  memory identity remain available. Guard synchronous client/scheduler calls with
+  daemon coordinator threads.
   On deadline failure, record the exact stage, best-effort force-cancel active work,
   and close client before cluster. Never apply this control-plane deadline to the
   scientific future itself.

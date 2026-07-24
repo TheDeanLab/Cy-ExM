@@ -134,6 +134,7 @@ def _probe_worker_before_timeout(
     worker_local_directory: str,
     expected_versions: Mapping[str, str],
     expected_threads: Mapping[str, str],
+    dask_worker: Any,
 ) -> dict[str, object]:
     """Keep a blocking worker probe off the Dask worker event-loop thread."""
     deadline = time.monotonic() + max(0.0, timeout_seconds)
@@ -148,6 +149,7 @@ def _probe_worker_before_timeout(
                 worker_local_directory=worker_local_directory,
                 expected_versions=expected_versions,
                 expected_threads=expected_threads,
+                _worker=dask_worker,
             ),
         ),
     )

@@ -273,3 +273,49 @@ def test_local_cluster_retries_once_after_atomic_marker_failure(
     marker = task.registration_directory.parent / "synthetic-evidence/retry.marker"
     assert marker.is_file()
     assert marker.read_text(encoding="utf-8").startswith("first attempt from pid ")
+
+
+def test_replacement_probe_wrapper_receives_real_distributed_worker(
+    tmp_path: Path,
+) -> None:
+    from distributed import Client, LocalCluster
+
+    from cyexm.execution.preflight import WorkerProbe
+    from cyexm.execution.slurm import _probe_worker_before_timeout
+
+    dataset_root = (tmp_path / "dataset").resolve()
+    output_root = (tmp_path / "output").resolve()
+    scratch_root = (tmp_path / "scratch").resolve()
+    dataset_root.mkdir()
+    output_root.mkdir()
+    scratch_root.mkdir()
+
+    with (
+        LocalCluster(
+            n_workers=1,
+            threads_per_worker=1,
+            processes=False,
+            dashboard_address=None,
+        ) as cluster,
+        Client(cluster) as client,
+    ):
+        workers = tuple(sorted(client.scheduler_info()["workers"]))
+        assert len(workers) == 1
+        raw = client.run(
+            _probe_worker_before_timeout,
+            timeout_seconds=10.0,
+            dataset_root=str(dataset_root),
+            output_root=str(output_root),
+            worker_local_directory=str(scratch_root),
+            expected_versions={},
+            expected_threads={},
+            workers=list(workers),
+        )
+
+    probe = WorkerProbe.from_dict(raw[workers[0]])
+    assert probe.ok is True
+    assert probe.worker_address == workers[0]
+    assert probe.memory_limit_bytes > 0
+    assert probe.dataset_visible is True
+    assert probe.output_writable is True
+    assert probe.scratch_usable is True

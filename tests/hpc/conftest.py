@@ -15,6 +15,12 @@ from hpc.environment import (
     validate_additional_acceptance_profile,
 )
 from hpc.fine_workflow_acceptance import fine_acceptance_profiles
+from hpc.fixed_affine_chunk_characterization import (
+    FixedAffineCharacterizationSpec,
+    ValidatedFixedAffineSource,
+    load_characterization_spec,
+    validate_fixed_affine_source,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CLEAREX_ROOT = Path("/project/bioinformatics/Danuser_lab/Dean/dean/git/clearex")
@@ -37,6 +43,15 @@ class FineHpcProfiles:
     fine_path: Path
     coarse: ExecutionProfile
     fine: ExecutionProfile
+
+
+@dataclass(frozen=True, slots=True)
+class FixedAffineCharacterizationContext:
+    """Validated operator inputs for the fixed-affine characterization."""
+
+    path: Path
+    spec: FixedAffineCharacterizationSpec
+    source: ValidatedFixedAffineSource
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -81,6 +96,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         metavar="PATH",
         help="approved strict fine-grained SLURM execution profile",
+    )
+    group.addoption(
+        "--cyexm-characterization",
+        action="store",
+        default=None,
+        metavar="PATH",
+        help="approved fixed-affine chunk characterization configuration",
     )
 
 
@@ -193,4 +215,61 @@ def fine_hpc_profiles(
         fine_path=fine_path,
         coarse=coarse,
         fine=fine,
+    )
+
+
+@pytest.fixture(scope="session")
+def fixed_affine_characterization_context(
+    request: pytest.FixtureRequest,
+    hpc_context: HpcAcceptanceContext,
+) -> FixedAffineCharacterizationContext:
+    """Validate the characterization source and fixed four-node profile."""
+    raw_path = request.config.getoption("--cyexm-characterization")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise pytest.UsageError(
+            "fixed-affine characterization requires --cyexm-characterization PATH"
+        )
+    try:
+        path = Path(raw_path).resolve(strict=True)
+        if not path.is_file():
+            raise ValueError("characterization path must be a file")
+        spec = load_characterization_spec(path)
+        source = validate_fixed_affine_source(spec.source_workflow_root)
+        profile = hpc_context.profile
+        slurm = profile.slurm
+        if (
+            profile.executor != "slurm"
+            or profile.parallelism.mode != "fine_grained"
+            or slurm is None
+            or slurm.workers != 4
+            or slurm.cores_per_worker != 30
+            or slurm.processes_per_worker != 1
+            or slurm.memory != "500GB"
+            or "--exclusive" not in slurm.job_extra_directives
+            or profile.native_threads.itk != 30
+            or profile.native_threads.blas != 30
+        ):
+            raise ValueError(
+                "characterization requires fine SLURM with four exclusive "
+                "500GB workers, one process, 30 cores, and 30/30 threads"
+            )
+        output = profile.paths.output_root.resolve(strict=True)
+        source_root = source.workflow_root.resolve(strict=True)
+        if (
+            output == source_root
+            or output.is_relative_to(source_root)
+            or source_root.is_relative_to(output)
+        ):
+            raise ValueError(
+                "characterization output and source workflow roots must be disjoint"
+            )
+    except Exception as error:
+        raise pytest.UsageError(
+            "fixed-affine characterization prerequisites failed before scheduler "
+            f"access: {type(error).__name__}: {error}"
+        ) from error
+    return FixedAffineCharacterizationContext(
+        path=path,
+        spec=spec,
+        source=source,
     )

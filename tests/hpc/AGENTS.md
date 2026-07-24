@@ -99,6 +99,12 @@
   chunk conditions ordered and uniquely named. Preserve source and destination
   hashes, exact fine-task evidence, condition cleanup, and the absence of affine
   estimation in caller-owned evidence.
+- Characterization quality analysis uses fixed-grid Z maximum projections,
+  exhaustive integer-shift gradient NCC, and reports the correction applied to the
+  moving image. Preserve the named bright and dim ROIs, confidence/prominence and
+  search-boundary flags, 128-pixel block windows on a 64-pixel stride, 16-pixel
+  seam proximity, and ANTs geometric Jacobian folding counts. Never interpret an
+  undefined or boundary-limited residual as a precise registration error.
 - Fine-grained production acceptance additionally requires exact coarse-versus-fine
   two-tier scientific parity, nonlinear chunks and channels placed concurrently on
   distinct SLURM jobs/hosts, the configured cap and fair round opportunities,

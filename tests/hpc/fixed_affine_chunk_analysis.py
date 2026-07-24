@@ -233,17 +233,14 @@ def classify_seam_proximity(
         raise ValueError("distance_px must be a nonnegative integer")
     shape_y = max(chunk.y_end for chunk in chunks)
     shape_x = max(chunk.x_end for chunk in chunks)
+    # Assembly writes canonical cores in chunk-ID order. Later overlapping cores
+    # replace earlier values, so the visible transition is each later core start,
+    # not the earlier core end.
     y_boundaries = {
-        value
-        for chunk in chunks
-        for value in (chunk.y_start, chunk.y_end)
-        if value not in {0, shape_y}
+        chunk.y_start for chunk in chunks if chunk.y_start not in {0, shape_y}
     }
     x_boundaries = {
-        value
-        for chunk in chunks
-        for value in (chunk.x_start, chunk.x_end)
-        if value not in {0, shape_x}
+        chunk.x_start for chunk in chunks if chunk.x_start not in {0, shape_x}
     }
     if any(abs(center_y - value) <= distance_px for value in y_boundaries) or any(
         abs(center_x - value) <= distance_px for value in x_boundaries

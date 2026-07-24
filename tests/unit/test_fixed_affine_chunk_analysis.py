@@ -110,6 +110,7 @@ def test_seam_proximity_uses_internal_core_boundaries() -> None:
     chunks = compute_chunk_grid((8, 300, 300), (8, 128, 128), 0.15)
 
     assert classify_seam_proximity(109, 64, chunks, distance_px=16) == "seam"
+    assert classify_seam_proximity(128, 64, chunks, distance_px=16) == "interior"
     assert classify_seam_proximity(64, 64, chunks, distance_px=16) == "interior"
     assert classify_seam_proximity(290, 290, chunks, distance_px=16) == "interior"
 

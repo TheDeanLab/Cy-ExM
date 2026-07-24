@@ -597,11 +597,31 @@ def _replacement_lineage(
         or target_attempts[1]["attempt"] != 2
         or target_attempts[1]["status"] != "completed"
     ):
+        if (
+            len(target_attempts) != 1
+            or target_attempts[0]["attempt"] != 1
+            or target_attempts[0]["status"] != "completed"
+            or target_attempts[0]["placement_accepted"] is not True
+        ):
+            raise HpcWorkflowAcceptanceError(
+                "replacement trial lacks a canonical coordinator retry or "
+                "scheduler-rescheduled target lineage"
+            )
+        failed_attempt: dict[str, object] | None = None
+        recovered = target_attempts[0]
+    else:
+        failed_attempt = {
+            "task_key": target_key,
+            "attempt": 1,
+            "status": "failed",
+        }
+        recovered = target_attempts[1]
+    if recovered["placement_accepted"] is not True:
         raise HpcWorkflowAcceptanceError(
-            "replacement trial lacks the exact failed/retried target lineage"
+            "replacement trial recovered target placement was not accepted"
         )
-    retry_ready = cast(str, target_attempts[1]["coordinator_ready_at"])
-    retry_identity = identity(target_attempts[1])
+    retry_ready = cast(str, recovered["coordinator_ready_at"])
+    retry_identity = identity(recovered)
     replacement_liveness_path = (
         "retry" if retry_identity == replacement_identity else "later-task"
     )
@@ -650,17 +670,16 @@ def _replacement_lineage(
             "sha256": _file_sha256(loss_marker_path),
         },
         "loss_marker": loss_summary,
-        "failed_attempt": {
-            "task_key": target_key,
-            "attempt": 1,
-            "status": "failed",
-        },
+        "failed_attempt": failed_attempt,
+        "recovery_mode": (
+            "scheduler-reschedule" if failed_attempt is None else "coordinator-retry"
+        ),
         "departed_worker": loss_identity,
         "replacement_worker": replacement_identity,
         "replacement_liveness_path": replacement_liveness_path,
         "retry": {
             "task_key": target_key,
-            "attempt": 2,
+            "attempt": recovered["attempt"],
             "status": "completed",
             **retry_identity,
         },

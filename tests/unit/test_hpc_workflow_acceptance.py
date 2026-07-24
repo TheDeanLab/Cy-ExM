@@ -860,6 +860,7 @@ def _fine_acceptance_report(root: Path) -> dict[str, object]:
                     "attempt": 1,
                     "status": "failed",
                 },
+                "recovery_mode": "coordinator-retry",
                 "departed_worker": {
                     "worker_address": "tcp://node-a:1",
                     "hostname": "node-a",
@@ -1628,6 +1629,72 @@ def test_fine_acceptance_accepts_later_replacement_liveness_without_retry_affini
     )
     cast(dict[str, object], replacement["retry"]).update(
         {
+            "worker_address": "tcp://node-b:1",
+            "hostname": "node-b",
+            "pid": 222,
+            "slurm_job_id": "102",
+        }
+    )
+    replacement["replacement_liveness_path"] = "later-task"
+    replacement["liveness"] = {
+        "task_key": "round-003:chunk:0000",
+        "status": "completed",
+        "worker_address": "tcp://node-c:1",
+        "hostname": "node-c",
+        "pid": 333,
+        "slurm_job_id": "103",
+    }
+    replacement["owned_job_ids"] = ["100", "101", "102", "103"]
+    outcome_path = tmp_path / "fine-worker-replacement-outcome.json"
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    outcome["owned_job_ids"] = ["100", "101", "102", "103"]
+    outcome_path.write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
+    _refresh_report_evidence_digest(
+        report,
+        path,
+        cast(dict[str, object], replacement["evidence_file"]),
+    )
+    _refresh_report_evidence_digest(
+        report,
+        outcome_path,
+        cast(dict[str, object], replacement["outcome_file"]),
+    )
+
+    assert validate_fine_acceptance_report(report, evidence_root=tmp_path) == report
+
+
+def test_fine_acceptance_accepts_scheduler_reschedule_before_replacement_liveness(
+    tmp_path: Path,
+) -> None:
+    report = _fine_acceptance_report(tmp_path)
+    path = tmp_path / "fine-worker-replacement-slurm-execution.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    graph = payload["fine_graph"]
+    target = graph["placements"][1]
+    target.update(
+        {
+            "attempt": 1,
+            "worker_address": "tcp://node-b:1",
+            "hostname": "node-b",
+            "pid": 222,
+            "slurm_job_id": "102",
+            "coordinator_submitted_at": "2026-07-22T09:59:59Z",
+            "coordinator_ready_at": "2026-07-22T10:00:02Z",
+        }
+    )
+    graph["placements"] = [target, graph["placements"][2]]
+    graph["attempt_counts"][0]["attempts"] = 1
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    replacement = cast(
+        dict[str, object],
+        cast(dict[str, object], report["durability"])["worker_replacement"],
+    )
+    replacement["failed_attempt"] = None
+    replacement["recovery_mode"] = "scheduler-reschedule"
+    cast(dict[str, object], replacement["retry"]).update(
+        {
+            "attempt": 1,
             "worker_address": "tcp://node-b:1",
             "hostname": "node-b",
             "pid": 222,

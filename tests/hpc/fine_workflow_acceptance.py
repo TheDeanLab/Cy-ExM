@@ -1086,6 +1086,7 @@ def _validate_worker_replacement(
                 "queue_after_file",
                 "loss_marker_file",
                 "failed_attempt",
+                "recovery_mode",
                 "departed_worker",
                 "replacement_worker",
                 "replacement_liveness_path",
@@ -1148,10 +1149,18 @@ def _validate_worker_replacement(
         raise HpcWorkflowAcceptanceError(
             "fine acceptance loss-marker summary is not checksum-bound to raw marker"
         )
-    failed = _fine_object(
-        replacement["failed_attempt"],
-        keys=frozenset({"task_key", "attempt", "status"}),
-        location=f"{location}.failed_attempt",
+    scheduler_reschedule = replacement["failed_attempt"] is None
+    recovery_mode = _fine_nonempty_string(
+        replacement["recovery_mode"], f"{location}.recovery_mode"
+    )
+    failed = (
+        None
+        if scheduler_reschedule
+        else _fine_object(
+            replacement["failed_attempt"],
+            keys=frozenset({"task_key", "attempt", "status"}),
+            location=f"{location}.failed_attempt",
+        )
     )
     departed = _fine_worker_identity(
         replacement["departed_worker"], f"{location}.departed_worker"
@@ -1230,14 +1239,22 @@ def _validate_worker_replacement(
     }
     if liveness_identity is not None:
         expected_owned.add(cast(str, liveness_identity["slurm_job_id"]))
+    recovered_attempt = 1 if scheduler_reschedule else 2
     if (
-        failed["task_key"] != loss_key
-        or failed["attempt"] != 1
-        or failed["status"] != "failed"
+        recovery_mode
+        != ("scheduler-reschedule" if scheduler_reschedule else "coordinator-retry")
+        or (
+            failed is not None
+            and (
+                failed["task_key"] != loss_key
+                or failed["attempt"] != 1
+                or failed["status"] != "failed"
+            )
+        )
         or departed != loss_identity
         or activated == departed
         or retry["task_key"] != loss_key
-        or retry["attempt"] != 2
+        or retry["attempt"] != recovered_attempt
         or retry["status"] != "completed"
         or tuple(owned) != outcome_owned
         or replacement["cleanup_outcome"] != "empty"
@@ -1335,20 +1352,42 @@ def _validate_worker_replacement(
         if liveness_path == "later-task"
         else []
     )
+    recovered_placement = (
+        target_placements[-1] if len(target_placements) == recovered_attempt else None
+    )
+    scheduler_reschedule_spans_loss = False
+    if scheduler_reschedule and recovered_placement is not None:
+        submitted = recovered_placement.get("coordinator_submitted_at")
+        ready = recovered_placement.get("coordinator_ready_at")
+        injected = (
+            raw_marker.get("injected_at") if isinstance(raw_marker, Mapping) else None
+        )
+        if all(type(value) is str for value in (submitted, ready, injected)):
+            scheduler_reschedule_spans_loss = (
+                _timestamp(cast(str, submitted))
+                <= _timestamp(cast(str, injected))
+                <= _timestamp(cast(str, ready))
+            )
     if (
         activation_index is None
         or departure_index is None
-        or attempt_by_key.get(loss_key) != 2
-        or len(target_placements) != 2
-        or [item.get("attempt") for item in target_placements] != [1, 2]
-        or target_placements[0].get("status") != "failed"
-        or target_placements[0].get("placement_accepted") is not False
-        or target_placements[1].get("status") != "completed"
-        or target_placements[1].get("placement_accepted") is not True
-        or raw_identity(target_placements[1]) != retry_identity
+        or attempt_by_key.get(loss_key) != recovered_attempt
+        or len(target_placements) != recovered_attempt
+        or [item.get("attempt") for item in target_placements]
+        != list(range(1, recovered_attempt + 1))
         or (
-            liveness_path == "retry" and raw_identity(target_placements[1]) != activated
+            not scheduler_reschedule
+            and (
+                target_placements[0].get("status") != "failed"
+                or target_placements[0].get("placement_accepted") is not False
+            )
         )
+        or recovered_placement is None
+        or recovered_placement.get("status") != "completed"
+        or recovered_placement.get("placement_accepted") is not True
+        or raw_identity(recovered_placement) != retry_identity
+        or (scheduler_reschedule and not scheduler_reschedule_spans_loss)
+        or (liveness_path == "retry" and raw_identity(recovered_placement) != activated)
         or (
             liveness_path == "later-task"
             and (
@@ -1357,7 +1396,7 @@ def _validate_worker_replacement(
                 or liveness_placements[-1].get("placement_accepted") is not True
                 or raw_identity(liveness_placements[-1]) != activated
                 or cast(str, liveness_placements[-1].get("coordinator_ready_at", ""))
-                <= cast(str, target_placements[1].get("coordinator_ready_at", ""))
+                <= cast(str, recovered_placement.get("coordinator_ready_at", ""))
             )
         )
     ):

@@ -131,5 +131,15 @@
   worker peak RSS externally, but it must restore patched runtime state in `finally`.
 - A worker-loss trial may terminate only the exact dedicated worker process after
   durably writing its one-shot marker. It must never terminate the coordinator, and
-  acceptance requires production departure, replacement, retry, liveness, and exact
-  named-job cleanup evidence before making a claim.
+  acceptance requires production departure, replacement, recovery, liveness, and
+  exact named-job cleanup evidence before making a claim. Dask may expose recovery
+  either as a failed coordinator attempt followed by a retry or as a transparent
+  scheduler reschedule of the original future. For the latter, require the recovered
+  task's coordinator interval to span the checksum-bound loss-marker timestamp and
+  require the admitted replacement identity to complete that task or a later
+  accepted scientific task.
+- `test_fine_worker_replacement_only.py` is a focused production diagnostic for
+  rerunning only worker-loss/replacement acceptance after scheduler-lifecycle
+  changes. Its report may supplement prior exact-commit gates, but it does not by
+  itself replace the complete fine-grained scientific, durability, cancellation,
+  deterministic-parity, and performance acceptance matrix.

@@ -25,6 +25,10 @@
   scheduling or artifact lifecycle. Completion-record primitives remain in
   `artifacts.py`; `whole_image.py`, `chunked.py`, and `channels.py` each own
   orchestration of their scoped artifacts.
+- Artifact progress observers may report a commit only after both atomic artifact and
+  canonical completion-record promotion, and may report reuse only after exact
+  `StageRequest`, identity, and reader validation. Keep observation context-local and
+  do not turn it into an alternate cache-validation path.
 - `channels.py` owns only one source channel's restart-safe transform artifact
   lifecycle. It configures native threads before requesting the lazy scientific
   backend, transforms through the accepted warp-plus-affine chain, and must not
@@ -36,6 +40,22 @@
 - Linear registration accepts native fixed and moving grids, but affine resampling
   must produce the exact fixed-reference scalar and mask geometry before whole-image
   or serial-chunked nonlinear work. Keep chunk geometry strict on that fixed grid.
+- Keep `_prepare_linear_state` as the shared private boundary for source snapshots,
+  image loading, crop, masks, fixed-reference persistence, pre-registration metrics,
+  affine preparation, and linear metrics. Consumers must preserve that stage order
+  and use its accepted fixed-grid scalar, mask, affine, paths, backend, and resolved
+  native-thread state without repeating preparation.
+- `prepared.py` owns the internal fixed-grid float32 NPY bundle. Commit each array
+  through the ordinary artifact store, promote the strict manifest last, and let
+  workers copy only one extended region from validated read-only memory maps. The
+  manifest must record and bind the exact supported ANTs pixel type for all four
+  prepared roles; reconstruct each regional image with that type so an integer
+  legacy fixed grid retains its scalar-resampling behavior while floating inputs
+  remain unquantized.
+- `chunk_stages.py` owns one prepared-region nonlinear task, float32 scalar-core
+  persistence, and full-grid assembly. Preserve the legacy ascending-ID overwrite
+  rule for expected overlapping output slices; task completion order must not change
+  scalar or displacement assembly.
 - Pre-registration metrics resample unequal moving scalar and mask grids to the fixed
   grid for diagnosis only; this must not replace or pre-resample the native moving
   inputs supplied to affine estimation.

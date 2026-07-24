@@ -9,6 +9,7 @@ type ChunkSizeZYX = tuple[int, int, int]
 type RegistrationStrategy = Literal["whole_image", "serial_chunked"]
 type ChannelInterpolation = Literal["linear", "nearestNeighbor"]
 type ExecutorName = Literal["sequential", "local_dask", "slurm"]
+type ParallelismMode = Literal["coarse", "fine_grained"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +111,11 @@ class SlurmSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ParallelismSpec:
+    mode: ParallelismMode = "coarse"
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionProfile:
     schema_version: int
     executor: ExecutorName
@@ -118,3 +124,4 @@ class ExecutionProfile:
     local_dask: LocalDaskSpec | None
     slurm: SlurmSpec | None
     source_path: Path
+    parallelism: ParallelismSpec = ParallelismSpec()

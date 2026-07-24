@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+from itertools import product
+
 import numpy as np
 import pytest
 
+from cyexm import chunking
+from cyexm.chunking import compute_chunk_grid as shared_compute_chunk_grid
+from cyexm.registration import chunked as registration_chunked
 from cyexm.registration.chunked import (
     ChunkInfo,
     compute_chunk_grid,
@@ -11,6 +18,63 @@ from cyexm.registration.chunked import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_registration_chunk_geometry_is_shared_by_import_identity() -> None:
+    assert registration_chunked.ChunkInfo is chunking.ChunkInfo
+    assert registration_chunked.compute_chunk_grid is shared_compute_chunk_grid
+    assert registration_chunked.extract_chunk is chunking.extract_chunk
+    assert registration_chunked.stitch_core is chunking.stitch_core
+
+
+def test_shared_chunk_geometry_import_is_standard_library_only() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import cyexm.chunking; "
+                "forbidden={'numpy','scipy','ants','dask'}; "
+                "assert not forbidden.intersection(sys.modules)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_nontrivial_chunk_grid_is_exact() -> None:
+    chunks = shared_compute_chunk_grid((9, 17, 19), (4, 8, 8), 0.25)
+    z_bounds = ((0, 4, 0, 4), (3, 7, 3, 7), (6, 9, 6, 9))
+    y_bounds = ((0, 8, 0, 9), (6, 14, 5, 15), (12, 17, 11, 17))
+    x_bounds = (
+        (0, 8, 0, 9),
+        (6, 14, 5, 15),
+        (12, 19, 11, 19),
+        (18, 19, 17, 19),
+    )
+
+    assert chunks == tuple(
+        ChunkInfo(
+            chunk_id=chunk_id,
+            z_start=z[0],
+            z_end=z[1],
+            y_start=y[0],
+            y_end=y[1],
+            x_start=x[0],
+            x_end=x[1],
+            z_start_ext=z[2],
+            z_end_ext=z[3],
+            y_start_ext=y[2],
+            y_end_ext=y[3],
+            x_start_ext=x[2],
+            x_end_ext=x[3],
+        )
+        for chunk_id, (z, y, x) in enumerate(product(z_bounds, y_bounds, x_bounds))
+    )
 
 
 def test_single_chunk_covers_smaller_volume() -> None:

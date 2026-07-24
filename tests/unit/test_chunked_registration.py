@@ -15,6 +15,7 @@ from cyexm.errors import (
     ChunkRegistrationError,
     RegistrationStageError,
 )
+from cyexm.registration import chunked as chunked_module
 from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
     WHOLE_SCALAR_POLICY,
@@ -80,6 +81,21 @@ def round_paths(tmp_path: Path) -> RegistrationPaths:
 
 def manifest_path(tmp_path: Path) -> Path:
     return tmp_path / "output" / "round_2_chunks" / "manifest.json"
+
+
+def scalar_core_path(tmp_path: Path, chunk_id: int) -> Path:
+    return (
+        tmp_path
+        / "output"
+        / "round_2_chunks"
+        / f"chunk_{chunk_id:04d}_registered_core.npy"
+    )
+
+
+def remove_scalar_core(tmp_path: Path, chunk_id: int) -> None:
+    path = scalar_core_path(tmp_path, chunk_id)
+    path.unlink()
+    ArtifactStore().record_path(path).unlink()
 
 
 def transitive_chunk_artifacts(
@@ -375,6 +391,32 @@ def test_manifest_is_canonical_ordered_and_records_local_warp_identities(
     assert request.parameters["axis_convention_version"] == "external-zyx-ants-xyz-v1"
 
 
+def test_assembly_is_independent_of_chunk_completion_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_assemble = chunked_module.assemble_nonlinear_chunks
+    observed_input_order: list[int] = []
+
+    def assemble_reversed(context: object, artifacts: object) -> object:
+        completed = tuple(artifacts)  # type: ignore[arg-type]
+        observed_input_order.extend(
+            int(item.warp_path.name.split("_", 2)[1]) for item in completed
+        )
+        return canonical_assemble(context, tuple(reversed(completed)))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        chunked_module,
+        "assemble_nonlinear_chunks",
+        assemble_reversed,
+    )
+
+    make_chunked_registration(tmp_path, backend=FakeChunkBackend()).register()
+
+    assert observed_input_order == [0, 1]
+    assert round_paths(tmp_path).registered.is_file()
+
+
 def test_chunked_full_request_records_transitive_chunk_evidence(
     tmp_path: Path,
 ) -> None:
@@ -658,7 +700,7 @@ def test_serial_chunk_scalar_is_local_core_stitch_fresh_and_on_full_warp_reuse(
         resumed_metric_scalar.data,
         fresh_metric_scalar.data,
     )
-    assert len(resumed.histogram_match_calls) == 2
+    assert resumed.histogram_match_calls == []
     assert resumed.registered_chunk_ids == []
     assert resumed.nonlinear_calls == 0
     assert tuple(FileIdentity.from_path(path) for path in preserved_artifacts) == (
@@ -962,6 +1004,7 @@ def test_cached_local_reconstruction_failure_preserves_valid_record(
     initial.register()
     local = initial.chunk_paths(0)
     record_before = local.completion_record.read_bytes()
+    remove_scalar_core(tmp_path, 0)
     resumed = FakeChunkBackend(fail_histogram_match=True)
 
     with pytest.raises(ChunkRegistrationError):
@@ -986,6 +1029,8 @@ def test_cached_deterministic_chunk_output_failure_stales_chain_and_recovers(
     initial = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
     initial.register()
     artifacts = transitive_chunk_artifacts(initial, tmp_path, 1)
+    if failure != "warp-float32":
+        remove_scalar_core(tmp_path, 1)
     failing_backend = FakeChunkBackend(
         invalid_scalar_chunk=1 if failure == "scalar-shape" else None,
         invalid_mask_chunk=1 if failure == "mask-shape" else None,
@@ -1017,6 +1062,7 @@ def test_cached_backend_value_error_preserves_transitive_records(
     initial = make_chunked_registration(tmp_path, backend=FakeChunkBackend())
     initial.register()
     artifacts = transitive_chunk_artifacts(initial, tmp_path, 1)
+    remove_scalar_core(tmp_path, 1)
     store = ArtifactStore()
     records_before = tuple(
         store.record_path(artifact).read_bytes() for artifact in artifacts

@@ -9,6 +9,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask
 
 _FAILING_ROUND = 3
@@ -210,7 +211,46 @@ def retry_once_runner(task: _WorkflowTask) -> RoundResult:
     raise RuntimeError(f"injected first-attempt failure for round {task.round}")
 
 
+def guarded_fine_runner(task: FineWorkflowTask) -> FineTaskResult:
+    """Run the exact fine boundary while forbidding worker-side Dask orchestration."""
+    import sys
+
+    from distributed import Client
+
+    original_init = Client.__init__
+    original_submit = Client.submit
+
+    def forbidden_init(self: object, *args: object, **kwargs: object) -> None:
+        del self, args, kwargs
+        raise AssertionError("fine worker attempted to construct a Dask Client")
+
+    def forbidden_submit(self: object, *args: object, **kwargs: object) -> None:
+        del self, args, kwargs
+        raise AssertionError("fine worker attempted to submit child Dask work")
+
+    Client.__init__ = forbidden_init  # type: ignore[method-assign]
+    Client.submit = forbidden_submit  # type: ignore[method-assign]
+    try:
+        from cyexm.workflow.fine_task import run_fine_task
+
+        result = run_fine_task(task)
+        forbidden_adapters = {
+            "cyexm.execution.dask",
+            "cyexm.execution.slurm",
+        }.intersection(sys.modules)
+        if forbidden_adapters:
+            raise AssertionError(
+                "fine worker imported executor adapters: "
+                f"{sorted(forbidden_adapters)!r}"
+            )
+        return result
+    finally:
+        Client.__init__ = original_init  # type: ignore[method-assign]
+        Client.submit = original_submit  # type: ignore[method-assign]
+
+
 __all__ = [
+    "guarded_fine_runner",
     "independent_failure_runner",
     "placement_runner",
     "retry_once_runner",

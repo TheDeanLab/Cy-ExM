@@ -1,6 +1,10 @@
 schema_version: 1
 executor: sequential
 
+# Explicit production default: one complete moving round is one scientific task.
+parallelism:
+  mode: coarse
+
 # Edit these caller-owned paths. Relative paths resolve from this profile's directory.
 paths:
   dataset_root: ../data

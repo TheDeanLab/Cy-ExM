@@ -24,9 +24,11 @@ from hpc.environment import (
     require_cli_paths,
     require_coordinator_native_threads,
     require_explicit_hpc_selection,
+    require_hpc_opt_in,
     run_environment_smoke,
     shared_path_identity,
     smoke_module_by_value,
+    validate_additional_acceptance_profile,
     validate_rendered_job_script,
     validate_scheduler_interface,
     validate_slurm_job_node_resources,
@@ -161,6 +163,64 @@ def test_hpc_acceptance_accepts_exact_explicit_marker_selection(
     arguments: tuple[str, ...],
 ) -> None:
     require_explicit_hpc_selection(arguments)
+
+
+@pytest.mark.parametrize("value", (None, False, 0, "true"))
+def test_hpc_acceptance_requires_exact_run_opt_in(value: object) -> None:
+    with pytest.raises(HpcAcceptanceError, match="--run-hpc"):
+        require_hpc_opt_in(value)
+
+
+def test_hpc_acceptance_accepts_exact_run_opt_in() -> None:
+    require_hpc_opt_in(True)
+
+
+def test_additional_profile_reuses_protected_storage_validation_before_writes(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    project_root = tmp_path / "project"
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    dataset, execution = _write_approved_inputs(archive_root, project_root)
+    evidence = archive_root / "approved" / "evidence"
+    evidence.mkdir()
+    versions = {name: name for name in ACCEPTANCE_PACKAGES}
+    context = prepare_acceptance_context(
+        dataset,
+        execution,
+        evidence,
+        repository_root=repository_root,
+        archive_root=archive_root,
+        project_root=project_root,
+        _git_commit=lambda _root: "a" * 40,
+        _version=versions.__getitem__,
+    )
+    protected = archive_root / "live-spheroid"
+    protected.mkdir()
+    fine_execution = archive_root / "approved" / "fine.yaml"
+    fine_execution.write_text(
+        execution.read_text(encoding="utf-8")
+        .replace(
+            str(archive_root / "approved" / "output"),
+            str(protected),
+        )
+        .replace("job_name: cyexm-smoke", "job_name: cyexm-fine"),
+        encoding="utf-8",
+    )
+    before = tuple(evidence.iterdir())
+
+    with pytest.raises(HpcAcceptanceError, match="protected"):
+        validate_additional_acceptance_profile(
+            context,
+            fine_execution,
+            repository_root=repository_root,
+            archive_root=archive_root,
+            project_root=project_root,
+            protected_roots=(protected,),
+        )
+
+    assert tuple(evidence.iterdir()) == before
 
 
 def test_prepare_context_loads_public_yaml_and_writes_atomic_provenance(

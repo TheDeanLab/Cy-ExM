@@ -23,6 +23,10 @@ from . import transforms as transform_helpers
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_ANTS_PIXELTYPES = frozenset(
+    {"unsigned char", "unsigned int", "float", "double"}
+)
+
 
 def _scientific_runtime() -> tuple[Any, Any]:
     import ants
@@ -54,6 +58,16 @@ class RegistrationBackend(Protocol):
         *,
         reference: object,
         has_components: bool = False,
+    ) -> object:
+        raise NotImplementedError
+
+    def from_geometry(
+        self,
+        array: object,
+        *,
+        geometry: ImageGeometry,
+        has_components: bool = False,
+        pixeltype: str | None = None,
     ) -> object:
         raise NotImplementedError
 
@@ -208,6 +222,31 @@ class AntsRegistrationBackend:
             direction=runtime_reference.direction,
             has_components=has_components,
         )
+
+    def from_geometry(
+        self,
+        array: object,
+        *,
+        geometry: ImageGeometry,
+        has_components: bool = False,
+        pixeltype: str | None = None,
+    ) -> object:
+        self._prepare()
+        ants, np = _scientific_runtime()
+        if pixeltype is not None and pixeltype not in _SUPPORTED_ANTS_PIXELTYPES:
+            raise ValueError(f"unsupported ANTs pixeltype: {pixeltype!r}")
+        image = ants.from_numpy(
+            external_to_ants_array(np.asarray(array)),
+            origin=geometry.origin,
+            spacing=geometry.spacing,
+            direction=geometry.direction,
+            has_components=has_components,
+        )
+        if pixeltype is not None and image.pixeltype != pixeltype:
+            image = image.clone(pixeltype)
+        if pixeltype is not None and image.pixeltype != pixeltype:
+            raise ValueError("ANTs image reconstruction did not preserve pixeltype")
+        return image
 
     def crop_image(
         self,

@@ -1035,6 +1035,35 @@ def test_status_requires_every_artifact_completion_record(tmp_path: Path) -> Non
     assert status.complete
 
 
+def test_status_ignores_invalid_fine_prepared_state_when_public_outputs_are_valid(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_plan(output_root)
+    artifacts = _expected_artifacts(output_root, 2)
+    for artifact in artifacts:
+        _commit_artifact(artifact, output_root)
+    registration = (
+        WorkflowLayout.for_dataset(output_root, "dataset-1").round(2).registration
+    )
+    prepared = registration / "round_2_prepared"
+    prepared.mkdir()
+    (prepared / "manifest.json").write_text(
+        '{"format_version":1,"invalid":"prepared dependency"}',
+        encoding="utf-8",
+    )
+    chunk_root = registration / "round_2_chunks"
+    chunk_root.mkdir()
+    (chunk_root / "chunk_0000_registered_core.npy").write_bytes(b"invalid")
+
+    status = inspect_workflow_status(output_root, "dataset-1")
+
+    assert status.rounds[1].status == "complete"
+    assert status.rounds[1].complete_artifacts == tuple(map(str, artifacts))
+    assert status.rounds[1].invalid_artifacts == ()
+    assert status.complete
+
+
 def test_status_infers_reference_native_threads_from_completion_evidence(
     tmp_path: Path,
 ) -> None:

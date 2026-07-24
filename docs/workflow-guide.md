@@ -23,15 +23,44 @@ resource request without opening the selected executor, while status inspects
 artifacts using an output root and dataset ID. `run` executes pending work and
 normally resumes valid artifacts through their completion records.
 
-Cy-ExM supports three executor boundaries. The sequential executor is the numerical
-and restart reference. The bounded local-Dask executor uses a process-based local
-cluster with one round slot per worker. The SLURM executor lazily constructs an owned
-`SLURMCluster`, with one process per worker job and one round slot per worker. Each
-executor prepares the reference round before submitting moving rounds; registration
-and channel transformation remain serial inside a round task.
+Cy-ExM supports three executor boundaries and two task granularities. The sequential
+executor is the numerical and restart reference. The bounded local-Dask executor
+uses a process-based local cluster, and the SLURM executor lazily constructs one
+owned `SLURMCluster`. Every worker has one eligible task slot.
 
-Portable SLURM checks cover construction, job-template rendering, preflight policy,
-failure mapping, cancellation, and cleanup. They are construction evidence, not
-real-cluster acceptance. Real SLURM submission and HPC acceptance require explicitly
-selected `hpc` tests, an operator-approved allocation and inputs, and external
-operational evidence.
+The execution profile selects the granularity:
+
+```yaml
+parallelism:
+  mode: coarse
+```
+
+or:
+
+```yaml
+parallelism:
+  mode: fine_grained
+```
+
+Omission preserves the `coarse` default. Coarse mode schedules one complete moving
+round per task. Fine mode uses the same public workflow command and scientific plan,
+but the coordinator schedules preparation, canonical nonlinear chunks, deterministic
+assembly, declared moving channels, and validation separately. The stable
+`serial_chunked` strategy name still describes the scientific chunking behavior;
+parallelism is an execution choice. See
+[Fine-grained registration](fine-grained-execution.md) for profiles, graph stages,
+resource admission, internal arrays, task logs, failure behavior, and restart
+examples.
+
+Each executor prepares the reference round before submitting moving work. Native
+fixed, registration-channel, and dependent-channel shapes may differ along Z, Y, and
+X. Matching legacy ClearEx and ANTs, affine application resamples scalar and mask
+data to the exact fixed-reference grid before nonlinear chunking, and dependent
+channels are transformed directly from their native grids onto that grid.
+
+The coarse round-level SLURM executor has the exact-commit acceptance recorded in the
+[Phase 2 audit](phase-2-acceptance.md). Portable real-ANTs/Local-Dask evidence is
+complete for the fine graph through implementation Task 10. Fine-grained real-SLURM
+production acceptance remains pending explicitly selected `hpc` tests with an
+operator-approved allocation, inputs, external operational evidence, scientific
+parity, task placement, cancellation, cleanup, and performance measurements.

@@ -17,6 +17,8 @@ from active characterization work.
   transforms, metrics, masks, interpolation, or native-thread settings.
 - Use [Artifact recovery and reproducibility](registration-artifacts.md) to
   understand restart-safe output reuse.
+- Use [Fine-grained registration](fine-grained-execution.md) to configure the
+  opt-in chunk/channel task graph and understand its current acceptance boundary.
 
 ## Scientific characterization
 

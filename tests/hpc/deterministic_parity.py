@@ -29,6 +29,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Run bounded seeded one-thread sequential/SLURM parity."
     )
     parser.add_argument("--execution", required=True, type=Path)
+    parser.add_argument("--fine-execution", type=Path)
     parser.add_argument("--owned-root", required=True, type=Path)
     parser.add_argument("--evidence", required=True, type=Path)
     return parser
@@ -121,6 +122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         from cyexm.workflow.api import run_workflow
         from cyexm.workflow.planning import build_workflow_plan
         from hpc.environment import collect_queue_snapshot as collect_queue
+        from hpc.fine_workflow_acceptance import fine_internal_parity_evidence
         from hpc.workflow_acceptance import (
             deterministic_acceptance_manifest,
             deterministic_sequential_profile,
@@ -133,9 +135,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         roots = _require_owned_root(args.owned_root)
         approved = load_execution_profile(args.execution)
+        fine_approved = (
+            None
+            if args.fine_execution is None
+            else load_execution_profile(args.fine_execution)
+        )
         parallel_profile = deterministic_slurm_profile(approved, roots["parallel"])
-        sequential_profile = deterministic_sequential_profile(
-            approved, roots["sequential"]
+        sequential_profile = (
+            deterministic_sequential_profile(approved, roots["sequential"])
+            if fine_approved is None
+            else deterministic_slurm_profile(fine_approved, roots["sequential"])
         )
         parallel_profile = replace(
             parallel_profile,
@@ -167,34 +176,60 @@ def main(argv: Sequence[str] | None = None) -> int:
             operation="deterministic-parallel",
             user=user,
         )
-        sequential = run_workflow(sequential_plan)
+        sequential = (
+            run_workflow(sequential_plan)
+            if fine_approved is None
+            else execute_owned_slurm_workflow(
+                sequential_plan,
+                runner=run_seeded_workflow_task,
+                evidence_dir=evidence_path.parent,
+                operation="deterministic-fine",
+                user=user,
+            )
+        )
         if not parallel.succeeded or not sequential.succeeded:
             _fail("deterministic sequential or SLURM workflow did not succeed")
         _require_one_thread_results(parallel, "SLURM")
         _require_one_thread_results(sequential, "sequential")
         parity = scientific_parity_evidence(sequential_plan, parallel_plan)
+        internal_parity = (
+            None
+            if fine_approved is None
+            else fine_internal_parity_evidence(parallel_plan, sequential_plan)
+        )
         final_queue = collect_queue(deterministic_job_name, user=user)
         if final_queue.get("jobs") != []:
             _fail("deterministic named SLURM jobs remain after strict parity")
+        if fine_approved is not None:
+            if sequential_profile.slurm is None:
+                _fail("deterministic fine profile lost its scheduler specification")
+            fine_queue = collect_queue(sequential_profile.slurm.job_name, user=user)
+            if fine_queue.get("jobs") != []:
+                _fail("deterministic fine SLURM jobs remain after strict parity")
+            final_queue = {
+                "jobs": [],
+                "coarse": final_queue,
+                "fine": fine_queue,
+            }
 
         native_threads = {
             _ITK_THREAD_ENV_VAR: 1,
             **{name: 1 for name in _BLAS_THREAD_ENV_VARS},
         }
-        _write_json(
-            evidence_path,
-            {
-                "schema_version": 1,
-                "status": "completed",
-                "seed": _SEED,
-                "native_threads": native_threads,
-                "inputs": input_evidence,
-                "parallel": parallel.to_dict(),
-                "sequential": sequential.to_dict(),
-                "strict_parity": parity,
-                "final_queue": final_queue,
-            },
-        )
+        payload = {
+            "schema_version": 1,
+            "status": "completed",
+            "seed": _SEED,
+            "native_threads": native_threads,
+            "inputs": input_evidence,
+            "parallel": parallel.to_dict(),
+            "sequential": sequential.to_dict(),
+            "strict_parity": parity,
+            "final_queue": final_queue,
+        }
+        if internal_parity is not None:
+            payload["strict_internal_parity"] = internal_parity
+        _write_json(evidence_path, payload)
         return 0
     except BaseException as error:
         failure = error

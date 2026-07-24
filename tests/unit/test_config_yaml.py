@@ -25,6 +25,15 @@ from cyexm.errors import (
 pytestmark = pytest.mark.unit
 
 
+def test_parallelism_configuration_is_not_exported_from_package_root() -> None:
+    import cyexm
+
+    assert "ParallelismMode" not in cyexm.__all__
+    assert "ParallelismSpec" not in cyexm.__all__
+    assert not hasattr(cyexm, "ParallelismMode")
+    assert not hasattr(cyexm, "ParallelismSpec")
+
+
 def test_configuration_errors_share_the_package_error_boundary() -> None:
     assert issubclass(ManifestDecodeError, CyExMError)
     assert issubclass(ConfigurationValidationError, CyExMError)

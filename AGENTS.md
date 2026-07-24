@@ -18,11 +18,13 @@
   artifacts through `cyexm workflow validate`, `cyexm workflow plan`,
   `cyexm workflow run`, and `cyexm workflow status`.
 - The current executor boundary includes sequential, bounded process-based local Dask,
-  and SLURM executors. Portable tests accept lazy SLURMCluster construction, bounded
-  workers, all-worker preflight, independent failure collection, cancellation, owned
-  cleanup, and operational evidence. Portable CI installs the HPC Python extra but
-  never contacts an external scheduler. Real SLURM submission and HPC acceptance
-  require explicitly selected `hpc` tests with operator-approved inputs and allocation.
+  and SLURM executors. `parallelism.mode: coarse` is the production default;
+  `fine_grained` is opt-in and changes task admission only. Portable real-ANTs and
+  Local-Dask fine-graph evidence is complete through implementation Task 10.
+  Fine-grained real SLURM production acceptance remains pending the exact-commit HPC
+  gate and explicitly selected `hpc` tests with operator-approved inputs and
+  allocation.
+  Portable CI installs the HPC Python extra but never contacts an external scheduler.
 - All Phase 2 additions follow the approved Phase 2 runtime design and implementation
   plans. Keep optional workflow, distributed, and HPC dependencies out of the base
   installation, and do not advertise a later milestone before its acceptance gate.
@@ -30,16 +32,18 @@
   spacing, and scientific choices; machine-specific local or HPC settings belong in
   separate execution profiles. The Phase 1 artifact store remains the only restart
   authority, and the serial chunk workflow remains the numerical reference. Do not
-  introduce nested chunk multiprocessing, a Dask chunk graph, or
-  `ParallelChunkedImageRegistration` inside round-level tasks by default.
-- Schedule one reference-preparation prerequisite followed by one coarse task per
-  moving round, and keep serial work inside each task. All executors use a hard
-  reference barrier in the same owned execution lifecycle; reference failure prevents
-  moving submission. Forcing the reference round propagates to every moving descendant.
-  Worker-backed executors expose one `round_slot` per worker and every submitted round
-  consumes one slot. SLURM uses one process per SLURM job and one node per round; do
-  not weaken that resource contract without explicit scientific and operational
-  acceptance.
+  introduce nested chunk multiprocessing, a worker-owned Dask graph, or
+  `ParallelChunkedImageRegistration` inside round-level tasks. The opt-in fine graph
+  is coordinator-owned and preserves every immutable scientific invariant.
+- Schedule one reference-preparation prerequisite followed by either one coarse task
+  per moving round or the coordinator-owned immutable fine graph. All executors use
+  a hard reference barrier in the same owned execution lifecycle; reference failure
+  prevents moving submission. Forcing the reference round propagates to every moving
+  descendant.
+  Worker-backed executors expose one `round_slot` per worker; each coarse round or
+  fine scientific task consumes one slot. Fine SLURM uses one process and one task
+  per dedicated job/node today; multiple workers per node require separate scientific
+  and operational acceptance.
 - `clearex.registration.pipeline` and `clearex.registration.tre` remain out of scope;
   do not recreate unrelated ClearEx surfaces in this repository.
 - Child `AGENTS.md` files add scope-specific guidance and inherit, rather than repeat,

@@ -4,7 +4,9 @@ Cy-ExM provides reusable cyclic expansion microscopy registration without a runt
 dependency on ClearEx. Its Phase 1 API supports restartable whole-image registration
 and a restartable **serial** chunked nonlinear workflow. Its Phase 2 workflow adds
 strict YAML configuration, immutable round planning, sequential and local-Dask
-execution, and a SLURM adapter accepted on the audited lab `512GB` profile. Both
+execution, and a coarse round-level SLURM adapter accepted on the audited lab
+`512GB` profile. Fine-grained local execution is available, while its real-SLURM
+production gate remains pending. Both
 registration strategies use affine registration before nonlinear registration and
 preserve physical image geometry. Nonlinear SyN supports either legacy Mattes mutual
 information or local cross-correlation (CC) with a configurable scalar voxel radius.
@@ -224,10 +226,20 @@ HPC system without changing its scientific identity.
 Planning validates inputs and creates one immutable `ReferenceTask` plus one immutable
 `RoundTask` per moving round. The reference task first materializes every declared
 reference channel on one shared reference grid. The selected executor then schedules
-the coarse moving-round tasks only after that prerequisite succeeds. Registration and
-channel transformation remain serial inside each moving-round task, and Phase 1
-completion records are the only restart authority. There is no nested chunk
-multiprocessing, no nested Dask graph, and no scheduler-dependent artifact cache.
+moving work only after that hard executor barrier succeeds. In `coarse` mode,
+registration and channel transformation remain serial inside each moving-round task.
+In opt-in `fine_grained` mode, the coordinator expands each round into immutable
+preparation, nonlinear-chunk, assembly, channel, and validation tasks. Workers never
+submit children or create a nested scheduler. Phase 1 completion records are the only
+restart authority, and no scheduler setting enters the artifact cache.
+There is no nested chunk multiprocessing in either mode.
+
+`parallelism.mode` belongs only in the execution profile and accepts exact `coarse`
+or `fine_grained`. Omitting `parallelism` normalizes to `coarse`. Execution mode is
+excluded from scientific identity, so the scientific fingerprint is unchanged when
+switching between compatible coarse and fine execution. See
+[Fine-grained registration](docs/fine-grained-execution.md) for the graph, internal
+artifacts, resource lifecycle, restart behavior, and current acceptance boundary.
 
 The public workflow API is available from `cyexm.workflow`:
 
@@ -337,6 +349,7 @@ The `executor` controls which one matching resource section is present:
 | --- | --- | --- |
 | `schema_version` | built-in integer `1` | Selects the strict execution-profile contract. |
 | `executor` | `sequential`, `local_dask`, or `slurm` | Selects exactly one executor-specific section. |
+| `parallelism` / `mode` | exact `coarse` or `fine_grained` | Operational task granularity. Omission normalizes to `coarse`; checked-in profiles declare it explicitly. |
 | `paths` / `dataset_root` | non-empty single-line path string | Root to which manifest image paths are bound. |
 | `paths` / `output_root` | non-empty single-line path string | Parent of `<dataset_id>` workflow output. |
 | `paths` / `worker_local_directory` | path string or `null` | Dask worker scratch; worker-backed executors require a non-null value. |
@@ -500,7 +513,13 @@ Reference sources are copied, never moved or modified. The current export bounda
 TIFF; the shared channel directory and task model keep output-format selection separate
 so a future schema can add formats without changing registration semantics.
 The moving-round directories are `rounds/round-002/registration/`,
-`rounds/round-002/channels/`, and `rounds/round-002/logs/round-002.log`.
+`rounds/round-002/channels/`, and `rounds/round-002/logs/`. Coarse moving rounds use
+the shared `round-NNN.log` (for example `round-002.log`). Fine moving tasks never
+append to that shared round log; each uses
+`round-NNN-<stage>-<item>.log` (for example
+`round-002-<stage>-<item>.log`). The reference task retains its ordinary
+`round-NNN.log` in either mode. The full coarse example path is
+`rounds/round-002/logs/round-002.log`.
 
 ```text
 <output-root>/<dataset-id>/
@@ -538,6 +557,8 @@ The moving-round directories are `rounds/round-002/registration/`,
         round_2_chunks/                            # serial_chunked only
           chunk_0000_warp.nii.gz
           chunk_0000_warp.nii.gz.complete.json
+          chunk_0000_registered_core.npy
+          chunk_0000_registered_core.npy.complete.json
           ...
           manifest.json
           manifest.json.complete.json
@@ -547,8 +568,16 @@ The moving-round directories are `rounds/round-002/registration/`,
         <each-other-source-basename>
         <each-other-source-basename>.complete.json
       logs/
-        round-002.log
+        round-002.log                              # coarse moving round only
+        round-002-<stage>-<item>.log               # each fine moving task
 ```
+
+Scalar cores are shared coarse/fine serial-chunk artifacts; prepared arrays are
+fine-only. Both coarse and fine serial chunk execution commit each scalar core and
+its completion record through the shared chunk-stage request, allowing either mode
+to reuse valid chunk reconstruction. Fine execution additionally creates the
+fixed-grid prepared bundle described in
+[Fine-grained execution](docs/fine-grained-execution.md).
 
 Every reusable artifact has its own matching `.complete.json`. A file alone, a
 completion record alone, an invalid identity, or incompatible request evidence is not
@@ -569,7 +598,9 @@ forcing only a moving round leaves valid reference artifacts reusable.
 execution profile, force selection, round results, timestamps, and available SLURM
 evidence. Operational summaries never authorize artifact reuse; they can be deleted
 without invalidating scientific artifacts. The current CLI writes diagnostics to
-stderr and per-round shared logs; it does not currently create the reserved root
+stderr. Coarse moving rounds and the reference task use an ordinary shared round log;
+fine moving tasks use deterministic unique task logs and never append concurrently to
+the coarse log. The CLI does not currently create the reserved root
 `logs/<run-id>.log` path.
 
 The read-only status command validates the scientific plan and authoritative
@@ -608,24 +639,35 @@ does not prevent later independent moving rounds. It opens no Dask scheduler.
 #### Local Dask
 
 `local_dask` lazily creates one owned, process-based `LocalCluster`. It starts
-`min(pending tasks, configured workers)` workers and gives every worker one
-`round_slot`. Even when all moving rounds are reusable, the cluster runs the reference
-revalidation barrier; it submits no moving work. The reference prerequisite and
-subsequent coarse moving-round tasks use that same cluster. Every task requires one
-slot, so only one runs in a worker even if its Dask `threads_per_worker` is larger. The
-client and cluster are closed for success, failure, startup error, and interruption.
+`min(pending tasks, configured workers)` workers in coarse mode and exactly the
+configured worker cap in fine-grained mode, where preparation determines later graph
+width. Every worker receives one `round_slot`. Even when all moving rounds are
+reusable, the cluster runs the reference revalidation barrier; it submits no moving
+work. The reference prerequisite and all subsequent work use that same cluster.
+Every coarse round or fine scientific task requires one slot, so only one runs in a
+worker even if its Dask `threads_per_worker` is larger. Fine ready tasks are admitted
+round-robin across rounds and remain work-conserving when only one round is ready.
+The client and cluster are closed for success, failure, startup error, and
+interruption.
 
 #### SLURM
 
-`slurm` lazily constructs one owned dask-jobqueue `SLURMCluster` and scales it to
-`min(pending tasks, configured workers)`. It requests one process per job and gives
-each worker one `round_slot`; reference preparation and every submitted moving round
-consume one slot. The reference barrier does not create a second cluster. This
-prevents more than one workflow task in a worker job. A claim of one dedicated node
-per job additionally depends on the site's allocation/exclusivity policy and must be
-confirmed during real HPC acceptance.
+`slurm` lazily constructs one owned dask-jobqueue `SLURMCluster`. Coarse mode scales
+to `min(pending tasks, configured workers)`. Fine mode starts one candidate worker
+for the reference barrier, then scales on demand to no more than the configured
+worker cap. It requests one process per job. Fine candidates advertise no eligible
+slot until the complete preflight succeeds; the coordinator then activates exactly
+one `round_slot`. Reference preparation and every submitted moving round or fine
+scientific task consume one slot. The reference barrier does not create a second
+cluster. Today this is one worker/job per dedicated node and one task per worker;
+multiple workers per node remain a future optimization. Dedicated-node truth still
+depends on site allocation/exclusivity policy and must be confirmed by exact-commit
+real-SLURM acceptance.
 
-Before any registration submission, every connected worker must pass preflight.
+In coarse mode, every connected worker must pass preflight before any registration
+submission. In fine mode, the initial candidate and every later newcomer must pass
+preflight and activation before that worker is eligible for scientific submission;
+already activated workers may continue their admitted tasks during scale-up.
 Preflight checks exact Cy-ExM/dependency versions, hostname and SLURM job identity,
 dataset/output visibility, scratch creation and cleanup, all six native-thread
 values, memory evidence, and scheduler/worker network identity. A timeout or mismatch
@@ -671,11 +713,14 @@ cancel other submitted rounds; all submitted work settles, successful artifacts 
 committed, a failed operational summary is written, and the workflow reports the
 failed round numbers.
 
-Post-execution SLURM evidence validation is a separate exit-3 path. After submitted
-rounds return, Cy-ExM validates the executor's operational evidence before reporting
-success. If that validation fails, it preserves the round results in the operational
-run record, the CLI exits `3`, and a later ordinary run can reuse those valid
-artifacts through normal completion-record validation.
+Invalid fine execution evidence is a separate exit-3 path for sequential, Local
+Dask, and SLURM. After submitted tasks return, Cy-ExM authenticates the executor's
+operational evidence before merging new summaries into the run record.
+Unauthenticated current-run summaries are omitted from durable `rounds`; only
+pre-run authenticated reuse remains, together with the execution-evidence error.
+Valid Phase 1 artifacts committed before rejection remain restartable through
+ordinary completion-record validation even though their unauthenticated operational
+summaries are absent.
 
 Automatic retries default to zero. A positive `task_retries` value is an
 executor-managed resubmission; Dask's opaque future retry count remains zero, and
@@ -693,7 +738,7 @@ artifact validation.
 | --- | --- |
 | `0` | Every round completed or was validly reused. |
 | `2` | Argument, YAML, configuration, input, plan, output, or fingerprint validation failed. |
-| `3` | Executor startup, worker connection, or preflight failure; also invalid SLURM operational evidence, including validation after round execution. Valid committed artifacts remain restartable. |
+| `3` | Executor startup, worker connection, or preflight failure; also invalid fine execution evidence for sequential, Local Dask, or SLURM, including validation after task execution. Unauthenticated current-run summaries are omitted, while valid committed artifacts remain restartable. |
 | `4` | At least one round failed after execution began. |
 | `130` | Operator interruption or termination through the CLI run handler. |
 
@@ -710,7 +755,8 @@ policy before submission.
 
 Portable fake-based SLURM construction, job-template rendering, preflight policy,
 failure mapping, evidence validation, cancellation, and cleanup are tested. Real
-SLURM submission and HPC acceptance completed on the audited lab partition. Only
+SLURM submission and HPC acceptance completed on the audited lab partition for the
+coarse round-level executor. Only
 tests explicitly selected with `-m hpc` may contact a scheduler or use representative
 lab data; they require an explicit allocation and caller-approved dataset, execution
 profile, output root, and external evidence directory. Portable CI always selects
@@ -727,13 +773,21 @@ seeded one-thread strict executor-parity gate. Acceptance is specific to the tes
 commit, approved manifest, and audited execution profile; it is not an unconditional
 guarantee for other clusters, resource profiles, datasets, or scientific policies.
 
+Portable real-ANTs/Local-Dask evidence is complete for fine-grained execution through
+implementation Task 10. Fine-grained real-SLURM production acceptance remains
+pending its own exact-commit two-tier scientific and operational gate; the coarse
+Phase 2 audit must not be read as acceptance of fine chunk/channel placement or
+performance.
+
 ### Remaining non-goals
 
-Phase 2 intentionally does not provide `ParallelChunkedImageRegistration`, per-chunk
-Dask scheduling, nested multiprocessing, parallel channel transformation, job arrays,
-cross-dataset scheduling, cloud or Kubernetes executors, or automatic resource
-optimization. It does not recreate ClearEx's GUI, pipeline, TRE, or general analysis
-framework, and it never silently changes executor: no silent fallback is permitted.
+Phase 2 intentionally does not provide `ParallelChunkedImageRegistration`, chunked
+or parallel whole-image affine estimation, nested multiprocessing, multiple workers
+per node, job arrays, cross-dataset scheduling, cloud or Kubernetes executors, or
+automatic resource optimization. Whole-image affine remains the preparation boundary
+even when nonlinear chunks and dependent channels run as fine tasks. It does not
+recreate ClearEx's GUI, pipeline, TRE, or general analysis framework, and it never
+silently changes executor: no silent fallback is permitted.
 Reference-round channels are materialized as shared TIFF outputs, with one identical
 crop applied to all of them when requested. Export to other file formats remains a
 future extension.

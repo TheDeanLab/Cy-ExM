@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from cyexm._nonlinear_metric import NonlinearMetricName
+from cyexm.config import load_dataset_manifest, load_execution_profile
 from cyexm.config.models import (
     ChannelSpec,
     DatasetManifest,
@@ -387,6 +388,74 @@ def test_plan_resolves_inputs_orders_rounds_and_creates_nothing(
         "round_3_488.tif",
     )
     assert not execution.paths.output_root.exists()
+
+
+def test_yaml_built_coarse_and_fine_plans_have_one_scientific_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    output_root = tmp_path / "output"
+    dataset_root.mkdir()
+    for name in ("round_1_488.tif", "round_2_488.tif"):
+        (dataset_root / name).touch()
+    dataset_yaml = tmp_path / "dataset.yaml"
+    dataset_yaml.write_text(
+        """
+schema_version: 1
+dataset_id: dataset-1
+voxel_spacing_um: {x: 0.324, y: 0.324, z: 0.9}
+reference:
+  round: 1
+  registration_channel: round_1_488.tif
+  channels:
+    - file: round_1_488.tif
+registration:
+  crop: false
+  linear: {type: TRSAA, accuracy: high}
+  nonlinear: {type: SyNOnly, accuracy: high, metric: mattes}
+rounds:
+  - round: 2
+    strategy: whole_image
+    registration_channel: round_2_488.tif
+    channels:
+      - {file: round_2_488.tif, interpolation: linear}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = load_dataset_manifest(dataset_yaml)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    def profile(mode: str) -> ExecutionProfile:
+        path = tmp_path / f"execution-{mode}.yaml"
+        path.write_text(
+            f"""
+schema_version: 1
+executor: sequential
+parallelism:
+  mode: {mode}
+paths:
+  dataset_root: {dataset_root}
+  output_root: {output_root}
+  worker_local_directory: null
+native_threads: {{itk: 1, blas: 1}}
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        return load_execution_profile(path)
+
+    coarse = build_workflow_plan(manifest, profile("coarse"))
+    fine = build_workflow_plan(manifest, profile("fine_grained"))
+
+    assert coarse.scientific_json == fine.scientific_json
+    assert coarse.scientific_fingerprint == fine.scientific_fingerprint
+    assert coarse.execution.parallelism.mode == "coarse"
+    assert fine.execution.parallelism.mode == "fine_grained"
 
 
 def test_plan_materializes_ordered_reference_channels_on_one_shared_grid(

@@ -33,3 +33,18 @@
 - Executor tests must make the reference barrier observable: reference submission
   precedes moving submissions, failure prevents descendant submission, and one owned
   client/cluster lifecycle spans both stages.
+- Fine executor tests must inject malformed task identity, native-thread order and
+  values, timestamps, artifacts, logs, and prepared manifests before controller
+  settlement. Every adapter must convert rejection into one exact failed attempt,
+  release no descendants, and continue independent siblings according to its retry
+  policy.
+- Prepared-manifest tests must fail closed on missing, extra, unsupported, or
+  request-mismatched ANTs pixel types for every fixed scalar, moving scalar, and mask
+  role; fake floating images must not imply that integer fixed grids are equivalent.
+- Documentation/example policy tests load every checked-in YAML through production
+  loaders, enforce explicit coarse/fine modes, and keep layered AGENTS ownership and
+  the fine-grained real-SLURM pending boundary synchronized.
+- Fine-HPC portable tests validate report builders and exact decoders with synthetic
+  external evidence only. Cover forged identities, checksums, paths, geometry,
+  placements, fairness, durability, cancellation, replacement, timing, and the 20%
+  nonlinear wall-time gate without contacting a scheduler or terminating a process.

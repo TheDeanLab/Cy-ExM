@@ -167,9 +167,15 @@ read-only audit material and was not reused for another acceptance attempt.
 
 ## Acceptance boundary
 
-Phase 2E is accepted for the tested Cy-ExM baseline, approved manifest, and audited
-lab `512GB` profile. Portable CI remains scheduler-free. Other clusters, partitions,
-thread counts, memory profiles, datasets, registration policies, or nested/per-chunk
-parallelism require their own operational and scientific validation. Per-chunk Dask
-parallelism, parallel channel transformation, and resource auto-optimization remain
-future work.
+This audit is the historical coarse round-level Phase 2E baseline for the tested
+Cy-ExM commit, approved manifest, and audited lab `512GB` profile. Its scientific
+substance and external evidence remain unchanged. Portable CI remains scheduler-free.
+Other clusters, partitions, thread counts, memory profiles, datasets, or registration
+policies require their own operational and scientific validation.
+
+Opt-in [fine-grained registration](fine-grained-execution.md) was implemented after
+this audit: fine chunk and declared-channel execution is implemented for sequential
+and Local Dask use. Fine-grained real SLURM production acceptance remains pending
+Tasks 12-13 and must demonstrate its separate exact-commit scientific, placement,
+failure, cancellation, cleanup, and performance gates. Multiple workers per node,
+chunked affine estimation, and automatic resource optimization remain future work.

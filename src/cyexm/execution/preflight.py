@@ -703,4 +703,45 @@ def validate_worker_probes(
     return tuple(probe for _address, probe in decoded)
 
 
-__all__ = ["WorkerProbe", "probe_worker", "validate_worker_probes"]
+def validate_slurm_worker_identities(
+    probes: tuple[WorkerProbe, ...],
+) -> None:
+    """Require one exact SLURM job and one host/process identity per worker."""
+    if type(probes) is not tuple or any(
+        type(probe) is not WorkerProbe for probe in probes
+    ):
+        raise TypeError("SLURM worker probes must be an exact tuple of WorkerProbe")
+    job_ids: set[str] = set()
+    worker_addresses: set[str] = set()
+    host_processes: set[tuple[str, int]] = set()
+    failures: list[str] = []
+    for probe in probes:
+        identity = (
+            f"worker_address={probe.worker_address!r}, hostname={probe.hostname!r}, "
+            f"pid={probe.pid!r}, SLURM_JOB_ID={probe.slurm_job_id!r}"
+        )
+        if probe.slurm_job_id is None:
+            failures.append(f"{identity}: SLURM_JOB_ID is required")
+        elif probe.slurm_job_id in job_ids:
+            failures.append(f"{identity}: duplicate SLURM_JOB_ID")
+        else:
+            job_ids.add(probe.slurm_job_id)
+        if probe.worker_address in worker_addresses:
+            failures.append(f"{identity}: duplicate worker address")
+        worker_addresses.add(probe.worker_address)
+        host_process = (probe.hostname, probe.pid)
+        if host_process in host_processes:
+            failures.append(f"{identity}: duplicate host/process identity")
+        host_processes.add(host_process)
+    if failures:
+        raise WorkerPreflightError(
+            "SLURM worker identity validation failed:\n- " + "\n- ".join(failures)
+        )
+
+
+__all__ = [
+    "WorkerProbe",
+    "probe_worker",
+    "validate_slurm_worker_identities",
+    "validate_worker_probes",
+]

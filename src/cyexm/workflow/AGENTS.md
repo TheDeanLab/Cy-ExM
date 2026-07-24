@@ -9,7 +9,54 @@
   moving task at the prepared registration-channel TIFF under the reference round's
   shared `channels` directory.
 - Workflow must not mutate a plan or create a scheduler.
+- Fine-grained workflow models embed the authoritative `RoundTask`; do not copy its
+  scientific fields into stage tasks. Initial and incremental graph expansion must
+  remain pure and coordinator-owned, and use the prepared manifest's fixed-grid ZYX
+  shape with the shared canonical chunk grid.
+- Fine task workers configure native threads before lazy scientific imports, execute
+  exactly one immutable stage, and never create clients, workers, or descendant
+  tasks. Concurrent stages use unique deterministic per-task logs rather than the
+  coarse round log.
+- `run_workflow` remains the only public execution entry point for coarse and fine
+  modes. Validate the exact mode-appropriate summary log: successful fine rounds use
+  their validation-task log, while failed or cancelled summaries use the canonical
+  representative terminal-task log.
+- Persist a strict scheduler-neutral fine evidence envelope for sequential and local
+  Dask execution, and validate the corresponding fine-graph extension for SLURM.
+  Cross-check public summaries against actual controller task results after
+  scientific work; missing or malformed evidence fails closed and never becomes
+  scientific reuse authority.
+- Treat results derived during the current execution as provisional until the exact
+  execution evidence validates. On evidence rejection or malformed cancellation
+  evidence, persist only reuse results authenticated before this run; never write a
+  rejected partial summary into the durable workflow record.
+- Bind a cancelled scheduler-neutral fine record to the exact API-caught
+  interruption and validate its structured scheduler-cancellation outcome against
+  live attempt evidence. Sequential records cancellation as `not_applicable`;
+  distributed records must distinguish no unfinished work, forced-cancel success,
+  and forced-cancel failure. Reject forged materialized and pre-controller causes.
+- Validate successful preparation evidence with the authoritative
+  `PreparedManifest` parser before graph expansion. Malformed worker descriptors
+  must become ordinary current-attempt failures so configured retries and
+  independent-sibling settlement remain intact.
+- Fine chunk workers must reconstruct every prepared regional image with the exact
+  manifest-bound ANTs pixel type. Missing, unsupported, or request-mismatched pixel
+  evidence fails closed rather than silently changing legacy scalar interpolation.
+- Fine failure results may retain only task-planned artifacts explicitly accepted by
+  the current delegate through the exact Phase 1 artifact-store request boundary and
+  still backed by the identical canonical completion record. Never infer partial
+  progress from current file identities or thread counts alone; force suppresses all
+  reused-artifact evidence.
+- Fine chunk assembly preserves the legacy ascending-ID overwrite rule for expected
+  overlapping output slices. Scheduling and completion order must not change the
+  canonical assembly order or scientific artifact identity.
+- Prepared arrays, local warps, and scalar cores are internal progress only. Public
+  completion/status authority remains the accepted affine/full warp, diagnostic,
+  metrics, declared channels, and their ordinary completion records.
 - Phase 1 completion records remain the only restart authority.
+- Round validation always executes the accepted full-chain check and therefore
+  reports `completed`; reused upstream artifacts remain identified by their
+  producer-task results and completion records.
 - Status must reconstruct moving-round provenance from the prepared reference TIFF's
   persisted geometry, not the native reference source grid. An unreadable prepared
   reference cannot authorize any moving-round completion chain.
@@ -32,7 +79,9 @@
   ordinary workflow failure semantics; do not require results for unsubmitted moving
   descendants or mask the failure with a result-cardinality error.
 - Use no module-scope scientific or scheduler imports.
-- `round_task.py` is the only real registration execution boundary in workflow. It
-  configures the task's native threads before its lazy registration/scientific
-  imports, executes channels serially, and must not create a Dask client, submit
-  child tasks, schedule other rounds, or start multiprocessing.
+- `round_task.py` is the coarse registration execution boundary and executes channels
+  serially. `fine_task.py` is the fine scientific worker boundary and executes
+  exactly one immutable stage per call. Both configure native threads before lazy
+  registration/scientific imports and must not create a Dask client, submit child
+  tasks, schedule other rounds, or start multiprocessing. The coordinator remains
+  the only scheduler owner.

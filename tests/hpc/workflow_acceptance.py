@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -686,6 +688,341 @@ def scientific_parity_evidence(
     )
 
 
+def _validated_scientific_comparison_evidence(
+    value: object,
+    *,
+    require_close: bool,
+    metric_absolute_tolerance: float,
+) -> dict[str, object]:
+    """Strictly decode the complete scientific-comparison evidence schema."""
+    import math
+
+    from cyexm.spatial import ImageGeometry
+
+    def exact_object(node: object, keys: set[str], location: str) -> dict[str, object]:
+        if not isinstance(node, dict) or set(node) != keys:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} has an invalid exact schema"
+            )
+        return cast(dict[str, object], node)
+
+    def finite_number(node: object, location: str) -> float:
+        if isinstance(node, bool) or not isinstance(node, int | float):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} is not a finite number"
+            )
+        number = float(node)
+        if not math.isfinite(number):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} is not finite"
+            )
+        return number
+
+    def numeric(
+        node: object, location: str, *, expected_shape: object | None = None
+    ) -> dict[str, object]:
+        payload = exact_object(
+            node,
+            {
+                "shape",
+                "reference_dtype",
+                "candidate_dtype",
+                "array_equal",
+                "close_required",
+                "maximum_absolute_difference",
+                "mean_absolute_difference",
+                "p99_9_absolute_difference",
+                "rtol",
+                "atol",
+            },
+            location,
+        )
+        shape = payload["shape"]
+        if (
+            not isinstance(shape, list)
+            or any(type(item) is not int or item < 1 for item in shape)
+            or (expected_shape is not None and shape != expected_shape)
+            or not isinstance(payload["reference_dtype"], str)
+            or not payload["reference_dtype"]
+            or payload["reference_dtype"] != payload["candidate_dtype"]
+            or type(payload["array_equal"]) is not bool
+            or payload["close_required"] is not require_close
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} shape/dtype contract changed"
+            )
+        for name in (
+            "maximum_absolute_difference",
+            "mean_absolute_difference",
+            "p99_9_absolute_difference",
+        ):
+            if finite_number(payload[name], f"{location}.{name}") < 0.0:
+                raise HpcWorkflowAcceptanceError(
+                    f"scientific comparison {location}.{name} is negative"
+                )
+        if require_close:
+            if (
+                payload["rtol"] != 0.0
+                or payload["atol"] != 0.0
+                or payload["array_equal"] is not True
+                or payload["maximum_absolute_difference"] != 0.0
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    f"scientific comparison {location} is not exactly equal"
+                )
+        elif payload["rtol"] != 1e-4 or payload["atol"] != 1e-5:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} tolerance changed"
+            )
+        return payload
+
+    def geometry(node: object, location: str) -> dict[str, object]:
+        payload = exact_object(
+            node, {"shape", "origin", "spacing", "direction"}, location
+        )
+        try:
+            ImageGeometry.from_dict(payload)
+        except (TypeError, ValueError) as error:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} is malformed"
+            ) from error
+        return payload
+
+    def tiff(node: object, location: str) -> None:
+        payload = exact_object(
+            node,
+            {"reference", "candidate", "dtype", "shape", "geometry", "numeric"},
+            location,
+        )
+        if (
+            not isinstance(payload["reference"], str)
+            or not payload["reference"]
+            or not isinstance(payload["candidate"], str)
+            or not payload["candidate"]
+            or not isinstance(payload["dtype"], str)
+            or not payload["dtype"]
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} artifact identity is malformed"
+            )
+        image_geometry = geometry(payload["geometry"], f"{location}.geometry")
+        if payload["shape"] != image_geometry["shape"]:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} shape differs from geometry"
+            )
+        comparison = numeric(
+            payload["numeric"], f"{location}.numeric", expected_shape=payload["shape"]
+        )
+        if comparison["reference_dtype"] != payload["dtype"]:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} dtype differs from numeric data"
+            )
+
+    expected_policy = (
+        "strict-deterministic-numeric-parity"
+        if require_close
+        else "stochastic-scientific-equivalence"
+    )
+    payload = exact_object(
+        value,
+        {
+            "schema_version",
+            "scientific_fingerprint",
+            "rtol",
+            "atol",
+            "comparison_policy",
+            "metric_absolute_tolerance",
+            "voxel_differences_are_characterization",
+            "rounds",
+        },
+        "root",
+    )
+    if (
+        payload["schema_version"] != 1
+        or not isinstance(payload["scientific_fingerprint"], str)
+        or not payload["scientific_fingerprint"]
+        or payload["comparison_policy"] != expected_policy
+        or payload["rtol"] != (0.0 if require_close else 1e-4)
+        or payload["atol"] != (0.0 if require_close else 1e-5)
+        or payload["metric_absolute_tolerance"] != metric_absolute_tolerance
+        or payload["voxel_differences_are_characterization"] is not (not require_close)
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "scientific comparison policy or tolerance contract changed"
+        )
+    rounds = payload["rounds"]
+    if not isinstance(rounds, list) or not rounds:
+        raise HpcWorkflowAcceptanceError(
+            "scientific comparison contains no round evidence"
+        )
+    observed_rounds: list[int] = []
+    for round_index, raw_round in enumerate(rounds):
+        location = f"rounds[{round_index}]"
+        round_payload = exact_object(
+            raw_round,
+            {
+                "round",
+                "strategy",
+                "affine",
+                "warp",
+                "registered",
+                "metrics",
+                "channels",
+            },
+            location,
+        )
+        round_number = round_payload["round"]
+        if (
+            type(round_number) is not int
+            or round_number < 1
+            or round_payload["strategy"] not in {"whole_image", "serial_chunked"}
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} identity is malformed"
+            )
+        observed_rounds.append(round_number)
+        affine = exact_object(
+            round_payload["affine"],
+            {"transform_type", "dimension", "fixed_parameters_exact", "parameters"},
+            f"{location}.affine",
+        )
+        if (
+            not isinstance(affine["transform_type"], str)
+            or not affine["transform_type"]
+            or affine["dimension"] != 3
+            or affine["fixed_parameters_exact"] is not True
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} affine metadata changed"
+            )
+        numeric(affine["parameters"], f"{location}.affine.parameters")
+        warp = exact_object(
+            round_payload["warp"], {"geometry", "numeric"}, f"{location}.warp"
+        )
+        warp_geometry = exact_object(
+            warp["geometry"],
+            {"shape", "origin", "spacing", "direction", "has_components"},
+            f"{location}.warp.geometry",
+        )
+        if (
+            not isinstance(warp_geometry["shape"], list)
+            or any(
+                type(item) is not int or item < 1
+                for item in cast(list[object], warp_geometry["shape"])
+            )
+            or warp_geometry["has_components"] is not True
+        ):
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} warp geometry changed"
+            )
+        geometry(
+            {
+                name: warp_geometry[name]
+                for name in ("shape", "origin", "spacing", "direction")
+            },
+            f"{location}.warp.geometry",
+        )
+        numeric(warp["numeric"], f"{location}.warp.numeric")
+        tiff(round_payload["registered"], f"{location}.registered")
+        metrics = exact_object(
+            round_payload["metrics"],
+            {"pre-registration", "linearly-registered", "nonlinear-registered"},
+            f"{location}.metrics",
+        )
+        stage_values: dict[str, tuple[dict[str, float], dict[str, float]]] = {}
+        for stage, raw_metric in metrics.items():
+            metric = exact_object(
+                raw_metric,
+                {
+                    "reference",
+                    "candidate",
+                    "absolute_differences",
+                    "absolute_tolerance",
+                },
+                f"{location}.metrics.{stage}",
+            )
+            reference = exact_object(
+                metric["reference"],
+                {"Correlation", "MattesMutualInformation"},
+                f"{location}.metrics.{stage}.reference",
+            )
+            candidate = exact_object(
+                metric["candidate"],
+                {"Correlation", "MattesMutualInformation"},
+                f"{location}.metrics.{stage}.candidate",
+            )
+            differences = exact_object(
+                metric["absolute_differences"],
+                {"Correlation", "MattesMutualInformation"},
+                f"{location}.metrics.{stage}.absolute_differences",
+            )
+            if metric["absolute_tolerance"] != metric_absolute_tolerance:
+                raise HpcWorkflowAcceptanceError(
+                    f"scientific comparison {location} metric tolerance changed"
+                )
+            reference_numbers: dict[str, float] = {}
+            candidate_numbers: dict[str, float] = {}
+            for name in ("Correlation", "MattesMutualInformation"):
+                reference_numbers[name] = finite_number(
+                    reference[name], f"{location}.{stage}.reference.{name}"
+                )
+                candidate_numbers[name] = finite_number(
+                    candidate[name], f"{location}.{stage}.candidate.{name}"
+                )
+                observed_difference = finite_number(
+                    differences[name], f"{location}.{stage}.difference.{name}"
+                )
+                if (
+                    abs(
+                        observed_difference
+                        - abs(candidate_numbers[name] - reference_numbers[name])
+                    )
+                    > 1e-12
+                    or observed_difference > metric_absolute_tolerance
+                ):
+                    raise HpcWorkflowAcceptanceError(
+                        f"scientific comparison {location} metric evidence is forged"
+                    )
+            stage_values[stage] = (reference_numbers, candidate_numbers)
+        for execution_index in (0, 1):
+            for name in ("Correlation", "MattesMutualInformation"):
+                if (
+                    stage_values["nonlinear-registered"][execution_index][name]
+                    < stage_values["pre-registration"][execution_index][name]
+                ):
+                    raise HpcWorkflowAcceptanceError(
+                        f"scientific comparison {location} nonlinear metric degraded"
+                    )
+        channels = round_payload["channels"]
+        if not isinstance(channels, list) or not channels:
+            raise HpcWorkflowAcceptanceError(
+                f"scientific comparison {location} contains no channels"
+            )
+        for channel_index, raw_channel in enumerate(channels):
+            channel = exact_object(
+                raw_channel,
+                {"source", "interpolation", "comparison"},
+                f"{location}.channels[{channel_index}]",
+            )
+            if (
+                not isinstance(channel["source"], str)
+                or not channel["source"]
+                or channel["interpolation"] not in {"linear", "nearest"}
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    f"scientific comparison {location} channel contract changed"
+                )
+            tiff(
+                channel["comparison"],
+                f"{location}.channels[{channel_index}].comparison",
+            )
+    if observed_rounds != sorted(set(observed_rounds)):
+        raise HpcWorkflowAcceptanceError(
+            "scientific comparison rounds are duplicate or noncanonical"
+        )
+    return payload
+
+
 def bounded_slurm_profile(
     profile: ExecutionProfile,
     output_root: Path,
@@ -918,7 +1255,11 @@ def _write_text_evidence(path: Path, value: str) -> None:
     atomic_write(path, writer, validator)
 
 
-def _validated_deterministic_parity_evidence(value: object) -> dict[str, object]:
+def _validated_deterministic_parity_evidence(
+    value: object,
+    *,
+    require_fine_internal: bool = False,
+) -> dict[str, object]:
     expected_keys = {
         "schema_version",
         "status",
@@ -930,6 +1271,8 @@ def _validated_deterministic_parity_evidence(value: object) -> dict[str, object]
         "strict_parity",
         "final_queue",
     }
+    if require_fine_internal:
+        expected_keys.add("strict_internal_parity")
     if not isinstance(value, dict) or set(value) != expected_keys:
         raise HpcWorkflowAcceptanceError(
             "deterministic parity evidence has an invalid exact schema"
@@ -1049,12 +1392,80 @@ def _validated_deterministic_parity_evidence(value: object) -> dict[str, object]
                 numeric,
                 f"round {round_index} channel {channel_index}",
             )
+    if require_fine_internal:
+        internal = value.get("strict_internal_parity")
+        if (
+            not isinstance(internal, Mapping)
+            or set(internal)
+            != {
+                "schema_version",
+                "local_warp_exact",
+                "diagnostic_exact",
+                "rounds",
+            }
+            or internal.get("schema_version") != 1
+            or internal.get("local_warp_exact") is not True
+            or internal.get("diagnostic_exact") is not True
+        ):
+            raise HpcWorkflowAcceptanceError(
+                "deterministic fine internal parity schema or summary is invalid"
+            )
+        internal_rounds = internal.get("rounds")
+        if not isinstance(internal_rounds, list) or not internal_rounds:
+            raise HpcWorkflowAcceptanceError(
+                "deterministic fine internal parity contains no chunk rounds"
+            )
+        seen_rounds: list[int] = []
+        for round_evidence in internal_rounds:
+            if (
+                not isinstance(round_evidence, Mapping)
+                or set(round_evidence) != {"round", "local_warps", "diagnostics"}
+                or type(round_evidence.get("round")) is not int
+            ):
+                raise HpcWorkflowAcceptanceError(
+                    "deterministic fine internal round evidence is malformed"
+                )
+            seen_rounds.append(cast(int, round_evidence["round"]))
+            for role in ("local_warps", "diagnostics"):
+                artifacts = round_evidence.get(role)
+                if not isinstance(artifacts, list) or not artifacts:
+                    raise HpcWorkflowAcceptanceError(
+                        f"deterministic fine internal {role} evidence is empty"
+                    )
+                names: list[str] = []
+                for artifact in artifacts:
+                    if (
+                        not isinstance(artifact, Mapping)
+                        or set(artifact) != {"name", "shape", "dtype", "exact"}
+                        or type(artifact.get("name")) is not str
+                        or type(artifact.get("dtype")) is not str
+                        or not isinstance(artifact.get("shape"), list)
+                        or not artifact["shape"]
+                        or any(
+                            type(item) is not int or item < 1
+                            for item in cast(list[object], artifact["shape"])
+                        )
+                        or artifact.get("exact") is not True
+                    ):
+                        raise HpcWorkflowAcceptanceError(
+                            f"deterministic fine internal {role} artifact is malformed"
+                        )
+                    names.append(cast(str, artifact["name"]))
+                if names != sorted(set(names)):
+                    raise HpcWorkflowAcceptanceError(
+                        f"deterministic fine internal {role} names are noncanonical"
+                    )
+        if seen_rounds != sorted(set(seen_rounds)):
+            raise HpcWorkflowAcceptanceError(
+                "deterministic fine internal rounds are noncanonical"
+            )
     return cast(dict[str, object], value)
 
 
 def execute_deterministic_parity_subprocess(
     *,
     execution_path: Path,
+    fine_execution_path: Path | None = None,
     owned_root: Path,
     evidence_dir: Path,
     timeout_seconds: float,
@@ -1069,6 +1480,10 @@ def execute_deterministic_parity_subprocess(
     if not execution_path.is_file():
         raise HpcWorkflowAcceptanceError(
             f"deterministic parity execution profile is not a file: {execution_path}"
+        )
+    if fine_execution_path is not None and not fine_execution_path.is_file():
+        raise HpcWorkflowAcceptanceError(
+            f"deterministic fine execution profile is not a file: {fine_execution_path}"
         )
     if owned_root.is_symlink() or not owned_root.is_dir():
         raise HpcWorkflowAcceptanceError(
@@ -1089,6 +1504,11 @@ def execute_deterministic_parity_subprocess(
         "hpc.deterministic_parity",
         "--execution",
         str(execution_path),
+        *(
+            ()
+            if fine_execution_path is None
+            else ("--fine-execution", str(fine_execution_path))
+        ),
         "--owned-root",
         str(owned_root),
         "--evidence",
@@ -1144,7 +1564,10 @@ def execute_deterministic_parity_subprocess(
         raise HpcWorkflowAcceptanceError(
             "deterministic parity subprocess did not write valid evidence"
         ) from error
-    return _validated_deterministic_parity_evidence(evidence)
+    return _validated_deterministic_parity_evidence(
+        evidence,
+        require_fine_internal=fine_execution_path is not None,
+    )
 
 
 @contextmanager
@@ -1299,7 +1722,346 @@ def _production_round_task(task: RoundTask) -> RoundResult:
 def _production_workflow_task(task: WorkflowTask) -> RoundResult:
     from cyexm.workflow.task import run_workflow_task
 
-    return run_workflow_task(task)
+    return cast(RoundResult, run_workflow_task(task))
+
+
+def _production_fine_task(task: Any) -> Any:
+    from cyexm.workflow.fine_task import run_fine_task
+
+    return run_fine_task(task)
+
+
+def _profiled_task_call(
+    task: Any,
+    *,
+    timing_root: Path,
+    key: str,
+    operation: Callable[[Any], Any],
+) -> Any:
+    import resource
+
+    from cyexm.registration.backend import AntsRegistrationBackend
+
+    nonlinear_calls: list[dict[str, object]] = []
+    original = AntsRegistrationBackend.nonlinear
+
+    def timed_nonlinear(self: Any, **kwargs: object) -> tuple[object, Path]:
+        started_at = _utc_now()
+        started = time.monotonic()
+        try:
+            return original(self, **kwargs)
+        finally:
+            ended = time.monotonic()
+            nonlinear_calls.append(
+                {
+                    "started_at": started_at,
+                    "ended_at": _utc_now(),
+                    "duration_seconds": float(max(0.0, ended - started)),
+                    "monotonic_started_seconds": float(started),
+                    "monotonic_ended_seconds": float(ended),
+                }
+            )
+
+    started_at = _utc_now()
+    started = time.monotonic()
+    status = "completed"
+    AntsRegistrationBackend.nonlinear = timed_nonlinear
+    try:
+        return operation(task)
+    except BaseException:
+        status = "failed"
+        raise
+    finally:
+        AntsRegistrationBackend.nonlinear = original
+        peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_memory_bytes = int(peak_rss * 1024)
+        _write_marker(
+            timing_root / f"{key.replace(':', '-')}.json",
+            {
+                "schema_version": 1,
+                "task_key": key,
+                "status": status,
+                "started_at": started_at,
+                "ended_at": _utc_now(),
+                "duration_seconds": float(max(0.0, time.monotonic() - started)),
+                "peak_memory_bytes": peak_memory_bytes,
+                "nonlinear_calls": nonlinear_calls,
+            },
+        )
+
+
+def run_profiled_workflow_task(
+    task: WorkflowTask,
+    *,
+    timing_root: Path,
+    _run_workflow_task: Callable[
+        [WorkflowTask], RoundResult
+    ] = _production_workflow_task,
+) -> RoundResult:
+    """Run one coarse task with acceptance-only kernel timing and peak RSS."""
+    key = (
+        f"round-{task.round:03d}:reference:main"
+        if type(task) is ReferenceTask
+        else f"round-{task.round:03d}:coarse:main"
+    )
+    return cast(
+        RoundResult,
+        _profiled_task_call(
+            task,
+            timing_root=timing_root,
+            key=key,
+            operation=_run_workflow_task,
+        ),
+    )
+
+
+def run_profiled_fine_task(
+    task: Any,
+    *,
+    timing_root: Path,
+    _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+) -> Any:
+    """Run one fine task with acceptance-only kernel timing and peak RSS."""
+    key = getattr(getattr(task, "key", None), "encoded", None)
+    if type(key) is not str:
+        raise HpcWorkflowAcceptanceError(
+            "profiled fine task lacks an exact task identity"
+        )
+    return _profiled_task_call(
+        task,
+        timing_root=timing_root,
+        key=key,
+        operation=_run_fine_task,
+    )
+
+
+def run_injected_fine_failure_task(
+    task: Any,
+    *,
+    target_key: str,
+    peer_key: str,
+    failure_marker: Path,
+    settled_marker: Path,
+    timeout_seconds: float = 1_800.0,
+    _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+) -> Any:
+    """Inject one exact-key failure once after one exact peer durably settles."""
+    from cyexm.workflow.fine_models import FineTaskKey
+
+    target = FineTaskKey.from_encoded(target_key)
+    peer = FineTaskKey.from_encoded(peer_key)
+    if target == peer or target.stage not in {"chunk", "channel"}:
+        raise HpcWorkflowAcceptanceError("fine failure keys must be distinct peers")
+    key = getattr(task, "key", None)
+    encoded = getattr(key, "encoded", None)
+    is_target = encoded == target_key
+    if is_target:
+        if failure_marker.exists():
+            return _run_fine_task(task)
+        if not settled_marker.is_file():
+            deadline = time.monotonic() + timeout_seconds
+            while not settled_marker.is_file():
+                if time.monotonic() >= deadline:
+                    raise HpcWorkflowAcceptanceError(
+                        "fine failure injection timed out waiting for a settled sibling"
+                    )
+                time.sleep(0.25)
+        peer_record = json.loads(settled_marker.read_text(encoding="utf-8"))
+        if (
+            not isinstance(peer_record, dict)
+            or peer_record.get("task_key") != peer_key
+            or peer_record.get("status") not in {"completed", "reused"}
+            or not peer_record.get("artifacts")
+        ):
+            raise HpcWorkflowAcceptanceError(
+                "fine failure settled-peer marker is not exact committed evidence"
+            )
+        _write_marker(
+            failure_marker,
+            {
+                "schema_version": 1,
+                "task_key": target_key,
+                "settled_peer_key": peer_key,
+                "status": "injected",
+                "injected_at": _utc_now(),
+            },
+        )
+        raise RuntimeError(f"injected fine acceptance failure for {target_key}")
+    result = _run_fine_task(task)
+    if encoded == peer_key and getattr(result, "status", None) in {
+        "completed",
+        "reused",
+    }:
+        _write_fine_peer_commit(settled_marker, peer_key, result)
+    return result
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_fine_peer_commit(path: Path, peer_key: str, result: Any) -> None:
+    artifacts = []
+    for raw in getattr(result, "artifact_paths", ()):
+        artifact = Path(raw).resolve(strict=True)
+        if not artifact.is_file():
+            raise HpcWorkflowAcceptanceError(
+                "fine committed peer artifact is not a real file"
+            )
+        artifacts.append(
+            {
+                "identity": FileIdentity.from_path(artifact).to_dict(),
+                "sha256": _file_digest(artifact),
+            }
+        )
+    if not artifacts:
+        raise HpcWorkflowAcceptanceError(
+            "fine committed peer must persist at least one artifact"
+        )
+    _write_marker(
+        path,
+        {
+            "schema_version": 1,
+            "task_key": peer_key,
+            "status": getattr(result, "status", None),
+            "artifacts": artifacts,
+            "committed_at": _utc_now(),
+        },
+    )
+
+
+def run_fine_cancellation_task(
+    task: Any,
+    *,
+    target_key: str,
+    peer_key: str,
+    committed_marker: Path,
+    ready_marker: Path,
+    timeout_seconds: float,
+    _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+    _monotonic: Callable[[], float] = time.monotonic,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    """Commit one exact peer, then block one distinct exact task for cancellation."""
+    from cyexm.workflow.fine_models import FineTaskKey
+
+    target = FineTaskKey.from_encoded(target_key)
+    peer = FineTaskKey.from_encoded(peer_key)
+    if (
+        target == peer
+        or target.round == peer.round
+        or target.stage not in {"chunk", "channel"}
+        or peer.stage != target.stage
+        or timeout_seconds <= 0.0
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine cancellation requires distinct cross-round exact peer keys"
+        )
+    key = getattr(task, "key", None)
+    encoded = getattr(key, "encoded", None)
+    if encoded == peer_key:
+        result = _run_fine_task(task)
+        if getattr(result, "status", None) not in {"completed", "reused"}:
+            raise HpcWorkflowAcceptanceError(
+                "fine cancellation peer did not commit successfully"
+            )
+        _write_fine_peer_commit(committed_marker, peer_key, result)
+        return result
+    if encoded != target_key:
+        return _run_fine_task(task)
+    deadline = _monotonic() + timeout_seconds
+    while not committed_marker.is_file():
+        if _monotonic() >= deadline:
+            raise HpcWorkflowAcceptanceError(
+                "fine cancellation timed out waiting for committed exact peer"
+            )
+        _sleep(0.25)
+    committed = json.loads(committed_marker.read_text(encoding="utf-8"))
+    if (
+        not isinstance(committed, dict)
+        or committed.get("task_key") != peer_key
+        or committed.get("status") not in {"completed", "reused"}
+        or not committed.get("artifacts")
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine cancellation peer marker lacks committed artifact evidence"
+        )
+    _write_marker(
+        ready_marker,
+        {
+            "blocked_task_key": target_key,
+            "committed_peer_key": peer_key,
+            "status": "waiting-for-coordinator-interruption",
+        },
+    )
+    while _monotonic() < deadline:
+        _sleep(min(0.25, max(0.0, deadline - _monotonic())))
+    raise HpcWorkflowAcceptanceError(
+        f"fine cancellation task {encoded} exceeded its bounded wait"
+    )
+
+
+def run_fine_worker_loss_task(
+    task: Any,
+    *,
+    target_key: str,
+    loss_marker: Path,
+    _run_fine_task: Callable[[Any], Any] = _production_fine_task,
+    _worker_identity: Callable[[], dict[str, object]] | None = None,
+    _utc_now: Callable[[], str] = _utc_now,
+    _exit: Callable[[int], Any] = os._exit,
+) -> Any:
+    """Terminate one worker exactly once, then let the replacement retry succeed."""
+    from cyexm.workflow.fine_models import FineTaskKey
+
+    target = FineTaskKey.from_encoded(target_key)
+    if target.stage not in {"chunk", "channel"}:
+        raise HpcWorkflowAcceptanceError(
+            "fine worker-loss stage must be chunk or channel"
+        )
+    key = getattr(task, "key", None)
+    if getattr(key, "encoded", None) != target_key or loss_marker.exists():
+        return _run_fine_task(task)
+
+    def production_identity() -> dict[str, object]:
+        from distributed import get_worker
+
+        return {
+            "worker_address": get_worker().address,
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        }
+
+    identity = (_worker_identity or production_identity)()
+    if (
+        set(identity) != {"worker_address", "hostname", "pid", "slurm_job_id"}
+        or any(
+            type(identity[name]) is not str or not identity[name]
+            for name in ("worker_address", "hostname", "slurm_job_id")
+        )
+        or type(identity["pid"]) is not int
+        or cast(int, identity["pid"]) < 1
+    ):
+        raise HpcWorkflowAcceptanceError(
+            "fine worker-loss marker requires one exact worker identity"
+        )
+    _write_marker(
+        loss_marker,
+        {
+            "schema_version": 1,
+            "task_key": target_key,
+            **identity,
+            "status": "worker-loss-injected",
+            "injected_at": _utc_now(),
+        },
+    )
+    _exit(75)
+    raise AssertionError("worker-loss exit unexpectedly returned")
 
 
 def run_seeded_workflow_task(
@@ -1530,7 +2292,10 @@ def execute_cancellation_acceptance(
     ready_marker: Path,
     successful_round: int,
     blocked_round: int,
+    committed_peer_key: str | None = None,
+    blocked_task_key: str | None = None,
     timeout_seconds: float,
+    fine_runner: Callable[[Any], Any] | None = None,
     _execute_owned: Callable[..., Any] | None = None,
     _send_signal: Callable[[int, int], None] = os.kill,
     _monotonic: Callable[[], float] = time.monotonic,
@@ -1542,9 +2307,23 @@ def execute_cancellation_acceptance(
             "cancellation timeout must be positive and bounded"
         )
     stopped = threading.Event()
+    if (committed_peer_key is None) != (blocked_task_key is None):
+        raise HpcWorkflowAcceptanceError(
+            "exact cancellation task keys must be supplied together"
+        )
+    exact_keys = committed_peer_key is not None and blocked_task_key is not None
     trigger: dict[str, object] = {
-        "blocked_round": blocked_round,
-        "committed_round": successful_round,
+        **(
+            {
+                "blocked_task_key": blocked_task_key,
+                "committed_peer_key": committed_peer_key,
+            }
+            if exact_keys
+            else {
+                "blocked_round": blocked_round,
+                "committed_round": successful_round,
+            }
+        ),
         "signal": "SIGINT",
         "status": "waiting",
         "timeout_seconds": timeout_seconds,
@@ -1561,8 +2340,17 @@ def execute_cancellation_acceptance(
                     trigger["error"] = _error_payload(error)
                     return
                 expected = {
-                    "blocked_round": blocked_round,
-                    "committed_round": successful_round,
+                    **(
+                        {
+                            "blocked_task_key": blocked_task_key,
+                            "committed_peer_key": committed_peer_key,
+                        }
+                        if exact_keys
+                        else {
+                            "blocked_round": blocked_round,
+                            "committed_round": successful_round,
+                        }
+                    ),
                     "status": "waiting-for-coordinator-interruption",
                 }
                 if payload != expected:
@@ -1610,6 +2398,7 @@ def execute_cancellation_acceptance(
                 evidence_dir=evidence_dir,
                 operation=operation,
                 user=user,
+                fine_runner=fine_runner,
             )
         except KeyboardInterrupt:
             exit_code = 130
@@ -1647,6 +2436,7 @@ def execute_owned_slurm_workflow(
     evidence_dir: Path,
     operation: str,
     user: str,
+    fine_runner: Callable[[Any], Any] | None = None,
     _executor_ctor: Callable[..., Any] = SlurmExecutor,
     _run_workflow: Callable[..., Any] = run_workflow,
     _collect_queue: Callable[..., dict[str, object]] = collect_queue_snapshot,
@@ -1672,7 +2462,10 @@ def execute_owned_slurm_workflow(
             f"the approved harness name {spec.job_name!r}"
         )
 
-    executor = _executor_ctor(plan.execution, _runner=runner)
+    executor_kwargs: dict[str, object] = {"_runner": runner}
+    if fine_runner is not None:
+        executor_kwargs["_fine_runner"] = fine_runner
+    executor = _executor_ctor(plan.execution, **executor_kwargs)
     result: Any = None
     execution_error: BaseException | None = None
     try:
@@ -1745,6 +2538,11 @@ __all__ = [
     "prepare_task5_output_roots",
     "run_cancellation_task",
     "run_failure_task",
+    "run_fine_cancellation_task",
+    "run_fine_worker_loss_task",
+    "run_injected_fine_failure_task",
+    "run_profiled_fine_task",
+    "run_profiled_workflow_task",
     "run_seeded_workflow_task",
     "scientific_equivalence_evidence",
     "scientific_parity_evidence",

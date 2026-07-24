@@ -17,12 +17,22 @@ from cyexm.config.models import (
     LocalDaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
+    ParallelismSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
 from cyexm.errors import ExecutorStartupError, RoundExecutionError
 from cyexm.execution import dask as dask_module
+from cyexm.execution._dask_common import collect_distributed_fine_results
 from cyexm.execution.dask import LocalDaskExecutor
+from cyexm.execution.dispatcher import FineGraphController
+from cyexm.runtime import NATIVE_THREAD_ENV_VARS
+from cyexm.workflow._execution_validation import _FineExecutionEvidence
+from cyexm.workflow.fine_models import (
+    FineTaskResult,
+    FineWorkflowTask,
+    RoundPreparationTask,
+)
 from cyexm.workflow.models import (
     ChannelTask,
     ReferenceChannelTask,
@@ -69,6 +79,7 @@ def _profile(
     *,
     workers: int = 4,
     retries: int = 0,
+    mode: str = "coarse",
 ) -> ExecutionProfile:
     return ExecutionProfile(
         schema_version=1,
@@ -89,6 +100,7 @@ def _profile(
         ),
         slurm=None,
         source_path=tmp_path / "execution.yaml",
+        parallelism=ParallelismSpec(mode=mode),  # type: ignore[arg-type]
     )
 
 
@@ -145,6 +157,51 @@ def _reference_task(tmp_path: Path) -> ReferenceTask:
         native_threads=NativeThreadSpec(itk=2, blas=3),
         channels=(ReferenceChannelTask(source=source, output=output),),
     )
+
+
+def _chunked_task(tmp_path: Path, round_number: int) -> RoundTask:
+    return replace(
+        _task(tmp_path, round_number),
+        strategy="serial_chunked",
+        chunk_size_zyx=(2, 8, 8),
+        overlap_fraction=0.25,
+    )
+
+
+def _prepared_descriptor() -> dict[str, object]:
+    identity = {"path": "/tmp/item", "st_size": 1, "st_mtime_ns": 2}
+    return {
+        "format_version": 2,
+        "fixed_scalar": identity,
+        "moving_linear_scalar": identity,
+        "fixed_mask": identity,
+        "moving_linear_mask": identity,
+        "native_fixed": identity,
+        "native_moving": identity,
+        "moving_crop": None,
+        "affine": identity,
+        "geometry": {
+            "shape": [4, 8, 8],
+            "origin": [0.0, 0.0, 0.0],
+            "spacing": [1.0, 1.0, 1.0],
+            "direction": [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        },
+        "scalar_policy": "float32-preserve-registration-values-v1",
+        "mask_policy": (
+            "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
+        ),
+        "native_threads": {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 2},
+        "pixeltypes": {
+            "fixed_mask": "float",
+            "fixed_scalar": "float",
+            "moving_linear_mask": "float",
+            "moving_linear_scalar": "float",
+        },
+    }
 
 
 def _result(task: RoundTask, *, status: str = "completed") -> RoundResult:
@@ -208,9 +265,57 @@ def _workflow_result(task: WorkflowTask) -> RoundResult:
     return _reference_result(task) if isinstance(task, ReferenceTask) else _result(task)
 
 
+def _fine_result(
+    task: FineWorkflowTask,
+    *,
+    status: str = "completed",
+    dask_task_key: str | None = "AUTO",
+) -> FineTaskResult:
+    failure = (
+        RoundFailure(task.key.stage, "RuntimeError", "injected failed result")
+        if status == "failed"
+        else None
+    )
+    return FineTaskResult(
+        task=task,
+        status=status,  # type: ignore[arg-type]
+        started_at="2026-07-20T10:00:00Z",
+        ended_at="2026-07-20T10:00:01Z",
+        duration_seconds=1.0,
+        hostname="worker-01",
+        pid=123,
+        dask_task_key=dask_task_key,
+        slurm_job_id=None,
+        native_threads=tuple(
+            (
+                name,
+                (
+                    task.native_threads.itk
+                    if name == NATIVE_THREAD_ENV_VARS[0]
+                    else task.native_threads.blas
+                ),
+            )
+            for name in NATIVE_THREAD_ENV_VARS
+        ),
+        artifact_paths=(
+            tuple(str(path) for path in task.output_paths)
+            if status in {"completed", "reused"}
+            else ()
+        ),
+        reused_artifacts=(),
+        log_path=str(task.log_path),
+        failure=failure,
+        prepared_descriptor=(
+            _prepared_descriptor()
+            if type(task) is RoundPreparationTask and status in {"completed", "reused"}
+            else None
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class _SubmitCall:
-    task: WorkflowTask
+    task: WorkflowTask | FineWorkflowTask
     key: str
     pure: bool
     retries: int
@@ -220,7 +325,7 @@ class _SubmitCall:
 class _FakeFuture:
     def __init__(
         self,
-        task: WorkflowTask,
+        task: WorkflowTask | FineWorkflowTask,
         key: str,
         outcome: object,
         *,
@@ -240,6 +345,8 @@ class _FakeAsCompleted(Iterator[tuple[_FakeFuture, object]]):
         self,
         modules: _FakeDistributedModules,
         futures: list[_FakeFuture],
+        *,
+        interrupt_after: int | None,
     ) -> None:
         self._modules = modules
         order = {
@@ -250,16 +357,14 @@ class _FakeAsCompleted(Iterator[tuple[_FakeFuture, object]]):
             key=lambda future: order.get(future.task.round, len(order)),
         )
         self._yielded = 0
+        self._interrupt_after = interrupt_after
 
     def __iter__(self) -> _FakeAsCompleted:
         return self
 
     def __next__(self) -> tuple[_FakeFuture, object]:
-        if (
-            self._modules.interrupt_after is not None
-            and self._yielded == self._modules.interrupt_after
-        ):
-            self._modules.interrupt_after = None
+        if self._interrupt_after is not None and self._yielded == self._interrupt_after:
+            self._interrupt_after = None
             raise KeyboardInterrupt("injected collection interruption")
         if not self._queue:
             raise StopIteration
@@ -294,8 +399,8 @@ class _FakeClient:
 
     def submit(
         self,
-        runner: Callable[[WorkflowTask], RoundResult],
-        task: WorkflowTask,
+        runner: Callable[..., object],
+        task: WorkflowTask | FineWorkflowTask,
         *,
         key: str,
         pure: bool,
@@ -309,8 +414,17 @@ class _FakeClient:
         self._modules.submit_calls.append(
             _SubmitCall(task, key, pure, retries, resources)
         )
-        configured = self._modules.outcomes.setdefault(task.round, [])
-        outcome = configured.pop(0) if configured else _workflow_result(task)
+        identity = task.key.encoded if hasattr(task, "key") else task.round
+        configured = self._modules.outcomes.setdefault(identity, [])
+        outcome = (
+            configured.pop(0)
+            if configured
+            else (
+                _fine_result(task) if hasattr(task, "key") else _workflow_result(task)
+            )
+        )
+        if type(outcome) is FineTaskResult and outcome.dask_task_key == "AUTO":
+            outcome = replace(outcome, dask_task_key=key)
         return _FakeFuture(
             task,
             key,
@@ -336,12 +450,14 @@ class _FakeDistributedModules:
         self.client_timeout: str | None = None
         self.wait_call: tuple[int, float] | None = None
         self.as_completed_call: tuple[bool, bool] | None = None
+        self.as_completed_initial_counts: list[int] = []
         self.submit_calls: list[_SubmitCall] = []
         self.events: list[str] = []
         self.cancel_call: tuple[tuple[_FakeFuture, ...], bool] | None = None
-        self.outcomes: dict[int, list[object]] = {}
+        self.outcomes: dict[int | str, list[object]] = {}
         self.order: tuple[int, ...] = ()
         self.interrupt_after: int | None = None
+        self.interrupt_as_completed_call: int | None = None
         self.cluster_error: Exception | None = None
         self.client_error: Exception | None = None
         self.wait_error: Exception | None = None
@@ -409,7 +525,18 @@ class _FakeDistributedModules:
         raise_errors: bool,
     ) -> _FakeAsCompleted:
         self.as_completed_call = (with_results, raise_errors)
-        return _FakeAsCompleted(self, futures)
+        self.as_completed_initial_counts.append(len(futures))
+        call_number = len(self.as_completed_initial_counts)
+        interrupt_after = (
+            self.interrupt_after
+            if self.interrupt_as_completed_call in {None, call_number}
+            else None
+        )
+        return _FakeAsCompleted(
+            self,
+            futures,
+            interrupt_after=interrupt_after,
+        )
 
     def parse_timedelta(self, value: str) -> float:
         assert value == "30s"
@@ -441,6 +568,532 @@ def test_local_executor_uses_one_round_slot_per_bounded_worker(tmp_path: Path) -
         {"round_slot": 1},
     ]
     assert tuple(result.round for result in results) == (1, 2, 3)
+
+
+def test_fine_local_executor_starts_exact_configured_workers_and_expands_on_coordinator(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+
+    results = LocalDaskExecutor(
+        _profile(tmp_path, workers=3, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (task,))
+
+    assert modules.cluster_kwargs is not None
+    assert modules.cluster_kwargs["n_workers"] == 3
+    assert modules.wait_call == (3, 30.0)
+    assert [call.task.round for call in modules.submit_calls] == [1, 2, 2, 2]
+    fine_calls = modules.submit_calls[1:]
+    assert [call.task.key.stage for call in fine_calls] == [  # type: ignore[union-attr]
+        "whole-image",
+        "channel",
+        "validation",
+    ]
+    assert [call.key for call in fine_calls] == [
+        "cyexm-round-002-whole-image-main",
+        "cyexm-round-002-channel-0000",
+        "cyexm-round-002-validation-main",
+    ]
+    assert all(call.resources == {"round_slot": 1} for call in fine_calls)
+    assert all(call.pure is False and call.retries == 0 for call in fine_calls)
+    assert tuple(result.round for result in results) == (1, 2)
+    assert results[1].status == "completed"
+
+
+def test_fine_collector_queries_scheduler_neutral_capacity_after_each_transition(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    controller = FineGraphController((_task(tmp_path, 2), _task(tmp_path, 3)))
+    client = _FakeClient(modules)
+    observations: list[tuple[int, int]] = []
+
+    def capacity_provider(graph: FineGraphController, running: int) -> int:
+        observations.append((running, graph.ready_count))
+        return 2
+
+    results, task_results, _attempts = collect_distributed_fine_results(
+        controller,
+        runner=_fine_result,
+        client=client,
+        as_completed=modules.as_completed,
+        task_retries=0,
+        capacity=4,
+        active=set(),
+        capacity_provider=capacity_provider,
+    )
+
+    assert tuple(result.round for result in results) == (2, 3)
+    assert task_results
+    assert observations[0] == (0, 2)
+    assert len(observations) == len(task_results) + 1
+    assert all(running <= 2 and ready >= 0 for running, ready in observations)
+
+
+def test_fine_local_executor_retries_exact_task_without_recording_intermediate_failure(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+    key = "round-002:whole-image:main"
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    fine_task = initial_fine_tasks((task,))[0]
+    modules.outcomes[key] = [
+        _fine_result(fine_task, status="failed"),
+        _fine_result(fine_task),
+    ]
+
+    results = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, retries=1, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (task,))
+
+    assert results[1].status == "completed"
+    assert [call.key for call in modules.submit_calls[1:3]] == [
+        "cyexm-round-002-whole-image-main",
+        "cyexm-round-002-whole-image-main-attempt-002",
+    ]
+
+
+def test_fine_local_executor_bounds_initial_work_and_settles_independent_sibling(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    first = _task(tmp_path, 2)
+    second = _task(tmp_path, 3)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    failed = initial_fine_tasks((first,))[0]
+    modules.outcomes[failed.key.encoded] = [_fine_result(failed, status="failed")]
+
+    reference, first_result, second_result = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (first, second))
+
+    assert modules.as_completed_initial_counts == [1, 2]
+    assert [call.task.round for call in modules.submit_calls[1:3]] == [2, 3]
+    assert first_result.status == "failed"
+    assert second_result.status == "completed"
+    assert reference.status == "completed"
+    assert not any(
+        hasattr(call.task, "key")
+        and call.task.round == 2
+        and call.task.key.stage == "channel"
+        for call in modules.submit_calls
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        RuntimeError("raised by worker"),
+        (RuntimeError, "not an exception", None),
+        object(),
+    ],
+)
+def test_fine_local_executor_structures_worker_and_malformed_failures(
+    tmp_path: Path,
+    outcome: object,
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    initial = initial_fine_tasks((task,))[0]
+    modules.outcomes[initial.key.encoded] = [outcome]
+
+    result = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (task,))[1]
+
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "whole-image"
+
+
+def test_fine_local_executor_converts_mismatched_exact_result_to_submitted_task(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    submitted_round = _task(tmp_path, 2)
+    other_round = _task(tmp_path, 3)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    submitted = initial_fine_tasks((submitted_round,))[0]
+    mismatched = initial_fine_tasks((other_round,))[0]
+    modules.outcomes[submitted.key.encoded] = [_fine_result(mismatched)]
+
+    result = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (submitted_round,))[1]
+
+    assert result.round == 2
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "whole-image"
+    assert result.failure.exception_type == "RoundExecutionError"
+    assert "does not match the submitted task" in result.failure.message
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        lambda value: replace(value, dask_task_key=None),
+        lambda value: replace(value, dask_task_key="cyexm-wrong-attempt-999"),
+        lambda value: replace(
+            value,
+            native_threads=(("itk", 2), ("blas", 3)),
+        ),
+        lambda value: replace(
+            value,
+            native_threads=tuple(reversed(value.native_threads)),
+        ),
+        lambda value: replace(
+            value,
+            native_threads=(
+                *value.native_threads[:-1],
+                (value.native_threads[-1][0], 999),
+            ),
+        ),
+        lambda value: replace(value, started_at="not-a-timestamp"),
+        lambda value: replace(value, started_at="2026-07-20T10:00:00"),
+        lambda value: replace(
+            value,
+            started_at="2026-07-20T10:00:02Z",
+            ended_at="2026-07-20T10:00:01Z",
+        ),
+        lambda value: replace(
+            value,
+            dask_task_key="cyexm-wrong-attempt-999",
+            native_threads=(("itk", 999), ("blas", 999)),
+            started_at="not-a-timestamp",
+        ),
+    ],
+)
+def test_fine_local_executor_rejects_matching_task_with_malformed_evidence(
+    tmp_path: Path,
+    malformed: Callable[[FineTaskResult], FineTaskResult],
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    initial = initial_fine_tasks((task,))[0]
+    expanded = tuple(
+        (
+            name,
+            2 if index == 0 else 3,
+        )
+        for index, name in enumerate(NATIVE_THREAD_ENV_VARS)
+    )
+    outcome = replace(_fine_result(initial), native_threads=expanded)
+    modules.outcomes[initial.key.encoded] = [malformed(outcome)]
+
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
+    result = executor.execute(_reference_task(tmp_path), (task,))[1]
+
+    assert result.round == 2
+    assert result.status == "failed"
+    assert result.failure is not None
+    assert result.failure.stage == "whole-image"
+    assert not any(
+        hasattr(call.task, "key") and call.task.key.stage == "channel"
+        for call in modules.submit_calls
+    )
+    assert len(executor._fine_task_results) == 1
+    assert executor._fine_task_results[0].status == "failed"
+
+
+def test_fine_local_executor_retries_malformed_evidence_before_descendants(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    initial = initial_fine_tasks((task,))[0]
+    first = replace(
+        _fine_result(initial),
+        dask_task_key="cyexm-wrong-attempt-999",
+    )
+    modules.outcomes[initial.key.encoded] = [first, _fine_result(initial)]
+
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained", retries=1),
+        _modules=lambda: modules,
+    )
+    result = executor.execute(_reference_task(tmp_path), (task,))[1]
+
+    assert result.status == "completed"
+    assert [call.task.key.stage for call in modules.submit_calls[1:]] == [  # type: ignore[union-attr]
+        "whole-image",
+        "whole-image",
+        "channel",
+        "validation",
+    ]
+    assert executor._fine_attempt_counts[0] == (
+        initial.key.encoded,
+        2,
+    )
+    evidence = executor.execution_evidence
+    assert type(evidence) is _FineExecutionEvidence
+    assert evidence.executor == "local_dask"
+    assert evidence.worker_cap == 4
+    assert evidence.attempt_counts[0] == (initial.key.encoded, 2)
+    assert tuple(result.key.encoded for result in evidence.task_results) == tuple(
+        key for key, _dependencies in evidence.task_graph
+    )
+    assert evidence.cleanup == (
+        ("client", True, None, None),
+        ("cluster", True, None, None),
+        ("configuration", True, None, None),
+    )
+
+
+def test_fine_local_executor_rejects_bad_prep_descriptor_and_settles_sibling(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    chunked = _chunked_task(tmp_path, 2)
+    sibling = _task(tmp_path, 3)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    preparation = initial_fine_tasks((chunked,))[0]
+    assert type(preparation) is RoundPreparationTask
+    modules.outcomes[preparation.key.encoded] = [
+        replace(
+            _fine_result(preparation),
+            prepared_descriptor={"bad": "descriptor"},
+        )
+    ]
+
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
+    reference, chunked_result, sibling_result = executor.execute(
+        _reference_task(tmp_path),
+        (chunked, sibling),
+    )
+
+    assert reference.status == "completed"
+    assert chunked_result.status == "failed"
+    assert sibling_result.status == "completed"
+    assert chunked_result.failure is not None
+    assert chunked_result.failure.stage == "preparation"
+    assert len(executor._fine_task_results) == 4
+    preparation_result = next(
+        result
+        for result in executor._fine_task_results
+        if result.task.key == preparation.key
+    )
+    assert preparation_result.status == "failed"
+    assert preparation_result.dask_task_key == "cyexm-round-002-preparation-main"
+    assert not any(
+        hasattr(call.task, "key")
+        and call.task.round == 2
+        and call.task.key.stage == "chunk"
+        for call in modules.submit_calls
+    )
+
+
+def test_fine_local_executor_retries_malformed_preparation_descriptor_before_chunks(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    chunked = _chunked_task(tmp_path, 2)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    preparation = initial_fine_tasks((chunked,))[0]
+    assert type(preparation) is RoundPreparationTask
+    modules.outcomes[preparation.key.encoded] = [
+        replace(
+            _fine_result(preparation),
+            prepared_descriptor={"bad": "descriptor"},
+        ),
+        _fine_result(preparation),
+    ]
+
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, retries=1, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
+    result = executor.execute(_reference_task(tmp_path), (chunked,))[1]
+
+    assert result.status == "completed"
+    round_calls = [
+        call for call in modules.submit_calls if call.task.round == chunked.round
+    ]
+    assert [call.task.key.stage for call in round_calls[:2]] == [  # type: ignore[union-attr]
+        "preparation",
+        "preparation",
+    ]
+    assert all(  # type: ignore[union-attr]
+        call.task.key.stage != "chunk" for call in round_calls[:2]
+    )
+    assert any(  # type: ignore[union-attr]
+        call.task.key.stage == "chunk" for call in round_calls[2:]
+    )
+    assert executor._fine_attempt_counts[0] == (
+        preparation.key.encoded,
+        2,
+    )
+
+
+def test_fine_local_executor_exhausts_retries_for_malformed_evidence(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    task = _task(tmp_path, 2)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    initial = initial_fine_tasks((task,))[0]
+    wrong = replace(_fine_result(initial), dask_task_key="wrong-attempt")
+    modules.outcomes[initial.key.encoded] = [wrong, wrong]
+
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained", retries=1),
+        _modules=lambda: modules,
+    )
+    result = executor.execute(_reference_task(tmp_path), (task,))[1]
+
+    assert result.status == "failed"
+    assert executor._fine_attempt_counts == ((initial.key.encoded, 2),)
+    assert len(executor._fine_task_results) == 1
+    assert executor._fine_task_results[0].dask_task_key == (
+        "cyexm-round-002-whole-image-main-attempt-002"
+    )
+
+
+def test_fine_local_executor_cancelled_result_blocks_only_descendants(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    cancelled_round = _task(tmp_path, 2)
+    sibling_round = _task(tmp_path, 3)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    cancelled = initial_fine_tasks((cancelled_round,))[0]
+    modules.outcomes[cancelled.key.encoded] = [
+        _fine_result(cancelled, status="cancelled")
+    ]
+
+    reference, cancelled_result, sibling_result = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (cancelled_round, sibling_round))
+
+    assert reference.status == "completed"
+    assert cancelled_result.status == "cancelled"
+    assert sibling_result.status == "completed"
+    assert not any(
+        hasattr(call.task, "key")
+        and call.task.round == 2
+        and call.task.key.stage == "channel"
+        for call in modules.submit_calls
+    )
+
+
+def test_fine_local_executor_settles_reverse_order_multiple_failures(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    modules.order = (3, 2)
+    first = _task(tmp_path, 2)
+    second = _task(tmp_path, 3)
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+
+    first_task, second_task = initial_fine_tasks((first, second))
+    modules.outcomes[first_task.key.encoded] = [
+        _fine_result(first_task, status="failed")
+    ]
+    modules.outcomes[second_task.key.encoded] = [
+        _fine_result(second_task, status="failed")
+    ]
+
+    results = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (first, second))
+
+    assert tuple(result.round for result in results) == (1, 2, 3)
+    assert tuple(result.status for result in results) == (
+        "completed",
+        "failed",
+        "failed",
+    )
+
+
+def test_fine_local_executor_preserves_dynamic_cross_round_fairness(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    first = _task(tmp_path, 2)
+    second = _task(tmp_path, 3)
+
+    LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    ).execute(_reference_task(tmp_path), (first, second))
+
+    moving_calls = modules.submit_calls[1:]
+    assert [(call.task.round, call.task.key.stage) for call in moving_calls] == [  # type: ignore[union-attr]
+        (2, "whole-image"),
+        (3, "whole-image"),
+        (2, "channel"),
+        (3, "channel"),
+        (2, "validation"),
+        (3, "validation"),
+    ]
+
+
+def test_fine_local_executor_cancels_unfinished_stage_on_interrupt(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    modules.interrupt_after = 0
+    modules.interrupt_as_completed_call = 2
+    modules.pending_rounds = {2}
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, workers=2, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="collection interruption"):
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+
+    assert modules.cancel_call is not None
+    cancelled, force = modules.cancel_call
+    assert len(cancelled) == 1
+    assert cancelled[0].task.key.stage == "whole-image"  # type: ignore[union-attr]
+    assert force is True
+    assert modules.events == ["client.close", "cluster.close"]
+    evidence = executor.execution_evidence
+    assert evidence.cancelled
+    assert evidence.interruption == (
+        "KeyboardInterrupt",
+        "injected collection interruption",
+    )
+    assert evidence.cancellation is not None
+    assert evidence.cancellation.outcome == "cancelled"
+    assert evidence.cancellation.unfinished_futures == 1
+    assert evidence.cancellation.succeeded is True
+    assert evidence.attempt_counts == (("round-002:whole-image:main", 1),)
+    assert evidence.task_results == ()
+    assert evidence.cleanup == (
+        ("client", True, None, None),
+        ("cluster", True, None, None),
+        ("configuration", True, None, None),
+    )
 
 
 def test_local_executor_owns_worker_ttl_config_for_cluster_and_execution(
@@ -496,6 +1149,29 @@ def test_local_executor_runs_reference_when_no_moving_rounds_are_pending(
     assert loaded is True
 
 
+def test_fine_local_executor_records_all_reused_pre_controller_evidence(
+    tmp_path: Path,
+) -> None:
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: _FakeDistributedModules(),
+    )
+
+    results = executor.execute(_reference_task(tmp_path), ())
+    evidence = executor.execution_evidence
+
+    assert tuple(result.round for result in results) == (1,)
+    assert evidence.reference_result == results[0]
+    assert evidence.round_results == ()
+    assert evidence.tasks == ()
+    assert evidence.pre_controller_terminal == (
+        "moving",
+        "reused",
+        "",
+        "all submitted moving rounds were already complete",
+    )
+
+
 def test_local_executor_collects_independently_but_returns_plan_order(
     tmp_path: Path,
 ) -> None:
@@ -523,6 +1199,26 @@ def test_local_executor_does_not_submit_moving_rounds_after_reference_failure(
     assert tuple(result.round for result in results) == (1,)
     assert results[0].status == "failed"
     assert [call.task.round for call in modules.submit_calls] == [1]
+
+
+def test_fine_local_reference_failure_has_authoritative_empty_graph_evidence(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeDistributedModules()
+    reference = _reference_task(tmp_path)
+    modules.outcomes[1] = [_reference_result(reference, status="failed")]
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
+
+    results = executor.execute(reference, (_task(tmp_path, 2),))
+    evidence = executor.execution_evidence
+
+    assert evidence.reference_result == results[0]
+    assert evidence.tasks == ()
+    assert evidence.pre_controller_terminal is not None
+    assert evidence.pre_controller_terminal[:2] == ("reference", "failed")
 
 
 def test_local_executor_resubmits_failed_results_with_a_unique_bounded_key(
@@ -757,16 +1453,23 @@ def test_local_executor_logs_cleanup_failures_without_losing_results(
     modules = _FakeDistributedModules()
     modules.client_close_error = RuntimeError("client cleanup failed")
     modules.cluster_close_error = RuntimeError("cluster cleanup failed")
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
 
     with caplog.at_level(logging.WARNING, logger="cyexm.execution.dask"):
-        results = LocalDaskExecutor(
-            _profile(tmp_path), _modules=lambda: modules
-        ).execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+        results = executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert results[0].status == "completed"
     assert modules.events == ["client.close", "cluster.close"]
     assert "client cleanup failed" in caplog.text
     assert "cluster cleanup failed" in caplog.text
+    assert executor.execution_evidence.cleanup == (
+        ("client", False, "RuntimeError", "client cleanup failed"),
+        ("cluster", False, "RuntimeError", "cluster cleanup failed"),
+        ("configuration", True, None, None),
+    )
 
 
 def test_local_executor_cancels_only_unfinished_futures_on_keyboard_interrupt(
@@ -806,18 +1509,25 @@ def test_local_executor_preserves_interrupt_when_cancel_and_cleanup_fail(
     modules.client_close_error = KeyboardInterrupt("client close failed")
     modules.cluster_close_error = SystemExit("cluster close failed")
 
+    executor = LocalDaskExecutor(
+        _profile(tmp_path, mode="fine_grained"),
+        _modules=lambda: modules,
+    )
     with (
         caplog.at_level(logging.WARNING, logger="cyexm.execution.dask"),
         pytest.raises(KeyboardInterrupt, match="collection interruption"),
     ):
-        LocalDaskExecutor(_profile(tmp_path), _modules=lambda: modules).execute(
-            _reference_task(tmp_path), (_task(tmp_path, 2),)
-        )
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
     assert "cancel failed" in caplog.text
     assert "client close failed" in caplog.text
     assert "cluster close failed" in caplog.text
     assert modules.events == ["client.close", "cluster.close"]
+    evidence = executor.execution_evidence
+    assert evidence.cancellation is not None
+    assert evidence.cancellation.outcome == "cancel_failed"
+    assert evidence.cancellation.exception_type == "SystemExit"
+    assert evidence.cancellation.message == "cancel failed"
 
 
 def test_local_executor_exports_from_execution_namespace() -> None:

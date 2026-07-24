@@ -264,16 +264,21 @@ warp and prepared inputs without rerunning nonlinear estimation.
 
 ## Canonical assembly
 
+**Erratum approved 2026-07-23:** The canonical legacy chunk grid has overlapping
+nominal core/output slices when overlap is nonzero. The earlier exactly-once,
+non-overlapping wording was incorrect. Assembly must preserve ClearEx behavior:
+process valid chunks in ascending chunk ID and let later IDs deterministically
+overwrite earlier values in overlap regions.
+
 Assembly starts only when every expected local warp and registered scalar core is
 valid. It allocates full fixed-grid scalar and vector destinations and processes
 chunks in ascending chunk-ID order, regardless of worker completion order.
 
 For each chunk, assembly copies the registered scalar core and displacement core into
-the canonical non-overlapping core slice. Coverage validation proves:
+the canonical legacy core/output slice. Coverage validation proves:
 
-- every fixed-grid voxel is written exactly once;
-- no core overlaps another core;
-- no gap remains;
+- every fixed-grid voxel is written at least once;
+- no gap remains, while expected overlap is accepted;
 - each local displacement has exactly three components;
 - every scalar and displacement value is finite; and
 - all chunk artifacts match the same prepared manifest, affine, grid, and scientific
@@ -282,8 +287,8 @@ the canonical non-overlapping core slice. Coverage validation proves:
 Assembly commits the same full nonlinear warp, chunk manifest, diagnostic registered
 TIFF, nonlinear metrics, and completion records as coarse serial execution. It
 reconstructs and thresholds the nonlinear mask under the existing policy. The
-canonical ordering and disjoint core writes make assembly independent of task
-completion order.
+canonical ascending-ID overwrite rule makes assembly independent of task completion
+order while preserving legacy scalar and displacement values at chunk boundaries.
 
 If an already valid full warp and its downstream registration artifacts are reusable,
 fine-grained execution does not require chunk resubmission merely because the
@@ -433,7 +438,8 @@ Tests cover:
 - unchanged local-warp cache identity across coarse and fine-grained modes;
 - reconstruction of a missing scalar core without rerunning SyN;
 - canonical assembly under permuted completion order;
-- gap, overlap, shape, component, dtype, finiteness, identity, and geometry failures;
+- gap, unexpected duplicate artifact, shape, component, dtype, finiteness, identity,
+  and geometry failures, while canonical grid overlap remains valid;
 - independent chunk and channel failure collection;
 - retry, cancellation, unsubmitted descendants, resume, and force propagation;
 - unique task logs and complete operational evidence;

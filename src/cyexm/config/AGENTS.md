@@ -12,6 +12,8 @@
   omitted CC radius to built-in integer 4, reject anisotropic or invalid radii, reject
   radius for Mattes, and keep the normalized nonlinear model free of runtime imports.
 - Scientific and execution roots are disjoint, neither containing the other.
+- Parallelism is operational execution policy. Omission normalizes to coarse, and no
+  scientific manifest or fingerprint may include the parallelism mode.
 - Parse `slurm.memory` centrally as positive whole decimal memory with exact `KB`,
   `MB`, `GB`, or `TB` suffixes. Reject invalid, fractional, zero, unsupported, or
   signed-64-bit-overflowing semantic and ceiling-normalized quantities.

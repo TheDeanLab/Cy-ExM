@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,7 +15,18 @@ from cyexm.config.models import (
     RegistrationStageSpec,
 )
 from cyexm.errors import RoundExecutionError, WorkflowPlanError
+from cyexm.registration.prepared import PreparedManifest
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
+from cyexm.workflow.fine_models import (
+    ChannelTransformTask,
+    ChunkAssemblyTask,
+    FineTaskResult,
+    FineWorkflowTask,
+    NonlinearChunkTask,
+    RoundPreparationTask,
+    RoundValidationTask,
+    WholeImageRegistrationTask,
+)
 from cyexm.workflow.models import (
     ChannelTask,
     ReferenceChannelTask,
@@ -23,6 +36,39 @@ from cyexm.workflow.models import (
     RoundTask,
     WorkflowTask,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _FineCancellationEvidence:
+    """Detached evidence for scheduler cancellation after an interruption."""
+
+    outcome: str
+    attempted: bool
+    unfinished_futures: int
+    force: bool | None
+    succeeded: bool | None
+    exception_type: str | None
+    message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FineExecutionEvidence:
+    """Detached scheduler-neutral evidence for one fine graph execution."""
+
+    executor: str
+    worker_cap: int
+    reference_result: RoundResult | None
+    round_results: tuple[RoundResult, ...]
+    pre_controller_terminal: tuple[str, str, str, str] | None
+    tasks: tuple[FineWorkflowTask, ...]
+    task_graph: tuple[tuple[str, tuple[str, ...]], ...]
+    task_results: tuple[FineTaskResult, ...]
+    attempt_counts: tuple[tuple[str, int], ...]
+    blocked_descendants: tuple[str, ...]
+    cancelled: bool
+    cleanup: tuple[tuple[str, bool, str | None, str | None], ...]
+    interruption: tuple[str, str] | None = None
+    cancellation: _FineCancellationEvidence | None = None
 
 
 def _canonical_path(path: object, location: str) -> Path:
@@ -415,7 +461,12 @@ def _validate_round_result_structure(result: object, location: str) -> None:
                 )
 
 
-def _validate_round_result(task: WorkflowTask, result: RoundResult) -> None:
+def _validate_round_result(
+    task: WorkflowTask,
+    result: RoundResult,
+    *,
+    fine_mode: bool = False,
+) -> None:
     location = f"Executor result for round {task.round}"
     _validate_round_result_structure(result, location)
     if result.dataset_id != task.dataset_id:
@@ -457,7 +508,50 @@ def _validate_round_result(task: WorkflowTask, result: RoundResult) -> None:
     ended_at = _parse_utc_timestamp(result.ended_at, f"{location} ended_at")
     if ended_at < started_at:
         raise RoundExecutionError(f"{location} ended_at must not precede started_at")
-    if result.log_path != str(task.log_path):
+    expected_log_path = task.log_path
+    if fine_mode and type(task) is RoundTask:
+        from cyexm.workflow.fine_models import FineTaskKey
+
+        if result.status in {"completed", "reused"}:
+            expected_key = FineTaskKey(task.round, "validation", "main")
+        else:
+            name = Path(result.log_path).name
+            prefix = f"round-{task.round:03d}-"
+            suffix = ".log"
+            if not name.startswith(prefix) or not name.endswith(suffix):
+                raise RoundExecutionError(
+                    f"{location} log_path is not a canonical fine task log"
+                )
+            encoded_item = name[len(prefix) : -len(suffix)]
+            stage: str
+            item: str
+            if encoded_item.startswith("whole-image-"):
+                stage, item = "whole-image", encoded_item.removeprefix("whole-image-")
+            else:
+                try:
+                    stage, item = encoded_item.rsplit("-", 1)
+                except ValueError as error:
+                    raise RoundExecutionError(
+                        f"{location} log_path is not a canonical fine task log"
+                    ) from error
+            try:
+                expected_key = FineTaskKey.from_encoded(
+                    f"round-{task.round:03d}:{stage}:{item}"
+                )
+            except (TypeError, ValueError) as error:
+                raise RoundExecutionError(
+                    f"{location} log_path is not a canonical fine task log"
+                ) from error
+            if (
+                result.status == "failed"
+                and result.failure is not None
+                and result.failure.stage != expected_key.stage
+            ):
+                raise RoundExecutionError(
+                    f"{location} log_path stage does not match failure evidence"
+                )
+        expected_log_path = task.log_path.parent / expected_key.log_name
+    if result.log_path != str(expected_log_path):
         raise RoundExecutionError(f"{location} log_path does not match the task")
 
     planned = _planned_task_artifacts(task)
@@ -481,6 +575,778 @@ def _validate_round_result(task: WorkflowTask, result: RoundResult) -> None:
         raise RoundExecutionError(
             f"{location} reused status must identify every artifact as reused"
         )
+
+
+def _parse_aware_timestamp(value: object, location: str) -> datetime:
+    if type(value) is not str or "T" not in value:
+        raise RoundExecutionError(
+            f"{location} must be a timezone-aware ISO 8601 timestamp"
+        )
+    encoded = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(encoded)
+    except ValueError as error:
+        raise RoundExecutionError(
+            f"{location} must be a timezone-aware ISO 8601 timestamp"
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RoundExecutionError(
+            f"{location} must be a timezone-aware ISO 8601 timestamp"
+        )
+    return parsed
+
+
+def _validate_fine_task_result(
+    task: FineWorkflowTask,
+    result: object,
+) -> FineTaskResult:
+    """Validate scheduler-neutral evidence for one exact fine task result."""
+    location = f"Fine executor result for {task.key.encoded}"
+    if type(result) is not FineTaskResult:
+        raise RoundExecutionError(f"{location} must be an exact FineTaskResult")
+    if type(result.task) is not type(task) or result.task != task:
+        raise RoundExecutionError(f"{location} does not match the submitted task")
+    try:
+        FineTaskResult(
+            task=result.task,
+            status=result.status,
+            started_at=result.started_at,
+            ended_at=result.ended_at,
+            duration_seconds=result.duration_seconds,
+            hostname=result.hostname,
+            pid=result.pid,
+            dask_task_key=result.dask_task_key,
+            slurm_job_id=result.slurm_job_id,
+            native_threads=result.native_threads,
+            artifact_paths=result.artifact_paths,
+            reused_artifacts=result.reused_artifacts,
+            log_path=result.log_path,
+            failure=result.failure,
+            prepared_descriptor=result.prepared_descriptor,
+        )
+    except (TypeError, ValueError) as error:
+        raise RoundExecutionError(
+            f"{location} violates the exact FineTaskResult structure: {error}"
+        ) from error
+    if type(result.status) is not str or result.status not in {
+        "reused",
+        "completed",
+        "failed",
+        "cancelled",
+    }:
+        raise RoundExecutionError(f"{location} has an unsupported status")
+    if type(result.hostname) is not str or not result.hostname:
+        raise RoundExecutionError(f"{location} hostname must be nonempty")
+    if type(result.pid) is not int or result.pid < 1:
+        raise RoundExecutionError(f"{location} pid must be a positive integer")
+    if (
+        type(result.duration_seconds) is not float
+        or not math.isfinite(result.duration_seconds)
+        or result.duration_seconds < 0.0
+    ):
+        raise RoundExecutionError(
+            f"{location} duration_seconds must be finite and non-negative"
+        )
+    for field_name, value in (
+        ("dask_task_key", result.dask_task_key),
+        ("slurm_job_id", result.slurm_job_id),
+    ):
+        if value is not None and (type(value) is not str or not value):
+            raise RoundExecutionError(
+                f"{location} {field_name} must be null or nonempty"
+            )
+
+    expected_threads = tuple(
+        (
+            name,
+            (
+                task.native_threads.itk
+                if name == NATIVE_THREAD_ENV_VARS[0]
+                else task.native_threads.blas
+            ),
+        )
+        for name in NATIVE_THREAD_ENV_VARS
+    )
+    if result.native_threads != expected_threads:
+        raise RoundExecutionError(
+            f"{location} native_threads must exactly match configured expanded "
+            "thread evidence"
+        )
+
+    started = _parse_aware_timestamp(result.started_at, f"{location} started_at")
+    ended = _parse_aware_timestamp(result.ended_at, f"{location} ended_at")
+    if ended < started:
+        raise RoundExecutionError(f"{location} ended_at precedes started_at")
+    if result.log_path != str(task.log_path):
+        raise RoundExecutionError(f"{location} log_path does not match the task")
+
+    planned = tuple(str(path) for path in task.output_paths)
+    if type(result.artifact_paths) is not tuple or len(
+        set(result.artifact_paths)
+    ) != len(result.artifact_paths):
+        raise RoundExecutionError(
+            f"{location} artifact_paths must be a unique exact tuple"
+        )
+    if any(
+        type(path) is not str or path not in planned for path in result.artifact_paths
+    ):
+        raise RoundExecutionError(
+            f"{location} artifact_paths must contain only planned outputs"
+        )
+    if result.status in {"completed", "reused"} and result.artifact_paths != planned:
+        raise RoundExecutionError(
+            f"{location} successful artifact_paths must equal planned outputs"
+        )
+    if (
+        type(result.reused_artifacts) is not tuple
+        or len(set(result.reused_artifacts)) != len(result.reused_artifacts)
+        or any(
+            type(path) is not str or path not in result.artifact_paths
+            for path in result.reused_artifacts
+        )
+    ):
+        raise RoundExecutionError(
+            f"{location} reused_artifacts must be a unique artifact subset"
+        )
+    if result.status == "reused" and result.reused_artifacts != planned:
+        raise RoundExecutionError(
+            f"{location} reused status must identify every output as reused"
+        )
+
+    failure = result.failure
+    if result.status == "failed":
+        if type(failure) is not RoundFailure:
+            raise RoundExecutionError(f"{location} requires exact failure evidence")
+        if failure.stage != task.key.stage:
+            raise RoundExecutionError(
+                f"{location} failure stage does not match the task"
+            )
+        if type(failure.exception_type) is not str or not failure.exception_type:
+            raise RoundExecutionError(
+                f"{location} failure exception_type must be nonempty"
+            )
+        if type(failure.message) is not str:
+            raise RoundExecutionError(
+                f"{location} failure message must be a built-in string"
+            )
+    elif failure is not None:
+        raise RoundExecutionError(
+            f"{location} failure must be absent unless status is failed"
+        )
+
+    if type(task) is RoundPreparationTask:
+        if (
+            result.status in {"completed", "reused"}
+            and result.prepared_descriptor is None
+        ):
+            raise RoundExecutionError(
+                f"{location} successful preparation requires its descriptor"
+            )
+        if result.status in {"completed", "reused"}:
+            descriptor = result.to_dict()["prepared_descriptor"]
+            if not isinstance(descriptor, Mapping):
+                raise RoundExecutionError(
+                    f"{location} prepared descriptor must be a JSON object"
+                )
+            try:
+                PreparedManifest.from_dict(descriptor)
+            except (TypeError, ValueError) as error:
+                raise RoundExecutionError(
+                    f"{location} prepared descriptor violates PreparedManifest: {error}"
+                ) from error
+    elif result.prepared_descriptor is not None:
+        raise RoundExecutionError(
+            f"{location} prepared descriptor belongs only to preparation"
+        )
+    return result
+
+
+def _validate_fine_successor_expansion(
+    task_by_key: Mapping[str, FineWorkflowTask],
+    results: tuple[FineTaskResult, ...],
+    *,
+    location: str,
+) -> None:
+    """Require materialized successors to equal the shared planning policy."""
+    from cyexm.workflow.fine_planning import channel_tasks, chunk_tasks
+
+    for result in results:
+        if result.status not in {"completed", "reused"}:
+            continue
+        if type(result.task) is RoundPreparationTask:
+            successors = chunk_tasks(result)
+        elif type(result.task) in {
+            ChunkAssemblyTask,
+            WholeImageRegistrationTask,
+        }:
+            successors = channel_tasks(result)
+        else:
+            continue
+        actual_successors = tuple(
+            task_by_key.get(task.key.encoded) for task in successors
+        )
+        if actual_successors != successors:
+            raise RoundExecutionError(
+                f"{location} successor tasks must match exact producer expansion"
+            )
+
+
+def _canonical_fine_execution_evidence(
+    value: object,
+    *,
+    expected_executor: str,
+    expected_reference_task: ReferenceTask,
+    expected_round_tasks: tuple[RoundTask, ...],
+    expected_round_results: tuple[RoundResult, ...],
+    expected_worker_cap: int,
+    task_retries: int,
+    expected_interruption: tuple[str, str] | None = None,
+) -> str:
+    """Validate and canonically encode scheduler-neutral fine execution evidence."""
+    from cyexm.execution.dispatcher import (
+        _summarize_fine_round,
+        canonical_fine_task_key,
+        validate_fine_graph_description,
+    )
+    from cyexm.workflow.fine_planning import initial_fine_tasks
+    from cyexm.workflow.models import canonical_json
+
+    location = "fine execution evidence"
+    if type(value) is not _FineExecutionEvidence:
+        raise RoundExecutionError(f"{location} must be an exact _FineExecutionEvidence")
+    if type(value.executor) is not str or value.executor != expected_executor:
+        raise RoundExecutionError(
+            f"{location} executor must equal {expected_executor!r}"
+        )
+    if (
+        type(value.worker_cap) is not int
+        or value.worker_cap != expected_worker_cap
+        or value.worker_cap < 1
+    ):
+        raise RoundExecutionError(
+            f"{location} worker_cap must equal the normalized profile"
+        )
+    if type(value.cancelled) is not bool:
+        raise RoundExecutionError(f"{location} cancelled must be an exact boolean")
+    if value.cancelled != (expected_interruption is not None):
+        raise RoundExecutionError(
+            f"{location} cancellation must match the caught interruption"
+        )
+    cancellation = value.cancellation
+    if expected_interruption is None:
+        if value.interruption is not None or cancellation is not None:
+            raise RoundExecutionError(
+                f"{location} settled execution cannot claim interruption evidence"
+            )
+    else:
+        if value.interruption != expected_interruption:
+            raise RoundExecutionError(
+                f"{location} interruption cause is not authoritative"
+            )
+        if type(cancellation) is not _FineCancellationEvidence:
+            raise RoundExecutionError(
+                f"{location} cancellation outcome evidence is required"
+            )
+        allowed_outcomes = (
+            {"not_applicable"}
+            if expected_executor == "sequential"
+            else {"no_unfinished", "cancelled", "cancel_failed"}
+        )
+        if cancellation.outcome not in allowed_outcomes:
+            raise RoundExecutionError(
+                f"{location} cancellation outcome is invalid for {expected_executor}"
+            )
+        if (
+            type(cancellation.attempted) is not bool
+            or type(cancellation.unfinished_futures) is not int
+            or cancellation.unfinished_futures < 0
+        ):
+            raise RoundExecutionError(f"{location} cancellation cardinality is invalid")
+        if cancellation.outcome in {"not_applicable", "no_unfinished"}:
+            valid_cancellation = (
+                not cancellation.attempted
+                and cancellation.unfinished_futures == 0
+                and cancellation.force is None
+                and cancellation.succeeded is None
+                and cancellation.exception_type is None
+                and cancellation.message is None
+            )
+        elif cancellation.outcome == "cancelled":
+            valid_cancellation = (
+                cancellation.attempted
+                and cancellation.unfinished_futures > 0
+                and cancellation.force is True
+                and cancellation.succeeded is True
+                and cancellation.exception_type is None
+                and cancellation.message is None
+            )
+        else:
+            valid_cancellation = (
+                cancellation.attempted
+                and cancellation.unfinished_futures > 0
+                and cancellation.force is True
+                and cancellation.succeeded is False
+                and type(cancellation.exception_type) is str
+                and bool(cancellation.exception_type)
+                and type(cancellation.message) is str
+            )
+        if not valid_cancellation:
+            raise RoundExecutionError(
+                f"{location} cancellation outcome fields are contradictory"
+            )
+    if type(expected_reference_task) is not ReferenceTask:
+        raise RoundExecutionError(
+            f"{location} requires the exact submitted reference task"
+        )
+    reference_summaries = tuple(
+        result
+        for result in expected_round_results
+        if result.round == expected_reference_task.round
+    )
+    if value.reference_result is None:
+        if reference_summaries:
+            raise RoundExecutionError(
+                f"{location} is missing the exact reference result"
+            )
+    else:
+        if type(value.reference_result) is not RoundResult:
+            raise RoundExecutionError(
+                f"{location} reference_result must be an exact RoundResult"
+            )
+        _validate_round_result(expected_reference_task, value.reference_result)
+        if reference_summaries != (value.reference_result,):
+            raise RoundExecutionError(
+                f"{location} reference result must equal the public summary"
+            )
+    if type(value.round_results) is not tuple or any(
+        type(result) is not RoundResult for result in value.round_results
+    ):
+        raise RoundExecutionError(
+            f"{location} round_results must be exact RoundResult values"
+        )
+    moving_summaries = tuple(
+        result
+        for result in expected_round_results
+        if result.round in {task.round for task in expected_round_tasks}
+    )
+    if value.round_results != moving_summaries:
+        raise RoundExecutionError(
+            f"{location} terminal round results must equal the public summaries"
+        )
+    terminal = value.pre_controller_terminal
+    if terminal is not None and (
+        type(terminal) is not tuple
+        or len(terminal) != 4
+        or any(type(item) is not str for item in terminal)
+    ):
+        raise RoundExecutionError(f"{location} pre_controller_terminal is invalid")
+    if value.tasks:
+        if terminal is not None:
+            raise RoundExecutionError(
+                f"{location} materialized graph cannot claim a pre-controller cause"
+            )
+    else:
+        if terminal is None:
+            raise RoundExecutionError(
+                f"{location} empty graph requires a pre-controller cause"
+            )
+        phase, status, exception_type, message = terminal
+        if phase == "reference":
+            if status not in {"failed", "cancelled"}:
+                raise RoundExecutionError(
+                    f"{location} reference terminal status is invalid"
+                )
+            if value.reference_result is None:
+                if not value.cancelled or status != "cancelled":
+                    raise RoundExecutionError(
+                        f"{location} missing reference result requires cancellation"
+                    )
+            elif value.reference_result.status != status:
+                raise RoundExecutionError(
+                    f"{location} reference terminal contradicts its result"
+                )
+            failure = (
+                None
+                if value.reference_result is None
+                else value.reference_result.failure
+            )
+            expected_exception = (
+                type(None).__name__
+                if failure is None and not value.cancelled
+                else (exception_type if failure is None else failure.exception_type)
+            )
+            if failure is not None and (
+                exception_type != expected_exception or message != failure.message
+            ):
+                raise RoundExecutionError(
+                    f"{location} reference terminal cause is not authoritative"
+                )
+            if (
+                failure is None
+                and value.cancelled
+                and (exception_type, message) != expected_interruption
+            ):
+                raise RoundExecutionError(
+                    f"{location} reference cancellation cause is not authoritative"
+                )
+        elif phase == "moving":
+            reference_succeeded = (
+                value.reference_result is not None
+                and value.reference_result.status in {"completed", "reused"}
+            )
+            reused_terminal = (
+                status == "reused"
+                and not value.cancelled
+                and reference_succeeded
+                and not expected_round_tasks
+                and not exception_type
+                and bool(message)
+            )
+            cancelled_terminal = (
+                status == "cancelled"
+                and value.cancelled
+                and reference_succeeded
+                and bool(expected_round_tasks)
+                and bool(exception_type)
+            )
+            if not reused_terminal and not cancelled_terminal:
+                raise RoundExecutionError(
+                    f"{location} moving terminal cause is contradictory"
+                )
+            if (
+                cancelled_terminal
+                and (exception_type, message) != expected_interruption
+            ):
+                raise RoundExecutionError(
+                    f"{location} moving cancellation cause is not authoritative"
+                )
+        else:
+            raise RoundExecutionError(f"{location} pre-controller phase is unsupported")
+    exact_task_types = (
+        RoundPreparationTask,
+        NonlinearChunkTask,
+        ChunkAssemblyTask,
+        WholeImageRegistrationTask,
+        ChannelTransformTask,
+        RoundValidationTask,
+    )
+    if type(value.tasks) is not tuple or any(
+        type(task) not in exact_task_types for task in value.tasks
+    ):
+        raise RoundExecutionError(f"{location} tasks must be exact fine task values")
+    expected_by_round = {task.round: task for task in expected_round_tasks}
+    task_by_key: dict[str, FineWorkflowTask] = {}
+    for index, task in enumerate(value.tasks):
+        if task.round_task != expected_by_round.get(task.round):
+            raise RoundExecutionError(
+                f"{location} tasks[{index}] is not bound to the exact submitted "
+                "RoundTask"
+            )
+        if task.key.encoded in task_by_key:
+            raise RoundExecutionError(f"{location} task keys must be unique")
+        task_by_key[task.key.encoded] = task
+    derived_graph = tuple(
+        (
+            task.key.encoded,
+            tuple(dependency.encoded for dependency in task.dependencies),
+        )
+        for task in value.tasks
+    )
+    if value.task_graph != derived_graph:
+        raise RoundExecutionError(
+            f"{location} task_graph must exactly describe immutable tasks"
+        )
+    graph_round_tasks = () if terminal is not None else expected_round_tasks
+    initial = initial_fine_tasks(graph_round_tasks)
+    if tuple(task for task in value.tasks if not task.dependencies) != initial:
+        raise RoundExecutionError(
+            f"{location} initial tasks must match submitted moving rounds"
+        )
+    if type(value.task_graph) is not tuple or any(
+        type(item) is not tuple
+        or len(item) != 2
+        or type(item[0]) is not str
+        or type(item[1]) is not tuple
+        or any(type(dependency) is not str for dependency in item[1])
+        for item in value.task_graph
+    ):
+        raise RoundExecutionError(f"{location} task_graph has an invalid structure")
+    if type(value.task_results) is not tuple:
+        raise RoundExecutionError(f"{location} task_results must be an exact tuple")
+    results_by_key: dict[str, FineTaskResult] = {}
+    terminal_statuses: dict[str, str] = {}
+    for index, result in enumerate(value.task_results):
+        if type(result) is not FineTaskResult:
+            raise RoundExecutionError(
+                f"{location} task_results[{index}] must be an exact FineTaskResult"
+            )
+        validated = _validate_fine_task_result(result.task, result)
+        if validated.task != task_by_key.get(validated.key.encoded):
+            raise RoundExecutionError(
+                f"{location} task_results[{index}] is not bound to the exact task"
+            )
+        key = validated.key.encoded
+        if key in results_by_key:
+            raise RoundExecutionError(f"{location} task result keys must be unique")
+        results_by_key[key] = validated
+        terminal_statuses[key] = validated.status
+    _validate_fine_successor_expansion(
+        task_by_key,
+        tuple(results_by_key.values()),
+        location=location,
+    )
+
+    summaries = {result.round: result for result in value.round_results}
+    if len(summaries) != len(
+        tuple(
+            result
+            for result in expected_round_results
+            if result.round in {task.round for task in expected_round_tasks}
+        )
+    ):
+        raise RoundExecutionError(f"{location} round summaries must be unique")
+    if (
+        not value.cancelled
+        and value.tasks
+        and set(summaries) != {task.round for task in expected_round_tasks}
+    ):
+        raise RoundExecutionError(
+            f"{location} requires one summary per submitted moving round"
+        )
+    for round_number, summary in summaries.items():
+        actual = tuple(
+            result for result in results_by_key.values() if result.round == round_number
+        )
+        try:
+            authoritative = _summarize_fine_round(
+                expected_by_round[round_number],
+                actual,
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise RoundExecutionError(
+                f"{location} cannot aggregate round {round_number}: {error}"
+            ) from error
+        if summary != authoritative:
+            raise RoundExecutionError(
+                f"{location} round summary must exactly equal canonical aggregation"
+            )
+
+    try:
+        task_keys, dependencies = validate_fine_graph_description(
+            value.task_graph,
+            graph_round_tasks,
+            allow_partial=value.cancelled,
+            terminal_statuses=terminal_statuses,
+        )
+    except (TypeError, ValueError) as error:
+        raise RoundExecutionError(
+            f"{location} task_graph is invalid: {error}"
+        ) from error
+    if set(results_by_key) - set(task_keys):
+        raise RoundExecutionError(
+            f"{location} task results must name materialized graph tasks"
+        )
+    if tuple(results_by_key) != tuple(
+        key for key in task_keys if key in results_by_key
+    ):
+        raise RoundExecutionError(
+            f"{location} task results must use canonical graph order"
+        )
+    for key, result in results_by_key.items():
+        result_dependencies = tuple(
+            dependency.encoded for dependency in result.task.dependencies
+        )
+        if dependencies[key] != result_dependencies:
+            raise RoundExecutionError(
+                f"{location} result task dependencies do not match task_graph"
+            )
+
+    if type(value.attempt_counts) is not tuple:
+        raise RoundExecutionError(f"{location} attempt_counts must be an exact tuple")
+    attempts: dict[str, int] = {}
+    for index, item in enumerate(value.attempt_counts):
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or type(item[1]) is not int
+            or item[1] < 1
+            or item[1] > task_retries + 1
+        ):
+            raise RoundExecutionError(f"{location} attempt_counts[{index}] is invalid")
+        key, count = item
+        if key in attempts or key not in dependencies:
+            raise RoundExecutionError(
+                f"{location} attempt keys must be unique graph task keys"
+            )
+        attempts[key] = count
+    expected_attempt_order = tuple(key for key in task_keys if key in attempts)
+    if tuple(attempts) != expected_attempt_order:
+        raise RoundExecutionError(
+            f"{location} attempt counts must use canonical graph order"
+        )
+    if not set(results_by_key) <= set(attempts):
+        raise RoundExecutionError(
+            f"{location} every task result requires attempt evidence"
+        )
+    if not value.cancelled and set(results_by_key) != set(attempts):
+        raise RoundExecutionError(
+            f"{location} settled execution attempts must have task results"
+        )
+    if value.cancelled and cancellation is not None:
+        outstanding_attempts = len(set(attempts) - set(results_by_key))
+        maximum_unfinished = (
+            outstanding_attempts
+            if value.tasks
+            else (1 if expected_executor != "sequential" else 0)
+        )
+        if cancellation.unfinished_futures > maximum_unfinished:
+            raise RoundExecutionError(
+                f"{location} cancellation cardinality exceeds live attempt evidence"
+            )
+
+    if type(value.blocked_descendants) is not tuple or any(
+        type(key) is not str for key in value.blocked_descendants
+    ):
+        raise RoundExecutionError(
+            f"{location} blocked_descendants must be an exact string tuple"
+        )
+    if value.blocked_descendants != tuple(
+        sorted(value.blocked_descendants, key=canonical_fine_task_key)
+    ):
+        raise RoundExecutionError(
+            f"{location} blocked descendants must use canonical order"
+        )
+    if (
+        len(set(value.blocked_descendants)) != len(value.blocked_descendants)
+        or not set(value.blocked_descendants) <= set(task_keys)
+        or set(value.blocked_descendants) & set(attempts)
+    ):
+        raise RoundExecutionError(
+            f"{location} blocked descendants must be unique unattempted graph tasks"
+        )
+    if not value.cancelled and set(value.blocked_descendants) != (
+        set(task_keys) - set(attempts)
+    ):
+        raise RoundExecutionError(
+            f"{location} blocked descendants must exactly explain unattempted tasks"
+        )
+
+    if type(value.cleanup) is not tuple:
+        raise RoundExecutionError(f"{location} cleanup must be an exact tuple")
+    cleanup: dict[str, dict[str, object]] = {}
+    for index, item in enumerate(value.cleanup):
+        if (
+            type(item) is not tuple
+            or len(item) != 4
+            or type(item[0]) is not str
+            or not item[0]
+            or type(item[1]) is not bool
+            or item[0] in cleanup
+        ):
+            raise RoundExecutionError(f"{location} cleanup[{index}] is invalid")
+        name, succeeded, error_type, error_message = item
+        if succeeded:
+            if error_type is not None or error_message is not None:
+                raise RoundExecutionError(
+                    f"{location} successful cleanup cannot contain an error"
+                )
+            cleanup[name] = {"attempted": True, "succeeded": True}
+        else:
+            if (
+                type(error_type) is not str
+                or not error_type
+                or type(error_message) is not str
+            ):
+                raise RoundExecutionError(
+                    f"{location} failed cleanup requires exact error evidence"
+                )
+            cleanup[name] = {
+                "attempted": True,
+                "succeeded": False,
+                "error": {
+                    "exception_type": error_type,
+                    "message": error_message,
+                },
+            }
+    expected_cleanup = (
+        ()
+        if expected_executor == "sequential"
+        else ("client", "cluster", "configuration")
+    )
+    if tuple(cleanup) != expected_cleanup:
+        raise RoundExecutionError(
+            f"{location} cleanup must match the executor-owned resources"
+        )
+
+    return canonical_json(
+        {
+            "schema_version": 1,
+            "executor": value.executor,
+            "mode": "fine_grained",
+            "worker_cap": value.worker_cap,
+            "reference_result": (
+                None
+                if value.reference_result is None
+                else value.reference_result.to_dict()
+            ),
+            "round_results": [result.to_dict() for result in value.round_results],
+            "pre_controller_terminal": (
+                None
+                if value.pre_controller_terminal is None
+                else {
+                    "phase": value.pre_controller_terminal[0],
+                    "status": value.pre_controller_terminal[1],
+                    "exception_type": value.pre_controller_terminal[2],
+                    "message": value.pre_controller_terminal[3],
+                }
+            ),
+            "task_graph": [
+                {"key": key, "dependencies": list(task_dependencies)}
+                for key, task_dependencies in value.task_graph
+            ],
+            "task_results": [
+                results_by_key[key].to_dict()
+                for key in task_keys
+                if key in results_by_key
+            ],
+            "attempt_counts": [
+                {"task_key": key, "attempts": attempts[key]}
+                for key in task_keys
+                if key in attempts
+            ],
+            "blocked_descendants": list(value.blocked_descendants),
+            "cancelled": value.cancelled,
+            "interruption": (
+                None
+                if value.interruption is None
+                else {
+                    "exception_type": value.interruption[0],
+                    "message": value.interruption[1],
+                }
+            ),
+            "cancellation": (
+                None
+                if cancellation is None
+                else {
+                    "outcome": cancellation.outcome,
+                    "attempted": cancellation.attempted,
+                    "unfinished_futures": cancellation.unfinished_futures,
+                    "force": cancellation.force,
+                    "succeeded": cancellation.succeeded,
+                    "error": (
+                        None
+                        if cancellation.exception_type is None
+                        else {
+                            "exception_type": cancellation.exception_type,
+                            "message": cancellation.message,
+                        }
+                    ),
+                }
+            ),
+            "cleanup": cleanup,
+        }
+    )
 
 
 __all__ = []

@@ -1,6 +1,10 @@
 schema_version: 1
 executor: local_dask
 
+# Opt-in fine graph: chunks and every declared moving channel become worker tasks.
+parallelism:
+  mode: fine_grained
+
 # Edit these caller-owned paths. Relative paths resolve from this profile's directory.
 paths:
   dataset_root: ../data

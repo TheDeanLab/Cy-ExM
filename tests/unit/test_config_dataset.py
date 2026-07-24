@@ -115,6 +115,8 @@ def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
         "LocalDaskSpec",
         "NativeThreadSpec",
         "NonlinearRegistrationStageSpec",
+        "ParallelismMode",
+        "ParallelismSpec",
         "ReferenceChannelSpec",
         "ReferenceSpec",
         "RegistrationSpec",

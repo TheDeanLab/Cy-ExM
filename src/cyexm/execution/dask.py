@@ -13,12 +13,19 @@ from cyexm.config.models import ExecutionProfile, LocalDaskSpec
 from cyexm.errors import ExecutorStartupError
 from cyexm.execution._dask_common import (
     ROUND_RESOURCE,
+    collect_distributed_fine_results,
     collect_distributed_results,
     dask_scheduler_config_overlay,
     future_is_unfinished,
     validate_distributed_tasks,
 )
-from cyexm.execution.base import WorkflowTaskRunner
+from cyexm.execution.base import FineWorkflowTaskRunner, WorkflowTaskRunner
+from cyexm.execution.dispatcher import FineGraphController
+from cyexm.workflow._execution_validation import (
+    _FineCancellationEvidence,
+    _FineExecutionEvidence,
+)
+from cyexm.workflow.fine_models import FineTaskResult
 from cyexm.workflow.models import ReferenceTask, RoundResult, RoundTask
 from cyexm.workflow.task import run_workflow_task
 
@@ -53,38 +60,122 @@ def _close_owned(
     client: Any | None,
     cluster: Any | None,
     configuration: AbstractContextManager[Any] | None,
-) -> None:
+) -> tuple[tuple[str, bool, str | None, str | None], ...]:
     exit_info = sys.exc_info()
+    statuses: list[tuple[str, bool, str | None, str | None]] = []
+
+    def close(name: str, operation: Callable[[], object]) -> None:
+        try:
+            operation()
+        except BaseException as error:
+            statuses.append((name, False, type(error).__name__, str(error)))
+            _LOGGER.warning("Failed to close owned local Dask %s: %s", name, error)
+        else:
+            statuses.append((name, True, None, None))
+
     if client is not None:
-        try:
-            client.close()
-        except BaseException as error:
-            _LOGGER.warning("Failed to close owned Dask client: %s", error)
+        close("client", client.close)
     if cluster is not None:
-        try:
-            cluster.close()
-        except BaseException as error:
-            _LOGGER.warning("Failed to close owned local Dask cluster: %s", error)
+        close("cluster", cluster.close)
     if configuration is not None:
-        try:
-            configuration.__exit__(*exit_info)
-        except BaseException as error:
-            _LOGGER.warning("Failed to close owned local Dask configuration: %s", error)
+        close("configuration", lambda: configuration.__exit__(*exit_info))
+    return tuple(statuses)
 
 
 class LocalDaskExecutor:
-    """Execute independent rounds on an owned, bounded ``LocalCluster``."""
+    """Execute coarse rounds or fine stages on an owned ``LocalCluster``.
+
+    The normalized profile selects the existing round-level runner or the shared
+    scheduler-neutral fine graph. This class owns the local cluster, client,
+    bounded worker pool, cancellation, and cleanup; workers execute one immutable
+    task and never create clients or submit descendants.
+
+    Parameters
+    ----------
+    profile : ExecutionProfile
+        Exact normalized ``local_dask`` profile. ``local_dask.workers`` is the hard
+        global task cap, and ``parallelism.mode`` selects coarse or fine admission.
+
+    Raises
+    ------
+    ExecutorStartupError
+        If the profile is incompatible or the owned scheduler lifecycle cannot
+        start within the configured timeout.
+
+    See Also
+    --------
+    SequentialExecutor :
+        Execute the same normalized coarse or fine work without a worker pool.
+    SlurmExecutor :
+        Execute the same work through preflight-gated SLURM workers.
+
+    Notes
+    -----
+    Reference preparation is a hard barrier in the same client lifecycle. Fine
+    siblings settle independently after a failure, and the coordinator retains the
+    exact graph, attempts, task results, cancellation, and cleanup evidence for
+    strict public run-record validation. Scientific reuse remains authorized only
+    by Phase 1 completion records.
+    """
 
     def __init__(
         self,
         profile: ExecutionProfile,
         *,
         _runner: WorkflowTaskRunner = run_workflow_task,
+        _fine_runner: FineWorkflowTaskRunner | None = None,
         _modules: Callable[[], Any] = _distributed_modules,
     ) -> None:
         self.profile = profile
         self._runner = _runner
+        self._fine_runner = _fine_runner
         self._modules = _modules
+        self._fine_task_results: tuple[FineTaskResult, ...] = ()
+        self._fine_attempt_counts: tuple[tuple[str, int], ...] = ()
+        self._fine_live_attempts: dict[str, int] = {}
+        self._fine_controller: FineGraphController | None = None
+        self._fine_reference_result: RoundResult | None = None
+        self._fine_pre_controller_terminal: tuple[str, str, str, str] | None = None
+        self._fine_cancelled = False
+        self._fine_interruption: tuple[str, str] | None = None
+        self._fine_cancellation: _FineCancellationEvidence | None = None
+        self._fine_cleanup: tuple[tuple[str, bool, str | None, str | None], ...] = ()
+
+    @property
+    def execution_evidence(self) -> _FineExecutionEvidence:
+        """Return detached scheduler-neutral fine graph evidence."""
+        controller = self._fine_controller
+        attempts = self._fine_attempt_counts
+        if self._fine_cancelled and not attempts:
+            attempts = tuple(
+                (key, self._fine_live_attempts[key])
+                for key, _dependencies in (
+                    () if controller is None else controller.graph_description
+                )
+                if key in self._fine_live_attempts
+            )
+        return _FineExecutionEvidence(
+            executor="local_dask",
+            worker_cap=self._spec().workers,
+            reference_result=self._fine_reference_result,
+            round_results=(
+                () if controller is None else controller._settled_round_results()
+            ),
+            pre_controller_terminal=self._fine_pre_controller_terminal,
+            tasks=() if controller is None else controller.tasks,
+            task_graph=() if controller is None else controller.graph_description,
+            task_results=() if controller is None else controller.task_results,
+            attempt_counts=attempts,
+            blocked_descendants=(
+                ()
+                if controller is None
+                else tuple(key.encoded for key in controller.blocked_keys)
+            ),
+            cancelled=self._fine_cancelled,
+            cleanup=self._fine_cleanup,
+            interruption=self._fine_interruption,
+            cancellation=self._fine_cancellation,
+        )
 
     def _spec(self) -> LocalDaskSpec:
         if self.profile.executor != "local_dask":
@@ -106,11 +197,24 @@ class LocalDaskExecutor:
         validate_distributed_tasks(
             (reference_task, *round_tasks), executor_name="LocalDaskExecutor"
         )
-        worker_count = min(max(1, len(round_tasks)), spec.workers)
+        fine_mode = self.profile.parallelism.mode == "fine_grained"
+        worker_count = (
+            spec.workers if fine_mode else min(max(1, len(round_tasks)), spec.workers)
+        )
         cluster: Any | None = None
         client: Any | None = None
         configuration: AbstractContextManager[Any] | None = None
         active: set[Any] = set()
+        self._fine_task_results = ()
+        self._fine_attempt_counts = ()
+        self._fine_live_attempts = {}
+        self._fine_controller = None
+        self._fine_reference_result = None
+        self._fine_pre_controller_terminal = None
+        self._fine_cancelled = False
+        self._fine_interruption = None
+        self._fine_cancellation = None
+        self._fine_cleanup = ()
 
         try:
             try:
@@ -150,20 +254,91 @@ class LocalDaskExecutor:
                 task_retries=spec.task_retries,
                 active=active,
             )
+            if fine_mode:
+                self._fine_reference_result = reference_results[0]
             if reference_results[0].status not in {"completed", "reused"}:
+                if fine_mode:
+                    failure = reference_results[0].failure
+                    self._fine_pre_controller_terminal = (
+                        "reference",
+                        reference_results[0].status,
+                        "" if failure is None else failure.exception_type,
+                        "" if failure is None else failure.message,
+                    )
                 return reference_results
             if not round_tasks:
+                if fine_mode:
+                    self._fine_pre_controller_terminal = (
+                        "moving",
+                        "reused",
+                        "",
+                        "all submitted moving rounds were already complete",
+                    )
                 return reference_results
-            moving_results, _attempts = collect_distributed_results(
-                round_tasks,
-                runner=self._runner,
-                client=execution_client,
-                as_completed=modules.as_completed,
-                task_retries=spec.task_retries,
-                active=active,
-            )
+            if fine_mode:
+                fine_runner = self._fine_runner
+                if fine_runner is None:
+                    from cyexm.workflow.fine_task import run_fine_task
+
+                    fine_runner = run_fine_task
+                controller = FineGraphController(round_tasks)
+                self._fine_controller = controller
+                moving_results, task_results, attempts = (
+                    collect_distributed_fine_results(
+                        controller,
+                        runner=fine_runner,
+                        client=execution_client,
+                        as_completed=modules.as_completed,
+                        task_retries=spec.task_retries,
+                        capacity=worker_count,
+                        active=active,
+                        submission_observer=lambda task, attempt: (
+                            self._fine_live_attempts.__setitem__(
+                                task.key.encoded,
+                                attempt,
+                            )
+                        ),
+                    )
+                )
+                self._fine_task_results = task_results
+                self._fine_attempt_counts = attempts
+            else:
+                moving_results, _attempts = collect_distributed_results(
+                    round_tasks,
+                    runner=self._runner,
+                    client=execution_client,
+                    as_completed=modules.as_completed,
+                    task_retries=spec.task_retries,
+                    active=active,
+                )
             return (*reference_results, *moving_results)
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as error:
+            self._fine_cancelled = fine_mode
+            if fine_mode:
+                self._fine_interruption = (type(error).__name__, str(error))
+            if fine_mode and self._fine_controller is None:
+                phase = (
+                    "moving"
+                    if self._fine_reference_result is not None
+                    and self._fine_reference_result.status in {"completed", "reused"}
+                    else "reference"
+                )
+                self._fine_pre_controller_terminal = (
+                    phase,
+                    "cancelled",
+                    type(error).__name__,
+                    str(error),
+                )
+            if fine_mode and (client is None or not active):
+                self._fine_cancellation = _FineCancellationEvidence(
+                    outcome="no_unfinished",
+                    attempted=False,
+                    unfinished_futures=0,
+                    force=None,
+                    succeeded=None,
+                    exception_type=None,
+                    message=None,
+                )
             if client is not None and active:
                 unfinished = tuple(
                     future
@@ -173,13 +348,35 @@ class LocalDaskExecutor:
                 try:
                     if unfinished:
                         client.cancel(unfinished, force=True)
-                except BaseException as error:
+                except BaseException as cancel_error:
+                    if fine_mode:
+                        self._fine_cancellation = _FineCancellationEvidence(
+                            outcome="cancel_failed",
+                            attempted=bool(unfinished),
+                            unfinished_futures=len(unfinished),
+                            force=True if unfinished else None,
+                            succeeded=False if unfinished else None,
+                            exception_type=type(cancel_error).__name__,
+                            message=str(cancel_error),
+                        )
                     _LOGGER.warning(
-                        "Failed to cancel unfinished local Dask futures: %s", error
+                        "Failed to cancel unfinished local Dask futures: %s",
+                        cancel_error,
                     )
+                else:
+                    if fine_mode:
+                        self._fine_cancellation = _FineCancellationEvidence(
+                            outcome=("cancelled" if unfinished else "no_unfinished"),
+                            attempted=bool(unfinished),
+                            unfinished_futures=len(unfinished),
+                            force=True if unfinished else None,
+                            succeeded=True if unfinished else None,
+                            exception_type=None,
+                            message=None,
+                        )
             raise
         finally:
-            _close_owned(client, cluster, configuration)
+            self._fine_cleanup = _close_owned(client, cluster, configuration)
 
 
 __all__ = ["LocalDaskExecutor"]

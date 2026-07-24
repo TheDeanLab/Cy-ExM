@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping, Sequence
-from numbers import Integral, Real
+from numbers import Integral
 from typing import Literal
 
 from cyexm._nonlinear_metric import resolve_nonlinear_metric
+from cyexm.chunking import chunk_grid
 from cyexm.spatial import AXIS_CONVENTION_VERSION, ImageGeometry, PixelSize
 
 WHOLE_SCALAR_POLICY = "whole-global-histogram-match-v1"
 CHUNK_SCALAR_POLICY = "serial-chunk-local-histogram-match-core-stitch-v1"
 OUTPUT_FORMAT_POLICY = "ome-compatible-tiff-uint16-v1"
 CHANNEL_POSTPROCESSING_POLICY = "clip-uint16-no-normalization-v1"
+PREPARED_SCALAR_POLICY = "float32-preserve-registration-values-v1"
+PREPARED_MASK_POLICY = (
+    "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
+)
 
 _LINEAR_ITERATIONS = {
     "high": [1000, 500, 250, 100],
@@ -196,79 +200,6 @@ def scalar_policy(strategy: Literal["whole_image", "serial_chunked"]) -> str:
     return WHOLE_SCALAR_POLICY if strategy == "whole_image" else CHUNK_SCALAR_POLICY
 
 
-def _positive_int_triple(value: Sequence[int], name: str) -> tuple[int, int, int]:
-    values = tuple(value)
-    if len(values) != 3:
-        raise ValueError(f"{name} must contain exactly three integers")
-    if any(isinstance(item, bool) or not isinstance(item, Integral) for item in values):
-        raise TypeError(f"{name} must contain exactly three integers")
-    normalized = tuple(int(item) for item in values)
-    if any(item <= 0 for item in normalized):
-        raise ValueError(f"{name} values must be positive")
-    return normalized[0], normalized[1], normalized[2]
-
-
-def _overlap_fraction(value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise TypeError("overlap_fraction must be a finite number")
-    overlap = float(value)
-    if not math.isfinite(overlap):
-        raise ValueError("overlap_fraction must be finite")
-    if overlap < 0.0 or overlap >= 1.0:
-        raise ValueError("overlap_fraction must satisfy 0 <= value < 1")
-    return overlap
-
-
-def chunk_grid(
-    image_shape_zyx: Sequence[int],
-    chunk_size_zyx: Sequence[int],
-    overlap_fraction: float,
-) -> tuple[dict[str, int], ...]:
-    """Derive the exact canonical serial chunk grid."""
-    shape_z, shape_y, shape_x = _positive_int_triple(image_shape_zyx, "image_shape")
-    chunk_z, chunk_y, chunk_x = _positive_int_triple(chunk_size_zyx, "chunk_size")
-    overlap = _overlap_fraction(overlap_fraction)
-    overlap_z, overlap_y, overlap_x = (
-        int(chunk_z * overlap),
-        int(chunk_y * overlap),
-        int(chunk_x * overlap),
-    )
-    step_z, step_y, step_x = (
-        chunk_z - overlap_z,
-        chunk_y - overlap_y,
-        chunk_x - overlap_x,
-    )
-    z_positions = (0,) if shape_z <= chunk_z else tuple(range(0, shape_z, step_z))
-    y_positions = (0,) if shape_y <= chunk_y else tuple(range(0, shape_y, step_y))
-    x_positions = (0,) if shape_x <= chunk_x else tuple(range(0, shape_x, step_x))
-
-    chunks: list[dict[str, int]] = []
-    for z_start in z_positions:
-        for y_start in y_positions:
-            for x_start in x_positions:
-                z_end = min(z_start + chunk_z, shape_z)
-                y_end = min(y_start + chunk_y, shape_y)
-                x_end = min(x_start + chunk_x, shape_x)
-                chunks.append(
-                    {
-                        "chunk_id": len(chunks),
-                        "z_start": z_start,
-                        "z_end": z_end,
-                        "y_start": y_start,
-                        "y_end": y_end,
-                        "x_start": x_start,
-                        "x_end": x_end,
-                        "z_start_ext": max(0, z_start - overlap_z // 2),
-                        "z_end_ext": min(shape_z, z_end + overlap_z // 2),
-                        "y_start_ext": max(0, y_start - overlap_y // 2),
-                        "y_end_ext": min(shape_y, y_end + overlap_y // 2),
-                        "x_start_ext": max(0, x_start - overlap_x // 2),
-                        "x_end_ext": min(shape_x, x_end + overlap_x // 2),
-                    }
-                )
-    return tuple(chunks)
-
-
 def chunk_bounds(chunk: Mapping[str, int]) -> tuple[int, int, int, int, int, int]:
     """Return one chunk's extended ZYX bounds."""
     return (
@@ -433,6 +364,8 @@ __all__ = [
     "CHANNEL_POSTPROCESSING_POLICY",
     "CHUNK_SCALAR_POLICY",
     "OUTPUT_FORMAT_POLICY",
+    "PREPARED_MASK_POLICY",
+    "PREPARED_SCALAR_POLICY",
     "WHOLE_SCALAR_POLICY",
     "affine_parameters",
     "canonical_compact_json",

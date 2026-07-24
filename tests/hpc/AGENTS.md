@@ -2,7 +2,8 @@
 
 - Every test in this directory is marked `hpc`; explicitly selected `hpc` execution
   means the actual pytest invocation contains exactly `-m hpc`, independent of
-  marker defaults, and supplies all three caller-owned Cy-ExM options.
+  marker defaults, includes exact `--run-hpc`, and supplies all three caller-owned
+  Cy-ExM options.
   Fail closed when an option, approved path, scheduler fact, allocation fact, or
   cleanup fact is missing. Never skip by hostname or infer approval from being on a
   login node.
@@ -85,3 +86,60 @@
 - Make no acceptance claim without a real allocation and complete machine-readable
   evidence. Never commit caller data, external evidence, generated arrays, job logs,
   credentials, or site-specific approved paths.
+- Fine-grained production acceptance additionally requires exact coarse-versus-fine
+  two-tier scientific parity, nonlinear chunks and channels placed concurrently on
+  distinct SLURM jobs/hosts, the configured cap and fair round opportunities,
+  injected chunk/channel failure with resume, cancellation with resume, exact owned
+  cleanup, and at least a 20% nonlinear-stage wall-time reduction. These real SLURM
+  requirements remain pending until the exact-commit external gate is complete.
+- The fine harness reuses the Phase 2E caller-owned context and owned-job lifecycle.
+  Its test alone additionally requires exact `--cyexm-coarse-execution` and
+  `--cyexm-fine-execution` profiles; the former must identify the same file as the
+  legacy `--cyexm-execution` option. Never derive either operator approval silently.
+- Apply the complete canonical archive/project/protected-root/input validation to
+  both approved profiles before creating any scenario root or contacting SLURM.
+  The profiles may differ only in coarse/fine mode, source path, and deliberately
+  disjoint output root, project scratch root, and job name; worker count, processes,
+  cores, memory, threads, queue, network, retries, directives, and controls must be
+  exact for a fair comparison. Protected roots include ClearEx and both declared
+  live spheroid paths above.
+- Preflight two serial-chunked rounds with real dependent channels before any
+  acceptance write. Failure, cancellation, and worker-loss controls bind exact
+  cross-round task keys. Every summarized claim must cross-check checksum-bound raw
+  attempt, placement, probe, scale, marker, deterministic, comparison, and queue
+  evidence; a summary boolean is never acceptance authority.
+- Cross-worker placement ordering and fairness use only checksum-bound primary-graph
+  coordinator submission/readiness timestamps, including preparation readiness;
+  never compare worker wall clocks. Cross-derive exact task worker/job/host fields,
+  scale sequence, activated-worker cap, concurrency, and fair dispatch from that raw
+  graph.
+- The performance gate compares a conservative fine coordinator upper bound through
+  assembly against the maximum complete per-round coarse nonlinear lower bound.
+  Aggregate every nonlinear call in each stable `round-XXX-coarse-main` record using
+  one worker-monotonic first-start/last-end span, or explicitly fall back to summed
+  call durations when monotonic bounds are unavailable; never take one maximum call.
+- Treat each owned-workflow `*-outcome.json` as the complete job-ID and cleanup
+  outcome authority, and its checksum-bound `*-queue-after.json[jobs]` as the
+  post-cleanup queue authority. Executor `cleanup` proves only ordered
+  client/cluster/configuration closure; never infer SLURM ownership from it or from
+  task placements. Lineage and placement job IDs must be subsets of the complete
+  outcome-owned set so additional initial workers remain visible.
+- Keep fine-only report schemas and audit decoders in
+  `fine_workflow_acceptance.py`. Keep shared submission, cleanup, fresh-coordinator,
+  and acceptance-only worker-runner machinery in `workflow_acceptance.py`.
+  Acceptance-only profiling may time the real ANTs nonlinear kernel and record
+  worker peak RSS externally, but it must restore patched runtime state in `finally`.
+- A worker-loss trial may terminate only the exact dedicated worker process after
+  durably writing its one-shot marker. It must never terminate the coordinator, and
+  acceptance requires production departure, replacement, recovery, liveness, and
+  exact named-job cleanup evidence before making a claim. Dask may expose recovery
+  either as a failed coordinator attempt followed by a retry or as a transparent
+  scheduler reschedule of the original future. For the latter, require the recovered
+  task's coordinator interval to span the checksum-bound loss-marker timestamp and
+  require the admitted replacement identity to complete that task or a later
+  accepted scientific task.
+- `test_fine_worker_replacement_only.py` is a focused production diagnostic for
+  rerunning only worker-loss/replacement acceptance after scheduler-lifecycle
+  changes. Its report may supplement prior exact-commit gates, but it does not by
+  itself replace the complete fine-grained scientific, durability, cancellation,
+  deterministic-parity, and performance acceptance matrix.

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
+import zlib
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -389,6 +391,27 @@ def _mip(path: Path) -> NDArray[np.float64]:
     return np.asarray(array.max(axis=0), dtype=np.float64)
 
 
+def _encoded_gradient_crop(
+    image: NDArray[np.float64],
+    roi: tuple[int, int, int, int],
+) -> dict[str, object]:
+    y0, y1, x0, x1 = roi
+    crop = _gradient_magnitude(image)[y0:y1, x0:x1]
+    low, high = np.percentile(crop, (1, 99))
+    if high <= low:
+        normalized = np.zeros(crop.shape, dtype=np.uint8)
+    else:
+        normalized = np.asarray(
+            np.clip((crop - low) / (high - low), 0.0, 1.0) * 255.0,
+            dtype=np.uint8,
+        )
+    return {
+        "shape_yx": list(normalized.shape),
+        "encoding": "zlib+base64+uint8",
+        "data": base64.b64encode(zlib.compress(normalized.tobytes())).decode("ascii"),
+    }
+
+
 def _runtime_summary(payload: dict[str, object]) -> dict[str, float | int]:
     raw_results = payload.get("fine_results")
     if not isinstance(raw_results, list):
@@ -445,6 +468,7 @@ def analyze_characterization(
     blockwise: list[dict[str, object]] = []
     jacobians: list[dict[str, object]] = []
     runtimes: list[dict[str, object]] = []
+    overlay_crops: list[dict[str, object]] = []
     for label in spec.condition_order:
         condition_root = output_root / f"chunk-{label}"
         dataset_root = condition_root / f"fixed-affine-chunk-{label}"
@@ -490,6 +514,15 @@ def analyze_characterization(
                         **residual.to_dict(),
                     }
                 )
+                overlay_crops.append(
+                    {
+                        "condition": label,
+                        "round": round_number,
+                        "roi": roi_name,
+                        "fixed": _encoded_gradient_crop(fixed_mip, roi),
+                        "registered": _encoded_gradient_crop(moving_mip, roi),
+                    }
+                )
             for block in blockwise_residuals(
                 fixed_mip,
                 moving_mip,
@@ -527,6 +560,7 @@ def analyze_characterization(
         "regional_residuals": regional,
         "blockwise_residuals": blockwise,
         "jacobians": jacobians,
+        "overlay_crops": overlay_crops,
         "runtimes": runtimes,
     }
     write_evidence_json(analysis_path, result)

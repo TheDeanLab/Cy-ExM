@@ -2591,24 +2591,24 @@ class SlurmExecutor:
                     coordinator_ready_at: str,
                 ) -> FineTaskResult:
                     matches = tuple(
-                        (probe.worker_address, probe)
+                        probe
                         for probe in activated_probe_history
-                        if probe.slurm_job_id == result.slurm_job_id
+                        if (
+                            probe.slurm_job_id == result.slurm_job_id
+                            and probe.hostname == result.hostname
+                            and probe.pid == result.pid
+                        )
                     )
                     if len(matches) != 1:
                         raise RoundExecutionError(
                             "SLURM fine task result must name exactly one activated "
-                            "worker job"
+                            "worker address/hostname/pid/job identity"
                         )
-                    _address, probe = matches[0]
-                    if (
-                        result.hostname != probe.hostname
-                        or result.pid != probe.pid
-                        or not probe_was_active_for_attempt(
-                            probe,
-                            coordinator_submitted_at,
-                            coordinator_ready_at,
-                        )
+                    probe = matches[0]
+                    if not probe_was_active_for_attempt(
+                        probe,
+                        coordinator_submitted_at,
+                        coordinator_ready_at,
                     ):
                         raise RoundExecutionError(
                             "SLURM fine task placement does not match the exact "
@@ -2622,32 +2622,19 @@ class SlurmExecutor:
                         ()
                         if raw is None
                         else tuple(
-                            address
+                            probe
                             for probe in activated_probe_history
-                            for address in (probe.worker_address,)
-                            if probe.slurm_job_id == raw.slurm_job_id
+                            if (
+                                probe.slurm_job_id == raw.slurm_job_id
+                                and probe.hostname == raw.hostname
+                                and probe.pid == raw.pid
+                            )
                         )
                     )
-                    probe = (
-                        next(
-                            (
-                                candidate
-                                for candidate in activated_probe_history
-                                if raw is not None
-                                and candidate.worker_address == matches[0]
-                                and candidate.slurm_job_id == raw.slurm_job_id
-                            ),
-                            None,
-                        )
-                        if raw is not None and len(matches) == 1
-                        else None
-                    )
+                    probe = matches[0] if len(matches) == 1 else None
                     placement_accepted = (
                         raw is not None
                         and probe is not None
-                        and raw.hostname == probe.hostname
-                        and raw.pid == probe.pid
-                        and raw.slurm_job_id == probe.slurm_job_id
                         and probe_was_active_for_attempt(
                             probe,
                             observation.coordinator_submitted_at,
@@ -2669,7 +2656,9 @@ class SlurmExecutor:
                             duration_seconds=(
                                 observation.settled_result.duration_seconds
                             ),
-                            worker_address=(matches[0] if len(matches) == 1 else None),
+                            worker_address=(
+                                probe.worker_address if probe is not None else None
+                            ),
                             hostname=None if raw is None else raw.hostname,
                             pid=None if raw is None else raw.pid,
                             slurm_job_id=None if raw is None else raw.slurm_job_id,

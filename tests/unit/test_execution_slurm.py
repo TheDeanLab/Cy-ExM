@@ -1124,6 +1124,69 @@ def test_fine_slurm_replaces_lost_worker_at_cap_before_retry(
     assert events[1]["activated"] == ["tcp://node-b:1234"]
 
 
+def test_fine_slurm_replacement_on_same_job_matches_hostname_and_pid(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.pending_rounds = {2}
+    first = "tcp://node-a:1234"
+    replacement = "tcp://node-a:5678"
+    initial_probe = _probe(first)
+    replacement_probe = _probe(replacement)
+    replacement_probe["slurm_job_id"] = initial_probe["slurm_job_id"]
+    replacement_probe["pid"] = 456
+    modules.probe_results = {
+        first: initial_probe,
+        replacement: replacement_probe,
+    }
+    first_key = "round-002:whole-image:main"
+    modules.outcomes[first_key] = [RuntimeError("departed worker")]
+
+    def replace_then_complete(
+        futures: tuple[_FakeFuture, ...],
+        call_number: int,
+    ) -> None:
+        if call_number == 1:
+            modules.connected_workers = (replacement,)
+        else:
+            for future in futures:
+                future._done = True
+
+    modules.wait_hook = replace_then_complete
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=1,
+        retries=1,
+        mode="fine_grained",
+    )
+
+    results = executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+
+    assert results[-1].status == "completed"
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    events = cast(list[dict[str, object]], fine["scale_events"])
+    assert events[1]["departed"] == [first]
+    assert events[1]["activated"] == [replacement]
+    placements = cast(list[dict[str, object]], fine["placements"])
+    accepted = [
+        placement
+        for placement in placements
+        if placement["placement_accepted"] is True
+        and placement["slurm_job_id"] == initial_probe["slurm_job_id"]
+    ]
+    assert accepted
+    assert {
+        (
+            placement["worker_address"],
+            placement["hostname"],
+            placement["pid"],
+        )
+        for placement in accepted
+    } == {(replacement, "node-a", 456)}
+
+
 def test_fine_slurm_reconciles_departure_before_settled_failure_retry(
     tmp_path: Path,
 ) -> None:

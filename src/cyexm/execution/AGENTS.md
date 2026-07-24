@@ -126,6 +126,12 @@
   closed if replacement validation does not complete. Reconciliation at the current
   cap must not issue another scale request. Local Dask retains its scheduler-native
   blocking completion behavior.
+- A nanny restart can replace a worker address and PID inside the same SLURM
+  allocation, so historical activated probes may legitimately share one
+  `SLURM_JOB_ID`. Resolve a task result against the unique activated
+  hostname/PID/job tuple, derive the worker address from that probe, and retain the
+  active-interval check. Never reject a valid replacement merely because an older
+  departed probe used the same allocation ID.
 - Use one absolute coordinator-owned startup-timeout deadline for the complete
   replacement transaction: health/arrival snapshots, worker arrival, probe
   broadcast, candidate resource checks, every scheduler activation, and the final

@@ -18,6 +18,7 @@ project:
       children:
         - file: brightness-dependence-investigation.md
         - file: cc-syn-radius-characterization.md
+        - file: fixed-affine-chunk-size-characterization.md
         - file: phase-1-acceptance.md
         - file: phase-2-acceptance.md
   exclude:

@@ -283,7 +283,12 @@ registration evidence, as discussed in the
 [brightness-dependence investigation](brightness-dependence-investigation.md).
 Nonlinear CC uses one scalar voxel radius; omission normalizes to the provisional
 radius 4. Changing the metric or radius is a scientific change and can invalidate
-nonlinear descendants. Changing coarse versus fine-grained execution is not.
+nonlinear descendants. Changing coarse versus fine-grained execution is not. The
+dataset-specific
+[fixed-affine chunk-size characterization](fixed-affine-chunk-size-characterization.md)
+uses that fine graph to isolate nonlinear spatial support, including regional
+residuals, seam behavior, deformation validity, and four-node runtime. It is
+characterization evidence rather than a new production chunk-size default.
 
 Portable real-ANTs/Local-Dask evidence is complete through implementation Task 10,
 including scientific equivalence to the sequential fine graph, multiple chunks and

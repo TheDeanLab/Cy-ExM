@@ -116,3 +116,10 @@ warp-Jacobian and folding checks, and chunk-seam analysis. If the remaining
 low-signal residual is unacceptable, the next scientifically motivated experiment
 is a low-weight gradient or Laplacian-of-Gaussian secondary CC metric rather than a
 larger scalar CC radius.
+
+The subsequent
+[fixed-affine nonlinear chunk-size characterization](fixed-affine-chunk-size-characterization.md)
+held this radius-4 affine state constant while varying only nonlinear chunk
+support. It reproduced these three dim residuals exactly at every tested chunk
+size, confirming that smaller chunks alone do not remove the remaining
+brightness-associated displacement.

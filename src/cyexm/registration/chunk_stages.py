@@ -59,8 +59,12 @@ class ChunkStageContext:
     fixed_geometry: ImageGeometry
     fixed: object
     moving_linear: object
+    raw_fixed: object
+    raw_moving_linear: object
     fixed_mask: object
     moving_linear_mask: object
+    preprocessing: dict[str, object] | None
+    registered_scalar_policy: str
     nonlinear_type: str
     nonlinear_accuracy: str
     nonlinear_metric: object
@@ -242,6 +246,8 @@ def _local_request(
         nonlinear_radius=context.nonlinear_radius,
         scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
     )
+    if context.preprocessing is not None:
+        parameters["preprocessing"] = context.preprocessing
     return StageRequest.for_identities(
         stage=f"nonlinear-chunk:{chunk.chunk_id}",
         inputs=context.source_identities,
@@ -261,6 +267,11 @@ def _scalar_core_request(
     warp_identity: FileIdentity,
 ) -> StageRequest:
     context.verify_sources()
+    parameters: dict[str, object] = {
+        "scalar_postprocessing_policy": CHUNK_SCALAR_POLICY
+    }
+    if context.preprocessing is not None:
+        parameters["preprocessing"] = context.preprocessing
     return StageRequest.for_identities(
         stage=f"nonlinear-chunk-scalar-core:{chunk.chunk_id}",
         inputs=context.source_identities,
@@ -269,7 +280,7 @@ def _scalar_core_request(
         accuracy="exact",
         native_threads=context.native_threads,
         upstream=warp_identity,
-        parameters={"scalar_postprocessing_policy": CHUNK_SCALAR_POLICY},
+        parameters=parameters,
     )
 
 
@@ -479,6 +490,18 @@ def _commit_manifest(
         local_warps=[identity.to_dict() for identity in warp_identities],
     )
     text = canonical_compact_json(payload)
+    parameters = chunk_manifest_parameters(
+        chunk_size_zyx=context.chunk_size,
+        image_shape_zyx=context.fixed_geometry.shape,
+        local_warps=[identity.to_dict() for identity in warp_identities],
+        nonlinear_accuracy=context.nonlinear_accuracy,
+        nonlinear_metric=context.nonlinear_metric,
+        nonlinear_radius=context.nonlinear_radius,
+        nonlinear_type=context.nonlinear_type,
+        overlap_fraction=context.overlap_fraction,
+    )
+    if context.preprocessing is not None:
+        parameters["preprocessing"] = context.preprocessing
     request = StageRequest.for_identities(
         stage="nonlinear-chunk-manifest",
         inputs=context.source_identities,
@@ -487,16 +510,7 @@ def _commit_manifest(
         accuracy="exact",
         native_threads=context.native_threads,
         upstream=context.affine_identity,
-        parameters=chunk_manifest_parameters(
-            chunk_size_zyx=context.chunk_size,
-            image_shape_zyx=context.fixed_geometry.shape,
-            local_warps=[identity.to_dict() for identity in warp_identities],
-            nonlinear_accuracy=context.nonlinear_accuracy,
-            nonlinear_metric=context.nonlinear_metric,
-            nonlinear_radius=context.nonlinear_radius,
-            nonlinear_type=context.nonlinear_type,
-            overlap_fraction=context.overlap_fraction,
-        ),
+        parameters=parameters,
     )
 
     def reader(path: Path) -> dict[str, object]:
@@ -548,6 +562,22 @@ def _validate_chunk_records(
         chunk.x_end_ext,
     )
     geometry = crop_geometry(context.fixed_geometry, bounds)
+    warp_parameters = local_chunk_parameters(
+        chunk=_chunk_dict(chunk),
+        chunks=[_chunk_dict(item) for item in context.chunks],
+        chunk_size_zyx=context.chunk_size,
+        fixed_mask_geometry=geometry,
+        image_shape_zyx=context.fixed_geometry.shape,
+        moving_geometry=geometry,
+        moving_mask_geometry=geometry,
+        overlap_fraction=context.overlap_fraction,
+        nonlinear_accuracy=context.nonlinear_accuracy,
+        nonlinear_metric=context.nonlinear_metric,
+        nonlinear_radius=context.nonlinear_radius,
+        scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+    )
+    if context.preprocessing is not None:
+        warp_parameters["preprocessing"] = context.preprocessing
     expected_warp = StageRequest.for_identities(
         stage=f"nonlinear-chunk:{chunk.chunk_id}",
         inputs=context.source_identities,
@@ -556,26 +586,18 @@ def _validate_chunk_records(
         accuracy=context.nonlinear_accuracy,
         native_threads=context.native_threads,
         upstream=context.affine_identity,
-        parameters=local_chunk_parameters(
-            chunk=_chunk_dict(chunk),
-            chunks=[_chunk_dict(item) for item in context.chunks],
-            chunk_size_zyx=context.chunk_size,
-            fixed_mask_geometry=geometry,
-            image_shape_zyx=context.fixed_geometry.shape,
-            moving_geometry=geometry,
-            moving_mask_geometry=geometry,
-            overlap_fraction=context.overlap_fraction,
-            nonlinear_accuracy=context.nonlinear_accuracy,
-            nonlinear_metric=context.nonlinear_metric,
-            nonlinear_radius=context.nonlinear_radius,
-            scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
-        ),
+        parameters=warp_parameters,
     )
     warp_record = CompletionRecord.read(context.store.record_path(artifact.warp_path))
     if warp_record.request != expected_warp or warp_record.artifact != (
         artifact.warp_identity
     ):
         raise ValueError("local warp completion evidence does not match assembly")
+    scalar_parameters: dict[str, object] = {
+        "scalar_postprocessing_policy": CHUNK_SCALAR_POLICY
+    }
+    if context.preprocessing is not None:
+        scalar_parameters["preprocessing"] = context.preprocessing
     expected_scalar = StageRequest.for_identities(
         stage=f"nonlinear-chunk-scalar-core:{chunk.chunk_id}",
         inputs=context.source_identities,
@@ -584,7 +606,7 @@ def _validate_chunk_records(
         accuracy="exact",
         native_threads=context.native_threads,
         upstream=artifact.warp_identity,
-        parameters={"scalar_postprocessing_policy": CHUNK_SCALAR_POLICY},
+        parameters=scalar_parameters,
     )
     scalar_record = CompletionRecord.read(
         context.store.record_path(artifact.scalar_core_path)
@@ -653,7 +675,7 @@ def _finalize_assembled_nonlinear(
                 nonlinear_accuracy=context.nonlinear_accuracy,
                 nonlinear_metric=context.nonlinear_metric,
                 nonlinear_radius=context.nonlinear_radius,
-                scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+                scalar_postprocessing_policy=context.registered_scalar_policy,
                 evidence=evidence,
             ),
         )
@@ -676,12 +698,19 @@ def _finalize_assembled_nonlinear(
             )
             committed = True
         raw_mask = backend.apply_warp(
-            fixed=context.fixed,
+            fixed=context.raw_fixed,
             moving=context.moving_linear_mask,
             warp_path=warp_path,
             interpolation="nearestNeighbor",
         )
         registered_mask = backend.threshold_mask(raw_mask)
+        if context.preprocessing is not None:
+            registered_image = backend.apply_warp(
+                fixed=context.raw_fixed,
+                moving=context.raw_moving_linear,
+                warp_path=warp_path,
+                interpolation="linear",
+            )
     except RegistrationStageError:
         if committed:
             context.store.mark_stale(warp_path)
@@ -706,7 +735,7 @@ def _finalize_assembled_nonlinear(
     try:
         metrics_request = _stage_request(
             context,
-            context.fixed,
+            context.raw_fixed,
             stage="metrics:nonlinear-registered",
             method="Correlation+MattesMutualInformation",
             accuracy="full",
@@ -717,7 +746,12 @@ def _finalize_assembled_nonlinear(
                 "resampled_to_fixed": False,
                 "sampling": "regular",
                 "sampling_pct": 1.0,
-                "scalar_postprocessing_policy": CHUNK_SCALAR_POLICY,
+                "scalar_postprocessing_policy": context.registered_scalar_policy,
+                **(
+                    {}
+                    if context.preprocessing is None
+                    else {"preprocessing": context.preprocessing}
+                ),
             },
         )
         metrics_cached = None
@@ -729,7 +763,7 @@ def _finalize_assembled_nonlinear(
             )
         if metrics_cached is None:
             metrics = backend.calculate_metrics(
-                context.fixed,
+                context.raw_fixed,
                 registered_image,
                 fixed_mask=context.fixed_mask,
                 moving_mask=registered_mask,
@@ -764,11 +798,18 @@ def _finalize_assembled_nonlinear(
             method=context.nonlinear_type,
             accuracy=context.nonlinear_accuracy,
             upstream=FileIdentity.from_path(warp_path),
-            parameters=registered_image_parameters(
-                minimum=minimum,
-                maximum=maximum,
-                scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
-            ),
+            parameters={
+                **registered_image_parameters(
+                    minimum=minimum,
+                    maximum=maximum,
+                    scalar_postprocessing_policy=context.registered_scalar_policy,
+                ),
+                **(
+                    {}
+                    if context.preprocessing is None
+                    else {"preprocessing": context.preprocessing}
+                ),
+            },
         )
 
         def read_registered(path: Path) -> object:
@@ -789,6 +830,9 @@ def _finalize_assembled_nonlinear(
         if registered_cached is None:
 
             def write_registered(path: Path) -> None:
+                if context.preprocessing is not None:
+                    backend.write_clipped_tiff(registered_image, path)
+                    return
                 backend.write_tiff(
                     registered_image,
                     path,
@@ -888,6 +932,8 @@ def assemble_nonlinear_chunks(
         "local_warps": [identity.to_dict() for identity in warp_identities],
         "overlap_fraction": context.overlap_fraction,
     }
+    if context.preprocessing is not None:
+        evidence["preprocessing"] = context.preprocessing
     reused = _finalize_assembled_nonlinear(
         context,
         registered_image,

@@ -36,6 +36,10 @@
   documents. General guides and examples must remain portable and use Cy-ExM names.
 - Do not include credentials, private GitHub URLs with tokens, generated evidence,
   dataset-specific output, or large command transcripts.
+- Fixed-affine chunk-size characterization claims must identify the accepted source
+  state, ZYX chunk geometry, overlap, nonlinear metric and radius, regional
+  confidence or boundary status, seam behavior, and deformation validity. Keep
+  dataset-specific recommendations distinct from production defaults.
 
 ## API documentation synchronization
 

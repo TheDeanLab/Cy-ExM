@@ -128,8 +128,11 @@ would reduce chromatic and photometric differences.
   is first demonstrated. It cannot recover absent structure. See the
   [ANTs N4 documentation](https://github.com/ANTsX/ANTs/wiki/N4BiasFieldCorrection).
 - **Smaller chunks:** could give dim structures more relative influence, but may
-  remove needed context and increase instability. Test this only after changing the
-  metric.
+  remove needed context and increase instability. The subsequent
+  [fixed-affine chunk-size characterization](fixed-affine-chunk-size-characterization.md)
+  tested 1125-, 512-, 256-, and 128-pixel XY chunks with CC radius 4. Smaller
+  chunks did not reduce the named dim-region residual and widened the tails of the
+  Jacobian distribution.
 - **Greater overlap:** unlikely to solve the observed region because it lies inside
   a chunk core, away from a seam.
 - **More iterations or reduced smoothing:** unlikely to help when the metric lacks a

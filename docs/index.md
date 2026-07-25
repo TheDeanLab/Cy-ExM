@@ -27,7 +27,10 @@ documents why dim regions can be harder to register and the evidence supporting
 local cross-correlation for nonlinear SyN. The
 [CC SyN radius characterization](cc-syn-radius-characterization.md) is explicitly
 a dataset-specific completed sweep and is not a statement of a universally
-optimized default.
+optimized default. The
+[fixed-affine nonlinear chunk-size characterization](fixed-affine-chunk-size-characterization.md)
+then isolates nonlinear spatial support while holding the accepted affine state
+constant.
 
 ## Acceptance evidence
 

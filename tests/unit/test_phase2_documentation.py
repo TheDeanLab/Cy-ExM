@@ -508,3 +508,48 @@ def test_phase_two_acceptance_is_coarse_history_not_fine_slurm_acceptance() -> N
         "per-chunk dask parallelism, parallel channel transformation, and resource "
         "auto-optimization remain future work"
     ) not in acceptance
+
+
+def test_fixed_affine_chunk_characterization_is_complete_and_navigable() -> None:
+    report_path = REPOSITORY_ROOT / "docs/fixed-affine-chunk-size-characterization.md"
+    assert report_path.is_file()
+    report = report_path.read_text(encoding="utf-8")
+    normalized = " ".join(report.split()).lower()
+    navigation = (REPOSITORY_ROOT / "docs/myst.yml").read_text(encoding="utf-8")
+    index = (REPOSITORY_ROOT / "docs/index.md").read_text(encoding="utf-8")
+
+    assert "<!-- RESULTS_TABLES -->" not in report
+    assert "<!-- INTERPRETATION -->" not in report
+    assert "fixed-affine-chunk-size-characterization.md" in navigation
+    assert "fixed-affine-chunk-size-characterization.md" in index
+    for required in (
+        "accepted radius-4 affine state held exactly fixed",
+        "trsaa estimator was never called",
+        "`[512,1125,1125]`",
+        "`[512,512,512]`",
+        "`[512,256,256]`",
+        "`[512,128,128]`",
+        "overlap fraction",
+        "0.15",
+        "y = 1600:1800",
+        "x = 300:400",
+        "y = 1227:1427",
+        "x = 840:1040",
+        "boundary optimum",
+        "seam-adjacent",
+        "geometric jacobian",
+        "dataset-specific",
+        "does not establish a universal chunk size",
+    ):
+        assert required in normalized
+    for name in (
+        "regional-residuals.png",
+        "regional-overlays.png",
+        "runtime-throughput.png",
+        "seam-interior.png",
+        "jacobian-validity.png",
+    ):
+        assert f"images/fixed-affine-chunk-size/{name}" in report
+        assert (
+            REPOSITORY_ROOT / "docs/images/fixed-affine-chunk-size" / name
+        ).is_file()

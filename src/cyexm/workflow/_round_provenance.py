@@ -627,7 +627,7 @@ def _registered_snapshot(
     if value_range is None:
         return None
     minimum, maximum = value_range
-    preprocessing = _feature_evidence(task, snapshot)
+    preprocessing = _feature_evidence(task, warp)
     if task.registration.preprocessing is not None and preprocessing is None:
         return None
     parameters = registered_image_parameters(

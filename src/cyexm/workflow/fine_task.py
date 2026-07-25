@@ -548,6 +548,8 @@ def _chunk_context(
         _verify_identity(manifest.native_fixed, "fixed source")
         _verify_identity(manifest.native_moving, "moving source")
         _verify_identity(manifest.affine, "affine")
+        if manifest.moving_crop is not None:
+            _verify_identity(manifest.moving_crop, "moving crop")
 
     def reuse_artifact(path: Path, request: object, reader: object) -> object | None:
         verify_sources()
@@ -583,6 +585,7 @@ def _chunk_context(
             store.mark_stale(path)
 
     if assembly:
+        verify_sources()
         raw_fixed = backend.load_image(
             round_task.fixed_image, round_task.voxel_spacing_xyz
         )

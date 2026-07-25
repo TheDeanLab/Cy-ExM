@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -207,6 +207,31 @@ def test_preprocessing_filter_normalizes_scalar_or_zyx_list(
 
     assert manifest.registration.preprocessing is not None
     assert manifest.registration.preprocessing.filter_sigma_zyx == expected
+
+
+def test_direct_manifest_rejects_noncanonical_integer_preprocessing_tuple(
+    tmp_path: Path,
+) -> None:
+    from cyexm.config.dataset import _validate_dataset_manifest
+
+    data = _valid_data()
+    _mapping_at(data, ("registration",))["preprocessing"] = {
+        "filter_sigma_zyx": [1, 2, 3]
+    }
+    normalized = _load_data(tmp_path, data)
+    assert normalized.registration.preprocessing is not None
+    direct = replace(
+        normalized,
+        registration=replace(
+            normalized.registration,
+            preprocessing=config.RegistrationPreprocessingSpec(
+                filter_sigma_zyx=(1, 2, 3)  # type: ignore[arg-type]
+            ),
+        ),
+    )
+
+    with pytest.raises(ConfigurationValidationError, match="built-in float"):
+        _validate_dataset_manifest(direct)
 
 
 @pytest.mark.parametrize(

@@ -688,11 +688,13 @@ def test_chunk_context_reconstructs_only_the_prepared_region(
         native_fixed=identity,
         native_moving=identity,
         affine=identity,
+        moving_crop=identity,
         pixeltypes=pixeltypes,
     )
     array = np.zeros(task.chunk.extended_shape, dtype=np.float32)
     region = PreparedRegion(array, array, array, array, geometry, pixeltypes)
     calls: list[ImageGeometry] = []
+    verified_roles: list[str] = []
 
     class Backend:
         def __init__(self, _threads: object) -> None:
@@ -713,6 +715,11 @@ def test_chunk_context_reconstructs_only_the_prepared_region(
             return SimpleNamespace(geometry=geometry)
 
     monkeypatch.setattr(worker, "_validated_prepared_manifest", lambda *_args: manifest)
+    monkeypatch.setattr(
+        worker,
+        "_verify_identity",
+        lambda _identity, role: verified_roles.append(role),
+    )
     monkeypatch.setattr(backend_module, "AntsRegistrationBackend", Backend)
     monkeypatch.setattr(prepared, "read_prepared_region", lambda *_args: region)
     monkeypatch.setattr(artifacts, "ArtifactStore", lambda: SimpleNamespace())
@@ -724,6 +731,8 @@ def test_chunk_context_reconstructs_only_the_prepared_region(
     assert actual_region is not None
     assert context.fixed is actual_region.fixed
     assert calls == [geometry, geometry, geometry, geometry]
+    context.verify_sources()
+    assert "moving crop" in verified_roles
 
 
 def test_prepared_bundle_is_bound_to_exact_round_and_runtime(

@@ -496,9 +496,21 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
                 "RegistrationPreprocessingSpec or null; "
                 f"got {preprocessing!r}"
             )
-        registration_mapping["preprocessing"] = {
-            "filter_sigma_zyx": list(preprocessing.filter_sigma_zyx)
-        }
+        sigma = preprocessing.filter_sigma_zyx
+        if type(sigma) is not tuple or len(sigma) != 3:
+            raise ConfigurationValidationError(
+                "registration.preprocessing.filter_sigma_zyx must be an exact "
+                "tuple containing three built-in floats; "
+                f"got {sigma!r}"
+            )
+        for index, value in enumerate(sigma):
+            if type(value) is not float or not math.isfinite(value) or value <= 0.0:
+                raise ConfigurationValidationError(
+                    "registration.preprocessing.filter_sigma_zyx"
+                    f"[{index}] must be a positive finite built-in float; "
+                    f"got {value!r}"
+                )
+        registration_mapping["preprocessing"] = {"filter_sigma_zyx": list(sigma)}
     parsed_registration = _registration(registration_mapping)
     round_mappings: list[dict[str, object]] = []
     for index, round_spec in enumerate(manifest.rounds):

@@ -232,6 +232,11 @@ def _registration_matches_snapshot(
     snapshot: _ScientificSnapshot,
 ) -> bool:
     try:
+        preprocessing_filter_sigma_zyx = (
+            None
+            if registration.preprocessing is None
+            else registration.preprocessing.filter_sigma_zyx
+        )
         return (
             type(registration.crop) is bool
             and registration.crop == snapshot.registration.crop
@@ -242,6 +247,8 @@ def _registration_matches_snapshot(
             == snapshot.registration.nonlinear_accuracy
             and registration.nonlinear.metric == snapshot.registration.nonlinear_metric
             and registration.nonlinear.radius == snapshot.registration.nonlinear_radius
+            and preprocessing_filter_sigma_zyx
+            == snapshot.registration.preprocessing_filter_sigma_zyx
         )
     except AttributeError:
         return False

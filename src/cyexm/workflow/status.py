@@ -21,6 +21,7 @@ from cyexm.io.tiff import _read_uint16_tiff_geometry_without_runtime
 from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
     OUTPUT_FORMAT_POLICY,
+    REGISTRATION_FEATURE_POLICY,
 )
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
@@ -71,6 +72,7 @@ _REFERENCE_KEYS = frozenset(
 )
 _REFERENCE_CHANNEL_KEYS = frozenset({"file", "manifest_file", "output"})
 _REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
+_REGISTRATION_PREPROCESSING_KEYS = frozenset({"algorithm", "filter_sigma_zyx"})
 _LINEAR_STAGE_KEYS = frozenset({"type", "accuracy"})
 _NONLINEAR_CC_STAGE_KEYS = frozenset({"type", "accuracy", "metric", "radius"})
 _NONLINEAR_MATTES_STAGE_KEYS = frozenset({"type", "accuracy", "metric", "bins"})
@@ -157,6 +159,7 @@ class _RegistrationContract:
     nonlinear_accuracy: str
     nonlinear_metric: NonlinearMetricName
     nonlinear_radius: int | None
+    preprocessing_filter_sigma_zyx: tuple[float, float, float] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,7 +425,17 @@ def _parse_source(
 
 
 def _parse_registration(value: object) -> _RegistrationContract:
-    mapping = _exact_mapping(value, _REGISTRATION_KEYS, "scientific plan registration")
+    preliminary = _mapping(value, "scientific plan registration")
+    expected = (
+        _REGISTRATION_KEYS | frozenset({"preprocessing"})
+        if "preprocessing" in preliminary
+        else _REGISTRATION_KEYS
+    )
+    mapping = _exact_mapping(
+        preliminary,
+        expected,
+        "scientific plan registration",
+    )
     crop = mapping["crop"]
     if type(crop) is not bool:
         raise WorkflowPlanError(
@@ -455,6 +468,24 @@ def _parse_registration(value: object) -> _RegistrationContract:
                 f"{nonlinear_location}.bins must be exactly {MATTES_BINS}; got {bins!r}"
             )
         nonlinear_radius = None
+    preprocessing_filter_sigma_zyx = None
+    if "preprocessing" in mapping:
+        preprocessing_location = "scientific plan registration.preprocessing"
+        preprocessing = _exact_mapping(
+            mapping["preprocessing"],
+            _REGISTRATION_PREPROCESSING_KEYS,
+            preprocessing_location,
+        )
+        if preprocessing["algorithm"] != REGISTRATION_FEATURE_POLICY:
+            raise WorkflowPlanError(
+                f"{preprocessing_location}.algorithm must be exactly "
+                f"{REGISTRATION_FEATURE_POLICY!r}; "
+                f"got {preprocessing['algorithm']!r}"
+            )
+        preprocessing_filter_sigma_zyx = _triple_float(
+            preprocessing["filter_sigma_zyx"],
+            f"{preprocessing_location}.filter_sigma_zyx",
+        )
     return _RegistrationContract(
         crop=crop,
         linear_type=_choice(
@@ -477,6 +508,7 @@ def _parse_registration(value: object) -> _RegistrationContract:
         ),
         nonlinear_metric=cast(NonlinearMetricName, metric),
         nonlinear_radius=nonlinear_radius,
+        preprocessing_filter_sigma_zyx=preprocessing_filter_sigma_zyx,
     )
 
 

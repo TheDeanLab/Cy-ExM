@@ -758,6 +758,54 @@ def test_status_rejects_boolean_scientific_schema_version(tmp_path: Path) -> Non
         inspect_workflow_status(output_root, "dataset-1")
 
 
+def test_status_accepts_canonical_registration_preprocessing(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    scientific["registration"]["preprocessing"] = {  # type: ignore[index]
+        "algorithm": "gaussian-background-mad-asinh-float32-v1",
+        "filter_sigma_zyx": [2.0, 12.0, 20.0],
+    }
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    status = inspect_workflow_status(output_root, "dataset-1")
+
+    assert status.rounds[1].status == "pending"
+
+
+@pytest.mark.parametrize(
+    "preprocessing",
+    [
+        {},
+        {"algorithm": "unknown", "filter_sigma_zyx": [12.0, 12.0, 12.0]},
+        {
+            "algorithm": "gaussian-background-mad-asinh-float32-v1",
+            "filter_sigma_zyx": [12.0, 12.0],
+        },
+        {
+            "algorithm": "gaussian-background-mad-asinh-float32-v1",
+            "filter_sigma_zyx": [12.0, 0.0, 12.0],
+        },
+    ],
+)
+def test_status_rejects_noncanonical_registration_preprocessing(
+    tmp_path: Path,
+    preprocessing: dict[str, object],
+) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    scientific["registration"]["preprocessing"] = preprocessing  # type: ignore[index]
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    with pytest.raises(WorkflowPlanError, match="preprocessing"):
+        inspect_workflow_status(output_root, "dataset-1")
+
+
 @pytest.mark.parametrize(
     "nonlinear",
     [

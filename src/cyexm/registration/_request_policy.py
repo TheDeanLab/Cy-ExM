@@ -19,6 +19,7 @@ PREPARED_SCALAR_POLICY = "float32-preserve-registration-values-v1"
 PREPARED_MASK_POLICY = (
     "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
 )
+REGISTRATION_FEATURE_POLICY = "gaussian-background-mad-asinh-float32-v1"
 
 _LINEAR_ITERATIONS = {
     "high": [1000, 500, 250, 100],

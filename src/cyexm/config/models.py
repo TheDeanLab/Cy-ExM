@@ -47,6 +47,11 @@ class RegistrationStageSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class RegistrationPreprocessingSpec:
+    filter_sigma_zyx: tuple[float, float, float] = (12.0, 12.0, 12.0)
+
+
+@dataclass(frozen=True, slots=True)
 class NonlinearRegistrationStageSpec:
     type: str
     accuracy: str
@@ -59,6 +64,7 @@ class RegistrationSpec:
     crop: bool
     linear: RegistrationStageSpec
     nonlinear: NonlinearRegistrationStageSpec
+    preprocessing: RegistrationPreprocessingSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -81,6 +81,12 @@ class ChunkPaths:
 
 
 class ChunkedImageRegistration(ImageRegistration):
+    """Register with serial fixed-grid nonlinear chunks.
+
+    Optional preprocessing follows :class:`ImageRegistration`: chunks estimate
+    feature warps, then the accepted full warp reconstructs the raw moving image.
+    """
+
     def __init__(
         self,
         fixed_image_path: str | os.PathLike[str],

@@ -85,3 +85,7 @@
   registration/scientific imports and must not create a Dask client, submit child
   tasks, schedule other rounds, or start multiprocessing. The coordinator remains
   the only scheduler owner.
+- Scientific plans include optional canonical registration preprocessing. Producer
+  and authoritative reader requests must change together; measured feature scales
+  bind affine descendants, while crop/reference/channel parameters stay independent
+  and channel invalidation remains transitive through transform identities.

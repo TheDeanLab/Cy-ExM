@@ -51,8 +51,10 @@ can resume without repeating successful reconstruction.
 
 ## Fine-grained internal artifacts
 
-Fine preparation commits four internal float32 arrays and a strict format-version-2
-manifest under `round_{round}_prepared/`:
+Fine preparation commits four internal float32 arrays under
+`round_{round}_prepared/`. Preprocessing-disabled bundles retain the exact strict
+format-version-2 manifest. Feature-enabled bundles use strict format version 3 and
+add the canonical preprocessing policy plus measured fixed and moving robust scales:
 
 | Artifact | Internal role |
 | --- | --- |
@@ -92,6 +94,10 @@ Scalar reconstruction is an explicit, versioned part of the request:
   `serial-chunk-local-histogram-match-core-stitch-v1`: apply each committed local
   warp, histogram-match against that chunk's affine moving distribution, convert the
   validated core to float32, and stitch the cores without a second global match.
+- feature-enabled registration uses
+  `feature-estimation-raw-warp-affine-clip-v1`: feature scalar cores remain internal
+  evidence, while the accepted full warp is applied to the raw affine-resampled
+  registration image and persisted with clipping but no normalization.
 
 Histogram matching depends on the reference intensity distribution, so matching
 each local distribution and then stitching is not generally equivalent to stitching
@@ -99,6 +105,15 @@ the warped volume and matching once globally. Preserving this ordering is theref
 a scientific requirement, not merely an output-format choice. In both modes, the
 nonlinear mask is independently reconstructed from the committed full warp with
 nearest-neighbor interpolation and thresholding at 0.5.
+
+The feature algorithm identifier, ZYX voxel sigma, and actual fixed/moving robust
+scales are part of affine and nonlinear descendant request identities. Changing a
+sigma therefore invalidates prepared format-3 arrays, affine descendants, local
+chunk warps and cores, the chunk manifest, full warp, metrics, and registered TIFF.
+Crop-bound artifacts, `fixed_reference.tif`, and reference-channel outputs do not
+include feature parameters and remain reusable when their own inputs and policies
+still match. Dependent-channel requests are unchanged; they are invalidated
+transitively when the accepted affine or warp identity changes.
 
 ## Completion record contents
 

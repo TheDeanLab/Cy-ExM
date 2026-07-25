@@ -166,6 +166,14 @@ class _LinearPreparation:
 
 
 class ImageRegistration:
+    """Register one moving image to one fixed image.
+
+    ``preprocess_filter_sigma_zyx`` is an optional canonical three-value tuple in
+    NumPy ZYX voxel units. When present, cropped feature images estimate transforms;
+    raw images still own masks, metrics, and final registered output. YAML scalar
+    expansion occurs before this Python API.
+    """
+
     def __init__(
         self,
         fixed_image_path: str | os.PathLike[str],
@@ -1257,6 +1265,7 @@ class ImageRegistration:
             return True
 
         try:
+
             def writer(path: Path) -> None:
                 if self.preprocess_filter_sigma_zyx is not None:
                     backend.write_clipped_tiff(moving_nonlinear, path)

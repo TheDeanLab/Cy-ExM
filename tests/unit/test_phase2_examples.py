@@ -11,6 +11,7 @@ from cyexm.config import (
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
     ParallelismSpec,
+    RegistrationPreprocessingSpec,
     RegistrationSpec,
     RegistrationStageSpec,
     SlurmMemoryQuantity,
@@ -95,6 +96,21 @@ def test_spheroid_manifest_records_approved_scientific_inputs() -> None:
     assert manifest.rounds[1].overlap_fraction == 0.15
     assert manifest.rounds[2].chunk_size_zyx is None
     assert manifest.rounds[2].overlap_fraction is None
+
+
+def test_preprocessed_spheroid_manifest_is_portable_and_uses_default_sigma() -> None:
+    path = REPOSITORY_ROOT / "examples/preprocessed-spheroid-dataset.yaml"
+
+    manifest = load_dataset_manifest(path)
+
+    assert manifest.registration.preprocessing == RegistrationPreprocessingSpec(
+        filter_sigma_zyx=(12.0, 12.0, 12.0)
+    )
+    assert manifest.registration.nonlinear.metric == "CC"
+    assert manifest.registration.nonlinear.radius == 4
+    raw = path.read_text(encoding="utf-8")
+    assert "filter_sigma_zyx: 12" in raw
+    assert not any(marker in raw for marker in ("/project", "/archive", "/endosome"))
 
 
 def _yaml_scalars(value: object) -> Iterator[object]:

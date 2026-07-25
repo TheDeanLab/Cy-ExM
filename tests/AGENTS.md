@@ -31,3 +31,6 @@
   sequential/Local-Dask parity, unequal spatial shapes, worker isolation, failure,
   cancellation, cleanup, and restart without external scheduler contact. It must not
   be described as real-SLURM placement or production acceptance.
+- Registration-feature changes require exact kernel tests, raw-versus-feature
+  boundary tests for whole/serial/fine execution, cache invalidation coverage, and a
+  bounded real-ANTs regression proving raw-scale fixed-grid output.

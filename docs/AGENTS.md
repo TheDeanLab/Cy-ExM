@@ -48,3 +48,8 @@ module API map, `See Also` decision boundaries, canonical examples, and relevant
 user-facing pages synchronized with the implemented signature and behavior. Use
 examples that preserve Cy-ExM's fixed/moving roles, public XYZ spacing, and NumPy ZYX
 volume order.
+
+Registration-preprocessing documentation must preserve the
+raw → crop → feature estimate → transform raw boundary. State that masks and metrics
+are raw-derived, sigmas are NumPy ZYX voxel counts, and feature images are never
+public TIFFs.

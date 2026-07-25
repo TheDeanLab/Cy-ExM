@@ -1,0 +1,46 @@
+schema_version: 1
+dataset_id: preprocessed-spheroid-registration-example
+
+# Public spacing is in micrometers and XYZ order. NumPy volume axes are ZYX.
+voxel_spacing_um:
+  x: 0.324
+  y: 0.324
+  z: 0.900
+
+reference:
+  round: 1
+  registration_channel: round_1_488_tubulin.tif
+  channels:
+    - file: round_1_488_tubulin.tif
+
+registration:
+  crop: false
+  preprocessing:
+    # Sigma is in NumPy ZYX voxel units, not micrometers.
+    filter_sigma_zyx: [12, 12, 12]
+    # A scalar is scientifically identical: filter_sigma_zyx: 12
+  linear:
+    type: TRSAA
+    accuracy: high
+  nonlinear:
+    type: SyNOnly
+    accuracy: high
+    metric: CC
+    # Omitted CC radius uses the provisional default of 4.
+
+rounds:
+  - round: 2
+    strategy: whole_image
+    registration_channel: round_2_488_tubulin.tif
+    channels:
+      - {file: round_2_488_tubulin.tif, interpolation: linear}
+      - {file: round_2_647_hsp60.tif, interpolation: linear}
+
+  - round: 3
+    strategy: serial_chunked
+    registration_channel: round_3_488_tubulin.tif
+    chunk_size_zyx: [512, 512, 512]
+    overlap_fraction: 0.15
+    channels:
+      - {file: round_3_488_tubulin.tif, interpolation: linear}
+      - {file: round_3_647_fbl.tif, interpolation: linear}

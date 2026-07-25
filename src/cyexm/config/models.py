@@ -48,6 +48,13 @@ class RegistrationStageSpec:
 
 @dataclass(frozen=True, slots=True)
 class RegistrationPreprocessingSpec:
+    """Optional transform-estimation feature settings.
+
+    ``filter_sigma_zyx`` is a Gaussian sigma in NumPy ZYX voxel units. YAML may
+    supply a scalar or three values; the normalized Python model always stores the
+    canonical three-value tuple.
+    """
+
     filter_sigma_zyx: tuple[float, float, float] = (12.0, 12.0, 12.0)
 
 

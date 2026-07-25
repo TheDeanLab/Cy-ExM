@@ -77,3 +77,10 @@
   ownership of one unique disposable warp candidate to their immediate caller. The
   caller must persist or consume it and then use the shared best-effort cleanup helper;
   a backend must never return a canonical cache path or shared native source.
+- Preprocessing-disabled prepared manifests remain exact format 2; enabled feature
+  manifests are strict format 3 and bind the algorithm, ZYX voxel sigma, and actual
+  fixed/moving robust scales.
+- Crop raw images before feature construction, derive masks from raw values greater
+  than zero, estimate affine/nonlinear transforms from features only, and reconstruct
+  metrics and public scalar output from raw fixed-grid data. Any algorithm change
+  requires a new policy identifier and a bounded scientific regression.

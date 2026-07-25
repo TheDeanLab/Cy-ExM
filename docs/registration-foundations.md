@@ -7,3 +7,24 @@ The same invariants state that masks use values greater than zero; affine preced
 The nonlinear metric may be Mattes or `CC`. CC radius is one positive scalar voxel radius, and omitted CC radius uses provisional value 4. A CC radius is not a per-axis physical radius. On anisotropic data, equal voxel extents produce an anisotropic physical neighborhood, so radius selection requires characterization rather than an assumed universal optimum.
 
 Finally, native ITK/BLAS-family threads default to one unless inherited or configured explicitly. Keep native-thread settings explicit in execution profiles when comparing runtimes or operating worker-backed executors.
+
+## Optional background-subtracted asinh features
+
+Schema version 1 permits an optional `registration.preprocessing` mapping. Omission
+disables preprocessing. An empty mapping enables the default
+`filter_sigma_zyx: [12, 12, 12]`; a positive scalar expands to all axes, and a
+three-value form is interpreted in NumPy `(z, y, x)` voxel order. These sigma values
+are voxel counts, not micrometers.
+
+Cy-ExM crops raw images first, creates greater-than-zero masks from those raw values,
+and then computes a feature independently for the fixed and moving registration
+channels. The feature is the positive portion of a signed Gaussian-background
+residual divided by `max(1.4826 × MAD, float32 epsilon)` and passed through `asinh`.
+The Gaussian boundary mode is reflective. TRSAA and nonlinear registration see the
+float32 features and raw-derived masks.
+
+Transforms remain the scientific result. The accepted affine and warp are applied to
+the original raw registration channel; dependent channels are likewise transformed
+from their original sources. Pre-, linear-, and nonlinear-registration metrics use
+raw intensities. The public registered TIFF is clipped to uint16 without intensity
+normalization. No normalized feature TIFF is a public artifact.

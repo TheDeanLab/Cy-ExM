@@ -140,6 +140,11 @@ def _registration_paths(
     return paths
 
 
+def _preprocess_sigma(task: RoundTask) -> tuple[float, float, float] | None:
+    preprocessing = task.registration.preprocessing
+    return None if preprocessing is None else preprocessing.filter_sigma_zyx
+
+
 def _reused_artifacts(
     paths: tuple[Path, ...],
     before: dict[Path, _ArtifactSnapshot],
@@ -293,6 +298,7 @@ def run_round_task(task: RoundTask) -> RoundResult:
             "nonlinear_accuracy": task.registration.nonlinear.accuracy,
             "nonlinear_metric": task.registration.nonlinear.metric,
             "nonlinear_radius": task.registration.nonlinear.radius,
+            "preprocess_filter_sigma_zyx": _preprocess_sigma(task),
         }
         stage = "registration"
         if task.strategy == "whole_image":

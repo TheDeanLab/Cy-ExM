@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 from cyexm.registration._request_policy import (
+    RAW_RECONSTRUCTED_SCALAR_POLICY,
     affine_parameters,
     canonical_compact_json,
     channel_transform_parameters,
@@ -23,6 +24,7 @@ from cyexm.registration._request_policy import (
     local_chunk_parameters,
     nonlinear_stage_parameters,
     registered_image_parameters,
+    registration_feature_parameters,
     scalar_policy,
 )
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
@@ -135,6 +137,44 @@ def _common(task: RoundTask) -> dict[str, object]:
     )
     parameters["prepared_fixed"] = task.prepared_fixed
     return parameters
+
+
+def _registration_scalar_policy(task: RoundTask) -> str:
+    if task.registration.preprocessing is not None:
+        return RAW_RECONSTRUCTED_SCALAR_POLICY
+    return scalar_policy(task.strategy)
+
+
+def _feature_evidence(
+    task: RoundTask,
+    snapshot: ArtifactSnapshot | None,
+) -> dict[str, object] | None:
+    configured = task.registration.preprocessing
+    if configured is None:
+        return None
+    if snapshot is None:
+        return None
+    value = snapshot[0].request.parameters.get("preprocessing")
+    if not isinstance(value, Mapping):
+        return None
+    fixed_scale = value.get("fixed_robust_scale")
+    moving_scale = value.get("moving_robust_scale")
+    for scale in (fixed_scale, moving_scale):
+        if (
+            isinstance(scale, bool)
+            or not isinstance(scale, int | float)
+            or not math.isfinite(float(scale))
+            or float(scale) <= 0.0
+        ):
+            return None
+    expected = registration_feature_parameters(
+        filter_sigma_zyx=configured.filter_sigma_zyx,
+        fixed_scale=float(fixed_scale),  # type: ignore[arg-type]
+        moving_scale=float(moving_scale),  # type: ignore[arg-type]
+    )
+    if not _parameters_match(dict(value), expected):
+        return None
+    return expected
 
 
 def _request_matches(
@@ -362,6 +402,16 @@ def _affine_snapshot(
     snapshot_reader: SnapshotReader,
 ) -> ArtifactSnapshot | None:
     snapshot = snapshot_reader(path)
+    preprocessing = _feature_evidence(task, snapshot)
+    if task.registration.preprocessing is not None and preprocessing is None:
+        return None
+    parameters = affine_parameters(
+        moving_geometry=geometries.moving,
+        linear_type=task.registration.linear.type,
+        accuracy=task.registration.linear.accuracy,
+    )
+    if preprocessing is not None:
+        parameters["preprocessing"] = preprocessing
     if not _request_matches(
         snapshot,
         stage="affine",
@@ -373,11 +423,7 @@ def _affine_snapshot(
         upstream=None,
         parameters={
             **_common(task),
-            **affine_parameters(
-                moving_geometry=geometries.moving,
-                linear_type=task.registration.linear.type,
-                accuracy=task.registration.linear.accuracy,
-            ),
+            **parameters,
         },
     ):
         return None
@@ -401,6 +447,12 @@ def _serial_chunk_evidence(
         task.overlap_fraction,
     )
     chunk_directory = paths.output / f"round_{task.round}_chunks"
+    preprocessing = _feature_evidence(
+        task,
+        snapshot_reader(Path(affine_identity.path)),
+    )
+    if task.registration.preprocessing is not None and preprocessing is None:
+        return None
     local_identities: list[FileIdentity] = []
     for chunk in grid:
         local_path = chunk_directory / f"chunk_{chunk['chunk_id']:04d}_warp.nii.gz"
@@ -416,6 +468,22 @@ def _serial_chunk_evidence(
                 chunk["x_end_ext"],
             ),
         )
+        parameters = local_chunk_parameters(
+            chunk=chunk,
+            chunks=grid,
+            chunk_size_zyx=task.chunk_size_zyx,
+            fixed_mask_geometry=local_geometry,
+            image_shape_zyx=geometry.shape,
+            moving_geometry=local_geometry,
+            moving_mask_geometry=local_geometry,
+            overlap_fraction=task.overlap_fraction,
+            nonlinear_accuracy=task.registration.nonlinear.accuracy,
+            nonlinear_metric=task.registration.nonlinear.metric,
+            nonlinear_radius=task.registration.nonlinear.radius,
+            scalar_postprocessing_policy=scalar_policy(task.strategy),
+        )
+        if preprocessing is not None:
+            parameters["preprocessing"] = preprocessing
         if not _request_matches(
             snapshot,
             stage=f"nonlinear-chunk:{chunk['chunk_id']}",
@@ -425,20 +493,7 @@ def _serial_chunk_evidence(
             accuracy=task.registration.nonlinear.accuracy,
             task=task,
             upstream=affine_identity,
-            parameters=local_chunk_parameters(
-                chunk=chunk,
-                chunks=grid,
-                chunk_size_zyx=task.chunk_size_zyx,
-                fixed_mask_geometry=local_geometry,
-                image_shape_zyx=geometry.shape,
-                moving_geometry=local_geometry,
-                moving_mask_geometry=local_geometry,
-                overlap_fraction=task.overlap_fraction,
-                nonlinear_accuracy=task.registration.nonlinear.accuracy,
-                nonlinear_metric=task.registration.nonlinear.metric,
-                nonlinear_radius=task.registration.nonlinear.radius,
-                scalar_postprocessing_policy=scalar_policy(task.strategy),
-            ),
+            parameters=parameters,
         ):
             return None
         if snapshot is None or Path(snapshot[1].path) != local_path.resolve():
@@ -448,6 +503,18 @@ def _serial_chunk_evidence(
     local_dicts = [identity.to_dict() for identity in local_identities]
     manifest_path = chunk_directory / "manifest.json"
     manifest_snapshot = snapshot_reader(manifest_path)
+    manifest_parameters = chunk_manifest_parameters(
+        chunk_size_zyx=task.chunk_size_zyx,
+        image_shape_zyx=geometry.shape,
+        local_warps=local_dicts,
+        nonlinear_accuracy=task.registration.nonlinear.accuracy,
+        nonlinear_metric=task.registration.nonlinear.metric,
+        nonlinear_radius=task.registration.nonlinear.radius,
+        nonlinear_type=task.registration.nonlinear.type,
+        overlap_fraction=task.overlap_fraction,
+    )
+    if preprocessing is not None:
+        manifest_parameters["preprocessing"] = preprocessing
     if not _request_matches(
         manifest_snapshot,
         stage="nonlinear-chunk-manifest",
@@ -457,16 +524,7 @@ def _serial_chunk_evidence(
         accuracy="exact",
         task=task,
         upstream=affine_identity,
-        parameters=chunk_manifest_parameters(
-            chunk_size_zyx=task.chunk_size_zyx,
-            image_shape_zyx=geometry.shape,
-            local_warps=local_dicts,
-            nonlinear_accuracy=task.registration.nonlinear.accuracy,
-            nonlinear_metric=task.registration.nonlinear.metric,
-            nonlinear_radius=task.registration.nonlinear.radius,
-            nonlinear_type=task.registration.nonlinear.type,
-            overlap_fraction=task.overlap_fraction,
-        ),
+        parameters=manifest_parameters,
     ):
         return None
     if (
@@ -487,13 +545,16 @@ def _serial_chunk_evidence(
             return None
     except (OSError, OverflowError, TypeError, UnicodeError, ValueError):
         return None
-    return {
+    evidence: dict[str, object] = {
         "chunk_grid": [dict(chunk) for chunk in grid],
         "chunk_manifest": manifest_snapshot[1].to_dict(),
         "chunk_size_zyx": list(task.chunk_size_zyx),
         "local_warps": local_dicts,
         "overlap_fraction": task.overlap_fraction,
     }
+    if preprocessing is not None:
+        evidence["preprocessing"] = preprocessing
+    return evidence
 
 
 def _warp_snapshot(
@@ -507,6 +568,9 @@ def _warp_snapshot(
 ) -> ArtifactSnapshot | None:
     evidence: dict[str, object] | None = None
     registration_mode: Literal["whole-image", "serial-chunked"] = "whole-image"
+    preprocessing = _feature_evidence(task, affine)
+    if task.registration.preprocessing is not None and preprocessing is None:
+        return None
     if task.strategy == "serial_chunked":
         registration_mode = "serial-chunked"
         evidence = _serial_chunk_evidence(
@@ -519,6 +583,8 @@ def _warp_snapshot(
         )
         if evidence is None:
             return None
+    elif preprocessing is not None:
+        evidence = {"preprocessing": preprocessing}
     snapshot = snapshot_reader(path)
     if not _request_matches(
         snapshot,
@@ -537,7 +603,7 @@ def _warp_snapshot(
                 nonlinear_accuracy=task.registration.nonlinear.accuracy,
                 nonlinear_metric=task.registration.nonlinear.metric,
                 nonlinear_radius=task.registration.nonlinear.radius,
-                scalar_postprocessing_policy=scalar_policy(task.strategy),
+                scalar_postprocessing_policy=_registration_scalar_policy(task),
                 evidence=evidence,
             ),
         },
@@ -561,6 +627,16 @@ def _registered_snapshot(
     if value_range is None:
         return None
     minimum, maximum = value_range
+    preprocessing = _feature_evidence(task, snapshot)
+    if task.registration.preprocessing is not None and preprocessing is None:
+        return None
+    parameters = registered_image_parameters(
+        minimum=minimum,
+        maximum=maximum,
+        scalar_postprocessing_policy=_registration_scalar_policy(task),
+    )
+    if preprocessing is not None:
+        parameters["preprocessing"] = preprocessing
     if not _request_matches(
         snapshot,
         stage="registered-image",
@@ -572,11 +648,7 @@ def _registered_snapshot(
         upstream=warp[1],
         parameters={
             **_common(task),
-            **registered_image_parameters(
-                minimum=minimum,
-                maximum=maximum,
-                scalar_postprocessing_policy=scalar_policy(task.strategy),
-            ),
+            **parameters,
         },
     ):
         return None

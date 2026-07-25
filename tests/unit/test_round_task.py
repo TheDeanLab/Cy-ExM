@@ -768,6 +768,7 @@ def test_round_task_passes_exact_strategy_constructor_arguments(
         "nonlinear_accuracy": task.registration.nonlinear.accuracy,
         "nonlinear_metric": task.registration.nonlinear.metric,
         "nonlinear_radius": task.registration.nonlinear.radius,
+        "preprocess_filter_sigma_zyx": None,
     }
     if strategy == "serial_chunked":
         expected["chunk_size"] = task.chunk_size_zyx
@@ -777,6 +778,35 @@ def test_round_task_passes_exact_strategy_constructor_arguments(
     assert isinstance(thread_config, NativeThreadConfig)
     assert thread_config.itk_threads == task.native_threads.itk
     assert thread_config.blas_threads == task.native_threads.blas
+
+
+def test_round_task_forwards_canonical_registration_preprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.config import RegistrationPreprocessingSpec
+
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    original = _task(tmp_path, channel_names=(), force=True)
+    task = replace(
+        original,
+        registration=replace(
+            original.registration,
+            preprocessing=RegistrationPreprocessingSpec(
+                filter_sigma_zyx=(2.0, 12.0, 20.0)
+            ),
+        ),
+    )
+    _install_runtime(monkeypatch, task, calls, constructors)
+
+    run_round_task(task)
+
+    assert constructors[0][1]["preprocess_filter_sigma_zyx"] == (
+        2.0,
+        12.0,
+        20.0,
+    )
 
 
 def test_round_task_passes_force_threads_spacing_and_interpolation_to_channels(

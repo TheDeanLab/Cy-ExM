@@ -12,6 +12,16 @@
 - Resolve nonlinear metric policy before loading scientific runtimes. Preserve
   standalone Mattes/32 defaults; forward exact `CC` plus its positive scalar radius
   through whole-image and every serial-chunk call and authoritative request record.
+- `preprocessing.py` owns the only supported registration feature: reflective
+  Gaussian background subtraction, a deterministic 1.4826-MAD scale calculated
+  from the signed residual before clipping, negative clipping at zero, and asinh.
+  Keep its NumPy and SciPy imports deferred and change its versioned policy identity
+  whenever numerical behavior changes.
+- Registration features are transform-estimation inputs only. Crop raw images before
+  deriving features, derive masks from cropped raw values greater than zero, and use
+  raw images for all existing metrics, registered scalar reconstruction, and channel
+  transformation. Never preprocess dependent channels or write feature TIFFs as
+  public outputs.
 - Apply forward transforms in warp-then-affine list order with both inversion
   flags false. Scalars use linear interpolation; labels and masks use
   `nearestNeighbor`, with transformed masks cast to float and thresholded at 0.5 so

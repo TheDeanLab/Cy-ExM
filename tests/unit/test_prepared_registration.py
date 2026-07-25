@@ -51,6 +51,7 @@ def _registration(
     *,
     backend: FakeBackend | None = None,
     force_override: bool = False,
+    preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
 ) -> ImageRegistration:
     fixed = tmp_path / "fixed.tif"
     moving = tmp_path / "moving.tif"
@@ -64,6 +65,7 @@ def _registration(
         pixel_size=(2.0, 3.0, 4.0),
         enable_logging=False,
         force_override=force_override,
+        preprocess_filter_sigma_zyx=preprocess_filter_sigma_zyx,
         _backend=backend or FakeBackend(),
     )
 
@@ -95,6 +97,66 @@ def test_prepared_paths_use_exact_internal_bundle_names(tmp_path: Path) -> None:
     assert paths.fixed_mask == paths.directory / "fixed_mask.npy"
     assert paths.moving_linear_mask == paths.directory / "moving_linear_mask.npy"
     assert paths.manifest == paths.directory / "manifest.json"
+
+
+def test_disabled_preparation_retains_exact_manifest_v2(tmp_path: Path) -> None:
+    manifest = commit_prepared_round(_registration(tmp_path))
+
+    assert manifest.format_version == 2
+    assert set(manifest.to_dict()) == {
+        "format_version",
+        "fixed_scalar",
+        "moving_linear_scalar",
+        "fixed_mask",
+        "moving_linear_mask",
+        "native_fixed",
+        "native_moving",
+        "moving_crop",
+        "affine",
+        "geometry",
+        "scalar_policy",
+        "mask_policy",
+        "native_threads",
+        "pixeltypes",
+    }
+
+
+def test_enabled_preparation_uses_strict_feature_manifest_v3(
+    tmp_path: Path,
+) -> None:
+    manifest = commit_prepared_round(
+        _registration(
+            tmp_path,
+            preprocess_filter_sigma_zyx=(2.0, 3.0, 4.0),
+        )
+    )
+
+    assert manifest.format_version == 3
+    assert manifest.preprocessing is not None
+    assert manifest.preprocessing["filter_sigma_zyx"] == [2.0, 3.0, 4.0]
+    assert manifest.fixed_feature_scale is not None
+    assert manifest.fixed_feature_scale > 0.0
+    assert manifest.moving_feature_scale is not None
+    assert manifest.moving_feature_scale > 0.0
+    assert set(manifest.to_dict()) == {
+        "format_version",
+        "fixed_scalar",
+        "moving_linear_scalar",
+        "fixed_mask",
+        "moving_linear_mask",
+        "native_fixed",
+        "native_moving",
+        "moving_crop",
+        "affine",
+        "geometry",
+        "scalar_policy",
+        "mask_policy",
+        "native_threads",
+        "pixeltypes",
+        "preprocessing",
+        "fixed_feature_scale",
+        "moving_feature_scale",
+    }
 
 
 def test_manifest_transport_rejects_unknown_keys(tmp_path: Path) -> None:

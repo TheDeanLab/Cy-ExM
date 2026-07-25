@@ -102,6 +102,11 @@ def _new_image_registration(task: RoundTask, threads: NativeThreadConfig) -> obj
         nonlinear_accuracy=task.registration.nonlinear.accuracy,
         nonlinear_metric=task.registration.nonlinear.metric,
         nonlinear_radius=task.registration.nonlinear.radius,
+        preprocess_filter_sigma_zyx=(
+            None
+            if task.registration.preprocessing is None
+            else task.registration.preprocessing.filter_sigma_zyx
+        ),
     )
 
 
@@ -344,6 +349,8 @@ def _validated_prepared_manifest(
         PREPARED_MASK_POLICY,
         PREPARED_SCALAR_POLICY,
         common_parameters,
+        preprocessing_config_parameters,
+        registration_feature_parameters,
     )
     from cyexm.registration.artifacts import (
         ArtifactStore,
@@ -362,6 +369,29 @@ def _validated_prepared_manifest(
     if not isinstance(descriptor, dict):
         raise TypeError("prepared descriptor must be a JSON object")
     manifest = PreparedManifest.from_dict(descriptor)
+    configured_preprocessing = task.registration.preprocessing
+    expected_format = 2 if configured_preprocessing is None else 3
+    if manifest.format_version != expected_format:
+        raise ValueError(
+            "prepared manifest format does not match registration preprocessing"
+        )
+    preprocessing: dict[str, object] | None = None
+    if configured_preprocessing is not None:
+        expected_static = preprocessing_config_parameters(
+            configured_preprocessing.filter_sigma_zyx
+        )
+        if manifest.preprocessing != expected_static:
+            raise ValueError("prepared preprocessing does not match the embedded round")
+        if (
+            manifest.fixed_feature_scale is None
+            or manifest.moving_feature_scale is None
+        ):
+            raise ValueError("prepared feature scales are missing")
+        preprocessing = registration_feature_parameters(
+            filter_sigma_zyx=configured_preprocessing.filter_sigma_zyx,
+            fixed_scale=manifest.fixed_feature_scale,
+            moving_scale=manifest.moving_feature_scale,
+        )
     fixed = FileIdentity.from_path(task.fixed_image)
     moving = FileIdentity.from_path(task.moving_image)
     if (manifest.native_fixed, manifest.native_moving) != (fixed, moving):
@@ -423,6 +453,7 @@ def _validated_prepared_manifest(
             "scalar_policy": PREPARED_SCALAR_POLICY,
             "mask_policy": PREPARED_MASK_POLICY,
             "ants_pixeltype": manifest.pixeltypes[role],
+            **({} if preprocessing is None else {"preprocessing": preprocessing}),
         }
         expected = StageRequest.for_identities(
             stage=f"prepared:{role}",
@@ -461,6 +492,7 @@ def _validated_prepared_manifest(
             "scalar_policy": PREPARED_SCALAR_POLICY,
             "mask_policy": PREPARED_MASK_POLICY,
             "pixeltypes": manifest.pixeltypes,
+            **({} if preprocessing is None else {"preprocessing": preprocessing}),
         },
     )
     manifest_record = CompletionRecord.read(store.record_path(prepared.manifest))
@@ -482,9 +514,15 @@ def _chunk_context(
     actual_threads: dict[str, int],
 ) -> tuple[Any, Any | None, tuple[Any, ...]]:
     from cyexm.chunking import compute_chunk_grid
+    from cyexm.registration._request_policy import (
+        CHUNK_SCALAR_POLICY,
+        RAW_RECONSTRUCTED_SCALAR_POLICY,
+        registration_feature_parameters,
+    )
     from cyexm.registration.artifacts import ArtifactStore
     from cyexm.registration.backend import AntsRegistrationBackend
     from cyexm.registration.chunk_stages import ChunkRegion, ChunkStageContext
+    from cyexm.registration.crop import read_bounds
     from cyexm.registration.prepared import read_prepared_region
 
     round_task = task.round_task
@@ -545,9 +583,36 @@ def _chunk_context(
             store.mark_stale(path)
 
     if assembly:
-        fixed = backend.load_image(round_task.fixed_image, round_task.voxel_spacing_xyz)
-        if backend.geometry(fixed) != manifest.geometry:
+        raw_fixed = backend.load_image(
+            round_task.fixed_image, round_task.voxel_spacing_xyz
+        )
+        if backend.geometry(raw_fixed) != manifest.geometry:
             raise ValueError("prepared fixed TIFF geometry does not match the manifest")
+        raw_moving = backend.load_image(
+            round_task.moving_image, round_task.voxel_spacing_xyz
+        )
+        if round_task.registration.crop:
+            from cyexm.workflow._round_provenance import RegistrationArtifactPaths
+
+            registration_paths = RegistrationArtifactPaths.for_round(
+                round_task.registration_directory,
+                round_task.round,
+            )
+            bounds = read_bounds(
+                registration_paths.moving_crop,
+                backend.geometry(raw_moving).shape,
+            )
+            raw_moving = backend.crop_image(raw_moving, bounds)
+        raw_moving_linear = backend.apply_affine(
+            fixed=raw_fixed,
+            moving=raw_moving,
+            transform=backend.read_affine(Path(manifest.affine.path)),
+            interpolation="linear",
+        )
+        if backend.geometry(raw_moving_linear) != manifest.geometry:
+            raise ValueError(
+                "prepared raw affine result geometry does not match the manifest"
+            )
         selected = _whole_chunk(manifest.geometry.shape)
     else:
         if type(task) is not NonlinearChunkTask:
@@ -574,14 +639,39 @@ def _chunk_context(
         geometry=region.geometry,
         pixeltype=region.pixeltypes["moving_linear_mask"],
     )
+    preprocessing = None
+    if getattr(manifest, "format_version", 2) == 3:
+        configured = round_task.registration.preprocessing
+        if (
+            configured is None
+            or manifest.fixed_feature_scale is None
+            or manifest.moving_feature_scale is None
+        ):
+            raise ValueError("prepared feature evidence is incomplete")
+        preprocessing = registration_feature_parameters(
+            filter_sigma_zyx=configured.filter_sigma_zyx,
+            fixed_scale=manifest.fixed_feature_scale,
+            moving_scale=manifest.moving_feature_scale,
+        )
+    if not assembly:
+        raw_fixed = fixed_region
+        raw_moving_linear = moving_region
     context = ChunkStageContext(
         source_identities=source_identities,
         affine_identity=manifest.affine,
         fixed_geometry=manifest.geometry,
-        fixed=fixed if assembly else fixed_region,
+        fixed=fixed_region,
         moving_linear=moving_region,
+        raw_fixed=raw_fixed,
+        raw_moving_linear=raw_moving_linear,
         fixed_mask=fixed_mask_region,
         moving_linear_mask=moving_mask_region,
+        preprocessing=preprocessing,
+        registered_scalar_policy=(
+            CHUNK_SCALAR_POLICY
+            if preprocessing is None
+            else RAW_RECONSTRUCTED_SCALAR_POLICY
+        ),
         nonlinear_type=round_task.registration.nonlinear.type,
         nonlinear_accuracy=round_task.registration.nonlinear.accuracy,
         nonlinear_metric=round_task.registration.nonlinear.metric,

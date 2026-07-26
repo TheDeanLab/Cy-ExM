@@ -13,10 +13,12 @@ import pytest
 from cyexm.config.models import (
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
+    RegistrationPreprocessingSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
 from cyexm.registration._request_policy import (
+    RAW_RECONSTRUCTED_SCALAR_POLICY,
     affine_parameters,
     canonical_compact_json,
     channel_transform_parameters,
@@ -30,6 +32,7 @@ from cyexm.registration._request_policy import (
     local_chunk_parameters,
     nonlinear_stage_parameters,
     registered_image_parameters,
+    registration_feature_parameters,
     scalar_policy,
 )
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
@@ -136,6 +139,15 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
         pixel_size_xyz=task.voxel_spacing_xyz,
     )
     common["prepared_fixed"] = task.prepared_fixed
+    preprocessing = (
+        None
+        if task.registration.preprocessing is None
+        else registration_feature_parameters(
+            filter_sigma_zyx=task.registration.preprocessing.filter_sigma_zyx,
+            fixed_scale=2.0,
+            moving_scale=3.0,
+        )
+    )
     fixed_geometry, moving_geometry = _effective_geometries(task)
     if task.registration.crop:
         crop_cases: tuple[
@@ -197,6 +209,13 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
             },
         )
         _ensure_completion(paths.fixed_reference, fixed_reference_request)
+    affine_request_parameters = affine_parameters(
+        moving_geometry=moving_geometry,
+        linear_type=task.registration.linear.type,
+        accuracy=task.registration.linear.accuracy,
+    )
+    if preprocessing is not None:
+        affine_request_parameters["preprocessing"] = preprocessing
     affine_request = StageRequest.for_identities(
         stage="affine",
         inputs=inputs,
@@ -207,11 +226,7 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
         upstream=None,
         parameters={
             **common,
-            **affine_parameters(
-                moving_geometry=moving_geometry,
-                linear_type=task.registration.linear.type,
-                accuracy=task.registration.linear.accuracy,
-            ),
+            **affine_request_parameters,
         },
     )
     _ensure_completion(paths.affine, affine_request)
@@ -219,7 +234,11 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
         return
 
     affine_identity = FileIdentity.from_path(paths.affine)
-    selected_scalar_policy = scalar_policy(task.strategy)
+    selected_scalar_policy = (
+        RAW_RECONSTRUCTED_SCALAR_POLICY
+        if preprocessing is not None
+        else scalar_policy(task.strategy)
+    )
     nonlinear_evidence: dict[str, object] = {}
     if task.strategy == "serial_chunked":
         assert task.chunk_size_zyx is not None
@@ -244,6 +263,22 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
                     chunk["x_end_ext"],
                 ),
             )
+            local_parameters = local_chunk_parameters(
+                chunk=chunk,
+                chunks=chunks,
+                chunk_size_zyx=task.chunk_size_zyx,
+                fixed_mask_geometry=local_geometry,
+                image_shape_zyx=fixed_geometry.shape,
+                moving_geometry=local_geometry,
+                moving_mask_geometry=local_geometry,
+                overlap_fraction=task.overlap_fraction,
+                nonlinear_accuracy=task.registration.nonlinear.accuracy,
+                nonlinear_metric=task.registration.nonlinear.metric,
+                nonlinear_radius=task.registration.nonlinear.radius,
+                scalar_postprocessing_policy=scalar_policy(task.strategy),
+            )
+            if preprocessing is not None:
+                local_parameters["preprocessing"] = preprocessing
             local_request = StageRequest.for_identities(
                 stage=f"nonlinear-chunk:{chunk['chunk_id']}",
                 inputs=inputs,
@@ -252,20 +287,7 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
                 accuracy=task.registration.nonlinear.accuracy,
                 native_threads=_native_thread_values(task),
                 upstream=affine_identity,
-                parameters=local_chunk_parameters(
-                    chunk=chunk,
-                    chunks=chunks,
-                    chunk_size_zyx=task.chunk_size_zyx,
-                    fixed_mask_geometry=local_geometry,
-                    image_shape_zyx=fixed_geometry.shape,
-                    moving_geometry=local_geometry,
-                    moving_mask_geometry=local_geometry,
-                    overlap_fraction=task.overlap_fraction,
-                    nonlinear_accuracy=task.registration.nonlinear.accuracy,
-                    nonlinear_metric=task.registration.nonlinear.metric,
-                    nonlinear_radius=task.registration.nonlinear.radius,
-                    scalar_postprocessing_policy=selected_scalar_policy,
-                ),
+                parameters=local_parameters,
             )
             _ensure_completion(local_warp, local_request)
             local_identities.append(FileIdentity.from_path(local_warp))
@@ -280,6 +302,18 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
             chunks=chunks,
             local_warps=local_dicts,
         )
+        manifest_parameters = chunk_manifest_parameters(
+            chunk_size_zyx=task.chunk_size_zyx,
+            image_shape_zyx=fixed_geometry.shape,
+            local_warps=local_dicts,
+            nonlinear_accuracy=task.registration.nonlinear.accuracy,
+            nonlinear_metric=task.registration.nonlinear.metric,
+            nonlinear_radius=task.registration.nonlinear.radius,
+            nonlinear_type=task.registration.nonlinear.type,
+            overlap_fraction=task.overlap_fraction,
+        )
+        if preprocessing is not None:
+            manifest_parameters["preprocessing"] = preprocessing
         manifest_request = StageRequest.for_identities(
             stage="nonlinear-chunk-manifest",
             inputs=inputs,
@@ -288,16 +322,7 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
             accuracy="exact",
             native_threads=_native_thread_values(task),
             upstream=affine_identity,
-            parameters=chunk_manifest_parameters(
-                chunk_size_zyx=task.chunk_size_zyx,
-                image_shape_zyx=fixed_geometry.shape,
-                local_warps=local_dicts,
-                nonlinear_accuracy=task.registration.nonlinear.accuracy,
-                nonlinear_metric=task.registration.nonlinear.metric,
-                nonlinear_radius=task.registration.nonlinear.radius,
-                nonlinear_type=task.registration.nonlinear.type,
-                overlap_fraction=task.overlap_fraction,
-            ),
+            parameters=manifest_parameters,
         )
         _ensure_completion(
             manifest,
@@ -311,6 +336,8 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
             "local_warps": local_dicts,
             "overlap_fraction": task.overlap_fraction,
         }
+    if preprocessing is not None:
+        nonlinear_evidence["preprocessing"] = preprocessing
     warp_request = StageRequest.for_identities(
         stage="nonlinear",
         inputs=inputs,
@@ -337,6 +364,13 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
         },
     )
     _ensure_completion(paths.warp, warp_request)
+    registered_parameters = registered_image_parameters(
+        minimum=0.0,
+        maximum=100.0,
+        scalar_postprocessing_policy=selected_scalar_policy,
+    )
+    if preprocessing is not None:
+        registered_parameters["preprocessing"] = preprocessing
     registered_request = StageRequest.for_identities(
         stage="registered-image",
         inputs=inputs,
@@ -347,11 +381,7 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
         upstream=FileIdentity.from_path(paths.warp),
         parameters={
             **common,
-            **registered_image_parameters(
-                minimum=0.0,
-                maximum=100.0,
-                scalar_postprocessing_policy=selected_scalar_policy,
-            ),
+            **registered_parameters,
         },
     )
     _ensure_completion(paths.registered, registered_request)
@@ -768,6 +798,7 @@ def test_round_task_passes_exact_strategy_constructor_arguments(
         "nonlinear_accuracy": task.registration.nonlinear.accuracy,
         "nonlinear_metric": task.registration.nonlinear.metric,
         "nonlinear_radius": task.registration.nonlinear.radius,
+        "preprocess_filter_sigma_zyx": None,
     }
     if strategy == "serial_chunked":
         expected["chunk_size"] = task.chunk_size_zyx
@@ -777,6 +808,35 @@ def test_round_task_passes_exact_strategy_constructor_arguments(
     assert isinstance(thread_config, NativeThreadConfig)
     assert thread_config.itk_threads == task.native_threads.itk
     assert thread_config.blas_threads == task.native_threads.blas
+
+
+def test_round_task_forwards_canonical_registration_preprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.config import RegistrationPreprocessingSpec
+
+    calls: list[tuple[str, str]] = []
+    constructors: list[tuple[str, dict[str, object]]] = []
+    original = _task(tmp_path, channel_names=(), force=True)
+    task = replace(
+        original,
+        registration=replace(
+            original.registration,
+            preprocessing=RegistrationPreprocessingSpec(
+                filter_sigma_zyx=(2.0, 12.0, 20.0)
+            ),
+        ),
+    )
+    _install_runtime(monkeypatch, task, calls, constructors)
+
+    run_round_task(task)
+
+    assert constructors[0][1]["preprocess_filter_sigma_zyx"] == (
+        2.0,
+        12.0,
+        20.0,
+    )
 
 
 def test_round_task_passes_force_threads_spacing_and_interpolation_to_channels(
@@ -1087,6 +1147,53 @@ def test_radius_change_preserves_affine_but_invalidates_nonlinear_descendants(
     assert evidence.artifacts == (paths.affine,)
     assert evidence.affine is not None
     assert evidence.warp is None
+
+
+def test_registered_output_rejects_feature_scales_that_differ_from_warp(
+    tmp_path: Path,
+) -> None:
+    original = _task(tmp_path, crop=False, channel_names=())
+    task = replace(
+        original,
+        registration=replace(
+            original.registration,
+            preprocessing=RegistrationPreprocessingSpec((2.0, 4.0, 4.0)),
+        ),
+    )
+    _commit_registration_chain(task)
+    paths = RegistrationArtifactPaths.for_round(
+        task.registration_directory,
+        task.round,
+    )
+    record_path = paths.registered.with_name(f"{paths.registered.name}.complete.json")
+    record = CompletionRecord.read(record_path)
+    changed_parameters = dict(record.request.parameters)
+    changed_preprocessing = dict(changed_parameters["preprocessing"])  # type: ignore[arg-type]
+    changed_preprocessing["fixed_robust_scale"] = 20.0
+    changed_parameters["preprocessing"] = changed_preprocessing
+    changed_request = replace(record.request, parameters=changed_parameters)
+    record_path.write_text(
+        CompletionRecord(
+            schema_version=record.schema_version,
+            request=changed_request,
+            artifact=record.artifact,
+        ).to_json(),
+        encoding="utf-8",
+    )
+
+    evidence = completion_evidence(
+        task,
+        paths,
+        SourceGeometries(
+            fixed=_FULL_FIXED_GEOMETRY,
+            moving=_FULL_MOVING_GEOMETRY,
+        ),
+        geometry_reader=lambda _path, _spacing: _FULL_FIXED_GEOMETRY,
+    )
+
+    assert evidence.affine is not None
+    assert evidence.warp is not None
+    assert paths.registered not in evidence.artifacts
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt("stop"), SystemExit(7)])

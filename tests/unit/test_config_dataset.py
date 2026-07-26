@@ -1,10 +1,11 @@
 from copy import deepcopy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path, PurePosixPath
 
 import pytest
 import yaml
 
+import cyexm.config as config
 from cyexm.config import (
     ChannelSpec,
     DatasetManifest,
@@ -119,6 +120,7 @@ def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
         "ParallelismSpec",
         "ReferenceChannelSpec",
         "ReferenceSpec",
+        "RegistrationPreprocessingSpec",
         "RegistrationSpec",
         "RegistrationStageSpec",
         "RoundSpec",
@@ -167,6 +169,103 @@ def test_load_dataset_manifest_normalizes_xyz_and_zyx_fields(tmp_path: Path) -> 
     assert manifest.rounds[1].chunk_size_zyx == (8, 16, 16)
     with pytest.raises(FrozenInstanceError):
         manifest.dataset_id = "changed"  # type: ignore[misc]
+
+
+def test_preprocessing_omission_disables_and_empty_mapping_uses_default(
+    tmp_path: Path,
+) -> None:
+    disabled = _load_data(tmp_path, _valid_data())
+    assert disabled.registration.preprocessing is None
+
+    data = _valid_data()
+    registration = _mapping_at(data, ("registration",))
+    registration["preprocessing"] = {}
+
+    enabled = _load_data(tmp_path, data)
+
+    assert enabled.registration.preprocessing == config.RegistrationPreprocessingSpec(
+        filter_sigma_zyx=(12.0, 12.0, 12.0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (6, (6.0, 6.0, 6.0)),
+        ([4, 12.5, 20], (4.0, 12.5, 20.0)),
+    ],
+)
+def test_preprocessing_filter_normalizes_scalar_or_zyx_list(
+    tmp_path: Path,
+    value: object,
+    expected: tuple[float, float, float],
+) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("registration",))["preprocessing"] = {"filter_sigma_zyx": value}
+
+    manifest = _load_data(tmp_path, data)
+
+    assert manifest.registration.preprocessing is not None
+    assert manifest.registration.preprocessing.filter_sigma_zyx == expected
+
+
+def test_direct_manifest_rejects_noncanonical_integer_preprocessing_tuple(
+    tmp_path: Path,
+) -> None:
+    from cyexm.config.dataset import _validate_dataset_manifest
+
+    data = _valid_data()
+    _mapping_at(data, ("registration",))["preprocessing"] = {
+        "filter_sigma_zyx": [1, 2, 3]
+    }
+    normalized = _load_data(tmp_path, data)
+    assert normalized.registration.preprocessing is not None
+    direct = replace(
+        normalized,
+        registration=replace(
+            normalized.registration,
+            preprocessing=config.RegistrationPreprocessingSpec(
+                filter_sigma_zyx=(1, 2, 3)  # type: ignore[arg-type]
+            ),
+        ),
+    )
+
+    with pytest.raises(ConfigurationValidationError, match="built-in float"):
+        _validate_dataset_manifest(direct)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        0,
+        -1,
+        float("inf"),
+        [1, 2],
+        [1, 2, 3, 4],
+        [1, False, 3],
+    ],
+)
+def test_preprocessing_filter_rejects_invalid_values(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("registration",))["preprocessing"] = {"filter_sigma_zyx": value}
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=r"registration\.preprocessing\.filter_sigma_zyx",
+    ):
+        _load_data(tmp_path, data)
+
+
+def test_preprocessing_rejects_unknown_keys(tmp_path: Path) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("registration",))["preprocessing"] = {"unknown": 12}
+
+    with pytest.raises(ConfigurationValidationError, match="keys must be exactly"):
+        _load_data(tmp_path, data)
 
 
 def test_load_dataset_manifest_preserves_round_and_channel_order(

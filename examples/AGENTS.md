@@ -37,3 +37,6 @@
 - Scientific-manifest examples must declare nonlinear `metric`; demonstrate CC's
   optional radius by omitting it only when the normalized provisional default 4 is
   the intended example behavior.
+- Keep the base spheroid manifest preprocessing-disabled by omission. The dedicated
+  preprocessed example must show strict optional-block semantics, NumPy ZYX voxel
+  sigma units, scalar/list equivalence, and no lab-specific paths.

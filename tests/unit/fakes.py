@@ -246,10 +246,21 @@ class FakeBackend:
     to_array_calls: int = 0
     events: list[str] = field(default_factory=list)
     load_paths: list[Path] = field(default_factory=list)
+    loaded_images: list[FakeImage] = field(default_factory=list)
+    zero_mask_inputs: list[FakeImage] = field(default_factory=list)
+    from_array_calls: list[tuple[np.ndarray, FakeImage, bool]] = field(
+        default_factory=list
+    )
     linear_kwargs: list[dict[str, object]] = field(default_factory=list)
     nonlinear_kwargs: list[dict[str, object]] = field(default_factory=list)
     affine_interpolations: list[str] = field(default_factory=list)
+    affine_application_inputs: list[tuple[FakeImage, FakeImage, str]] = field(
+        default_factory=list
+    )
     warp_applications: list[tuple[Path, str]] = field(default_factory=list)
+    warp_application_inputs: list[tuple[FakeImage, FakeImage, Path, str]] = field(
+        default_factory=list
+    )
     transform_lists: list[tuple[Path, Path]] = field(default_factory=list)
     transform_inversions: list[tuple[bool, bool]] = field(default_factory=list)
     transform_interpolations: list[str] = field(default_factory=list)
@@ -297,6 +308,7 @@ class FakeBackend:
             template = self.moving_image
         loaded = template.clone()
         loaded.spacing = tuple(float(value) for value in pixel_size_xyz)
+        self.loaded_images.append(loaded)
         return loaded
 
     def zero_mask(self, image: object) -> object:
@@ -304,6 +316,7 @@ class FakeBackend:
         if not isinstance(source, FakeImage):
             raise TypeError("image must be a FakeImage")
         self.events.append("zero-mask")
+        self.zero_mask_inputs.append(source)
         return fake_image(
             data=(source.data > 0).astype(np.float32),
             origin=source.origin,
@@ -358,8 +371,10 @@ class FakeBackend:
             raise TypeError("reference must be a FakeImage")
         if self.fail_scalar_from_array and not has_components:
             raise RuntimeError("injected scalar array conversion failure")
+        values = np.asarray(array)
+        self.from_array_calls.append((values.copy(), source, has_components))
         return fake_image(
-            data=np.asarray(array),
+            data=values,
             origin=source.origin,
             spacing=source.spacing,
             direction=source.direction,
@@ -446,6 +461,7 @@ class FakeBackend:
             raise TypeError("fixed and moving must be FakeImages")
         self.events.append(f"apply-affine:{interpolation}")
         self.affine_interpolations.append(interpolation)
+        self.affine_application_inputs.append((fixed, moving, interpolation))
         if self.fail_affine_interpolation == interpolation:
             raise RuntimeError(f"injected {interpolation} affine application failure")
         return self._resample_to_reference(moving, fixed)
@@ -472,13 +488,13 @@ class FakeBackend:
         warp_path: Path,
         interpolation: str,
     ) -> object:
-        del fixed
-        if not isinstance(moving, FakeImage):
-            raise TypeError("moving must be a FakeImage")
+        if not isinstance(fixed, FakeImage) or not isinstance(moving, FakeImage):
+            raise TypeError("fixed and moving must be FakeImages")
         if not warp_path.is_file():
             raise FileNotFoundError(warp_path)
         self.events.append(f"apply-warp:{interpolation}")
         self.warp_applications.append((warp_path, interpolation))
+        self.warp_application_inputs.append((fixed, moving, warp_path, interpolation))
         if self.fail_warp_interpolation == interpolation:
             raise RuntimeError(f"injected {interpolation} warp application failure")
         offset = 10.0 if interpolation == "linear" else 0.0

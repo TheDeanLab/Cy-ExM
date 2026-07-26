@@ -48,3 +48,6 @@
   external evidence only. Cover forged identities, checksums, paths, geometry,
   placements, fairness, durability, cancellation, replacement, timing, and the 20%
   nonlinear wall-time gate without contacting a scheduler or terminating a process.
+- Preserve exact prepared format-2 keys when preprocessing is disabled. Format-3
+  tests must reject policy, sigma, scale, descriptor, completion-record, and source
+  identity mismatches and prove regional workers do not load raw full volumes.

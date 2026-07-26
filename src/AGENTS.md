@@ -19,3 +19,6 @@
   round-task modules, and CLI imports must remain usable without importing ANTs or
   scheduler libraries. Machine-specific execution adapters depend on those models,
   never the reverse.
+- Registration-feature preprocessing must keep NumPy/SciPy imports deferred to the
+  scientific execution boundary; configuration, planning, status, and CLI imports
+  remain lightweight.

@@ -20,6 +20,7 @@ from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration._native_paths import discard_path
 from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
+    RAW_RECONSTRUCTED_SCALAR_POLICY,
     WHOLE_SCALAR_POLICY,
     affine_parameters,
     common_parameters,
@@ -28,7 +29,9 @@ from cyexm.registration._request_policy import (
     linear_parameters,
     nonlinear_parameters,
     nonlinear_stage_parameters,
+    preprocessing_config_parameters,
     registered_image_parameters,
+    registration_feature_parameters,
 )
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.registration.backend import AntsRegistrationBackend, RegistrationBackend
@@ -89,6 +92,34 @@ def _validated_bool(value: object, name: str) -> bool:
     return value
 
 
+def _validated_preprocessing_sigma(
+    value: tuple[float, float, float] | None,
+) -> tuple[float, float, float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, tuple):
+        raise TypeError(
+            "preprocess_filter_sigma_zyx must be a canonical three-value tuple"
+        )
+    if len(value) != 3:
+        raise ValueError(
+            "preprocess_filter_sigma_zyx must contain exactly three values"
+        )
+    normalized: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, Real):
+            raise TypeError(
+                "preprocess_filter_sigma_zyx values must be positive and finite"
+            )
+        number = float(item)
+        if not math.isfinite(number) or number <= 0.0:
+            raise ValueError(
+                "preprocess_filter_sigma_zyx values must be positive and finite"
+            )
+        normalized.append(number)
+    return normalized[0], normalized[1], normalized[2]
+
+
 @dataclass(frozen=True, slots=True)
 class RegistrationPaths:
     output: Path
@@ -125,12 +156,24 @@ class _LinearPreparation:
     resolved: ResolvedNativeThreads
     fixed: object
     moving_linear: object
+    raw_fixed: object
+    raw_moving_linear: object
     fixed_mask: object
     moving_linear_mask: object
     affine: object
+    fixed_feature_scale: float | None
+    moving_feature_scale: float | None
 
 
 class ImageRegistration:
+    """Register one moving image to one fixed image.
+
+    ``preprocess_filter_sigma_zyx`` is an optional canonical three-value tuple in
+    NumPy ZYX voxel units. When present, cropped feature images estimate transforms;
+    raw images still own masks, metrics, and final registered output. YAML scalar
+    expansion occurs before this Python API.
+    """
+
     def __init__(
         self,
         fixed_image_path: str | os.PathLike[str],
@@ -150,6 +193,7 @@ class ImageRegistration:
         nonlinear_accuracy: str = "high",
         nonlinear_metric: object = "mattes",
         nonlinear_radius: object = None,
+        preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
         _backend: RegistrationBackend | None = None,
         _artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -180,12 +224,16 @@ class ImageRegistration:
         resolved_metric = resolve_nonlinear_metric(nonlinear_metric, nonlinear_radius)
         self.nonlinear_metric = resolved_metric.metric
         self.nonlinear_radius = resolved_metric.radius
+        self.preprocess_filter_sigma_zyx = _validated_preprocessing_sigma(
+            preprocess_filter_sigma_zyx
+        )
         self._backend = _backend
         self._artifact_store = _artifact_store
         self._log = logger
         self._nonlinear_mode: Literal["whole-image", "serial-chunked"] = "whole-image"
         self._scalar_postprocessing_policy = WHOLE_SCALAR_POLICY
         self._nonlinear_request_evidence: dict[str, object] = {}
+        self._registration_feature_evidence: dict[str, object] | None = None
         self._prepare_nonlinear_before_reuse = False
         self._source_paths: tuple[Path, Path] | None = None
         self._source_identities: tuple[FileIdentity, FileIdentity] | None = None
@@ -220,22 +268,49 @@ class ImageRegistration:
             self._verify_source_identities()
             raise
         self._verify_source_identities()
-        fixed, moving = self._crop_if_requested(backend, fixed, moving, paths, resolved)
-        fixed_mask = backend.zero_mask(fixed)
-        moving_mask = backend.zero_mask(moving)
+        raw_fixed, raw_moving = self._crop_if_requested(
+            backend, fixed, moving, paths, resolved
+        )
+        fixed_mask = backend.zero_mask(raw_fixed)
+        moving_mask = backend.zero_mask(raw_moving)
 
         if not self.prepared_fixed:
-            self._commit_fixed_reference(backend, fixed, paths, resolved)
+            self._commit_fixed_reference(backend, raw_fixed, paths, resolved)
         self._commit_metrics(
             "pre-registration",
             backend,
-            fixed,
-            moving,
+            raw_fixed,
+            raw_moving,
             fixed_mask,
             moving_mask,
             paths,
             resolved,
         )
+
+        fixed = raw_fixed
+        moving = raw_moving
+        fixed_feature_scale: float | None = None
+        moving_feature_scale: float | None = None
+        self._registration_feature_evidence = None
+        if self.preprocess_filter_sigma_zyx is not None:
+            fixed, fixed_feature_scale = self._registration_feature(
+                backend, raw_fixed, "fixed"
+            )
+            moving, moving_feature_scale = self._registration_feature(
+                backend, raw_moving, "moving"
+            )
+            self._registration_feature_evidence = registration_feature_parameters(
+                filter_sigma_zyx=self.preprocess_filter_sigma_zyx,
+                fixed_scale=fixed_feature_scale,
+                moving_scale=moving_feature_scale,
+            )
+            self._scalar_postprocessing_policy = RAW_RECONSTRUCTED_SCALAR_POLICY
+            if self.enable_logging:
+                self._log.info(
+                    "Registration preprocessing robust scales: fixed=%g, moving=%g",
+                    fixed_feature_scale,
+                    moving_feature_scale,
+                )
 
         affine, moving_linear, moving_linear_mask = self._load_or_estimate_affine(
             backend,
@@ -246,11 +321,32 @@ class ImageRegistration:
             paths,
             resolved,
         )
+        raw_moving_linear = moving_linear
+        if self.preprocess_filter_sigma_zyx is not None:
+            try:
+                raw_moving_linear = backend.apply_affine(
+                    fixed=raw_fixed,
+                    moving=raw_moving,
+                    transform=affine,
+                    interpolation="linear",
+                )
+                self._validate_affine_result_geometry(
+                    backend,
+                    raw_fixed,
+                    raw_moving_linear,
+                    moving_linear_mask,
+                )
+            except RegistrationStageError:
+                raise
+            except Exception as error:
+                raise RegistrationStageError(
+                    f"raw affine reconstruction failed for round {self.imaging_round}"
+                ) from error
         self._commit_metrics(
             "linearly-registered",
             backend,
-            fixed,
-            moving_linear,
+            raw_fixed,
+            raw_moving_linear,
             fixed_mask,
             moving_linear_mask,
             paths,
@@ -263,9 +359,13 @@ class ImageRegistration:
             resolved=resolved,
             fixed=fixed,
             moving_linear=moving_linear,
+            raw_fixed=raw_fixed,
+            raw_moving_linear=raw_moving_linear,
             fixed_mask=fixed_mask,
             moving_linear_mask=moving_linear_mask,
             affine=affine,
+            fixed_feature_scale=fixed_feature_scale,
+            moving_feature_scale=moving_feature_scale,
         )
 
     def register(self) -> None:
@@ -282,10 +382,23 @@ class ImageRegistration:
                 state.resolved,
             )
         )
+        if self.preprocess_filter_sigma_zyx is not None:
+            try:
+                moving_nonlinear = state.backend.apply_warp(
+                    fixed=state.raw_fixed,
+                    moving=state.raw_moving_linear,
+                    warp_path=warp_path,
+                    interpolation="linear",
+                )
+            except Exception as error:
+                raise RegistrationStageError(
+                    "raw nonlinear reconstruction failed "
+                    f"for round {self.imaging_round}"
+                ) from error
         self._commit_metrics(
             "nonlinear-registered",
             state.backend,
-            state.fixed,
+            state.raw_fixed,
             moving_nonlinear,
             state.fixed_mask,
             moving_nonlinear_mask,
@@ -299,6 +412,43 @@ class ImageRegistration:
             state.resolved,
             warp_path,
         )
+
+    def _registration_feature(
+        self,
+        backend: RegistrationBackend,
+        raw: object,
+        role: Literal["fixed", "moving"],
+    ) -> tuple[object, float]:
+        sigma = self.preprocess_filter_sigma_zyx
+        if sigma is None:
+            raise RuntimeError("registration preprocessing is disabled")
+        try:
+            from cyexm.registration.preprocessing import background_subtract_asinh
+
+            result = background_subtract_asinh(backend.to_array(raw), sigma)
+            feature = backend.from_array(result.array, reference=raw)
+            if not geometry_compatible(
+                backend.geometry(feature),
+                backend.geometry(raw),
+            ):
+                raise ValueError(
+                    "registration feature geometry does not match its raw source"
+                )
+            return feature, result.robust_scale
+        except Exception as error:
+            raise RegistrationStageError(
+                f"{role} preprocessing stage failed for round {self.imaging_round}"
+            ) from error
+
+    def _preprocessing_parameters(self, *, derived: bool) -> dict[str, object] | None:
+        sigma = self.preprocess_filter_sigma_zyx
+        if sigma is None:
+            return None
+        if derived:
+            if self._registration_feature_evidence is None:
+                raise RuntimeError("registration feature scales are not available")
+            return dict(self._registration_feature_evidence)
+        return preprocessing_config_parameters(sigma)
 
     def _store(self) -> ArtifactStore:
         if self._artifact_store is None:
@@ -656,6 +806,11 @@ class ImageRegistration:
                 parameters["scalar_postprocessing_policy"] = (
                     self._scalar_postprocessing_policy
                 )
+            preprocessing = self._preprocessing_parameters(
+                derived=stage != "pre-registration"
+            )
+            if preprocessing is not None:
+                parameters["preprocessing"] = preprocessing
             request = self._request(
                 backend,
                 fixed,
@@ -706,6 +861,14 @@ class ImageRegistration:
         resolved: ResolvedNativeThreads,
     ) -> tuple[object, object, object]:
         try:
+            parameters = affine_parameters(
+                moving_geometry=backend.geometry(moving),
+                linear_type=self.linear_type,
+                accuracy=self.linear_accuracy,
+            )
+            preprocessing = self._preprocessing_parameters(derived=True)
+            if preprocessing is not None:
+                parameters["preprocessing"] = preprocessing
             request = self._request(
                 backend,
                 fixed,
@@ -714,11 +877,7 @@ class ImageRegistration:
                 method=self.linear_type,
                 accuracy=self.linear_accuracy,
                 upstream=None,
-                parameters=affine_parameters(
-                    moving_geometry=backend.geometry(moving),
-                    linear_type=self.linear_type,
-                    accuracy=self.linear_accuracy,
-                ),
+                parameters=parameters,
             )
         except RegistrationStageError:
             raise
@@ -869,6 +1028,10 @@ class ImageRegistration:
 
             try:
                 affine_identity = FileIdentity.from_path(paths.affine)
+                nonlinear_evidence = dict(self._nonlinear_request_evidence)
+                preprocessing = self._preprocessing_parameters(derived=True)
+                if preprocessing is not None:
+                    nonlinear_evidence["preprocessing"] = preprocessing
                 parameters = nonlinear_stage_parameters(
                     moving_geometry=backend.geometry(moving_linear),
                     registration_mode=self._nonlinear_mode,
@@ -876,7 +1039,7 @@ class ImageRegistration:
                     nonlinear_metric=self.nonlinear_metric,
                     nonlinear_radius=self.nonlinear_radius,
                     scalar_postprocessing_policy=self._scalar_postprocessing_policy,
-                    evidence=self._nonlinear_request_evidence,
+                    evidence=nonlinear_evidence,
                 )
                 request = self._request(
                     backend,
@@ -998,6 +1161,13 @@ class ImageRegistration:
                 source=raw_scalar,
                 reference=moving_linear,
             )
+        elif self._scalar_postprocessing_policy == RAW_RECONSTRUCTED_SCALAR_POLICY:
+            scalar = backend.apply_warp(
+                fixed=fixed,
+                moving=moving_linear,
+                warp_path=warp_path,
+                interpolation="linear",
+            )
         elif self._scalar_postprocessing_policy == CHUNK_SCALAR_POLICY:
             if prepared_scalar is None:
                 raise RuntimeError(
@@ -1049,6 +1219,14 @@ class ImageRegistration:
         try:
             minimum, maximum = self._image_range(backend, moving_nonlinear)
             expected_geometry = backend.geometry(moving_nonlinear)
+            parameters = registered_image_parameters(
+                minimum=minimum,
+                maximum=maximum,
+                scalar_postprocessing_policy=self._scalar_postprocessing_policy,
+            )
+            preprocessing = self._preprocessing_parameters(derived=True)
+            if preprocessing is not None:
+                parameters["preprocessing"] = preprocessing
             request = self._request(
                 backend,
                 moving_nonlinear,
@@ -1057,11 +1235,7 @@ class ImageRegistration:
                 method=self.nonlinear_type,
                 accuracy=self.nonlinear_accuracy,
                 upstream=FileIdentity.from_path(warp_path),
-                parameters=registered_image_parameters(
-                    minimum=minimum,
-                    maximum=maximum,
-                    scalar_postprocessing_policy=self._scalar_postprocessing_policy,
-                ),
+                parameters=parameters,
             )
         except RegistrationStageError:
             raise
@@ -1091,15 +1265,22 @@ class ImageRegistration:
             return True
 
         try:
-            self._commit_artifact(
-                paths.registered,
-                request,
-                writer=lambda path: backend.write_tiff(
+
+            def writer(path: Path) -> None:
+                if self.preprocess_filter_sigma_zyx is not None:
+                    backend.write_clipped_tiff(moving_nonlinear, path)
+                    return
+                backend.write_tiff(
                     moving_nonlinear,
                     path,
                     min_value=minimum,
                     max_value=maximum,
-                ),
+                )
+
+            self._commit_artifact(
+                paths.registered,
+                request,
+                writer=writer,
                 validator=validator,
             )
         except RegistrationStageError:
@@ -1127,6 +1308,7 @@ def register_round(
     nonlinear_accuracy: str = "high",
     nonlinear_metric: object = "mattes",
     nonlinear_radius: object = None,
+    preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
 ) -> None:
     ImageRegistration(
         fixed_image_path,
@@ -1144,6 +1326,7 @@ def register_round(
         nonlinear_accuracy=nonlinear_accuracy,
         nonlinear_metric=nonlinear_metric,
         nonlinear_radius=nonlinear_radius,
+        preprocess_filter_sigma_zyx=preprocess_filter_sigma_zyx,
     ).register()
 
 

@@ -18,6 +18,7 @@ from cyexm.errors import (
 from cyexm.registration import chunked as chunked_module
 from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
+    RAW_RECONSTRUCTED_SCALAR_POLICY,
     WHOLE_SCALAR_POLICY,
 )
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
@@ -185,6 +186,64 @@ def test_successful_chunked_registration_removes_kernel_warp_candidates(
 
     assert backend.temporary_warps
     assert all(not path.exists() for path in backend.temporary_warps)
+
+
+def test_preprocessed_chunks_estimate_features_and_reconstruct_raw_output(
+    tmp_path: Path,
+) -> None:
+    backend = FakeChunkBackend()
+    registration = make_chunked_registration(
+        tmp_path,
+        backend=backend,
+        preprocess_filter_sigma_zyx=(1.0, 2.0, 3.0),
+    )
+
+    registration.register()
+
+    raw_fixed, raw_moving = backend.loaded_images[:2]
+    assert backend.zero_mask_inputs == [raw_fixed, raw_moving]
+    assert backend.linear_kwargs[0]["fixed_image"] is not raw_fixed
+    assert all(
+        call["fixed_image"] is not raw_fixed for call in backend.nonlinear_kwargs
+    )
+    assert backend.metric_calls[0][0] is raw_fixed
+    assert backend.metric_calls[1][0] is raw_fixed
+    assert backend.metric_calls[2][0] is raw_fixed
+    raw_nonlinear = backend.metric_calls[2][1]
+    assert isinstance(raw_nonlinear, FakeImage)
+    np.testing.assert_array_equal(raw_nonlinear.data, raw_moving.data + 10.0)
+    np.testing.assert_array_equal(
+        backend.clipped_tiff_values[-1],
+        np.clip(raw_nonlinear.data, 0, 65535).astype(np.uint16),
+    )
+
+    paths = round_paths(tmp_path)
+    warp_request = CompletionRecord.read(
+        ArtifactStore().record_path(paths.warp)
+    ).request
+    registered_request = CompletionRecord.read(
+        ArtifactStore().record_path(paths.registered)
+    ).request
+    assert (
+        warp_request.parameters["scalar_postprocessing_policy"]
+        == RAW_RECONSTRUCTED_SCALAR_POLICY
+    )
+    assert warp_request.parameters["preprocessing"]["filter_sigma_zyx"] == [
+        1.0,
+        2.0,
+        3.0,
+    ]
+    assert (
+        registered_request.parameters["preprocessing"]
+        == (warp_request.parameters["preprocessing"])
+    )
+    local_request = CompletionRecord.read(
+        ArtifactStore().record_path(registration.chunk_paths(0).warp)
+    ).request
+    assert (
+        local_request.parameters["preprocessing"]
+        == (warp_request.parameters["preprocessing"])
+    )
 
 
 def test_local_candidate_cleanup_oserror_does_not_fail_registration(

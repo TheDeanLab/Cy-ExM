@@ -281,6 +281,45 @@ def test_registration_defaults_are_legacy_compatible(tmp_path: Path) -> None:
     assert registration.nonlinear_accuracy == "high"
     assert registration.crop is False
     assert registration.force_override is False
+    assert registration.preprocess_filter_sigma_zyx is None
+
+
+def test_constructor_stores_registration_preprocessing_sigma(tmp_path: Path) -> None:
+    registration = ImageRegistration(
+        tmp_path / "fixed.tif",
+        tmp_path / "moving.tif",
+        tmp_path / "result",
+        preprocess_filter_sigma_zyx=(1.0, 2.0, 3.0),
+    )
+
+    assert registration.preprocess_filter_sigma_zyx == (1.0, 2.0, 3.0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param((1.0, 2.0), id="short"),
+        pytest.param((1.0, 2.0, 3.0, 4.0), id="long"),
+        pytest.param((1.0, 0.0, 3.0), id="zero"),
+        pytest.param((1.0, -2.0, 3.0), id="negative"),
+        pytest.param((1.0, float("nan"), 3.0), id="nan"),
+        pytest.param((1.0, float("inf"), 3.0), id="infinite"),
+        pytest.param((1.0, True, 3.0), id="boolean"),
+        pytest.param([1.0, 2.0, 3.0], id="non-canonical-list"),
+        pytest.param(12.0, id="non-canonical-scalar"),
+    ],
+)
+def test_constructor_rejects_invalid_registration_preprocessing_sigma(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        ImageRegistration(
+            tmp_path / "fixed.tif",
+            tmp_path / "moving.tif",
+            tmp_path / "result",
+            preprocess_filter_sigma_zyx=value,  # type: ignore[arg-type]
+        )
 
 
 def test_registration_paths_are_round_scoped(tmp_path: Path) -> None:
@@ -334,6 +373,7 @@ def test_new_configuration_parameters_are_keyword_only() -> None:
         "linear_accuracy",
         "nonlinear_type",
         "nonlinear_accuracy",
+        "preprocess_filter_sigma_zyx",
         "_backend",
         "_artifact_store",
     ):
@@ -372,6 +412,7 @@ def test_constructor_stores_custom_scalar_configuration(tmp_path: Path) -> None:
         nonlinear_accuracy="low",
         nonlinear_metric="CC",
         nonlinear_radius=2,
+        preprocess_filter_sigma_zyx=(1.0, 2.0, 3.0),
     )
 
     assert registration.imaging_round == 7
@@ -505,6 +546,7 @@ def test_register_round_forwards_every_option_and_registers_once(
         nonlinear_accuracy="low",
         nonlinear_metric="CC",
         nonlinear_radius=2,
+        preprocess_filter_sigma_zyx=(1.0, 2.0, 3.0),
     )
 
     assert received["args"] == (
@@ -525,8 +567,75 @@ def test_register_round_forwards_every_option_and_registers_once(
         "nonlinear_accuracy": "low",
         "nonlinear_metric": "CC",
         "nonlinear_radius": 2,
+        "preprocess_filter_sigma_zyx": (1.0, 2.0, 3.0),
     }
     assert register_calls == 1
+
+
+def test_enabled_preprocessing_estimates_from_features_but_uses_raw_for_science(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    registration = make_registration(
+        tmp_path,
+        backend=backend,
+        preprocess_filter_sigma_zyx=(1.0, 2.0, 3.0),
+    )
+
+    registration.register()
+
+    raw_fixed, raw_moving = backend.loaded_images[:2]
+    estimator_fixed = backend.linear_kwargs[0]["fixed_image"]
+    estimator_moving = backend.linear_kwargs[0]["moving_image"]
+    assert estimator_fixed is not raw_fixed
+    assert estimator_moving is not raw_moving
+    assert len(backend.from_array_calls) == 2
+    assert backend.from_array_calls[0][1] is raw_fixed
+    assert backend.from_array_calls[1][1] is raw_moving
+    assert backend.zero_mask_inputs == [raw_fixed, raw_moving]
+
+    assert backend.metric_calls[0][0] is raw_fixed
+    assert backend.metric_calls[0][1] is raw_moving
+    assert backend.metric_calls[1][0] is raw_fixed
+    assert backend.metric_calls[2][0] is raw_fixed
+    assert backend.nonlinear_kwargs[0]["fixed_image"] is estimator_fixed
+    assert backend.histogram_match_calls == []
+
+    raw_affine_calls = [
+        call for call in backend.affine_application_inputs if call[1] is raw_moving
+    ]
+    assert len(raw_affine_calls) == 1
+    raw_linear = raw_affine_calls[0][0]
+    assert raw_linear is raw_fixed
+    raw_warp_calls = [
+        call
+        for call in backend.warp_application_inputs
+        if call[1] is backend.metric_calls[1][1]
+    ]
+    assert len(raw_warp_calls) == 1
+    raw_nonlinear = backend.metric_calls[2][1]
+    assert isinstance(raw_nonlinear, FakeImage)
+    np.testing.assert_array_equal(raw_nonlinear.data, raw_moving.data + 10.0)
+    np.testing.assert_array_equal(
+        backend.clipped_tiff_values[-1],
+        np.clip(raw_nonlinear.data, 0, 65535).astype(np.uint16),
+    )
+    assert backend.tiff_images[-1] is raw_fixed
+
+    paths = round_paths(tmp_path)
+    pre_request = completion_request(paths.pre_metrics)
+    affine_request = completion_request(paths.affine)
+    nonlinear_request = completion_request(paths.warp)
+    registered_request = completion_request(paths.registered)
+    assert pre_request.parameters["preprocessing"]["filter_sigma_zyx"] == [
+        1.0,
+        2.0,
+        3.0,
+    ]
+    assert "fixed_robust_scale" not in pre_request.parameters["preprocessing"]
+    for request in (affine_request, nonlinear_request, registered_request):
+        assert request.parameters["preprocessing"]["fixed_robust_scale"] > 0.0
+        assert request.parameters["preprocessing"]["moving_robust_scale"] > 0.0
 
 
 def test_register_resolves_threads_before_loading_any_image(

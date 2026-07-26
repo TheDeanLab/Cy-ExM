@@ -26,6 +26,7 @@ from cyexm.errors import (
 from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
     OUTPUT_FORMAT_POLICY,
+    REGISTRATION_FEATURE_POLICY,
 )
 from cyexm.spatial import (
     AXIS_CONVENTION_VERSION,
@@ -652,6 +653,21 @@ def _scientific_mapping(
     tasks: tuple[RoundTask, ...],
 ) -> dict[str, object]:
     tasks_by_round = {task.round: task for task in tasks}
+    registration_mapping: dict[str, object] = {
+        "crop": manifest.registration.crop,
+        "linear": {
+            "type": manifest.registration.linear.type,
+            "accuracy": manifest.registration.linear.accuracy,
+        },
+        "nonlinear": _nonlinear_mapping(manifest.registration.nonlinear),
+    }
+    if manifest.registration.preprocessing is not None:
+        registration_mapping["preprocessing"] = {
+            "algorithm": REGISTRATION_FEATURE_POLICY,
+            "filter_sigma_zyx": list(
+                manifest.registration.preprocessing.filter_sigma_zyx
+            ),
+        }
     return {
         "schema_version": manifest.schema_version,
         "dataset_id": manifest.dataset_id,
@@ -685,14 +701,7 @@ def _scientific_mapping(
                 )
             ],
         },
-        "registration": {
-            "crop": manifest.registration.crop,
-            "linear": {
-                "type": manifest.registration.linear.type,
-                "accuracy": manifest.registration.linear.accuracy,
-            },
-            "nonlinear": _nonlinear_mapping(manifest.registration.nonlinear),
-        },
+        "registration": registration_mapping,
         "sources": [
             _header_mapping(headers[path]) for path in sorted(headers, key=str)
         ],

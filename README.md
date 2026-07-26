@@ -271,9 +271,10 @@ runtimes are imported lazily only at the selected execution boundary.
 
 ### Checked-in YAML examples
 
-The repository provides four version-1 starting points:
+The repository provides five version-1 starting points:
 
 - [Spheroid scientific dataset manifest](examples/spheroid-dataset.yaml)
+- [Preprocessed spheroid scientific manifest](examples/preprocessed-spheroid-dataset.yaml)
 - [Sequential execution profile](examples/execution-sequential.yaml)
 - [Local-Dask execution profile](examples/execution-local-dask.yaml)
 - [Editable 512-GB SLURM profile](examples/execution-slurm-512gb.yaml)
@@ -297,6 +298,8 @@ are:
 | `reference` / `channels` | nonempty ordered list with unique `file` values and basenames | Every reference-round image copied to the shared reference output in declaration order. |
 | reference channel `file` | safe relative POSIX path | Source below `paths.dataset_root`; its basename becomes the reference channel output name. |
 | `registration` / `crop` | built-in boolean | Enables or disables Phase 1 fixed/moving foreground cropping. |
+| `registration` / `preprocessing` | optional mapping | Omission disables registration-feature preprocessing; `{}` enables the canonical 12-voxel-per-axis default. |
+| `registration` / `preprocessing` / `filter_sigma_zyx` | positive number or three positive numbers | Gaussian background-filter sigma in NumPy ZYX voxel units. A scalar expands to all axes; this is not micrometers. |
 | `registration` / `linear` / `type` | `Translation`, `Rigid`, `Similarity`, `Affine`, or `TRSAA` | Phase 1 linear method. |
 | `registration` / `linear` / `accuracy` | `high`, `medium`, `low`, or `dry run` | Phase 1 linear schedule. |
 | `registration` / `nonlinear` / `type` | `Elastic`, `SyNOnly`, or `SyN` | Phase 1 nonlinear method. |
@@ -335,6 +338,45 @@ Radius 4 therefore means a 9-by-9-by-9 voxel neighborhood. With anisotropic voxe
 spacing that neighborhood is physically anisotropic even though its voxel radius is
 equal along X, Y, and Z. The default of 4 is provisional pending dataset-specific
 characterization; it is not a claim of optimality.
+
+### Optional registration-feature preprocessing
+
+Omit `registration.preprocessing` to preserve the legacy intensity workflow. Enable
+the default 12-voxel Gaussian filter with an empty mapping, a scalar, an isotropic
+list, or an anisotropic ZYX list:
+
+```yaml
+# Disabled: omit registration.preprocessing entirely.
+
+# Enabled with the canonical [12, 12, 12] voxel default:
+preprocessing: {}
+
+# These are scientifically identical:
+preprocessing: {filter_sigma_zyx: 12}
+preprocessing: {filter_sigma_zyx: [12, 12, 12]}
+
+# Anisotropic NumPy ZYX voxel sigmas:
+preprocessing: {filter_sigma_zyx: [4, 12, 12]}
+```
+
+The operation is `raw → crop → feature estimate → transform raw`. For each cropped
+registration image, Cy-ExM computes a reflective-boundary Gaussian background,
+forms the signed residual, deterministically samples
+`residual.ravel()[::max(1, residual.size // 2_000_000)]`, and estimates
+`scale = max(1.4826 × MAD(sample), float32 epsilon)` before clipping negative
+residuals to zero and evaluating `asinh(residual / scale)` as float32. TRSAA and nonlinear
+registration estimate their transforms from these features. Greater-than-zero masks,
+all three registration metric files, `nonlinear_registered_<round>.tif`, and every
+declared dependent-channel output remain raw-intensity products. Accepted transforms
+are never estimated from or applied to a saved normalized TIFF.
+
+Changing the sigma invalidates feature-dependent affine, linear/nonlinear metrics,
+local chunk artifacts, prepared format-3 arrays, assembled warp, and registered
+output. Source identities, authenticated crop bounds, fixed-reference TIFFs, and
+reference-channel materialization remain independently reusable. Fine-grained
+preprocessing-disabled bundles retain exact prepared manifest format 2; enabled
+feature bundles use strict format 3 with the algorithm, sigma, and measured robust
+scales.
 
 The loader uses safe YAML decoding and rejects unknown keys, missing keys, duplicate
 mapping keys, YAML aliases, custom tags, non-scalar keys, specialized collection

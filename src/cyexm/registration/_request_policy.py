@@ -19,6 +19,8 @@ PREPARED_SCALAR_POLICY = "float32-preserve-registration-values-v1"
 PREPARED_MASK_POLICY = (
     "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
 )
+REGISTRATION_FEATURE_POLICY = "gaussian-background-mad-asinh-float32-v1"
+RAW_RECONSTRUCTED_SCALAR_POLICY = "feature-estimation-raw-warp-affine-clip-v1"
 
 _LINEAR_ITERATIONS = {
     "high": [1000, 500, 250, 100],
@@ -118,6 +120,34 @@ def affine_parameters(
         "mask_interpolation": "nearestNeighbor",
         "moving_geometry": moving_geometry.to_dict(),
         "registration_parameters": linear_parameters(linear_type, accuracy),
+    }
+
+
+def preprocessing_config_parameters(
+    filter_sigma_zyx: tuple[float, float, float],
+) -> dict[str, object]:
+    """Return static registration-feature construction evidence."""
+    return {
+        "algorithm": REGISTRATION_FEATURE_POLICY,
+        "filter_sigma_zyx": list(filter_sigma_zyx),
+        "dtype": "float32",
+        "background_boundary": "reflect",
+        "robust_scale": "1.4826-mad-signed-residual-stride-max-2m-v1",
+        "negative_residual": "clip-zero-before-asinh-v1",
+    }
+
+
+def registration_feature_parameters(
+    *,
+    filter_sigma_zyx: tuple[float, float, float],
+    fixed_scale: float,
+    moving_scale: float,
+) -> dict[str, object]:
+    """Return feature construction evidence including derived robust scales."""
+    return {
+        **preprocessing_config_parameters(filter_sigma_zyx),
+        "fixed_robust_scale": fixed_scale,
+        "moving_robust_scale": moving_scale,
     }
 
 

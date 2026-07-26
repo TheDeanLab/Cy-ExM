@@ -22,6 +22,7 @@ from cyexm.config.models import (
     PixelSpacingXYZ,
     ReferenceChannelSpec,
     ReferenceSpec,
+    RegistrationPreprocessingSpec,
     RegistrationSpec,
     RegistrationStageSpec,
     RegistrationStrategy,
@@ -49,6 +50,7 @@ _VOXEL_SPACING_KEYS = frozenset({"x", "y", "z"})
 _REFERENCE_KEYS = frozenset({"round", "registration_channel", "channels"})
 _REFERENCE_CHANNEL_KEYS = frozenset({"file"})
 _REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
+_REGISTRATION_PREPROCESSING_KEYS = frozenset({"filter_sigma_zyx"})
 _LINEAR_STAGE_KEYS = frozenset({"type", "accuracy"})
 _NONLINEAR_STAGE_KEYS = frozenset({"type", "accuracy", "metric"})
 _NONLINEAR_CC_STAGE_KEYS = _NONLINEAR_STAGE_KEYS | frozenset({"radius"})
@@ -175,8 +177,48 @@ def _nonlinear_stage(value: object) -> NonlinearRegistrationStageSpec:
     )
 
 
+def _filter_sigma_zyx(value: object) -> tuple[float, float, float]:
+    yaml_path = "registration.preprocessing.filter_sigma_zyx"
+    if isinstance(value, list):
+        if len(value) != 3:
+            raise ConfigurationValidationError(
+                f"{yaml_path} must be a positive finite scalar or contain exactly "
+                f"three positive finite ZYX values; got {value!r}"
+            )
+        return (
+            finite_positive_float(value[0], f"{yaml_path}[0]"),
+            finite_positive_float(value[1], f"{yaml_path}[1]"),
+            finite_positive_float(value[2], f"{yaml_path}[2]"),
+        )
+    scalar = finite_positive_float(value, yaml_path)
+    return scalar, scalar, scalar
+
+
+def _preprocessing(value: object) -> RegistrationPreprocessingSpec:
+    if not isinstance(value, Mapping):
+        raise ConfigurationValidationError(
+            f"registration.preprocessing must be a mapping; got {value!r}"
+        )
+    expected = frozenset() if not value else _REGISTRATION_PREPROCESSING_KEYS
+    mapping = require_exact_keys(value, expected, "registration.preprocessing")
+    if not mapping:
+        return RegistrationPreprocessingSpec()
+    return RegistrationPreprocessingSpec(
+        filter_sigma_zyx=_filter_sigma_zyx(mapping["filter_sigma_zyx"])
+    )
+
+
 def _registration(value: object) -> RegistrationSpec:
-    mapping = require_exact_keys(value, _REGISTRATION_KEYS, "registration")
+    if not isinstance(value, Mapping):
+        raise ConfigurationValidationError(
+            f"registration must be a mapping; got {value!r}"
+        )
+    expected = (
+        _REGISTRATION_KEYS | frozenset({"preprocessing"})
+        if "preprocessing" in value
+        else _REGISTRATION_KEYS
+    )
+    mapping = require_exact_keys(value, expected, "registration")
     crop = mapping["crop"]
     if type(crop) is not bool:
         raise ConfigurationValidationError(
@@ -186,6 +228,11 @@ def _registration(value: object) -> RegistrationSpec:
         crop=crop,
         linear=_stage(mapping["linear"], "registration.linear", _LINEAR_TYPES),
         nonlinear=_nonlinear_stage(mapping["nonlinear"]),
+        preprocessing=(
+            _preprocessing(mapping["preprocessing"])
+            if "preprocessing" in mapping
+            else None
+        ),
     )
 
 
@@ -433,16 +480,38 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
     }
     if nonlinear_stage.metric == "CC":
         nonlinear_mapping["radius"] = nonlinear_stage.radius
-    parsed_registration = _registration(
-        {
-            "crop": manifest.registration.crop,
-            "linear": {
-                "type": linear_stage.type,
-                "accuracy": linear_stage.accuracy,
-            },
-            "nonlinear": nonlinear_mapping,
-        }
-    )
+    registration_mapping: dict[str, object] = {
+        "crop": manifest.registration.crop,
+        "linear": {
+            "type": linear_stage.type,
+            "accuracy": linear_stage.accuracy,
+        },
+        "nonlinear": nonlinear_mapping,
+    }
+    preprocessing = manifest.registration.preprocessing
+    if preprocessing is not None:
+        if type(preprocessing) is not RegistrationPreprocessingSpec:
+            raise ConfigurationValidationError(
+                "registration.preprocessing must be a "
+                "RegistrationPreprocessingSpec or null; "
+                f"got {preprocessing!r}"
+            )
+        sigma = preprocessing.filter_sigma_zyx
+        if type(sigma) is not tuple or len(sigma) != 3:
+            raise ConfigurationValidationError(
+                "registration.preprocessing.filter_sigma_zyx must be an exact "
+                "tuple containing three built-in floats; "
+                f"got {sigma!r}"
+            )
+        for index, value in enumerate(sigma):
+            if type(value) is not float or not math.isfinite(value) or value <= 0.0:
+                raise ConfigurationValidationError(
+                    "registration.preprocessing.filter_sigma_zyx"
+                    f"[{index}] must be a positive finite built-in float; "
+                    f"got {value!r}"
+                )
+        registration_mapping["preprocessing"] = {"filter_sigma_zyx": list(sigma)}
+    parsed_registration = _registration(registration_mapping)
     round_mappings: list[dict[str, object]] = []
     for index, round_spec in enumerate(manifest.rounds):
         round_path = f"rounds[{index}]"

@@ -26,6 +26,7 @@ from cyexm.config.models import (
     NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
+    RegistrationPreprocessingSpec,
     RegistrationSpec,
     RegistrationStageSpec,
     RoundSpec,
@@ -333,6 +334,33 @@ def _serial_plan(tmp_path: Path) -> WorkflowPlan:
         tasks=(task,),
         scientific_json=scientific_json,
         scientific_fingerprint=sha256_fingerprint(scientific_json),
+    )
+
+
+def test_registration_snapshot_match_includes_preprocessing() -> None:
+    registration = replace(
+        _registration(),
+        preprocessing=RegistrationPreprocessingSpec(filter_sigma_zyx=(2.0, 12.0, 20.0)),
+    )
+    contract = SimpleNamespace(
+        crop=registration.crop,
+        linear_type=registration.linear.type,
+        linear_accuracy=registration.linear.accuracy,
+        nonlinear_type=registration.nonlinear.type,
+        nonlinear_accuracy=registration.nonlinear.accuracy,
+        nonlinear_metric=registration.nonlinear.metric,
+        nonlinear_radius=registration.nonlinear.radius,
+        preprocessing_filter_sigma_zyx=(2.0, 12.0, 20.0),
+    )
+
+    assert workflow_api._registration_matches_snapshot(
+        registration,
+        SimpleNamespace(registration=contract),
+    )
+    contract.preprocessing_filter_sigma_zyx = (2.0, 13.0, 20.0)
+    assert not workflow_api._registration_matches_snapshot(
+        registration,
+        SimpleNamespace(registration=contract),
     )
 
 

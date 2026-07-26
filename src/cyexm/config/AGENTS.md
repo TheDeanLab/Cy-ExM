@@ -25,3 +25,6 @@
 - This package must not import ANTs, NumPy, SciPy, Dask, distributed, or
   dask-jobqueue. It must not mutate the filesystem or environment or initialize a
   scheduler.
+- Schema version 1 owns the optional `registration.preprocessing` block. Omission
+  disables it; `{}` defaults to `(12.0, 12.0, 12.0)`; a positive scalar expands to
+  three axes; and a list must be an exact positive finite NumPy ZYX triple.

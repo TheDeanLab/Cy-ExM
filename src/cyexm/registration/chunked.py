@@ -32,7 +32,11 @@ from cyexm.registration.chunk_stages import (
     assemble_nonlinear_chunks,
     run_nonlinear_chunk,
 )
-from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
+from cyexm.registration.whole_image import (
+    ImageRegistration,
+    RegistrationPaths,
+    _LinearPreparation,
+)
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 from cyexm.spatial import PixelSize
 
@@ -77,6 +81,12 @@ class ChunkPaths:
 
 
 class ChunkedImageRegistration(ImageRegistration):
+    """Register with serial fixed-grid nonlinear chunks.
+
+    Optional preprocessing follows :class:`ImageRegistration`: chunks estimate
+    feature warps, then the accepted full warp reconstructs the raw moving image.
+    """
+
     def __init__(
         self,
         fixed_image_path: str | os.PathLike[str],
@@ -98,6 +108,7 @@ class ChunkedImageRegistration(ImageRegistration):
         nonlinear_accuracy: str = "high",
         nonlinear_metric: object = "mattes",
         nonlinear_radius: object = None,
+        preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
         _backend: RegistrationBackend | None = None,
         _artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -118,6 +129,7 @@ class ChunkedImageRegistration(ImageRegistration):
             nonlinear_accuracy=nonlinear_accuracy,
             nonlinear_metric=nonlinear_metric,
             nonlinear_radius=nonlinear_radius,
+            preprocess_filter_sigma_zyx=preprocess_filter_sigma_zyx,
             _backend=_backend,
             _artifact_store=_artifact_store,
         )
@@ -187,13 +199,7 @@ class ChunkedImageRegistration(ImageRegistration):
     def register(self) -> None:
         state = self._prepare_linear_state()
         try:
-            self._run_nonlinear_chunks(
-                state.backend,
-                state.fixed,
-                state.moving_linear,
-                state.fixed_mask,
-                state.moving_linear_mask,
-            )
+            self._run_nonlinear_chunks(state)
         except (CacheValidationError, ChunkRegistrationError, RegistrationStageError):
             raise
         except Exception as error:
@@ -203,15 +209,16 @@ class ChunkedImageRegistration(ImageRegistration):
 
     def _run_nonlinear_chunks(
         self,
-        backend: RegistrationBackend,
-        fixed: object,
-        moving_linear: object,
-        fixed_mask: object,
-        moving_linear_mask: object,
+        state: _LinearPreparation,
     ) -> AssembledNonlinear:
         self._nonlinear_request_evidence = {}
         resolved = configure_native_threads(self.native_threads)
         np = _scientific_runtime()
+        backend = state.backend
+        fixed = state.fixed
+        moving_linear = state.moving_linear
+        fixed_mask = state.fixed_mask
+        moving_linear_mask = state.moving_linear_mask
         fixed_geometry = backend.geometry(fixed)
         image_shape = _positive_int_triple(fixed_geometry.shape, "fixed image shape")
         fixed_array = self._validated_scalar_array(
@@ -263,8 +270,16 @@ class ChunkedImageRegistration(ImageRegistration):
             fixed_geometry=fixed_geometry,
             fixed=fixed,
             moving_linear=moving_linear,
+            raw_fixed=state.raw_fixed,
+            raw_moving_linear=state.raw_moving_linear,
             fixed_mask=fixed_mask,
             moving_linear_mask=moving_linear_mask,
+            preprocessing=(
+                None
+                if self._registration_feature_evidence is None
+                else dict(self._registration_feature_evidence)
+            ),
+            registered_scalar_policy=self._scalar_postprocessing_policy,
             nonlinear_type=self.nonlinear_type,
             nonlinear_accuracy=self.nonlinear_accuracy,
             nonlinear_metric=self.nonlinear_metric,

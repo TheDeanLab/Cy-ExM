@@ -20,6 +20,7 @@ from cyexm.config.models import (
     NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
     ReferenceSpec,
+    RegistrationPreprocessingSpec,
     RegistrationSpec,
     RegistrationStageSpec,
     RoundSpec,
@@ -1057,6 +1058,53 @@ def test_scientific_fingerprint_contains_complete_policy_but_not_execution_choic
             )
         ),
     )
+
+
+def test_preprocessing_is_optional_canonical_scientific_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(round_order=(2,))
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    disabled = build_workflow_plan(manifest, execution)
+    enabled_manifest = replace(
+        manifest,
+        registration=replace(
+            manifest.registration,
+            preprocessing=RegistrationPreprocessingSpec(
+                filter_sigma_zyx=(12.0, 12.0, 12.0)
+            ),
+        ),
+    )
+    enabled = build_workflow_plan(enabled_manifest, execution)
+    anisotropic = build_workflow_plan(
+        replace(
+            enabled_manifest,
+            registration=replace(
+                enabled_manifest.registration,
+                preprocessing=RegistrationPreprocessingSpec(
+                    filter_sigma_zyx=(12.0, 13.0, 12.0)
+                ),
+            ),
+        ),
+        execution,
+    )
+
+    disabled_registration = json.loads(disabled.scientific_json)["registration"]
+    enabled_registration = json.loads(enabled.scientific_json)["registration"]
+    assert "preprocessing" not in disabled_registration
+    assert enabled_registration["preprocessing"] == {
+        "algorithm": "gaussian-background-mad-asinh-float32-v1",
+        "filter_sigma_zyx": [12.0, 12.0, 12.0],
+    }
+    assert disabled.scientific_fingerprint != enabled.scientific_fingerprint
+    assert enabled.scientific_fingerprint != anisotropic.scientific_fingerprint
 
 
 def test_cc_default_radius_has_one_canonical_plan_identity(

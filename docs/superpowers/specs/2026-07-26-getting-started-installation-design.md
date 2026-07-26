@@ -1,6 +1,6 @@
 # Getting Started Installation Guide Design
 
-**Status:** Approved design; implementation not yet started  
+**Status:** Approved design; implementation completed in `e8694f4`
 **Date:** 2026-07-26
 
 ## Context

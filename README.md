@@ -361,9 +361,10 @@ preprocessing: {filter_sigma_zyx: [4, 12, 12]}
 
 The operation is `raw → crop → feature estimate → transform raw`. For each cropped
 registration image, Cy-ExM computes a reflective-boundary Gaussian background,
-forms the signed residual, estimates
-`scale = max(1.4826 × MAD(residual), float32 epsilon)`, clips negative residuals to
-zero, and evaluates `asinh(residual / scale)` as float32. TRSAA and nonlinear
+forms the signed residual, deterministically samples
+`residual.ravel()[::max(1, residual.size // 2_000_000)]`, and estimates
+`scale = max(1.4826 × MAD(sample), float32 epsilon)` before clipping negative
+residuals to zero and evaluating `asinh(residual / scale)` as float32. TRSAA and nonlinear
 registration estimate their transforms from these features. Greater-than-zero masks,
 all three registration metric files, `nonlinear_registered_<round>.tif`, and every
 declared dependent-channel output remain raw-intensity products. Accepted transforms

@@ -18,10 +18,12 @@ are voxel counts, not micrometers.
 
 Cy-ExM crops raw images first, creates greater-than-zero masks from those raw values,
 and then computes a feature independently for the fixed and moving registration
-channels. The feature is the positive portion of a signed Gaussian-background
-residual divided by `max(1.4826 × MAD, float32 epsilon)` and passed through `asinh`.
-The Gaussian boundary mode is reflective. TRSAA and nonlinear registration see the
-float32 features and raw-derived masks.
+channels. It deterministically samples each signed Gaussian-background residual as
+`residual.ravel()[::max(1, residual.size // 2_000_000)]` before clipping, and uses
+its MAD to calculate `max(1.4826 × MAD(sample), float32 epsilon)`. The feature is
+the positive portion of the full signed residual divided by that scale and passed
+through `asinh`. The Gaussian boundary mode is reflective. TRSAA and nonlinear
+registration see the float32 features and raw-derived masks.
 
 Transforms remain the scientific result. The accepted affine and warp are applied to
 the original raw registration channel; dependent channels are likewise transformed

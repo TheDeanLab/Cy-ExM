@@ -45,6 +45,94 @@ class RegistrationFeature:
     robust_scale: float
 
 
+@dataclass(frozen=True, slots=True)
+class FeatureMask:
+    """Derived binary registration mask and realized support counts."""
+
+    array: object
+    foreground_voxels: int
+    total_voxels: int
+
+
+def _positive_finite(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"{name} must be a positive finite number")
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return number
+
+
+def _validated_spacing(
+    value: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    if type(value) is not tuple or len(value) != 3:
+        raise TypeError("spacing must be an exact ZYX tuple of three values")
+    return (
+        _positive_finite(value[0], "spacing z"),
+        _positive_finite(value[1], "spacing y"),
+        _positive_finite(value[2], "spacing x"),
+    )
+
+
+def feature_mask(
+    feature: object,
+    spacing_zyx: tuple[float, float, float],
+    *,
+    min_component_volume_um3: float,
+    dilation_radius_um: float,
+) -> FeatureMask:
+    """Return cleaned and physically dilated positive feature support."""
+    spacing = _validated_spacing(spacing_zyx)
+    minimum_volume = _positive_finite(
+        min_component_volume_um3,
+        "minimum component volume",
+    )
+    dilation = _positive_finite(dilation_radius_um, "dilation radius")
+    np, ndi = _scientific_runtime()
+    array = np.asarray(feature, dtype=np.float32)
+    if array.ndim != 3:
+        raise ValueError("feature mask construction requires a 3D image")
+    if not bool(np.isfinite(array).all()):
+        raise ValueError("feature mask construction requires finite feature values")
+
+    support = array > 0.0
+    labels, _ = ndi.label(
+        support,
+        structure=np.ones((3, 3, 3), dtype=bool),
+    )
+    minimum_voxels = max(
+        1,
+        math.ceil(minimum_volume / math.prod(spacing)),
+    )
+    counts = np.bincount(labels.ravel())
+    keep = counts >= minimum_voxels
+    keep[0] = False
+    cleaned = keep[labels]
+    if not bool(cleaned.any()):
+        raise ValueError("feature mask has no foreground after component filtering")
+
+    radii = tuple(math.ceil(dilation / axis_spacing) for axis_spacing in spacing)
+    footprint_shape = tuple(2 * radius + 1 for radius in radii)
+    coordinates = np.indices(footprint_shape, dtype=np.float64)
+    distance_squared = np.zeros(footprint_shape, dtype=np.float64)
+    for axis, (radius, axis_spacing) in enumerate(zip(radii, spacing, strict=True)):
+        distance_squared += ((coordinates[axis] - radius) * axis_spacing) ** 2
+    footprint = distance_squared <= dilation**2
+    mask = ndi.binary_dilation(cleaned, structure=footprint).astype(
+        np.float32,
+        copy=False,
+    )
+    foreground = int(np.count_nonzero(mask))
+    if foreground == 0:
+        raise ValueError("feature mask has no foreground after dilation")
+    return FeatureMask(
+        array=mask,
+        foreground_voxels=foreground,
+        total_voxels=int(mask.size),
+    )
+
+
 def background_subtract_asinh(
     image: object,
     filter_sigma_zyx: tuple[float, float, float],
@@ -96,6 +184,8 @@ def background_subtract_asinh(
 
 __all__ = (
     "REGISTRATION_FEATURE_POLICY",
+    "FeatureMask",
     "RegistrationFeature",
     "background_subtract_asinh",
+    "feature_mask",
 )

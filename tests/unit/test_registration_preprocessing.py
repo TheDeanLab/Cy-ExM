@@ -102,6 +102,117 @@ def test_scale_uses_signed_residual_before_negative_clipping() -> None:
     np.testing.assert_array_equal(result.array, expected)
 
 
+def test_feature_mask_filters_components_and_dilates_in_physical_space() -> None:
+    production = _production()
+    feature = np.zeros((5, 9, 9), dtype=np.float32)
+    feature[2, 4, 4] = 1.0
+    feature[2, 1:3, 1:3] = 1.0
+
+    result = production.feature_mask(
+        feature,
+        spacing_zyx=(2.0, 0.5, 0.5),
+        min_component_volume_um3=1.0,
+        dilation_radius_um=1.0,
+    )
+
+    assert result.array.dtype == np.dtype("float32")
+    assert set(np.unique(result.array)) == {0.0, 1.0}
+    assert result.array[2, 4, 4] == 0.0
+    assert result.array[2, 0, 1] == 1.0
+    assert result.array[1, 1, 1] == 0.0
+    assert result.foreground_voxels == int(np.count_nonzero(result.array))
+    assert result.total_voxels == feature.size
+
+
+def test_feature_mask_uses_strict_positive_support_and_full_connectivity() -> None:
+    production = _production()
+    feature = np.zeros((4, 4, 4), dtype=np.float32)
+    feature[0, 0, 0] = -1.0
+    feature[1, 1, 1] = np.finfo(np.float32).tiny
+    feature[2, 2, 2] = 1.0
+
+    result = production.feature_mask(
+        feature,
+        spacing_zyx=(1.0, 1.0, 1.0),
+        min_component_volume_um3=2.0,
+        dilation_radius_um=0.1,
+    )
+
+    expected = np.zeros_like(feature)
+    expected[1, 1, 1] = 1.0
+    expected[2, 2, 2] = 1.0
+    np.testing.assert_array_equal(result.array, expected)
+
+
+def test_feature_mask_fails_when_filtering_removes_all_support() -> None:
+    production = _production()
+    feature = np.zeros((3, 3, 3), dtype=np.float32)
+    feature[1, 1, 1] = 1.0
+
+    with pytest.raises(ValueError, match="no foreground"):
+        production.feature_mask(
+            feature,
+            spacing_zyx=(1.0, 1.0, 1.0),
+            min_component_volume_um3=2.0,
+            dilation_radius_um=1.0,
+        )
+
+
+def test_feature_mask_evidence_is_canonical_and_records_realized_counts() -> None:
+    from cyexm.registration._request_policy import feature_mask_parameters
+
+    assert feature_mask_parameters(
+        min_component_volume_um3=1.0,
+        dilation_radius_um=2.0,
+        fixed_foreground_voxels=25,
+        fixed_total_voxels=100,
+        moving_foreground_voxels=40,
+        moving_total_voxels=100,
+    ) == {
+        "algorithm": "positive-support-components-physical-dilation-v1",
+        "dilation_radius_um": 2.0,
+        "fixed_foreground_fraction": 0.25,
+        "fixed_foreground_voxels": 25,
+        "fixed_total_voxels": 100,
+        "min_component_volume_um3": 1.0,
+        "moving_foreground_fraction": 0.4,
+        "moving_foreground_voxels": 40,
+        "moving_total_voxels": 100,
+        "threshold": "finite-feature-greater-than-zero-v1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("feature", "spacing", "minimum_volume", "dilation"),
+    [
+        (
+            np.full((3, 3, 3), np.nan, dtype=np.float32),
+            (1.0, 1.0, 1.0),
+            1.0,
+            1.0,
+        ),
+        (np.ones((3, 3, 3)), (0.0, 1.0, 1.0), 1.0, 1.0),
+        (np.ones((3, 3, 3)), (1.0, 1.0, 1.0), True, 1.0),
+        (np.ones((3, 3, 3)), (1.0, 1.0, 1.0), 1.0, float("inf")),
+    ],
+)
+def test_feature_mask_rejects_invalid_inputs(
+    feature: np.ndarray,
+    spacing: tuple[object, object, object],
+    minimum_volume: object,
+    dilation: object,
+) -> None:
+    production = _production()
+
+    with pytest.raises((TypeError, ValueError)):
+        production.feature_mask(
+            feature,
+            spacing_zyx=spacing,
+            min_component_volume_um3=minimum_volume,
+            dilation_radius_um=dilation,
+        )
+
+
 @pytest.mark.parametrize(
     "image",
     [

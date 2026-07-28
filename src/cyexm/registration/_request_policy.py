@@ -20,6 +20,7 @@ PREPARED_MASK_POLICY = (
     "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
 )
 REGISTRATION_FEATURE_POLICY = "gaussian-background-mad-asinh-float32-v1"
+FEATURE_MASK_POLICY = "positive-support-components-physical-dilation-v1"
 RAW_RECONSTRUCTED_SCALAR_POLICY = "feature-estimation-raw-warp-affine-clip-v1"
 
 _LINEAR_ITERATIONS = {
@@ -148,6 +149,44 @@ def registration_feature_parameters(
         **preprocessing_config_parameters(filter_sigma_zyx),
         "fixed_robust_scale": fixed_scale,
         "moving_robust_scale": moving_scale,
+    }
+
+
+def feature_mask_config_parameters(
+    *,
+    min_component_volume_um3: float,
+    dilation_radius_um: float,
+) -> dict[str, object]:
+    """Return static feature-derived registration-mask evidence."""
+    return {
+        "algorithm": FEATURE_MASK_POLICY,
+        "dilation_radius_um": dilation_radius_um,
+        "min_component_volume_um3": min_component_volume_um3,
+        "threshold": "finite-feature-greater-than-zero-v1",
+    }
+
+
+def feature_mask_parameters(
+    *,
+    min_component_volume_um3: float,
+    dilation_radius_um: float,
+    fixed_foreground_voxels: int,
+    fixed_total_voxels: int,
+    moving_foreground_voxels: int,
+    moving_total_voxels: int,
+) -> dict[str, object]:
+    """Return mask policy plus realized fixed and moving support evidence."""
+    return {
+        **feature_mask_config_parameters(
+            min_component_volume_um3=min_component_volume_um3,
+            dilation_radius_um=dilation_radius_um,
+        ),
+        "fixed_foreground_fraction": (fixed_foreground_voxels / fixed_total_voxels),
+        "fixed_foreground_voxels": fixed_foreground_voxels,
+        "fixed_total_voxels": fixed_total_voxels,
+        "moving_foreground_fraction": (moving_foreground_voxels / moving_total_voxels),
+        "moving_foreground_voxels": moving_foreground_voxels,
+        "moving_total_voxels": moving_total_voxels,
     }
 
 

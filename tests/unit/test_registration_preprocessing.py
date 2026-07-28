@@ -183,6 +183,27 @@ def test_feature_mask_evidence_is_canonical_and_records_realized_counts() -> Non
 
 
 @pytest.mark.parametrize(
+    ("fixed_foreground", "fixed_total"),
+    [(True, 100), (0, 100), (101, 100), (10, 0)],
+)
+def test_feature_mask_evidence_rejects_invalid_counts(
+    fixed_foreground: object,
+    fixed_total: object,
+) -> None:
+    from cyexm.registration._request_policy import feature_mask_parameters
+
+    with pytest.raises((TypeError, ValueError), match="fixed"):
+        feature_mask_parameters(
+            min_component_volume_um3=1.0,
+            dilation_radius_um=1.0,
+            fixed_foreground_voxels=fixed_foreground,  # type: ignore[arg-type]
+            fixed_total_voxels=fixed_total,  # type: ignore[arg-type]
+            moving_foreground_voxels=10,
+            moving_total_voxels=100,
+        )
+
+
+@pytest.mark.parametrize(
     ("feature", "spacing", "minimum_volume", "dilation"),
     [
         (

@@ -179,6 +179,16 @@ def feature_mask_parameters(
     moving_total_voxels: int,
 ) -> dict[str, object]:
     """Return mask policy plus realized fixed and moving support evidence."""
+    for role, foreground, total in (
+        ("fixed", fixed_foreground_voxels, fixed_total_voxels),
+        ("moving", moving_foreground_voxels, moving_total_voxels),
+    ):
+        if type(foreground) is not int or type(total) is not int:
+            raise TypeError(f"{role} feature mask counts must be built-in integers")
+        if foreground <= 0 or total <= 0 or foreground > total:
+            raise ValueError(
+                f"{role} feature mask counts must satisfy 0 < foreground <= total"
+            )
     return {
         **feature_mask_config_parameters(
             min_component_volume_um3=min_component_volume_um3,

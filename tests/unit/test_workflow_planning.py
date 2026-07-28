@@ -16,6 +16,7 @@ from cyexm.config.models import (
     DatasetManifest,
     ExecutionPaths,
     ExecutionProfile,
+    FeatureMaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
@@ -1095,6 +1096,22 @@ def test_preprocessing_is_optional_canonical_scientific_identity(
         ),
         execution,
     )
+    masked = build_workflow_plan(
+        replace(
+            enabled_manifest,
+            registration=replace(
+                enabled_manifest.registration,
+                preprocessing=RegistrationPreprocessingSpec(
+                    filter_sigma_zyx=(12.0, 12.0, 12.0),
+                    feature_mask=FeatureMaskSpec(
+                        min_component_volume_um3=2.0,
+                        dilation_radius_um=3.0,
+                    ),
+                ),
+            ),
+        ),
+        execution,
+    )
 
     disabled_registration = json.loads(disabled.scientific_json)["registration"]
     enabled_registration = json.loads(enabled.scientific_json)["registration"]
@@ -1103,8 +1120,16 @@ def test_preprocessing_is_optional_canonical_scientific_identity(
         "algorithm": "gaussian-background-mad-asinh-float32-v1",
         "filter_sigma_zyx": [12.0, 12.0, 12.0],
     }
+    masked_registration = json.loads(masked.scientific_json)["registration"]
+    assert masked_registration["preprocessing"]["feature_mask"] == {
+        "algorithm": "positive-support-components-physical-dilation-v1",
+        "dilation_radius_um": 3.0,
+        "min_component_volume_um3": 2.0,
+        "threshold": "finite-feature-greater-than-zero-v1",
+    }
     assert disabled.scientific_fingerprint != enabled.scientific_fingerprint
     assert enabled.scientific_fingerprint != anisotropic.scientific_fingerprint
+    assert enabled.scientific_fingerprint != masked.scientific_fingerprint
 
 
 def test_cc_default_radius_has_one_canonical_plan_identity(

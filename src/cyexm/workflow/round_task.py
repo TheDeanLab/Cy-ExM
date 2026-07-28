@@ -145,6 +145,11 @@ def _preprocess_sigma(task: RoundTask) -> tuple[float, float, float] | None:
     return None if preprocessing is None else preprocessing.filter_sigma_zyx
 
 
+def _preprocess_feature_mask(task: RoundTask) -> object | None:
+    preprocessing = task.registration.preprocessing
+    return None if preprocessing is None else preprocessing.feature_mask
+
+
 def _reused_artifacts(
     paths: tuple[Path, ...],
     before: dict[Path, _ArtifactSnapshot],
@@ -299,6 +304,7 @@ def run_round_task(task: RoundTask) -> RoundResult:
             "nonlinear_metric": task.registration.nonlinear.metric,
             "nonlinear_radius": task.registration.nonlinear.radius,
             "preprocess_filter_sigma_zyx": _preprocess_sigma(task),
+            "preprocess_feature_mask": _preprocess_feature_mask(task),
         }
         stage = "registration"
         if task.strategy == "whole_image":

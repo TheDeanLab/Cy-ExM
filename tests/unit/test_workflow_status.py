@@ -776,6 +776,28 @@ def test_status_accepts_canonical_registration_preprocessing(
     assert status.rounds[1].status == "pending"
 
 
+def test_status_accepts_canonical_feature_mask_policy(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    scientific = _scientific_mapping(output_root)
+    scientific["registration"]["preprocessing"] = {  # type: ignore[index]
+        "algorithm": "gaussian-background-mad-asinh-float32-v1",
+        "filter_sigma_zyx": [2.0, 12.0, 20.0],
+        "feature_mask": {
+            "algorithm": "positive-support-components-physical-dilation-v1",
+            "dilation_radius_um": 3.0,
+            "min_component_volume_um3": 2.0,
+            "threshold": "finite-feature-greater-than-zero-v1",
+        },
+    }
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+    status = inspect_workflow_status(output_root, "dataset-1")
+
+    assert status.rounds[1].status == "pending"
+
+
 @pytest.mark.parametrize(
     "preprocessing",
     [
@@ -788,6 +810,16 @@ def test_status_accepts_canonical_registration_preprocessing(
         {
             "algorithm": "gaussian-background-mad-asinh-float32-v1",
             "filter_sigma_zyx": [12.0, 0.0, 12.0],
+        },
+        {
+            "algorithm": "gaussian-background-mad-asinh-float32-v1",
+            "filter_sigma_zyx": [12.0, 12.0, 12.0],
+            "feature_mask": {
+                "algorithm": "unknown",
+                "dilation_radius_um": 1.0,
+                "min_component_volume_um3": 1.0,
+                "threshold": "finite-feature-greater-than-zero-v1",
+            },
         },
     ],
 )

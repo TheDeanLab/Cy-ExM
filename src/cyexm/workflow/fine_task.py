@@ -107,6 +107,11 @@ def _new_image_registration(task: RoundTask, threads: NativeThreadConfig) -> obj
             if task.registration.preprocessing is None
             else task.registration.preprocessing.filter_sigma_zyx
         ),
+        preprocess_feature_mask=(
+            None
+            if task.registration.preprocessing is None
+            else task.registration.preprocessing.feature_mask
+        ),
     )
 
 
@@ -346,9 +351,9 @@ def _validated_prepared_manifest(
     import json
 
     from cyexm.registration._request_policy import (
-        PREPARED_MASK_POLICY,
         PREPARED_SCALAR_POLICY,
         common_parameters,
+        feature_mask_config_parameters,
         preprocessing_config_parameters,
         registration_feature_parameters,
     )
@@ -370,7 +375,11 @@ def _validated_prepared_manifest(
         raise TypeError("prepared descriptor must be a JSON object")
     manifest = PreparedManifest.from_dict(descriptor)
     configured_preprocessing = task.registration.preprocessing
-    expected_format = 2 if configured_preprocessing is None else 3
+    expected_format = (
+        2
+        if configured_preprocessing is None
+        else (4 if configured_preprocessing.feature_mask is not None else 3)
+    )
     if manifest.format_version != expected_format:
         raise ValueError(
             "prepared manifest format does not match registration preprocessing"
@@ -380,8 +389,27 @@ def _validated_prepared_manifest(
         expected_static = preprocessing_config_parameters(
             configured_preprocessing.filter_sigma_zyx
         )
-        if manifest.preprocessing != expected_static:
+        actual_static = dict(manifest.preprocessing or {})
+        actual_mask = actual_static.pop("feature_mask", None)
+        if actual_static != expected_static:
             raise ValueError("prepared preprocessing does not match the embedded round")
+        configured_mask = configured_preprocessing.feature_mask
+        if configured_mask is None:
+            if actual_mask is not None:
+                raise ValueError("prepared feature mask is unexpectedly enabled")
+        else:
+            if not isinstance(actual_mask, dict):
+                raise ValueError("prepared feature mask evidence is missing")
+            expected_mask = feature_mask_config_parameters(
+                min_component_volume_um3=(configured_mask.min_component_volume_um3),
+                dilation_radius_um=configured_mask.dilation_radius_um,
+            )
+            if any(
+                actual_mask.get(key) != value for key, value in expected_mask.items()
+            ):
+                raise ValueError(
+                    "prepared feature mask does not match the embedded round"
+                )
         if (
             manifest.fixed_feature_scale is None
             or manifest.moving_feature_scale is None
@@ -392,6 +420,8 @@ def _validated_prepared_manifest(
             fixed_scale=manifest.fixed_feature_scale,
             moving_scale=manifest.moving_feature_scale,
         )
+        if actual_mask is not None:
+            preprocessing["feature_mask"] = dict(actual_mask)
     fixed = FileIdentity.from_path(task.fixed_image)
     moving = FileIdentity.from_path(task.moving_image)
     if (manifest.native_fixed, manifest.native_moving) != (fixed, moving):
@@ -451,7 +481,7 @@ def _validated_prepared_manifest(
             "format_version": manifest.format_version,
             "prepared_role": role,
             "scalar_policy": PREPARED_SCALAR_POLICY,
-            "mask_policy": PREPARED_MASK_POLICY,
+            "mask_policy": manifest.mask_policy,
             "ants_pixeltype": manifest.pixeltypes[role],
             **({} if preprocessing is None else {"preprocessing": preprocessing}),
         }
@@ -490,7 +520,7 @@ def _validated_prepared_manifest(
         parameters={
             "format_version": manifest.format_version,
             "scalar_policy": PREPARED_SCALAR_POLICY,
-            "mask_policy": PREPARED_MASK_POLICY,
+            "mask_policy": manifest.mask_policy,
             "pixeltypes": manifest.pixeltypes,
             **({} if preprocessing is None else {"preprocessing": preprocessing}),
         },
@@ -643,7 +673,7 @@ def _chunk_context(
         pixeltype=region.pixeltypes["moving_linear_mask"],
     )
     preprocessing = None
-    if getattr(manifest, "format_version", 2) == 3:
+    if getattr(manifest, "format_version", 2) in {3, 4}:
         configured = round_task.registration.preprocessing
         if (
             configured is None
@@ -656,6 +686,13 @@ def _chunk_context(
             fixed_scale=manifest.fixed_feature_scale,
             moving_scale=manifest.moving_feature_scale,
         )
+        if manifest.format_version == 4:
+            if not isinstance(manifest.preprocessing, dict):
+                raise ValueError("prepared feature mask evidence is incomplete")
+            feature_mask = manifest.preprocessing.get("feature_mask")
+            if not isinstance(feature_mask, dict):
+                raise ValueError("prepared feature mask evidence is incomplete")
+            preprocessing["feature_mask"] = dict(feature_mask)
     if not assembly:
         raw_fixed = fixed_region
         raw_moving_linear = moving_region

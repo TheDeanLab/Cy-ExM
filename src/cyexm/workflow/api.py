@@ -237,6 +237,17 @@ def _registration_matches_snapshot(
             if registration.preprocessing is None
             else registration.preprocessing.filter_sigma_zyx
         )
+        feature_mask = (
+            None
+            if registration.preprocessing is None
+            else registration.preprocessing.feature_mask
+        )
+        feature_mask_minimum = (
+            None if feature_mask is None else feature_mask.min_component_volume_um3
+        )
+        feature_mask_dilation = (
+            None if feature_mask is None else feature_mask.dilation_radius_um
+        )
         return (
             type(registration.crop) is bool
             and registration.crop == snapshot.registration.crop
@@ -249,6 +260,10 @@ def _registration_matches_snapshot(
             and registration.nonlinear.radius == snapshot.registration.nonlinear_radius
             and preprocessing_filter_sigma_zyx
             == snapshot.registration.preprocessing_filter_sigma_zyx
+            and feature_mask_minimum
+            == snapshot.registration.preprocessing_feature_mask_min_component_volume_um3
+            and feature_mask_dilation
+            == snapshot.registration.preprocessing_feature_mask_dilation_radius_um
         )
     except AttributeError:
         return False

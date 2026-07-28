@@ -338,9 +338,17 @@ def _serial_plan(tmp_path: Path) -> WorkflowPlan:
 
 
 def test_registration_snapshot_match_includes_preprocessing() -> None:
+    from cyexm.config import FeatureMaskSpec
+
     registration = replace(
         _registration(),
-        preprocessing=RegistrationPreprocessingSpec(filter_sigma_zyx=(2.0, 12.0, 20.0)),
+        preprocessing=RegistrationPreprocessingSpec(
+            filter_sigma_zyx=(2.0, 12.0, 20.0),
+            feature_mask=FeatureMaskSpec(
+                min_component_volume_um3=2.0,
+                dilation_radius_um=3.0,
+            ),
+        ),
     )
     contract = SimpleNamespace(
         crop=registration.crop,
@@ -351,6 +359,8 @@ def test_registration_snapshot_match_includes_preprocessing() -> None:
         nonlinear_metric=registration.nonlinear.metric,
         nonlinear_radius=registration.nonlinear.radius,
         preprocessing_filter_sigma_zyx=(2.0, 12.0, 20.0),
+        preprocessing_feature_mask_min_component_volume_um3=2.0,
+        preprocessing_feature_mask_dilation_radius_um=3.0,
     )
 
     assert workflow_api._registration_matches_snapshot(
@@ -358,6 +368,12 @@ def test_registration_snapshot_match_includes_preprocessing() -> None:
         SimpleNamespace(registration=contract),
     )
     contract.preprocessing_filter_sigma_zyx = (2.0, 13.0, 20.0)
+    assert not workflow_api._registration_matches_snapshot(
+        registration,
+        SimpleNamespace(registration=contract),
+    )
+    contract.preprocessing_filter_sigma_zyx = (2.0, 12.0, 20.0)
+    contract.preprocessing_feature_mask_dilation_radius_um = 4.0
     assert not workflow_api._registration_matches_snapshot(
         registration,
         SimpleNamespace(registration=contract),

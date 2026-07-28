@@ -11,6 +11,7 @@ from typing import Any, Literal
 import pytest
 
 from cyexm.config.models import (
+    FeatureMaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
     RegistrationPreprocessingSpec,
@@ -28,6 +29,7 @@ from cyexm.registration._request_policy import (
     common_parameters,
     crop_geometry,
     crop_parameters,
+    feature_mask_parameters,
     fixed_reference_parameters,
     local_chunk_parameters,
     nonlinear_stage_parameters,
@@ -148,6 +150,20 @@ def _commit_registration_chain(task: RoundTask, *, affine_only: bool = False) ->
             moving_scale=3.0,
         )
     )
+    if (
+        preprocessing is not None
+        and task.registration.preprocessing is not None
+        and task.registration.preprocessing.feature_mask is not None
+    ):
+        mask = task.registration.preprocessing.feature_mask
+        preprocessing["feature_mask"] = feature_mask_parameters(
+            min_component_volume_um3=mask.min_component_volume_um3,
+            dilation_radius_um=mask.dilation_radius_um,
+            fixed_foreground_voxels=40,
+            fixed_total_voxels=100,
+            moving_foreground_voxels=50,
+            moving_total_voxels=100,
+        )
     fixed_geometry, moving_geometry = _effective_geometries(task)
     if task.registration.crop:
         crop_cases: tuple[
@@ -799,6 +815,7 @@ def test_round_task_passes_exact_strategy_constructor_arguments(
         "nonlinear_metric": task.registration.nonlinear.metric,
         "nonlinear_radius": task.registration.nonlinear.radius,
         "preprocess_filter_sigma_zyx": None,
+        "preprocess_feature_mask": None,
     }
     if strategy == "serial_chunked":
         expected["chunk_size"] = task.chunk_size_zyx
@@ -824,7 +841,11 @@ def test_round_task_forwards_canonical_registration_preprocessing(
         registration=replace(
             original.registration,
             preprocessing=RegistrationPreprocessingSpec(
-                filter_sigma_zyx=(2.0, 12.0, 20.0)
+                filter_sigma_zyx=(2.0, 12.0, 20.0),
+                feature_mask=FeatureMaskSpec(
+                    min_component_volume_um3=2.0,
+                    dilation_radius_um=3.0,
+                ),
             ),
         ),
     )
@@ -836,6 +857,10 @@ def test_round_task_forwards_canonical_registration_preprocessing(
         2.0,
         12.0,
         20.0,
+    )
+    assert constructors[0][1]["preprocess_feature_mask"] == FeatureMaskSpec(
+        min_component_volume_um3=2.0,
+        dilation_radius_um=3.0,
     )
 
 
@@ -1194,6 +1219,71 @@ def test_registered_output_rejects_feature_scales_that_differ_from_warp(
     assert evidence.affine is not None
     assert evidence.warp is not None
     assert paths.registered not in evidence.artifacts
+
+
+def test_feature_mask_policy_is_required_through_completion_chain(
+    tmp_path: Path,
+) -> None:
+    original = _task(tmp_path, crop=False, channel_names=())
+    task = replace(
+        original,
+        registration=replace(
+            original.registration,
+            preprocessing=RegistrationPreprocessingSpec(
+                filter_sigma_zyx=(2.0, 4.0, 4.0),
+                feature_mask=FeatureMaskSpec(
+                    min_component_volume_um3=2.0,
+                    dilation_radius_um=3.0,
+                ),
+            ),
+        ),
+    )
+    _commit_registration_chain(task)
+    paths = RegistrationArtifactPaths.for_round(
+        task.registration_directory,
+        task.round,
+    )
+
+    accepted = completion_evidence(
+        task,
+        paths,
+        SourceGeometries(
+            fixed=_FULL_FIXED_GEOMETRY,
+            moving=_FULL_MOVING_GEOMETRY,
+        ),
+        geometry_reader=lambda _path, _spacing: _FULL_FIXED_GEOMETRY,
+    )
+    assert accepted.affine is not None
+    assert accepted.warp is not None
+
+    record_path = paths.affine.with_name(f"{paths.affine.name}.complete.json")
+    record = CompletionRecord.read(record_path)
+    parameters = dict(record.request.parameters)
+    preprocessing = dict(parameters["preprocessing"])  # type: ignore[arg-type]
+    feature_mask = dict(preprocessing["feature_mask"])  # type: ignore[arg-type]
+    feature_mask["dilation_radius_um"] = 4.0
+    preprocessing["feature_mask"] = feature_mask
+    parameters["preprocessing"] = preprocessing
+    record_path.write_text(
+        CompletionRecord(
+            schema_version=record.schema_version,
+            request=replace(record.request, parameters=parameters),
+            artifact=record.artifact,
+        ).to_json(),
+        encoding="utf-8",
+    )
+
+    rejected = completion_evidence(
+        task,
+        paths,
+        SourceGeometries(
+            fixed=_FULL_FIXED_GEOMETRY,
+            moving=_FULL_MOVING_GEOMETRY,
+        ),
+        geometry_reader=lambda _path, _spacing: _FULL_FIXED_GEOMETRY,
+    )
+    assert rejected.affine is None
+    assert rejected.warp is None
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt("stop"), SystemExit(7)])

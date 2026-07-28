@@ -27,6 +27,7 @@ from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
     OUTPUT_FORMAT_POLICY,
     REGISTRATION_FEATURE_POLICY,
+    feature_mask_config_parameters,
 )
 from cyexm.spatial import (
     AXIS_CONVENTION_VERSION,
@@ -662,12 +663,19 @@ def _scientific_mapping(
         "nonlinear": _nonlinear_mapping(manifest.registration.nonlinear),
     }
     if manifest.registration.preprocessing is not None:
-        registration_mapping["preprocessing"] = {
+        preprocessing_mapping: dict[str, object] = {
             "algorithm": REGISTRATION_FEATURE_POLICY,
             "filter_sigma_zyx": list(
                 manifest.registration.preprocessing.filter_sigma_zyx
             ),
         }
+        feature_mask = manifest.registration.preprocessing.feature_mask
+        if feature_mask is not None:
+            preprocessing_mapping["feature_mask"] = feature_mask_config_parameters(
+                min_component_volume_um3=feature_mask.min_component_volume_um3,
+                dilation_radius_um=feature_mask.dilation_radius_um,
+            )
+        registration_mapping["preprocessing"] = preprocessing_mapping
     return {
         "schema_version": manifest.schema_version,
         "dataset_id": manifest.dataset_id,

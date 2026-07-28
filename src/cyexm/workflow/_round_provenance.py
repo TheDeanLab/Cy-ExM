@@ -20,6 +20,7 @@ from cyexm.registration._request_policy import (
     common_parameters,
     crop_geometry,
     crop_parameters,
+    feature_mask_parameters,
     fixed_reference_parameters,
     local_chunk_parameters,
     nonlinear_stage_parameters,
@@ -172,6 +173,28 @@ def _feature_evidence(
         fixed_scale=float(fixed_scale),  # type: ignore[arg-type]
         moving_scale=float(moving_scale),  # type: ignore[arg-type]
     )
+    configured_mask = configured.feature_mask
+    actual_mask = value.get("feature_mask")
+    if configured_mask is None:
+        if actual_mask is not None:
+            return None
+    else:
+        if not isinstance(actual_mask, Mapping):
+            return None
+        try:
+            canonical_mask = feature_mask_parameters(
+                min_component_volume_um3=(configured_mask.min_component_volume_um3),
+                dilation_radius_um=configured_mask.dilation_radius_um,
+                fixed_foreground_voxels=actual_mask["fixed_foreground_voxels"],  # type: ignore[arg-type]
+                fixed_total_voxels=actual_mask["fixed_total_voxels"],  # type: ignore[arg-type]
+                moving_foreground_voxels=actual_mask["moving_foreground_voxels"],  # type: ignore[arg-type]
+                moving_total_voxels=actual_mask["moving_total_voxels"],  # type: ignore[arg-type]
+            )
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return None
+        if dict(actual_mask) != canonical_mask:
+            return None
+        expected["feature_mask"] = canonical_mask
     if not _parameters_match(dict(value), expected):
         return None
     return expected

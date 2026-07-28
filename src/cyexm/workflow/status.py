@@ -11,8 +11,10 @@ from typing import Literal, cast
 
 from cyexm._nonlinear_metric import MATTES_BINS, NonlinearMetricName
 from cyexm.config.models import (
+    FeatureMaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
+    RegistrationPreprocessingSpec,
     RegistrationSpec,
     RegistrationStageSpec,
 )
@@ -20,6 +22,7 @@ from cyexm.errors import WorkflowPlanError
 from cyexm.io.tiff import _read_uint16_tiff_geometry_without_runtime
 from cyexm.registration._request_policy import (
     CHANNEL_POSTPROCESSING_POLICY,
+    FEATURE_MASK_POLICY,
     OUTPUT_FORMAT_POLICY,
     REGISTRATION_FEATURE_POLICY,
 )
@@ -73,6 +76,14 @@ _REFERENCE_KEYS = frozenset(
 _REFERENCE_CHANNEL_KEYS = frozenset({"file", "manifest_file", "output"})
 _REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
 _REGISTRATION_PREPROCESSING_KEYS = frozenset({"algorithm", "filter_sigma_zyx"})
+_REGISTRATION_FEATURE_MASK_KEYS = frozenset(
+    {
+        "algorithm",
+        "dilation_radius_um",
+        "min_component_volume_um3",
+        "threshold",
+    }
+)
 _LINEAR_STAGE_KEYS = frozenset({"type", "accuracy"})
 _NONLINEAR_CC_STAGE_KEYS = frozenset({"type", "accuracy", "metric", "radius"})
 _NONLINEAR_MATTES_STAGE_KEYS = frozenset({"type", "accuracy", "metric", "bins"})
@@ -160,6 +171,8 @@ class _RegistrationContract:
     nonlinear_metric: NonlinearMetricName
     nonlinear_radius: int | None
     preprocessing_filter_sigma_zyx: tuple[float, float, float] | None
+    preprocessing_feature_mask_min_component_volume_um3: float | None
+    preprocessing_feature_mask_dilation_radius_um: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,11 +482,22 @@ def _parse_registration(value: object) -> _RegistrationContract:
             )
         nonlinear_radius = None
     preprocessing_filter_sigma_zyx = None
+    preprocessing_feature_mask_min_component_volume_um3 = None
+    preprocessing_feature_mask_dilation_radius_um = None
     if "preprocessing" in mapping:
         preprocessing_location = "scientific plan registration.preprocessing"
-        preprocessing = _exact_mapping(
+        preprocessing_preliminary = _mapping(
             mapping["preprocessing"],
-            _REGISTRATION_PREPROCESSING_KEYS,
+            preprocessing_location,
+        )
+        preprocessing_keys = (
+            _REGISTRATION_PREPROCESSING_KEYS | frozenset({"feature_mask"})
+            if "feature_mask" in preprocessing_preliminary
+            else _REGISTRATION_PREPROCESSING_KEYS
+        )
+        preprocessing = _exact_mapping(
+            preprocessing_preliminary,
+            preprocessing_keys,
             preprocessing_location,
         )
         if preprocessing["algorithm"] != REGISTRATION_FEATURE_POLICY:
@@ -486,6 +510,30 @@ def _parse_registration(value: object) -> _RegistrationContract:
             preprocessing["filter_sigma_zyx"],
             f"{preprocessing_location}.filter_sigma_zyx",
         )
+        if "feature_mask" in preprocessing:
+            mask_location = f"{preprocessing_location}.feature_mask"
+            feature_mask = _exact_mapping(
+                preprocessing["feature_mask"],
+                _REGISTRATION_FEATURE_MASK_KEYS,
+                mask_location,
+            )
+            if feature_mask["algorithm"] != FEATURE_MASK_POLICY:
+                raise WorkflowPlanError(
+                    f"{mask_location}.algorithm must be exactly "
+                    f"{FEATURE_MASK_POLICY!r}; got {feature_mask['algorithm']!r}"
+                )
+            if feature_mask["threshold"] != "finite-feature-greater-than-zero-v1":
+                raise WorkflowPlanError(f"{mask_location}.threshold is not canonical")
+            preprocessing_feature_mask_min_component_volume_um3 = _finite_number(
+                feature_mask["min_component_volume_um3"],
+                f"{mask_location}.min_component_volume_um3",
+                positive=True,
+            )
+            preprocessing_feature_mask_dilation_radius_um = _finite_number(
+                feature_mask["dilation_radius_um"],
+                f"{mask_location}.dilation_radius_um",
+                positive=True,
+            )
     return _RegistrationContract(
         crop=crop,
         linear_type=_choice(
@@ -509,6 +557,12 @@ def _parse_registration(value: object) -> _RegistrationContract:
         nonlinear_metric=cast(NonlinearMetricName, metric),
         nonlinear_radius=nonlinear_radius,
         preprocessing_filter_sigma_zyx=preprocessing_filter_sigma_zyx,
+        preprocessing_feature_mask_min_component_volume_um3=(
+            preprocessing_feature_mask_min_component_volume_um3
+        ),
+        preprocessing_feature_mask_dilation_radius_um=(
+            preprocessing_feature_mask_dilation_radius_um
+        ),
     )
 
 
@@ -996,6 +1050,27 @@ def _task_from_snapshot(
     native_threads: NativeThreadSpec,
 ) -> RoundTask:
     round_layout = layout.round(round_contract.round)
+    preprocessing = None
+    sigma = snapshot.registration.preprocessing_filter_sigma_zyx
+    if sigma is not None:
+        feature_mask = None
+        minimum_volume = (
+            snapshot.registration.preprocessing_feature_mask_min_component_volume_um3
+        )
+        if minimum_volume is not None:
+            dilation = (
+                snapshot.registration.preprocessing_feature_mask_dilation_radius_um
+            )
+            if dilation is None:
+                raise RuntimeError("feature mask dilation evidence is missing")
+            feature_mask = FeatureMaskSpec(
+                min_component_volume_um3=minimum_volume,
+                dilation_radius_um=dilation,
+            )
+        preprocessing = RegistrationPreprocessingSpec(
+            filter_sigma_zyx=sigma,
+            feature_mask=feature_mask,
+        )
     return RoundTask(
         dataset_id=snapshot.dataset_id,
         round=round_contract.round,
@@ -1017,6 +1092,7 @@ def _task_from_snapshot(
                 metric=snapshot.registration.nonlinear_metric,
                 radius=snapshot.registration.nonlinear_radius,
             ),
+            preprocessing=preprocessing,
         ),
         native_threads=native_threads,
         channels=tuple(

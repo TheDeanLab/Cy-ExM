@@ -14,6 +14,7 @@ from cyexm.chunking import (
     extract_chunk,
     stitch_core,
 )
+from cyexm.config.models import FeatureMaskSpec
 from cyexm.errors import (
     CacheValidationError,
     ChunkRegistrationError,
@@ -109,6 +110,7 @@ class ChunkedImageRegistration(ImageRegistration):
         nonlinear_metric: object = "mattes",
         nonlinear_radius: object = None,
         preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
+        preprocess_feature_mask: FeatureMaskSpec | None = None,
         _backend: RegistrationBackend | None = None,
         _artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -130,6 +132,7 @@ class ChunkedImageRegistration(ImageRegistration):
             nonlinear_metric=nonlinear_metric,
             nonlinear_radius=nonlinear_radius,
             preprocess_filter_sigma_zyx=preprocess_filter_sigma_zyx,
+            preprocess_feature_mask=preprocess_feature_mask,
             _backend=_backend,
             _artifact_store=_artifact_store,
         )
@@ -217,8 +220,8 @@ class ChunkedImageRegistration(ImageRegistration):
         backend = state.backend
         fixed = state.fixed
         moving_linear = state.moving_linear
-        fixed_mask = state.fixed_mask
-        moving_linear_mask = state.moving_linear_mask
+        fixed_mask = state.registration_fixed_mask
+        moving_linear_mask = state.registration_moving_linear_mask
         fixed_geometry = backend.geometry(fixed)
         image_shape = _positive_int_triple(fixed_geometry.shape, "fixed image shape")
         fixed_array = self._validated_scalar_array(

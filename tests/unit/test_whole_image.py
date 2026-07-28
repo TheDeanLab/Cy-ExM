@@ -13,6 +13,7 @@ import pytest
 from fakes import FakeBackend, FakeImage, fake_image
 
 import cyexm.registration.whole_image as whole_image
+from cyexm.config import FeatureMaskSpec
 from cyexm.errors import CacheValidationError, RegistrationStageError
 from cyexm.registration._request_policy import nonlinear_parameters
 from cyexm.registration.artifacts import (
@@ -374,6 +375,7 @@ def test_new_configuration_parameters_are_keyword_only() -> None:
         "nonlinear_type",
         "nonlinear_accuracy",
         "preprocess_filter_sigma_zyx",
+        "preprocess_feature_mask",
         "_backend",
         "_artifact_store",
     ):
@@ -395,6 +397,10 @@ def test_register_round_exposes_the_legacy_positional_prefix() -> None:
 
 def test_constructor_stores_custom_scalar_configuration(tmp_path: Path) -> None:
     native_threads = NativeThreadConfig(itk_threads=2, blas_threads=3)
+    feature_mask = FeatureMaskSpec(
+        min_component_volume_um3=2.0,
+        dilation_radius_um=3.0,
+    )
 
     registration = ImageRegistration(
         tmp_path / "fixed.tif",
@@ -413,6 +419,7 @@ def test_constructor_stores_custom_scalar_configuration(tmp_path: Path) -> None:
         nonlinear_metric="CC",
         nonlinear_radius=2,
         preprocess_filter_sigma_zyx=(1.0, 2.0, 3.0),
+        preprocess_feature_mask=feature_mask,
     )
 
     assert registration.imaging_round == 7
@@ -425,6 +432,7 @@ def test_constructor_stores_custom_scalar_configuration(tmp_path: Path) -> None:
     assert registration.linear_accuracy == "high"
     assert registration.nonlinear_type == "SyN"
     assert registration.nonlinear_accuracy == "low"
+    assert registration.preprocess_feature_mask is feature_mask
     assert registration.prepared_fixed is False
 
 
@@ -526,6 +534,10 @@ def test_register_round_forwards_every_option_and_registers_once(
 
     monkeypatch.setattr(whole_image, "ImageRegistration", RecordingRegistration)
     native_threads = NativeThreadConfig(itk_threads=2, blas_threads=3)
+    feature_mask = FeatureMaskSpec(
+        min_component_volume_um3=2.0,
+        dilation_radius_um=3.0,
+    )
     fixed = tmp_path / "fixed.tif"
     moving = tmp_path / "moving.tif"
     output = tmp_path / "output"
@@ -547,6 +559,7 @@ def test_register_round_forwards_every_option_and_registers_once(
         nonlinear_metric="CC",
         nonlinear_radius=2,
         preprocess_filter_sigma_zyx=(1.0, 2.0, 3.0),
+        preprocess_feature_mask=feature_mask,
     )
 
     assert received["args"] == (
@@ -568,6 +581,7 @@ def test_register_round_forwards_every_option_and_registers_once(
         "nonlinear_metric": "CC",
         "nonlinear_radius": 2,
         "preprocess_filter_sigma_zyx": (1.0, 2.0, 3.0),
+        "preprocess_feature_mask": feature_mask,
     }
     assert register_calls == 1
 
@@ -636,6 +650,59 @@ def test_enabled_preprocessing_estimates_from_features_but_uses_raw_for_science(
     for request in (affine_request, nonlinear_request, registered_request):
         assert request.parameters["preprocessing"]["fixed_robust_scale"] > 0.0
         assert request.parameters["preprocessing"]["moving_robust_scale"] > 0.0
+
+
+def test_feature_mask_is_used_for_registration_but_not_raw_metrics(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    registration = make_registration(
+        tmp_path,
+        backend=backend,
+        preprocess_filter_sigma_zyx=(1.0, 2.0, 3.0),
+        preprocess_feature_mask=FeatureMaskSpec(
+            min_component_volume_um3=0.001,
+            dilation_radius_um=0.15,
+        ),
+    )
+
+    registration.register()
+
+    assert len(backend.from_array_calls) == 4
+    fixed_registration_mask = backend.linear_kwargs[0]["fixed_mask"]
+    moving_registration_mask = backend.linear_kwargs[0]["moving_mask"]
+    fixed_raw_mask = backend.metric_calls[0][2]
+    moving_raw_mask = backend.metric_calls[0][3]
+    assert fixed_registration_mask is not fixed_raw_mask
+    assert moving_registration_mask is not moving_raw_mask
+    np.testing.assert_array_equal(
+        backend.from_array_calls[2][0],
+        fixed_registration_mask.data,  # type: ignore[union-attr]
+    )
+    np.testing.assert_array_equal(
+        backend.from_array_calls[3][0],
+        moving_registration_mask.data,  # type: ignore[union-attr]
+    )
+
+    assert backend.nonlinear_kwargs[0]["fixed_mask"] is fixed_registration_mask
+    assert backend.nonlinear_kwargs[0]["moving_mask"] is not backend.metric_calls[1][3]
+    assert backend.metric_calls[1][2] is fixed_raw_mask
+    assert backend.metric_calls[2][2] is fixed_raw_mask
+    assert backend.metric_calls[2][3] is not backend.nonlinear_kwargs[0]["moving_mask"]
+
+    affine_request = completion_request(round_paths(tmp_path).affine)
+    mask_evidence = affine_request.parameters["preprocessing"]["feature_mask"]
+    assert mask_evidence["fixed_foreground_voxels"] > 0
+    assert mask_evidence["moving_foreground_voxels"] > 0
+
+
+def test_feature_mask_requires_enabled_preprocessing(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires registration preprocessing"):
+        make_registration(
+            tmp_path,
+            backend=FakeBackend(),
+            preprocess_feature_mask=FeatureMaskSpec(),
+        )
 
 
 def test_register_resolves_threads_before_loading_any_image(

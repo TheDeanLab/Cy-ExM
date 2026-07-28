@@ -512,8 +512,8 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
     for role, image in (
         ("fixed scalar", state.fixed),
         ("moving scalar", state.moving_linear),
-        ("fixed mask", state.fixed_mask),
-        ("moving mask", state.moving_linear_mask),
+        ("fixed mask", state.registration_fixed_mask),
+        ("moving mask", state.registration_moving_linear_mask),
     ):
         if backend.geometry(image) != geometry:
             raise ValueError(f"{role} geometry does not match the fixed geometry")
@@ -522,14 +522,14 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
     arrays = (
         _prepared_array(np, backend, state.fixed, geometry),
         _prepared_array(np, backend, state.moving_linear, geometry),
-        _prepared_array(np, backend, state.fixed_mask, geometry),
-        _prepared_array(np, backend, state.moving_linear_mask, geometry),
+        _prepared_array(np, backend, state.registration_fixed_mask, geometry),
+        _prepared_array(np, backend, state.registration_moving_linear_mask, geometry),
     )
     images = (
         state.fixed,
         state.moving_linear,
-        state.fixed_mask,
-        state.moving_linear_mask,
+        state.registration_fixed_mask,
+        state.registration_moving_linear_mask,
     )
     pixeltypes: dict[str, str] = {}
     for role, image in zip(

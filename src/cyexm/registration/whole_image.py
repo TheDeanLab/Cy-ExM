@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from cyexm._nonlinear_metric import resolve_nonlinear_metric
+from cyexm.config.models import FeatureMaskSpec
 from cyexm.errors import (
     CacheValidationError,
     ChunkRegistrationError,
@@ -25,6 +26,8 @@ from cyexm.registration._request_policy import (
     affine_parameters,
     common_parameters,
     crop_parameters,
+    feature_mask_config_parameters,
+    feature_mask_parameters,
     fixed_reference_parameters,
     linear_parameters,
     nonlinear_parameters,
@@ -120,6 +123,20 @@ def _validated_preprocessing_sigma(
     return normalized[0], normalized[1], normalized[2]
 
 
+def _validated_feature_mask(value: object) -> FeatureMaskSpec | None:
+    if value is None:
+        return None
+    if type(value) is not FeatureMaskSpec:
+        raise TypeError("preprocess_feature_mask must be a FeatureMaskSpec or None")
+    for name in ("min_component_volume_um3", "dilation_radius_um"):
+        item = getattr(value, name)
+        if type(item) is not float or not math.isfinite(item) or item <= 0.0:
+            raise ValueError(
+                f"preprocess_feature_mask.{name} must be a positive finite float"
+            )
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class RegistrationPaths:
     output: Path
@@ -158,8 +175,10 @@ class _LinearPreparation:
     moving_linear: object
     raw_fixed: object
     raw_moving_linear: object
-    fixed_mask: object
-    moving_linear_mask: object
+    raw_fixed_mask: object
+    raw_moving_linear_mask: object
+    registration_fixed_mask: object
+    registration_moving_linear_mask: object
     affine: object
     fixed_feature_scale: float | None
     moving_feature_scale: float | None
@@ -194,6 +213,7 @@ class ImageRegistration:
         nonlinear_metric: object = "mattes",
         nonlinear_radius: object = None,
         preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
+        preprocess_feature_mask: FeatureMaskSpec | None = None,
         _backend: RegistrationBackend | None = None,
         _artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -227,6 +247,14 @@ class ImageRegistration:
         self.preprocess_filter_sigma_zyx = _validated_preprocessing_sigma(
             preprocess_filter_sigma_zyx
         )
+        self.preprocess_feature_mask = _validated_feature_mask(preprocess_feature_mask)
+        if (
+            self.preprocess_feature_mask is not None
+            and self.preprocess_filter_sigma_zyx is None
+        ):
+            raise ValueError(
+                "preprocess_feature_mask requires registration preprocessing"
+            )
         self._backend = _backend
         self._artifact_store = _artifact_store
         self._log = logger
@@ -271,8 +299,8 @@ class ImageRegistration:
         raw_fixed, raw_moving = self._crop_if_requested(
             backend, fixed, moving, paths, resolved
         )
-        fixed_mask = backend.zero_mask(raw_fixed)
-        moving_mask = backend.zero_mask(raw_moving)
+        raw_fixed_mask = backend.zero_mask(raw_fixed)
+        raw_moving_mask = backend.zero_mask(raw_moving)
 
         if not self.prepared_fixed:
             self._commit_fixed_reference(backend, raw_fixed, paths, resolved)
@@ -281,8 +309,8 @@ class ImageRegistration:
             backend,
             raw_fixed,
             raw_moving,
-            fixed_mask,
-            moving_mask,
+            raw_fixed_mask,
+            raw_moving_mask,
             paths,
             resolved,
         )
@@ -291,6 +319,8 @@ class ImageRegistration:
         moving = raw_moving
         fixed_feature_scale: float | None = None
         moving_feature_scale: float | None = None
+        registration_fixed_mask = raw_fixed_mask
+        registration_moving_mask = raw_moving_mask
         self._registration_feature_evidence = None
         if self.preprocess_filter_sigma_zyx is not None:
             fixed, fixed_feature_scale = self._registration_feature(
@@ -299,11 +329,36 @@ class ImageRegistration:
             moving, moving_feature_scale = self._registration_feature(
                 backend, raw_moving, "moving"
             )
-            self._registration_feature_evidence = registration_feature_parameters(
+            feature_evidence = registration_feature_parameters(
                 filter_sigma_zyx=self.preprocess_filter_sigma_zyx,
                 fixed_scale=fixed_feature_scale,
                 moving_scale=moving_feature_scale,
             )
+            if self.preprocess_feature_mask is not None:
+                registration_fixed_mask, fixed_mask_result = self._registration_mask(
+                    backend, fixed, "fixed"
+                )
+                registration_moving_mask, moving_mask_result = self._registration_mask(
+                    backend, moving, "moving"
+                )
+                policy = self.preprocess_feature_mask
+                feature_evidence["feature_mask"] = feature_mask_parameters(
+                    min_component_volume_um3=policy.min_component_volume_um3,
+                    dilation_radius_um=policy.dilation_radius_um,
+                    fixed_foreground_voxels=fixed_mask_result.foreground_voxels,
+                    fixed_total_voxels=fixed_mask_result.total_voxels,
+                    moving_foreground_voxels=moving_mask_result.foreground_voxels,
+                    moving_total_voxels=moving_mask_result.total_voxels,
+                )
+                if self.enable_logging:
+                    self._log.info(
+                        "Registration feature masks: fixed=%d/%d, moving=%d/%d",
+                        fixed_mask_result.foreground_voxels,
+                        fixed_mask_result.total_voxels,
+                        moving_mask_result.foreground_voxels,
+                        moving_mask_result.total_voxels,
+                    )
+            self._registration_feature_evidence = feature_evidence
             self._scalar_postprocessing_policy = RAW_RECONSTRUCTED_SCALAR_POLICY
             if self.enable_logging:
                 self._log.info(
@@ -316,12 +371,13 @@ class ImageRegistration:
             backend,
             fixed,
             moving,
-            fixed_mask,
-            moving_mask,
+            registration_fixed_mask,
+            registration_moving_mask,
             paths,
             resolved,
         )
         raw_moving_linear = moving_linear
+        raw_moving_linear_mask = moving_linear_mask
         if self.preprocess_filter_sigma_zyx is not None:
             try:
                 raw_moving_linear = backend.apply_affine(
@@ -342,13 +398,36 @@ class ImageRegistration:
                 raise RegistrationStageError(
                     f"raw affine reconstruction failed for round {self.imaging_round}"
                 ) from error
+        if self.preprocess_feature_mask is not None:
+            try:
+                raw_moving_linear_mask = backend.threshold_mask(
+                    backend.apply_affine(
+                        fixed=raw_fixed,
+                        moving=raw_moving_mask,
+                        transform=affine,
+                        interpolation="nearestNeighbor",
+                    )
+                )
+                self._validate_affine_result_geometry(
+                    backend,
+                    raw_fixed,
+                    raw_moving_linear,
+                    raw_moving_linear_mask,
+                )
+            except RegistrationStageError:
+                raise
+            except Exception as error:
+                raise RegistrationStageError(
+                    "raw mask affine reconstruction failed "
+                    f"for round {self.imaging_round}"
+                ) from error
         self._commit_metrics(
             "linearly-registered",
             backend,
             raw_fixed,
             raw_moving_linear,
-            fixed_mask,
-            moving_linear_mask,
+            raw_fixed_mask,
+            raw_moving_linear_mask,
             paths,
             resolved,
         )
@@ -361,8 +440,10 @@ class ImageRegistration:
             moving_linear=moving_linear,
             raw_fixed=raw_fixed,
             raw_moving_linear=raw_moving_linear,
-            fixed_mask=fixed_mask,
-            moving_linear_mask=moving_linear_mask,
+            raw_fixed_mask=raw_fixed_mask,
+            raw_moving_linear_mask=raw_moving_linear_mask,
+            registration_fixed_mask=registration_fixed_mask,
+            registration_moving_linear_mask=moving_linear_mask,
             affine=affine,
             fixed_feature_scale=fixed_feature_scale,
             moving_feature_scale=moving_feature_scale,
@@ -375,13 +456,14 @@ class ImageRegistration:
                 state.backend,
                 state.fixed,
                 state.moving_linear,
-                state.fixed_mask,
-                state.moving_linear_mask,
+                state.registration_fixed_mask,
+                state.registration_moving_linear_mask,
                 state.affine,
                 state.paths,
                 state.resolved,
             )
         )
+        raw_moving_nonlinear_mask = moving_nonlinear_mask
         if self.preprocess_filter_sigma_zyx is not None:
             try:
                 moving_nonlinear = state.backend.apply_warp(
@@ -395,13 +477,28 @@ class ImageRegistration:
                     "raw nonlinear reconstruction failed "
                     f"for round {self.imaging_round}"
                 ) from error
+        if self.preprocess_feature_mask is not None:
+            try:
+                raw_moving_nonlinear_mask = state.backend.threshold_mask(
+                    state.backend.apply_warp(
+                        fixed=state.raw_fixed,
+                        moving=state.raw_moving_linear_mask,
+                        warp_path=warp_path,
+                        interpolation="nearestNeighbor",
+                    )
+                )
+            except Exception as error:
+                raise RegistrationStageError(
+                    "raw mask nonlinear reconstruction failed "
+                    f"for round {self.imaging_round}"
+                ) from error
         self._commit_metrics(
             "nonlinear-registered",
             state.backend,
             state.raw_fixed,
             moving_nonlinear,
-            state.fixed_mask,
-            moving_nonlinear_mask,
+            state.raw_fixed_mask,
+            raw_moving_nonlinear_mask,
             state.paths,
             state.resolved,
         )
@@ -440,6 +537,44 @@ class ImageRegistration:
                 f"{role} preprocessing stage failed for round {self.imaging_round}"
             ) from error
 
+    def _registration_mask(
+        self,
+        backend: RegistrationBackend,
+        feature: object,
+        role: Literal["fixed", "moving"],
+    ) -> tuple[object, Any]:
+        policy = self.preprocess_feature_mask
+        if policy is None:
+            raise RuntimeError("feature-derived registration masking is disabled")
+        try:
+            from cyexm.registration.preprocessing import feature_mask
+
+            spacing_xyz = backend.geometry(feature).spacing
+            spacing_zyx = (
+                spacing_xyz[2],
+                spacing_xyz[1],
+                spacing_xyz[0],
+            )
+            result = feature_mask(
+                backend.to_array(feature),
+                spacing_zyx,
+                min_component_volume_um3=policy.min_component_volume_um3,
+                dilation_radius_um=policy.dilation_radius_um,
+            )
+            mask = backend.from_array(result.array, reference=feature)
+            if not geometry_compatible(
+                backend.geometry(mask),
+                backend.geometry(feature),
+            ):
+                raise ValueError(
+                    "registration feature mask geometry does not match its feature"
+                )
+            return mask, result
+        except Exception as error:
+            raise RegistrationStageError(
+                f"{role} feature-mask stage failed for round {self.imaging_round}"
+            ) from error
+
     def _preprocessing_parameters(self, *, derived: bool) -> dict[str, object] | None:
         sigma = self.preprocess_filter_sigma_zyx
         if sigma is None:
@@ -448,7 +583,14 @@ class ImageRegistration:
             if self._registration_feature_evidence is None:
                 raise RuntimeError("registration feature scales are not available")
             return dict(self._registration_feature_evidence)
-        return preprocessing_config_parameters(sigma)
+        parameters = preprocessing_config_parameters(sigma)
+        policy = self.preprocess_feature_mask
+        if policy is not None:
+            parameters["feature_mask"] = feature_mask_config_parameters(
+                min_component_volume_um3=policy.min_component_volume_um3,
+                dilation_radius_um=policy.dilation_radius_um,
+            )
+        return parameters
 
     def _store(self) -> ArtifactStore:
         if self._artifact_store is None:
@@ -1309,6 +1451,7 @@ def register_round(
     nonlinear_metric: object = "mattes",
     nonlinear_radius: object = None,
     preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
+    preprocess_feature_mask: FeatureMaskSpec | None = None,
 ) -> None:
     ImageRegistration(
         fixed_image_path,
@@ -1327,6 +1470,7 @@ def register_round(
         nonlinear_metric=nonlinear_metric,
         nonlinear_radius=nonlinear_radius,
         preprocess_filter_sigma_zyx=preprocess_filter_sigma_zyx,
+        preprocess_feature_mask=preprocess_feature_mask,
     ).register()
 
 

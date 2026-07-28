@@ -188,9 +188,11 @@ class ImageRegistration:
     """Register one moving image to one fixed image.
 
     ``preprocess_filter_sigma_zyx`` is an optional canonical three-value tuple in
-    NumPy ZYX voxel units. When present, cropped feature images estimate transforms;
-    raw images still own masks, metrics, and final registered output. YAML scalar
-    expansion occurs before this Python API.
+    NumPy ZYX voxel units. When present, cropped feature images estimate transforms
+    that are applied to the raw images. ``preprocess_feature_mask`` can additionally
+    derive transform-estimation masks from positive feature support; raw-image masks
+    remain diagnostic, and the final registered output remains raw intensity data.
+    YAML scalar expansion occurs before this Python API.
     """
 
     def __init__(

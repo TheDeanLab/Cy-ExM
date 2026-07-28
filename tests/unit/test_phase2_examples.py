@@ -7,6 +7,7 @@ import yaml
 
 from cyexm.config import (
     ExecutionPaths,
+    FeatureMaskSpec,
     LocalDaskSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
@@ -104,12 +105,19 @@ def test_preprocessed_spheroid_manifest_is_portable_and_uses_default_sigma() -> 
     manifest = load_dataset_manifest(path)
 
     assert manifest.registration.preprocessing == RegistrationPreprocessingSpec(
-        filter_sigma_zyx=(12.0, 12.0, 12.0)
+        filter_sigma_zyx=(12.0, 12.0, 12.0),
+        feature_mask=FeatureMaskSpec(
+            min_component_volume_um3=1.0,
+            dilation_radius_um=1.0,
+        ),
     )
     assert manifest.registration.nonlinear.metric == "CC"
     assert manifest.registration.nonlinear.radius == 4
     raw = path.read_text(encoding="utf-8")
     assert "filter_sigma_zyx: 12" in raw
+    assert "feature_mask:" in raw
+    assert "min_component_volume_um3: 1.0" in raw
+    assert "dilation_radius_um: 1.0" in raw
     assert not any(marker in raw for marker in ("/project", "/archive", "/endosome"))
 
 

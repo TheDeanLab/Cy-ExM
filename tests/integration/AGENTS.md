@@ -20,6 +20,9 @@
   a real-library regression whose native fixed and moving shapes differ along Z, Y,
   and X. Assert exact fixed-reference geometry immediately after affine resampling
   and for every persisted scalar, mask, warp, and transformed-channel output.
+- Feature-mask integration tests must prove nontrivial masks reach both TRSAA and
+  SyN, unequal native shapes still enter nonlinear work on the fixed grid, and the
+  registered output remains a raw-derived uint16 TIFF.
 - Nonlinear metric changes require a bounded real-ANTs acceptance test proving the
   selected scalar policy materializes a finite warp on exact fixed geometry. Radius
   optimization on representative datasets remains separate HPC/scientific acceptance.

@@ -50,6 +50,7 @@ examples that preserve Cy-ExM's fixed/moving roles, public XYZ spacing, and NumP
 volume order.
 
 Registration-preprocessing documentation must preserve the
-raw → crop → feature estimate → transform raw boundary. State that masks and metrics
-are raw-derived, sigmas are NumPy ZYX voxel counts, and feature images are never
-public TIFFs.
+raw → crop → feature estimate → transform raw boundary. State that diagnostic masks
+and metrics are raw-derived, optional feature masks affect registration metrics only,
+sigmas are NumPy ZYX voxel counts, morphology uses physical micrometers, and feature
+images are never public TIFFs.

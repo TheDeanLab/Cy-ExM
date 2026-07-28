@@ -70,10 +70,12 @@
   each source into the reference round's shared `channels` directory, never move it;
   when cropping is enabled, estimate one crop from the registration channel and apply
   the identical bounds to all declared reference channels.
-- Preserve masks based on values greater than zero, affine-before-nonlinear transform
-  order, TRSAA linear registration, SyNOnly nonlinear registration, scalar linear
-  interpolation, mask nearest-neighbor interpolation, and ANTs origin, spacing, and
-  direction.
+- Preserve raw diagnostic masks based on values greater than zero. Optional
+  feature-derived registration masks use strict positive asinh support, physical
+  component filtering and dilation, and never replace raw diagnostic masks or raw
+  outputs. Preserve affine-before-nonlinear transform order, TRSAA linear
+  registration, SyNOnly nonlinear registration, scalar linear interpolation, mask
+  nearest-neighbor interpolation, and ANTs origin, spacing, and direction.
 - Affine registration remains Mattes/32. Nonlinear registration supports exact `CC`
   and `mattes`; CC uses one positive scalar voxel radius with omitted radius normalized
   to the provisional default 4, while Mattes uses 32 bins and rejects a radius.

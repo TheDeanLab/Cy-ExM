@@ -19,6 +19,10 @@ registration:
     # Sigma is in NumPy ZYX voxel units, not micrometers.
     filter_sigma_zyx: [12, 12, 12]
     # A scalar is scientifically identical: filter_sigma_zyx: 12
+    # Feature masking is optional. These morphology values are micrometers.
+    feature_mask:
+      min_component_volume_um3: 1.0
+      dilation_radius_um: 1.0
   linear:
     type: TRSAA
     accuracy: high

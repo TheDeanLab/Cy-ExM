@@ -18,10 +18,12 @@
   Keep its NumPy and SciPy imports deferred and change its versioned policy identity
   whenever numerical behavior changes.
 - Registration features are transform-estimation inputs only. Crop raw images before
-  deriving features, derive masks from cropped raw values greater than zero, and use
-  raw images for all existing metrics, registered scalar reconstruction, and channel
-  transformation. Never preprocess dependent channels or write feature TIFFs as
-  public outputs.
+  deriving features. Raw greater-than-zero masks own diagnostics; when the optional
+  feature-mask policy is enabled, independent fixed/moving registration masks use
+  strict positive feature support, full-volume physical morphology, and every ANTs
+  stage. Use raw images for all existing metrics, registered scalar reconstruction,
+  and channel transformation. Never preprocess dependent channels or write feature
+  TIFFs as public outputs.
 - Apply forward transforms in warp-then-affine list order with both inversion
   flags false. Scalars use linear interpolation; labels and masks use
   `nearestNeighbor`, with transformed masks cast to float and thresholded at 0.5 so
@@ -77,10 +79,12 @@
   ownership of one unique disposable warp candidate to their immediate caller. The
   caller must persist or consume it and then use the shared best-effort cleanup helper;
   a backend must never return a canonical cache path or shared native source.
-- Preprocessing-disabled prepared manifests remain exact format 2; enabled feature
-  manifests are strict format 3 and bind the algorithm, ZYX voxel sigma, and actual
-  fixed/moving robust scales.
-- Crop raw images before feature construction, derive masks from raw values greater
-  than zero, estimate affine/nonlinear transforms from features only, and reconstruct
-  metrics and public scalar output from raw fixed-grid data. Any algorithm change
-  requires a new policy identifier and a bounded scientific regression.
+- Preprocessing-disabled prepared manifests remain exact format 2; unmasked feature
+  manifests are strict format 3; feature-masked manifests are strict format 4. Format
+  4 binds the physical policy, realized support, binary array policy, and exact
+  fixed-grid mask identities.
+- Compute feature-mask morphology on each full cropped image before chunk extraction;
+  never relabel components or dilate per chunk. Estimate affine/nonlinear transforms
+  from features only and reconstruct metrics and public scalar output from raw
+  fixed-grid data. Any algorithm change requires a new policy identifier and a
+  bounded scientific regression.

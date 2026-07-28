@@ -51,3 +51,6 @@
 - Preserve exact prepared format-2 keys when preprocessing is disabled. Format-3
   tests must reject policy, sigma, scale, descriptor, completion-record, and source
   identity mismatches and prove regional workers do not load raw full volumes.
+- Preserve exact format-3 behavior when feature masking is omitted. Format-4 tests
+  must validate binary/nonempty arrays, physical policy, realized counts/fractions,
+  producer/reader agreement, and full-volume-before-chunk morphology.

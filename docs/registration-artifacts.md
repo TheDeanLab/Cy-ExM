@@ -54,14 +54,16 @@ can resume without repeating successful reconstruction.
 Fine preparation commits four internal float32 arrays under
 `round_{round}_prepared/`. Preprocessing-disabled bundles retain the exact strict
 format-version-2 manifest. Feature-enabled bundles use strict format version 3 and
-add the canonical preprocessing policy plus measured fixed and moving robust scales:
+add the canonical preprocessing policy plus measured fixed and moving robust scales.
+Feature-masked bundles use strict format version 4 and additionally bind the physical
+morphology policy and realized fixed/moving foreground evidence:
 
 | Artifact | Internal role |
 | --- | --- |
 | `fixed_scalar.npy` | fixed scalar on the exact reference grid |
 | `moving_linear_scalar.npy` | affine-resampled moving scalar on that grid |
-| `fixed_mask.npy` | fixed greater-than-zero float mask |
-| `moving_linear_mask.npy` | nearest-neighbor affine mask, thresholded on that grid |
+| `fixed_mask.npy` | fixed registration metric mask: raw greater-than-zero support or optional feature support |
+| `moving_linear_mask.npy` | corresponding nearest-neighbor affine mask, thresholded on that grid |
 | `manifest.json` | identities, geometry, policies, native threads, and exact ANTs pixel types |
 
 These arrays are uncompressed C-contiguous float32 files. Chunk workers validate the
@@ -107,9 +109,11 @@ nonlinear mask is independently reconstructed from the committed full warp with
 nearest-neighbor interpolation and thresholding at 0.5.
 
 The feature algorithm identifier, ZYX voxel sigma, and actual fixed/moving robust
-scales are part of affine and nonlinear descendant request identities. Changing a
-sigma therefore invalidates prepared format-3 arrays, affine descendants, local
-chunk warps and cores, the chunk manifest, full warp, metrics, and registered TIFF.
+scales are part of affine and nonlinear descendant request identities. Format 4 also
+records the strict-positive threshold, component/dilation policy in physical units,
+and realized foreground counts and fractions. Changing a sigma or mask policy
+therefore invalidates prepared feature arrays, affine descendants, local chunk warps
+and cores, the chunk manifest, full warp, metrics, and registered TIFF.
 Crop-bound artifacts, `fixed_reference.tif`, and reference-channel outputs do not
 include feature parameters and remain reusable when their own inputs and policies
 still match. Dependent-channel requests are unchanged; they are invalidated

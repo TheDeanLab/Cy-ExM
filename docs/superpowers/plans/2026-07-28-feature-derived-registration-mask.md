@@ -370,7 +370,7 @@ git commit -m "feat: route feature masks through registration stages"
 - Modify: `src/cyexm/registration/chunk_stages.py`
 - Test: `tests/unit/test_prepared_registration.py`
 - Test: `tests/unit/test_chunk_stages.py`
-- Test: `tests/unit/test_fine_task.py`
+- Test: `tests/unit/test_fine_workflow_task.py`
 
 **Interfaces:**
 - Consumes: Task 3 registration fixed-grid masks and realized evidence.
@@ -405,7 +405,7 @@ equal slices from the prepared full-grid registration masks.
 
 ```bash
 uv run pytest tests/unit/test_prepared_registration.py \
-  tests/unit/test_chunk_stages.py tests/unit/test_fine_task.py -q
+  tests/unit/test_chunk_stages.py tests/unit/test_fine_workflow_task.py -q
 ```
 
 Expected: format 4 is unsupported.
@@ -429,11 +429,11 @@ the two prepared masks without recomputing morphology.
 
 ```bash
 uv run pytest tests/unit/test_prepared_registration.py \
-  tests/unit/test_chunk_stages.py tests/unit/test_fine_task.py -q
+  tests/unit/test_chunk_stages.py tests/unit/test_fine_workflow_task.py -q
 uv run ruff check src/cyexm/registration/prepared.py \
   src/cyexm/registration/chunk_stages.py \
   tests/unit/test_prepared_registration.py tests/unit/test_chunk_stages.py \
-  tests/unit/test_fine_task.py
+  tests/unit/test_fine_workflow_task.py
 uv run basedpyright src/cyexm/registration/prepared.py \
   src/cyexm/registration/chunk_stages.py
 ```
@@ -446,7 +446,7 @@ Expected: all pass.
 git add src/cyexm/registration/prepared.py \
   src/cyexm/registration/chunk_stages.py \
   tests/unit/test_prepared_registration.py tests/unit/test_chunk_stages.py \
-  tests/unit/test_fine_task.py
+  tests/unit/test_fine_workflow_task.py
 git commit -m "feat: persist feature masks for fine registration"
 ```
 
@@ -461,7 +461,7 @@ git commit -m "feat: persist feature masks for fine registration"
 - Modify: `src/cyexm/workflow/api.py`
 - Test: `tests/unit/test_workflow_planning.py`
 - Test: `tests/unit/test_round_task.py`
-- Test: `tests/unit/test_fine_task.py`
+- Test: `tests/unit/test_fine_workflow_task.py`
 - Test: `tests/unit/test_workflow_status.py`
 - Test: `tests/unit/test_workflow_api.py`
 
@@ -492,7 +492,7 @@ rejects a missing or altered mask policy.
 
 ```bash
 uv run pytest tests/unit/test_workflow_planning.py \
-  tests/unit/test_round_task.py tests/unit/test_fine_task.py \
+  tests/unit/test_round_task.py tests/unit/test_fine_workflow_task.py \
   tests/unit/test_workflow_status.py tests/unit/test_workflow_api.py -q
 ```
 
@@ -519,10 +519,10 @@ rather than receiving feature preprocessing directly.
 
 ```bash
 uv run pytest tests/unit/test_workflow_planning.py \
-  tests/unit/test_round_task.py tests/unit/test_fine_task.py \
+  tests/unit/test_round_task.py tests/unit/test_fine_workflow_task.py \
   tests/unit/test_workflow_status.py tests/unit/test_workflow_api.py -q
 uv run ruff check src/cyexm/workflow tests/unit/test_workflow_planning.py \
-  tests/unit/test_round_task.py tests/unit/test_fine_task.py \
+  tests/unit/test_round_task.py tests/unit/test_fine_workflow_task.py \
   tests/unit/test_workflow_status.py tests/unit/test_workflow_api.py
 uv run basedpyright src/cyexm/workflow
 ```
@@ -536,7 +536,7 @@ git add src/cyexm/workflow/planning.py src/cyexm/workflow/round_task.py \
   src/cyexm/workflow/fine_task.py src/cyexm/workflow/_round_provenance.py \
   src/cyexm/workflow/status.py src/cyexm/workflow/api.py \
   tests/unit/test_workflow_planning.py tests/unit/test_round_task.py \
-  tests/unit/test_fine_task.py tests/unit/test_workflow_status.py \
+  tests/unit/test_fine_workflow_task.py tests/unit/test_workflow_status.py \
   tests/unit/test_workflow_api.py
 git commit -m "feat: bind feature masks to workflow provenance"
 ```
@@ -615,7 +615,7 @@ file not intentionally changed.
 - Modify: `docs/registration-artifacts.md`
 - Modify: `docs/index.md`
 - Modify: `docs/myst.yml`
-- Modify: `docs/asinh-preprocessing-registration-investigation.md`
+- Create: `docs/feature-derived-registration-masks.md`
 - Modify: `AGENTS.md`
 - Modify: `src/cyexm/registration/AGENTS.md`
 - Modify: `src/cyexm/workflow/AGENTS.md`
@@ -686,7 +686,7 @@ uv run pytest tests/unit/test_phase2_examples.py -q
 uv run pre-commit run --files README.md \
   examples/preprocessed-spheroid-dataset.yaml docs/workflow-guide.md \
   docs/registration-artifacts.md docs/index.md docs/myst.yml \
-  docs/asinh-preprocessing-registration-investigation.md AGENTS.md \
+  docs/feature-derived-registration-masks.md AGENTS.md \
   src/cyexm/registration/AGENTS.md src/cyexm/workflow/AGENTS.md \
   tests/AGENTS.md tests/unit/AGENTS.md tests/integration/AGENTS.md \
   examples/AGENTS.md docs/AGENTS.md
@@ -705,7 +705,7 @@ Expected: tests, hooks, and 12-or-more-page strict HTML build pass.
 ```bash
 git add README.md examples/preprocessed-spheroid-dataset.yaml \
   docs/workflow-guide.md docs/registration-artifacts.md docs/index.md \
-  docs/myst.yml docs/asinh-preprocessing-registration-investigation.md \
+  docs/myst.yml docs/feature-derived-registration-masks.md \
   AGENTS.md src/cyexm/registration/AGENTS.md \
   src/cyexm/workflow/AGENTS.md tests/AGENTS.md tests/unit/AGENTS.md \
   tests/integration/AGENTS.md examples/AGENTS.md docs/AGENTS.md \
@@ -738,7 +738,7 @@ uv run pytest \
   tests/unit/test_chunk_stages.py \
   tests/unit/test_workflow_planning.py \
   tests/unit/test_round_task.py \
-  tests/unit/test_fine_task.py \
+  tests/unit/test_fine_workflow_task.py \
   tests/unit/test_workflow_status.py \
   tests/unit/test_workflow_api.py \
   tests/integration/test_registration_preprocessing.py -q

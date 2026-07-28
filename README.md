@@ -300,6 +300,9 @@ are:
 | `registration` / `crop` | built-in boolean | Enables or disables Phase 1 fixed/moving foreground cropping. |
 | `registration` / `preprocessing` | optional mapping | Omission disables registration-feature preprocessing; `{}` enables the canonical 12-voxel-per-axis default. |
 | `registration` / `preprocessing` / `filter_sigma_zyx` | positive number or three positive numbers | Gaussian background-filter sigma in NumPy ZYX voxel units. A scalar expands to all axes; this is not micrometers. |
+| `registration` / `preprocessing` / `feature_mask` | optional mapping | Omission retains raw greater-than-zero registration masks; `{}` enables positive-feature support with the provisional physical morphology defaults. |
+| `feature_mask` / `min_component_volume_um3` | positive number | Minimum connected-component volume in cubic micrometers; default `1.0`. |
+| `feature_mask` / `dilation_radius_um` | positive number | Physical Euclidean dilation radius in micrometers; default `1.0`. |
 | `registration` / `linear` / `type` | `Translation`, `Rigid`, `Similarity`, `Affine`, or `TRSAA` | Phase 1 linear method. |
 | `registration` / `linear` / `accuracy` | `high`, `medium`, `low`, or `dry run` | Phase 1 linear schedule. |
 | `registration` / `nonlinear` / `type` | `Elastic`, `SyNOnly`, or `SyN` | Phase 1 nonlinear method. |
@@ -357,6 +360,11 @@ preprocessing: {filter_sigma_zyx: [12, 12, 12]}
 
 # Anisotropic NumPy ZYX voxel sigmas:
 preprocessing: {filter_sigma_zyx: [4, 12, 12]}
+
+# Optional feature-derived registration masks:
+preprocessing:
+  filter_sigma_zyx: [12, 12, 12]
+  feature_mask: {}  # provisional 1.0 um3 minimum and 1.0 um radius
 ```
 
 The operation is `raw → crop → feature estimate → transform raw`. For each cropped
@@ -364,19 +372,32 @@ registration image, Cy-ExM computes a reflective-boundary Gaussian background,
 forms the signed residual, deterministically samples
 `residual.ravel()[::max(1, residual.size // 2_000_000)]`, and estimates
 `scale = max(1.4826 × MAD(sample), float32 epsilon)` before clipping negative
-residuals to zero and evaluating `asinh(residual / scale)` as float32. TRSAA and nonlinear
-registration estimate their transforms from these features. Greater-than-zero masks,
-all three registration metric files, `nonlinear_registered_<round>.tif`, and every
-declared dependent-channel output remain raw-intensity products. Accepted transforms
-are never estimated from or applied to a saved normalized TIFF.
+residuals to zero and evaluating `asinh(residual / scale)` as float32. TRSAA and
+nonlinear registration estimate their transforms from these features. By default,
+the existing raw greater-than-zero masks remain the ANTs metric masks.
+
+When `feature_mask` is present, Cy-ExM instead selects strict positive asinh support,
+removes components smaller than the configured physical volume, and dilates retained
+support with an ellipsoid defined by the physical radius and image spacing. Fixed and
+moving masks are derived independently on the full cropped images before chunking.
+They are applied at every TRSAA and SyN stage; the moving mask is affine-resampled
+with nearest-neighbor interpolation and thresholded at 0.5 on the fixed grid.
+
+Raw greater-than-zero masks still own all three diagnostic metric files.
+`nonlinear_registered_<round>.tif` and every declared dependent-channel output remain
+raw-intensity products. Accepted transforms are never estimated from or applied to a
+saved normalized TIFF. Feature masking is opt-in and does not guarantee faster or
+more accurate registration; the physical defaults are provisional pending
+dataset-specific characterization.
 
 Changing the sigma invalidates feature-dependent affine, linear/nonlinear metrics,
-local chunk artifacts, prepared format-3 arrays, assembled warp, and registered
+local chunk artifacts, prepared arrays, assembled warp, and registered
 output. Source identities, authenticated crop bounds, fixed-reference TIFFs, and
 reference-channel materialization remain independently reusable. Fine-grained
 preprocessing-disabled bundles retain exact prepared manifest format 2; enabled
-feature bundles use strict format 3 with the algorithm, sigma, and measured robust
-scales.
+feature bundles without feature masking use strict format 3. Masked feature bundles
+use strict format 4, which additionally binds the mask algorithm, physical morphology
+values, realized foreground counts/fractions, and mask-array policy.
 
 The loader uses safe YAML decoding and rejects unknown keys, missing keys, duplicate
 mapping keys, YAML aliases, custom tags, non-scalar keys, specialized collection

@@ -19,6 +19,8 @@ from active characterization work.
   understand restart-safe output reuse.
 - Use [Fine-grained registration](fine-grained-execution.md) to configure the
   opt-in chunk/channel task graph and understand its current acceptance boundary.
+- Read [Feature-derived registration masks](feature-derived-registration-masks.md)
+  before excluding zero-valued asinh support from transform estimation.
 
 ## Scientific characterization
 

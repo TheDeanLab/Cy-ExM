@@ -12,6 +12,7 @@ project:
       children:
         - file: registration-foundations.md
         - file: registration-artifacts.md
+        - file: feature-derived-registration-masks.md
         - file: workflow-guide.md
         - file: fine-grained-execution.md
     - title: Characterization and evidence

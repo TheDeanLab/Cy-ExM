@@ -89,3 +89,7 @@
   and authoritative reader requests must change together; measured feature scales
   bind affine descendants, while crop/reference/channel parameters stay independent
   and channel invalidation remains transitive through transform identities.
+- Optional feature-mask plans bind the algorithm, physical component/dilation values,
+  and realized fixed/moving support through affine, prepared format 4, nonlinear,
+  registered, validation, and status evidence. Omission must preserve unmasked
+  preprocessing identity exactly.

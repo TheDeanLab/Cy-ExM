@@ -58,6 +58,15 @@ X. Matching legacy ClearEx and ANTs, affine application resamples scalar and mas
 data to the exact fixed-reference grid before nonlinear chunking, and dependent
 channels are transformed directly from their native grids onto that grid.
 
+When registration-feature preprocessing is enabled, an optional `feature_mask`
+mapping can restrict ANTs metrics to cleaned positive asinh support. The component
+minimum and dilation radius use physical micrometer units; morphology is computed on
+the full cropped fixed and moving images before chunk extraction. Diagnostic metrics
+continue to use raw greater-than-zero masks, and accepted transforms continue to be
+applied to raw channels. See
+[Feature-derived registration masks](feature-derived-registration-masks.md) for the
+exact schema, algorithm, artifact format, and scientific limitations.
+
 The coarse round-level SLURM executor has the exact-commit acceptance recorded in the
 [Phase 2 audit](phase-2-acceptance.md). Portable real-ANTs/Local-Dask evidence is
 complete for the fine graph through implementation Task 10. Fine-grained real-SLURM

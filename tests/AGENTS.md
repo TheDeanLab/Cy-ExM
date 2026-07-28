@@ -34,3 +34,6 @@
 - Registration-feature changes require exact kernel tests, raw-versus-feature
   boundary tests for whole/serial/fine execution, cache invalidation coverage, and a
   bounded real-ANTs regression proving raw-scale fixed-grid output.
+- Feature-mask changes additionally require anisotropic physical-morphology tests,
+  independent fixed/moving routing, raw diagnostic-mask preservation, strict
+  format-4 evidence, unequal-shape real-ANTs coverage, and empty-mask failure.

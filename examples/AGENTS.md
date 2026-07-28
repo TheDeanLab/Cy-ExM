@@ -39,4 +39,5 @@
   the intended example behavior.
 - Keep the base spheroid manifest preprocessing-disabled by omission. The dedicated
   preprocessed example must show strict optional-block semantics, NumPy ZYX voxel
-  sigma units, scalar/list equivalence, and no lab-specific paths.
+  sigma units, scalar/list equivalence, optional physical-unit feature masking, and
+  no lab-specific paths.

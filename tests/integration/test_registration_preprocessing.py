@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from cyexm.config import FeatureMaskSpec
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord
 from cyexm.registration.backend import AntsRegistrationBackend
 from cyexm.registration.whole_image import ImageRegistration, RegistrationPaths
@@ -21,13 +22,30 @@ class _CountingBackend(AntsRegistrationBackend):
         super().__init__(native_threads)
         self.linear_calls = 0
         self.nonlinear_calls = 0
+        self.registration_mask_counts: list[tuple[int, int, int, int]] = []
+
+    def _record_masks(self, kwargs: dict[str, object]) -> None:
+        import numpy as np
+
+        fixed = np.asarray(self.to_array(kwargs["fixed_mask"]))
+        moving = np.asarray(self.to_array(kwargs["moving_mask"]))
+        self.registration_mask_counts.append(
+            (
+                int(np.count_nonzero(fixed)),
+                int(fixed.size),
+                int(np.count_nonzero(moving)),
+                int(moving.size),
+            )
+        )
 
     def linear(self, **kwargs: object) -> tuple[object, object | None, object]:
         self.linear_calls += 1
+        self._record_masks(kwargs)
         return super().linear(**kwargs)
 
     def nonlinear(self, **kwargs: object) -> tuple[object, Path]:
         self.nonlinear_calls += 1
+        self._record_masks(kwargs)
         return super().nonlinear(**kwargs)
 
 
@@ -37,6 +55,7 @@ def _registration(
     output: Path,
     native_threads: NativeThreadConfig,
     backend: AntsRegistrationBackend,
+    feature_mask: FeatureMaskSpec | None = None,
 ) -> ImageRegistration:
     return ImageRegistration(
         fixed,
@@ -51,6 +70,7 @@ def _registration(
         nonlinear_metric="CC",
         nonlinear_radius=4,
         preprocess_filter_sigma_zyx=_SIGMA_ZYX,
+        preprocess_feature_mask=feature_mask,
         _backend=backend,
     )
 
@@ -125,3 +145,51 @@ def test_real_preprocessing_estimates_features_and_persists_raw_fixed_grid(
     ).register()
     assert resumed_backend.linear_calls == 0
     assert resumed_backend.nonlinear_calls == 0
+
+
+def test_real_feature_masks_drive_ants_while_output_remains_raw(
+    synthetic_tiffs: tuple[Path, Path],
+    tmp_path: Path,
+    native_threads: NativeThreadConfig,
+) -> None:
+    import numpy as np
+    import tifffile
+
+    fixed, moving = synthetic_tiffs
+    output = tmp_path / "feature-mask"
+    backend = _CountingBackend(native_threads)
+    policy = FeatureMaskSpec(
+        min_component_volume_um3=0.02,
+        dilation_radius_um=0.2,
+    )
+
+    _registration(
+        fixed,
+        moving,
+        output,
+        native_threads,
+        backend,
+        feature_mask=policy,
+    ).register()
+
+    assert len(backend.registration_mask_counts) == 2
+    for (
+        fixed_count,
+        fixed_total,
+        moving_count,
+        moving_total,
+    ) in backend.registration_mask_counts:
+        assert 0 < fixed_count < fixed_total
+        assert 0 < moving_count < moving_total
+
+    paths = RegistrationPaths.for_round(output, 1)
+    affine = CompletionRecord.read(ArtifactStore().record_path(paths.affine)).request
+    evidence = affine.parameters["preprocessing"]["feature_mask"]
+    assert evidence["fixed_foreground_voxels"] > 0
+    assert evidence["moving_foreground_voxels"] > 0
+
+    registered = tifffile.imread(paths.registered)
+    raw_moving = tifffile.imread(moving)
+    assert registered.dtype == np.dtype(np.uint16)
+    assert registered.shape == raw_moving.shape
+    assert int(registered.max()) > 100

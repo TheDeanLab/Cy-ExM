@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from cyexm.config import FeatureMaskSpec
 from cyexm.io.images import zero_mask
 from cyexm.registration import linear, nonlinear
 from cyexm.registration._native_paths import discard_path
@@ -303,6 +304,11 @@ def test_unequal_native_shapes_are_affine_resampled_before_chunking(
         native_threads=native_threads,
         linear_accuracy="dry run",
         nonlinear_accuracy="dry run",
+        preprocess_filter_sigma_zyx=(2.0, 4.0, 4.0),
+        preprocess_feature_mask=FeatureMaskSpec(
+            min_component_volume_um3=0.02,
+            dilation_radius_um=0.2,
+        ),
         _backend=backend,
     )
 

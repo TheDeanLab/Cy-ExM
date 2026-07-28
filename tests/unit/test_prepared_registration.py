@@ -10,6 +10,7 @@ import pytest
 from fakes import FakeBackend, FakeImage, fake_image
 
 import cyexm.registration.whole_image as whole_image
+from cyexm.config import FeatureMaskSpec
 from cyexm.errors import CacheValidationError, RegistrationStageError
 from cyexm.registration.artifacts import (
     ArtifactStore,
@@ -52,6 +53,7 @@ def _registration(
     backend: FakeBackend | None = None,
     force_override: bool = False,
     preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
+    preprocess_feature_mask: FeatureMaskSpec | None = None,
 ) -> ImageRegistration:
     fixed = tmp_path / "fixed.tif"
     moving = tmp_path / "moving.tif"
@@ -66,6 +68,7 @@ def _registration(
         enable_logging=False,
         force_override=force_override,
         preprocess_filter_sigma_zyx=preprocess_filter_sigma_zyx,
+        preprocess_feature_mask=preprocess_feature_mask,
         _backend=backend or FakeBackend(),
     )
 
@@ -157,6 +160,49 @@ def test_enabled_preparation_uses_strict_feature_manifest_v3(
         "fixed_feature_scale",
         "moving_feature_scale",
     }
+
+
+def test_feature_mask_preparation_uses_strict_manifest_v4(tmp_path: Path) -> None:
+    manifest = commit_prepared_round(
+        _registration(
+            tmp_path,
+            preprocess_filter_sigma_zyx=(2.0, 3.0, 4.0),
+            preprocess_feature_mask=FeatureMaskSpec(),
+        )
+    )
+
+    assert manifest.format_version == 4
+    assert manifest.preprocessing is not None
+    mask = manifest.preprocessing["feature_mask"]
+    assert mask["algorithm"] == ("positive-support-components-physical-dilation-v1")
+    assert mask["fixed_foreground_voxels"] > 0
+    assert mask["moving_foreground_voxels"] > 0
+    assert manifest.mask_policy == (
+        "feature-positive-support-components-physical-dilation-float32-v1"
+    )
+    assert PreparedManifest.from_dict(manifest.to_dict()) == manifest
+
+
+@pytest.mark.parametrize("format_version", [2, 3])
+def test_legacy_prepared_formats_reject_feature_mask_evidence(
+    tmp_path: Path,
+    format_version: int,
+) -> None:
+    registration = _registration(
+        tmp_path,
+        preprocess_filter_sigma_zyx=(None if format_version == 2 else (2.0, 3.0, 4.0)),
+    )
+    payload = commit_prepared_round(registration).to_dict()
+    if format_version == 2:
+        payload["preprocessing"] = {"feature_mask": {}}
+    else:
+        payload["preprocessing"]["feature_mask"] = {}  # type: ignore[index]
+
+    with pytest.raises(
+        ValueError,
+        match=r"prepared manifest keys|feature mask|canonical",
+    ):
+        PreparedManifest.from_dict(payload)
 
 
 def test_manifest_transport_rejects_unknown_keys(tmp_path: Path) -> None:

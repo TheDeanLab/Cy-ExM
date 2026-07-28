@@ -11,12 +11,13 @@ from typing import TYPE_CHECKING, Any, Self
 
 from cyexm.errors import CacheValidationError
 from cyexm.registration._request_policy import (
+    FEATURE_PREPARED_MASK_POLICY,
     PREPARED_MASK_POLICY,
     PREPARED_SCALAR_POLICY,
     canonical_compact_json,
     common_parameters,
+    feature_mask_parameters,
     preprocessing_config_parameters,
-    registration_feature_parameters,
 )
 from cyexm.registration.artifacts import (
     ArtifactStore,
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 
 _FORMAT_VERSION_DISABLED = 2
 _FORMAT_VERSION_FEATURES = 3
+_FORMAT_VERSION_FEATURE_MASK = 4
 _PIXELTYPE_ROLES = (
     "fixed_mask",
     "fixed_scalar",
@@ -67,6 +69,7 @@ _MANIFEST_KEYS_V3 = _MANIFEST_KEYS_V2 | frozenset(
         "moving_feature_scale",
     }
 )
+_MANIFEST_KEYS_V4 = _MANIFEST_KEYS_V3
 
 
 def _scientific_runtime() -> Any:
@@ -156,6 +159,7 @@ class PreparedManifest:
         if self.format_version not in {
             _FORMAT_VERSION_DISABLED,
             _FORMAT_VERSION_FEATURES,
+            _FORMAT_VERSION_FEATURE_MASK,
         }:
             raise ValueError(
                 f"Unsupported prepared format version: {self.format_version}"
@@ -190,11 +194,21 @@ class PreparedManifest:
                     "prepared preprocessing filter_sigma_zyx must contain "
                     "three positive finite values"
                 )
+            feature_mask = self.preprocessing.get("feature_mask")
+            static_preprocessing = dict(self.preprocessing)
+            static_preprocessing.pop("feature_mask", None)
             canonical = preprocessing_config_parameters(
                 (float(sigma[0]), float(sigma[1]), float(sigma[2]))
             )
-            if self.preprocessing != canonical:
+            if static_preprocessing != canonical:
                 raise ValueError("prepared preprocessing policy is not canonical")
+            if self.format_version == _FORMAT_VERSION_FEATURES:
+                if feature_mask is not None:
+                    raise ValueError(
+                        "prepared format version 3 must not declare a feature mask"
+                    )
+            else:
+                self._validate_feature_mask_evidence(feature_mask)
             for name in ("fixed_feature_scale", "moving_feature_scale"):
                 scale = getattr(self, name)
                 if type(scale) is not float or not math.isfinite(scale) or scale <= 0.0:
@@ -220,7 +234,12 @@ class PreparedManifest:
             raise ValueError("geometry is not canonical")
         if self.scalar_policy != PREPARED_SCALAR_POLICY:
             raise ValueError("unsupported prepared scalar policy")
-        if self.mask_policy != PREPARED_MASK_POLICY:
+        expected_mask_policy = (
+            FEATURE_PREPARED_MASK_POLICY
+            if self.format_version == _FORMAT_VERSION_FEATURE_MASK
+            else PREPARED_MASK_POLICY
+        )
+        if self.mask_policy != expected_mask_policy:
             raise ValueError("unsupported prepared mask policy")
         if not isinstance(self.native_threads, dict) or not self.native_threads:
             raise ValueError("native_threads must be a non-empty JSON object")
@@ -246,6 +265,53 @@ class PreparedManifest:
                 raise ValueError(
                     f"unsupported ANTs pixeltype for {role}: {pixeltype!r}"
                 )
+
+    @staticmethod
+    def _validate_feature_mask_evidence(value: object) -> None:
+        mapping = _mapping(value, "preprocessing.feature_mask")
+        expected_keys = frozenset(
+            {
+                "algorithm",
+                "dilation_radius_um",
+                "fixed_foreground_fraction",
+                "fixed_foreground_voxels",
+                "fixed_total_voxels",
+                "min_component_volume_um3",
+                "moving_foreground_fraction",
+                "moving_foreground_voxels",
+                "moving_total_voxels",
+                "threshold",
+            }
+        )
+        if set(mapping) != expected_keys:
+            raise ValueError("prepared feature mask evidence keys are not canonical")
+        for name in ("min_component_volume_um3", "dilation_radius_um"):
+            item = mapping[name]
+            if type(item) is not float or not math.isfinite(item) or item <= 0.0:
+                raise ValueError(
+                    f"prepared feature mask {name} must be a positive finite float"
+                )
+        counts: dict[str, int] = {}
+        for role in ("fixed", "moving"):
+            foreground = mapping[f"{role}_foreground_voxels"]
+            total = mapping[f"{role}_total_voxels"]
+            if (
+                type(foreground) is not int
+                or type(total) is not int
+                or foreground <= 0
+                or total <= 0
+                or foreground > total
+            ):
+                raise ValueError(f"prepared {role} feature mask counts are invalid")
+            counts[f"{role}_foreground_voxels"] = foreground
+            counts[f"{role}_total_voxels"] = total
+        expected = feature_mask_parameters(
+            min_component_volume_um3=mapping["min_component_volume_um3"],  # type: ignore[arg-type]
+            dilation_radius_um=mapping["dilation_radius_um"],  # type: ignore[arg-type]
+            **counts,  # type: ignore[arg-type]
+        )
+        if dict(mapping) != expected:
+            raise ValueError("prepared feature mask evidence is not canonical")
 
     @property
     def array_identities(
@@ -277,7 +343,10 @@ class PreparedManifest:
             "native_threads": dict(self.native_threads),
             "pixeltypes": dict(self.pixeltypes),
         }
-        if self.format_version == _FORMAT_VERSION_FEATURES:
+        if self.format_version in {
+            _FORMAT_VERSION_FEATURES,
+            _FORMAT_VERSION_FEATURE_MASK,
+        }:
             payload.update(
                 preprocessing=dict(self.preprocessing or {}),
                 fixed_feature_scale=self.fixed_feature_scale,
@@ -293,6 +362,7 @@ class PreparedManifest:
         expected_keys = {
             _FORMAT_VERSION_DISABLED: _MANIFEST_KEYS_V2,
             _FORMAT_VERSION_FEATURES: _MANIFEST_KEYS_V3,
+            _FORMAT_VERSION_FEATURE_MASK: _MANIFEST_KEYS_V4,
         }.get(format_version)
         if expected_keys is None:
             raise ValueError(f"Unsupported prepared format version: {format_version}")
@@ -383,6 +453,20 @@ def _prepared_array(
     return np.array(source, dtype=np.float32, order="C", copy=True)
 
 
+def _prepared_mask_array(
+    np: Any,
+    backend: RegistrationBackend,
+    image: object,
+    geometry: ImageGeometry,
+) -> Any:
+    array = _prepared_array(np, backend, image, geometry)
+    if not bool(np.logical_or(array == 0.0, array == 1.0).all()):
+        raise ValueError("prepared mask arrays must contain only 0.0 and 1.0")
+    if not bool(np.any(array == 1.0)):
+        raise ValueError("prepared mask arrays must contain foreground")
+    return array
+
+
 def _validate_array(
     np: Any,
     path: Path,
@@ -434,7 +518,11 @@ def _array_request(
             "format_version": format_version,
             "prepared_role": role,
             "scalar_policy": PREPARED_SCALAR_POLICY,
-            "mask_policy": PREPARED_MASK_POLICY,
+            "mask_policy": (
+                FEATURE_PREPARED_MASK_POLICY
+                if format_version == _FORMAT_VERSION_FEATURE_MASK
+                else PREPARED_MASK_POLICY
+            ),
             "ants_pixeltype": pixeltype,
         }
     )
@@ -522,8 +610,10 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
     arrays = (
         _prepared_array(np, backend, state.fixed, geometry),
         _prepared_array(np, backend, state.moving_linear, geometry),
-        _prepared_array(np, backend, state.registration_fixed_mask, geometry),
-        _prepared_array(np, backend, state.registration_moving_linear_mask, geometry),
+        _prepared_mask_array(np, backend, state.registration_fixed_mask, geometry),
+        _prepared_mask_array(
+            np, backend, state.registration_moving_linear_mask, geometry
+        ),
     )
     images = (
         state.fixed,
@@ -558,14 +648,16 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
     if registration.preprocess_filter_sigma_zyx is not None:
         if state.fixed_feature_scale is None or state.moving_feature_scale is None:
             raise RuntimeError("prepared registration feature scales are unavailable")
-        format_version = _FORMAT_VERSION_FEATURES
-        preprocessing = preprocessing_config_parameters(
-            registration.preprocess_filter_sigma_zyx
-        )
-        preprocessing_with_scales = registration_feature_parameters(
-            filter_sigma_zyx=registration.preprocess_filter_sigma_zyx,
-            fixed_scale=state.fixed_feature_scale,
-            moving_scale=state.moving_feature_scale,
+        preprocessing_with_scales = registration._preprocessing_parameters(derived=True)
+        if preprocessing_with_scales is None:
+            raise RuntimeError("prepared preprocessing evidence is unavailable")
+        preprocessing = dict(preprocessing_with_scales)
+        preprocessing.pop("fixed_robust_scale")
+        preprocessing.pop("moving_robust_scale")
+        format_version = (
+            _FORMAT_VERSION_FEATURE_MASK
+            if registration.preprocess_feature_mask is not None
+            else _FORMAT_VERSION_FEATURES
         )
     moving_crop = (
         FileIdentity.from_path(state.paths.moving_crop) if registration.crop else None
@@ -661,13 +753,18 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
         affine=affine,
         geometry=geometry,
         scalar_policy=PREPARED_SCALAR_POLICY,
-        mask_policy=PREPARED_MASK_POLICY,
+        mask_policy=(
+            FEATURE_PREPARED_MASK_POLICY
+            if format_version == _FORMAT_VERSION_FEATURE_MASK
+            else PREPARED_MASK_POLICY
+        ),
         native_threads=dict(sorted(state.resolved.values.items())),
         pixeltypes=pixeltypes,
         preprocessing=preprocessing,
         fixed_feature_scale=state.fixed_feature_scale,
         moving_feature_scale=state.moving_feature_scale,
     )
+    effective_mask_policy = manifest.mask_policy
     manifest_request = StageRequest.for_identities(
         stage="prepared:manifest",
         inputs=(
@@ -684,7 +781,7 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
         parameters={
             "format_version": format_version,
             "scalar_policy": PREPARED_SCALAR_POLICY,
-            "mask_policy": PREPARED_MASK_POLICY,
+            "mask_policy": effective_mask_policy,
             "pixeltypes": pixeltypes,
             **(
                 {}

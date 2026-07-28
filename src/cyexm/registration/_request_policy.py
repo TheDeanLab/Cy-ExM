@@ -19,6 +19,9 @@ PREPARED_SCALAR_POLICY = "float32-preserve-registration-values-v1"
 PREPARED_MASK_POLICY = (
     "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
 )
+FEATURE_PREPARED_MASK_POLICY = (
+    "feature-positive-support-components-physical-dilation-float32-v1"
+)
 REGISTRATION_FEATURE_POLICY = "gaussian-background-mad-asinh-float32-v1"
 FEATURE_MASK_POLICY = "positive-support-components-physical-dilation-v1"
 RAW_RECONSTRUCTED_SCALAR_POLICY = "feature-estimation-raw-warp-affine-clip-v1"

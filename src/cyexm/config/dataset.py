@@ -18,6 +18,7 @@ from cyexm.config.models import (
     ChannelSpec,
     ChunkSizeZYX,
     DatasetManifest,
+    FeatureMaskSpec,
     NonlinearRegistrationStageSpec,
     PixelSpacingXYZ,
     ReferenceChannelSpec,
@@ -50,7 +51,8 @@ _VOXEL_SPACING_KEYS = frozenset({"x", "y", "z"})
 _REFERENCE_KEYS = frozenset({"round", "registration_channel", "channels"})
 _REFERENCE_CHANNEL_KEYS = frozenset({"file"})
 _REGISTRATION_KEYS = frozenset({"crop", "linear", "nonlinear"})
-_REGISTRATION_PREPROCESSING_KEYS = frozenset({"filter_sigma_zyx"})
+_REGISTRATION_PREPROCESSING_KEYS = frozenset({"filter_sigma_zyx", "feature_mask"})
+_FEATURE_MASK_KEYS = frozenset({"min_component_volume_um3", "dilation_radius_um"})
 _LINEAR_STAGE_KEYS = frozenset({"type", "accuracy"})
 _NONLINEAR_STAGE_KEYS = frozenset({"type", "accuracy", "metric"})
 _NONLINEAR_CC_STAGE_KEYS = _NONLINEAR_STAGE_KEYS | frozenset({"radius"})
@@ -199,12 +201,58 @@ def _preprocessing(value: object) -> RegistrationPreprocessingSpec:
         raise ConfigurationValidationError(
             f"registration.preprocessing must be a mapping; got {value!r}"
         )
-    expected = frozenset() if not value else _REGISTRATION_PREPROCESSING_KEYS
-    mapping = require_exact_keys(value, expected, "registration.preprocessing")
-    if not mapping:
-        return RegistrationPreprocessingSpec()
+    actual = frozenset(value)
+    if not all(isinstance(key, str) for key in value) or not actual.issubset(
+        _REGISTRATION_PREPROCESSING_KEYS
+    ):
+        raise ConfigurationValidationError(
+            "registration.preprocessing keys must be exactly a subset of "
+            f"{sorted(_REGISTRATION_PREPROCESSING_KEYS)!r}; got {sorted(actual)!r}"
+        )
+    feature_mask: FeatureMaskSpec | None = None
+    if "feature_mask" in value:
+        feature_mask = _feature_mask(value["feature_mask"])
     return RegistrationPreprocessingSpec(
-        filter_sigma_zyx=_filter_sigma_zyx(mapping["filter_sigma_zyx"])
+        filter_sigma_zyx=(
+            _filter_sigma_zyx(value["filter_sigma_zyx"])
+            if "filter_sigma_zyx" in value
+            else (12.0, 12.0, 12.0)
+        ),
+        feature_mask=feature_mask,
+    )
+
+
+def _feature_mask(value: object) -> FeatureMaskSpec:
+    yaml_path = "registration.preprocessing.feature_mask"
+    if not isinstance(value, Mapping):
+        raise ConfigurationValidationError(
+            f"{yaml_path} must be a mapping; got {value!r}"
+        )
+    actual = frozenset(value)
+    if not all(isinstance(key, str) for key in value) or not actual.issubset(
+        _FEATURE_MASK_KEYS
+    ):
+        raise ConfigurationValidationError(
+            f"{yaml_path} keys must be exactly a subset of "
+            f"{sorted(_FEATURE_MASK_KEYS)!r}; got {sorted(actual)!r}"
+        )
+    return FeatureMaskSpec(
+        min_component_volume_um3=(
+            finite_positive_float(
+                value["min_component_volume_um3"],
+                f"{yaml_path}.min_component_volume_um3",
+            )
+            if "min_component_volume_um3" in value
+            else 1.0
+        ),
+        dilation_radius_um=(
+            finite_positive_float(
+                value["dilation_radius_um"],
+                f"{yaml_path}.dilation_radius_um",
+            )
+            if "dilation_radius_um" in value
+            else 1.0
+        ),
     )
 
 
@@ -510,7 +558,28 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
                     f"[{index}] must be a positive finite built-in float; "
                     f"got {value!r}"
                 )
-        registration_mapping["preprocessing"] = {"filter_sigma_zyx": list(sigma)}
+        preprocessing_mapping: dict[str, object] = {"filter_sigma_zyx": list(sigma)}
+        feature_mask = preprocessing.feature_mask
+        if feature_mask is not None:
+            if type(feature_mask) is not FeatureMaskSpec:
+                raise ConfigurationValidationError(
+                    "registration.preprocessing.feature_mask must be a "
+                    f"FeatureMaskSpec or null; got {feature_mask!r}"
+                )
+            mask_mapping: dict[str, float] = {}
+            for name in (
+                "min_component_volume_um3",
+                "dilation_radius_um",
+            ):
+                value = getattr(feature_mask, name)
+                if type(value) is not float or not math.isfinite(value) or value <= 0.0:
+                    raise ConfigurationValidationError(
+                        f"registration.preprocessing.feature_mask.{name} must "
+                        f"be a positive finite built-in float; got {value!r}"
+                    )
+                mask_mapping[name] = value
+            preprocessing_mapping["feature_mask"] = mask_mapping
+        registration_mapping["preprocessing"] = preprocessing_mapping
     parsed_registration = _registration(registration_mapping)
     round_mappings: list[dict[str, object]] = []
     for index, round_spec in enumerate(manifest.rounds):

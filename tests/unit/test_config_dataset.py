@@ -113,6 +113,7 @@ def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
         "DatasetManifest",
         "ExecutionPaths",
         "ExecutionProfile",
+        "FeatureMaskSpec",
         "LocalDaskSpec",
         "NativeThreadSpec",
         "NonlinearRegistrationStageSpec",
@@ -186,6 +187,80 @@ def test_preprocessing_omission_disables_and_empty_mapping_uses_default(
     assert enabled.registration.preprocessing == config.RegistrationPreprocessingSpec(
         filter_sigma_zyx=(12.0, 12.0, 12.0)
     )
+
+
+def test_feature_mask_omission_and_empty_mapping_are_distinct(tmp_path: Path) -> None:
+    data = _valid_data()
+    registration = _mapping_at(data, ("registration",))
+    registration["preprocessing"] = {}
+
+    omitted = _load_data(tmp_path, data)
+
+    assert omitted.registration.preprocessing is not None
+    assert omitted.registration.preprocessing.feature_mask is None
+
+    registration["preprocessing"] = {"feature_mask": {}}
+    enabled = _load_data(tmp_path, data)
+
+    assert enabled.registration.preprocessing is not None
+    assert enabled.registration.preprocessing.feature_mask == config.FeatureMaskSpec(
+        min_component_volume_um3=1.0,
+        dilation_radius_um=1.0,
+    )
+
+
+def test_feature_mask_normalizes_partial_values_and_round_trips(tmp_path: Path) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("registration",))["preprocessing"] = {
+        "filter_sigma_zyx": 6,
+        "feature_mask": {"dilation_radius_um": 2},
+    }
+
+    manifest = _load_data(tmp_path, data)
+
+    assert manifest.registration.preprocessing == config.RegistrationPreprocessingSpec(
+        filter_sigma_zyx=(6.0, 6.0, 6.0),
+        feature_mask=config.FeatureMaskSpec(
+            min_component_volume_um3=1.0,
+            dilation_radius_um=2.0,
+        ),
+    )
+
+    from cyexm.config.dataset import _validate_dataset_manifest
+
+    _validate_dataset_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["min_component_volume_um3", "dilation_radius_um"],
+)
+@pytest.mark.parametrize("value", [True, 0, -1, float("inf"), [1.0]])
+def test_feature_mask_rejects_invalid_physical_values(
+    tmp_path: Path,
+    key: str,
+    value: object,
+) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("registration",))["preprocessing"] = {
+        "feature_mask": {key: value}
+    }
+
+    with pytest.raises(
+        ConfigurationValidationError,
+        match=rf"registration\.preprocessing\.feature_mask\.{key}",
+    ):
+        _load_data(tmp_path, data)
+
+
+def test_feature_mask_rejects_unknown_keys(tmp_path: Path) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("registration",))["preprocessing"] = {
+        "feature_mask": {"threshold": 0.5}
+    }
+
+    with pytest.raises(ConfigurationValidationError, match="keys must be exactly"):
+        _load_data(tmp_path, data)
 
 
 @pytest.mark.parametrize(

@@ -47,6 +47,14 @@ class RegistrationStageSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class FeatureMaskSpec:
+    """Optional physical morphology for an asinh registration-feature mask."""
+
+    min_component_volume_um3: float = 1.0
+    dilation_radius_um: float = 1.0
+
+
+@dataclass(frozen=True, slots=True)
 class RegistrationPreprocessingSpec:
     """Optional transform-estimation feature settings.
 
@@ -56,6 +64,7 @@ class RegistrationPreprocessingSpec:
     """
 
     filter_sigma_zyx: tuple[float, float, float] = (12.0, 12.0, 12.0)
+    feature_mask: FeatureMaskSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)

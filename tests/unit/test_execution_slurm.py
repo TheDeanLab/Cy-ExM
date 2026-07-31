@@ -1132,6 +1132,50 @@ def test_multi_process_template_rejects_inexact_worker_resources(
         )
 
 
+def test_multi_process_probe_batch_requires_one_complete_job_group(
+    tmp_path: Path,
+) -> None:
+    profile = _profile(
+        tmp_path,
+        workers=3,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+    assert profile.slurm is not None
+    resources = slurm_module.derive_slurm_job_resources(
+        profile.slurm,
+        profile.native_threads,
+        profile.parallelism,
+    )
+    first = WorkerProbe.from_dict(_probe("tcp://node-a:1234"))
+    first = replace(
+        first,
+        memory_limit_bytes=resources.process_memory_bytes,
+    )
+    second = replace(
+        first,
+        worker_address="tcp://node-a:1235",
+        pid=first.pid + 1,
+    )
+
+    batch = slurm_module._validated_probe_batch(
+        {
+            first.worker_address: first.to_dict(),
+            second.worker_address: second.to_dict(),
+        },
+        expected_addresses=(first.worker_address, second.worker_address),
+        resources=resources,
+    )
+
+    assert batch == {
+        first.worker_address: first,
+        second.worker_address: second,
+    }
+
+
 def test_fine_slurm_starts_candidates_without_slots_then_activates_after_preflight(
     tmp_path: Path,
 ) -> None:

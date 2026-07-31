@@ -94,6 +94,32 @@ def _errors(probe: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(value)  # type: ignore[arg-type]
 
 
+def _slurm_probe(
+    *,
+    address: str,
+    pid: int,
+    job_id: str = "123",
+    hostname: str = "node-a",
+    network_host: str = "10.0.0.1",
+    memory_limit_bytes: int = 233 * 1024**3,
+) -> WorkerProbe:
+    return WorkerProbe(
+        ok=True,
+        worker_address=address,
+        hostname=hostname,
+        pid=pid,
+        slurm_job_id=job_id,
+        package_versions=(),
+        native_threads=(),
+        dataset_visible=True,
+        output_writable=True,
+        scratch_usable=True,
+        memory_limit_bytes=memory_limit_bytes,
+        network_host=network_host,
+        errors=(),
+    )
+
+
 def test_probe_records_worker_identity_paths_threads_and_memory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -153,28 +179,23 @@ def test_probe_accepts_remote_dask_worker_keyword_injection(
 
 
 def test_slurm_identity_validation_rejects_missing_and_duplicate_job_identity() -> None:
-    base = WorkerProbe.from_dict(
-        {
-            "ok": True,
-            "worker_address": "tcp://node-a:1234",
-            "hostname": "node-a",
-            "pid": 12,
-            "slurm_job_id": "9001",
-            "package_versions": [],
-            "native_threads": [],
-            "dataset_visible": True,
-            "output_writable": True,
-            "scratch_usable": True,
-            "memory_limit_bytes": 1,
-            "network_host": "node-a",
-            "errors": [],
-        }
-    )
+    try:
+        from cyexm.execution.preflight import SlurmWorkerGroup
+    except ImportError:
+        pytest.fail("SLURM worker-group evidence is missing")
+    base = _slurm_probe(address="tcp://node-a:1234", pid=12, job_id="9001")
 
-    validate_slurm_worker_identities((base,))
+    assert validate_slurm_worker_identities((base,)) == (
+        SlurmWorkerGroup(
+            slurm_job_id="9001",
+            hostname="node-a",
+            network_host="10.0.0.1",
+            probes=(base,),
+        ),
+    )
     with pytest.raises(WorkerPreflightError, match="SLURM_JOB_ID is required"):
         validate_slurm_worker_identities((replace(base, slurm_job_id=None),))
-    with pytest.raises(WorkerPreflightError, match="duplicate SLURM_JOB_ID"):
+    with pytest.raises(WorkerPreflightError, match="exactly 1 process"):
         validate_slurm_worker_identities(
             (
                 base,
@@ -185,6 +206,83 @@ def test_slurm_identity_validation_rejects_missing_and_duplicate_job_identity() 
                     network_host="node-b",
                 ),
             )
+        )
+
+
+def test_slurm_worker_groups_accept_two_processes_in_one_job() -> None:
+    try:
+        from cyexm.execution.preflight import SlurmWorkerGroup
+    except ImportError:
+        pytest.fail("SLURM worker-group evidence is missing")
+    first = _slurm_probe(address="tcp://10.0.0.1:1234", pid=12)
+    second = _slurm_probe(address="tcp://10.0.0.1:1235", pid=13)
+
+    groups = validate_slurm_worker_identities(
+        (second, first),
+        processes_per_job=2,
+        expected_process_memory_bytes=233 * 1024**3,
+    )
+
+    assert groups == (
+        SlurmWorkerGroup(
+            slurm_job_id="123",
+            hostname="node-a",
+            network_host="10.0.0.1",
+            probes=(first, second),
+        ),
+    )
+    assert groups[0].addresses == (
+        "tcp://10.0.0.1:1234",
+        "tcp://10.0.0.1:1235",
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        ("too_few", "exactly 2 processes"),
+        ("too_many", "exactly 2 processes"),
+        ("hostnames", "one hostname"),
+        ("network_hosts", "one network host"),
+        ("host_pid", "duplicate host/process identity"),
+        ("address", "duplicate worker address"),
+        ("memory", "memory limit"),
+    ),
+)
+def test_slurm_worker_groups_reject_incomplete_or_inconsistent_jobs(
+    case: str,
+    message: str,
+) -> None:
+    first = _slurm_probe(address="tcp://10.0.0.1:1234", pid=12)
+    second = _slurm_probe(address="tcp://10.0.0.1:1235", pid=13)
+    probes = (first, second)
+    if case == "too_few":
+        probes = (first,)
+    elif case == "too_many":
+        probes = (
+            first,
+            second,
+            _slurm_probe(address="tcp://10.0.0.1:1236", pid=14),
+        )
+    elif case == "hostnames":
+        probes = (first, replace(second, hostname="node-b"))
+    elif case == "network_hosts":
+        probes = (first, replace(second, network_host="10.0.0.2"))
+    elif case == "host_pid":
+        probes = (first, replace(second, pid=first.pid))
+    elif case == "address":
+        probes = (first, replace(second, worker_address=first.worker_address))
+    elif case == "memory":
+        probes = (
+            first,
+            replace(second, memory_limit_bytes=466 * 1024**3),
+        )
+
+    with pytest.raises(WorkerPreflightError, match=message):
+        validate_slurm_worker_identities(
+            probes,
+            processes_per_job=2,
+            expected_process_memory_bytes=233 * 1024**3,
         )
 
 

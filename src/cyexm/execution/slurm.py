@@ -15,7 +15,10 @@ from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from typing import Any, cast
 
-from cyexm.config._slurm_resources import derive_slurm_job_resources
+from cyexm.config._slurm_resources import (
+    SlurmJobResources,
+    derive_slurm_job_resources,
+)
 from cyexm.config.execution import _validate_execution_profile
 from cyexm.config.memory import SlurmMemoryQuantity, normalize_slurm_memory
 from cyexm.config.models import ExecutionProfile, SlurmSpec
@@ -1581,6 +1584,7 @@ def _validated_probe_batch(
     raw_probes: object,
     *,
     expected_addresses: tuple[str, ...],
+    resources: SlurmJobResources,
     prior_probes: Mapping[str, WorkerProbe] | None = None,
 ) -> dict[str, WorkerProbe]:
     """Validate exact scheduler keys, embedded identities, and SLURM uniqueness."""
@@ -1606,7 +1610,11 @@ def _validated_probe_batch(
             + "\n- ".join(mismatches)
         )
     combined = (*(() if prior_probes is None else prior_probes.values()), *probes)
-    validate_slurm_worker_identities(tuple(combined))
+    validate_slurm_worker_identities(
+        tuple(combined),
+        processes_per_job=resources.processes_per_job,
+        expected_process_memory_bytes=resources.process_memory_bytes,
+    )
     return dict(zip(expected_addresses, probes, strict=True))
 
 
@@ -2012,6 +2020,7 @@ class SlurmExecutor:
                     batch = _validated_probe_batch(
                         raw_probes,
                         expected_addresses=connected,
+                        resources=resources,
                     )
                     probes = tuple(batch[address] for address in connected)
                     assert initial_scale_event is not None
@@ -2198,6 +2207,7 @@ class SlurmExecutor:
                         new_batch = _validated_probe_batch(
                             raw_new,
                             expected_addresses=newcomers,
+                            resources=resources,
                             prior_probes=validated_probes,
                         )
                         validated_probes.update(new_batch)
@@ -2407,6 +2417,7 @@ class SlurmExecutor:
                         current_batch = _validated_probe_batch(
                             raw_current,
                             expected_addresses=next_connected,
+                            resources=resources,
                         )
                     except BaseException as error:
                         if isinstance(error, KeyboardInterrupt):
@@ -2483,6 +2494,7 @@ class SlurmExecutor:
                                 for address in newcomers
                             },
                             expected_addresses=newcomers,
+                            resources=resources,
                             prior_probes=prior,
                         )
                         event.probed.extend(newcomers)

@@ -236,6 +236,21 @@ class WorkerProbe:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SlurmWorkerGroup:
+    """Canonical worker-process evidence for one owned SLURM job."""
+
+    slurm_job_id: str
+    hostname: str
+    network_host: str
+    probes: tuple[WorkerProbe, ...]
+
+    @property
+    def addresses(self) -> tuple[str, ...]:
+        """Return canonical worker addresses for the job."""
+        return tuple(probe.worker_address for probe in self.probes)
+
+
 def _error(errors: list[str], message: str, error: BaseException) -> None:
     errors.append(f"{message}: {type(error).__name__}: {error}")
 
@@ -705,27 +720,50 @@ def validate_worker_probes(
 
 def validate_slurm_worker_identities(
     probes: tuple[WorkerProbe, ...],
-) -> None:
-    """Require one exact SLURM job and one host/process identity per worker."""
+    *,
+    processes_per_job: int = 1,
+    expected_process_memory_bytes: int | None = None,
+) -> tuple[SlurmWorkerGroup, ...]:
+    """Validate and return complete canonical SLURM worker-process groups."""
     if type(probes) is not tuple or any(
         type(probe) is not WorkerProbe for probe in probes
     ):
         raise TypeError("SLURM worker probes must be an exact tuple of WorkerProbe")
-    job_ids: set[str] = set()
+    if type(processes_per_job) is not int or processes_per_job < 1:
+        raise TypeError("processes_per_job must be a built-in integer of at least 1")
+    if (
+        expected_process_memory_bytes is not None
+        and (
+            type(expected_process_memory_bytes) is not int
+            or expected_process_memory_bytes < 1
+        )
+    ):
+        raise TypeError(
+            "expected_process_memory_bytes must be None or a positive built-in "
+            "integer"
+        )
+
+    grouped: dict[str, list[WorkerProbe]] = {}
     worker_addresses: set[str] = set()
     host_processes: set[tuple[str, int]] = set()
     failures: list[str] = []
     for probe in probes:
+        try:
+            probe.__post_init__()
+        except (TypeError, ValueError) as error:
+            failures.append(
+                "invalid WorkerProbe payload: "
+                f"{type(error).__name__}: {error}"
+            )
+            continue
         identity = (
             f"worker_address={probe.worker_address!r}, hostname={probe.hostname!r}, "
             f"pid={probe.pid!r}, SLURM_JOB_ID={probe.slurm_job_id!r}"
         )
         if probe.slurm_job_id is None:
             failures.append(f"{identity}: SLURM_JOB_ID is required")
-        elif probe.slurm_job_id in job_ids:
-            failures.append(f"{identity}: duplicate SLURM_JOB_ID")
         else:
-            job_ids.add(probe.slurm_job_id)
+            grouped.setdefault(probe.slurm_job_id, []).append(probe)
         if probe.worker_address in worker_addresses:
             failures.append(f"{identity}: duplicate worker address")
         worker_addresses.add(probe.worker_address)
@@ -733,13 +771,56 @@ def validate_slurm_worker_identities(
         if host_process in host_processes:
             failures.append(f"{identity}: duplicate host/process identity")
         host_processes.add(host_process)
+        if (
+            expected_process_memory_bytes is not None
+            and probe.memory_limit_bytes != expected_process_memory_bytes
+        ):
+            failures.append(
+                f"{identity}: worker memory limit must be exactly "
+                f"{expected_process_memory_bytes} bytes; got "
+                f"{probe.memory_limit_bytes}"
+            )
+
+    groups: list[SlurmWorkerGroup] = []
+    for job_id in sorted(grouped):
+        job_probes = tuple(
+            sorted(grouped[job_id], key=lambda probe: probe.worker_address)
+        )
+        hostnames = {probe.hostname for probe in job_probes}
+        network_hosts = {probe.network_host for probe in job_probes}
+        if len(job_probes) != processes_per_job:
+            failures.append(
+                f"SLURM_JOB_ID={job_id!r} must contain exactly "
+                f"{processes_per_job} processes; got {len(job_probes)}"
+            )
+        if len(hostnames) != 1:
+            failures.append(
+                f"SLURM_JOB_ID={job_id!r} must use one hostname; "
+                f"got {tuple(sorted(hostnames))!r}"
+            )
+        if len(network_hosts) != 1:
+            failures.append(
+                f"SLURM_JOB_ID={job_id!r} must use one network host; "
+                f"got {tuple(sorted(network_hosts))!r}"
+            )
+        if len(hostnames) == 1 and len(network_hosts) == 1:
+            groups.append(
+                SlurmWorkerGroup(
+                    slurm_job_id=job_id,
+                    hostname=next(iter(hostnames)),
+                    network_host=next(iter(network_hosts)),
+                    probes=job_probes,
+                )
+            )
     if failures:
         raise WorkerPreflightError(
             "SLURM worker identity validation failed:\n- " + "\n- ".join(failures)
         )
+    return tuple(groups)
 
 
 __all__ = [
+    "SlurmWorkerGroup",
     "WorkerProbe",
     "probe_worker",
     "validate_slurm_worker_identities",

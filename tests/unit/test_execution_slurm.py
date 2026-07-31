@@ -77,6 +77,10 @@ def _profile(
     retries: int = 0,
     directives: tuple[str, ...] = (),
     mode: str = "coarse",
+    cores: int = 72,
+    processes: int = 1,
+    itk_threads: int = 2,
+    blas_threads: int = 3,
 ) -> ExecutionProfile:
     return ExecutionProfile(
         schema_version=1,
@@ -86,13 +90,13 @@ def _profile(
             output_root=tmp_path / "output",
             worker_local_directory=tmp_path / "scratch",
         ),
-        native_threads=NativeThreadSpec(itk=2, blas=3),
+        native_threads=NativeThreadSpec(itk=itk_threads, blas=blas_threads),
         local_dask=None,
         slurm=SlurmSpec(
             queue="512GB",
             workers=workers,
-            cores_per_worker=72,
-            processes_per_worker=1,
+            cores_per_worker=cores,
+            processes_per_worker=processes,
             memory="500GB",
             walltime="72:00:00",
             interface="ib0",
@@ -773,8 +777,12 @@ class _FakeSlurmModules:
         worker_extra_args = " ".join(
             cast(list[str], kwargs.get("worker_extra_args", []))
         )
-        worker_memory = format_bytes(parse_bytes(cast(str, kwargs["memory"]))).replace(
-            " ", ""
+        processes = cast(int, kwargs["processes"])
+        worker_memory = format_bytes(
+            parse_bytes(cast(str, kwargs["memory"])) // processes
+        ).replace(
+            " ",
+            "",
         )
         if self.rendered_worker_memory is not None:
             worker_memory = self.rendered_worker_memory
@@ -784,6 +792,9 @@ class _FakeSlurmModules:
             f"--resources {worker_extra_args.removeprefix('--resources ')} "
             if worker_extra_args
             else ""
+        )
+        worker_count_fragment = (
+            f"--nworkers {processes} " if processes > 1 else ""
         )
         self.job_script_text = (
             f"{kwargs.get('shebang', '#!/bin/bash')}\n"
@@ -796,7 +807,8 @@ class _FakeSlurmModules:
             f"{directives}\n"
             f"{rendered_headers}\n"
             f"{prologue}\n{python} -m {worker_command} tcp://scheduler:8786 "
-            f"--name fake --nthreads {kwargs['cores']} "
+            f"--name fake {worker_count_fragment}"
+            f"--nthreads {cast(int, kwargs['cores']) // processes} "
             f"--memory-limit {worker_memory} --nanny "
             f"--death-timeout {kwargs['death_timeout']} "
             f"--local-directory {kwargs['local_directory']} "
@@ -858,9 +870,22 @@ def _executor(
     workers: int = 4,
     retries: int = 0,
     mode: str = "coarse",
+    cores: int = 72,
+    processes: int = 1,
+    itk_threads: int = 2,
+    blas_threads: int = 3,
 ) -> SlurmExecutor:
     return SlurmExecutor(
-        _profile(tmp_path, workers=workers, retries=retries, mode=mode),
+        _profile(
+            tmp_path,
+            workers=workers,
+            retries=retries,
+            mode=mode,
+            cores=cores,
+            processes=processes,
+            itk_threads=itk_threads,
+            blas_threads=blas_threads,
+        ),
         _modules=lambda: modules,
         _version=lambda name: "test-version" if name in _PACKAGES else "unexpected",
     )
@@ -1000,6 +1025,111 @@ def test_slurm_executor_builds_one_process_jobs_with_round_resource(
         )
         == 500_363_689_984
     )
+
+
+def test_fine_slurm_renders_two_processes_with_divided_resources(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.scale_error = RuntimeError("stop after rendered-template validation")
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=3,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+
+    with pytest.raises(
+        ExecutorStartupError,
+        match="stop after rendered-template validation",
+    ):
+        executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+
+    assert modules.cluster_kwargs is not None
+    assert modules.cluster_kwargs["cores"] == 30
+    assert modules.cluster_kwargs["processes"] == 2
+    assert modules.cluster_kwargs["memory"] == "466GiB"
+    assert modules.cluster_kwargs["job_cpu"] == 30
+    assert modules.cluster_kwargs["job_mem"] == "466G"
+    assert "--nworkers 2" in modules.job_script_text
+    assert "--nthreads 15" in modules.job_script_text
+    assert "--memory-limit 233.00GiB" in modules.job_script_text
+    assert (
+        slurm_module.validate_slurm_job_script(
+            modules.job_script_text,
+            _profile(
+                tmp_path,
+                workers=3,
+                mode="fine_grained",
+                cores=30,
+                processes=2,
+                itk_threads=15,
+                blas_threads=15,
+            ),
+        )
+        == 233 * 1024**3
+    )
+    assert modules.scale_calls == [{"jobs": 1}]
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        ("--nworkers 2 ", ""),
+        ("--nworkers 2 ", "--nworkers 3 "),
+        ("--nworkers 2 ", "--nworkers 2 --nworkers 2 "),
+        ("--nthreads 15 ", "--nthreads 30 "),
+        ("--memory-limit 233.00GiB ", "--memory-limit 466.00GiB "),
+    ),
+)
+def test_multi_process_template_rejects_inexact_worker_resources(
+    tmp_path: Path,
+    old: str,
+    new: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.SLURMCluster(
+        config_name="cyexm-slurm",
+        queue="512GB",
+        cores=30,
+        processes=2,
+        memory="466GiB",
+        walltime="72:00:00",
+        job_cpu=30,
+        job_mem="466G",
+        interface="ib0",
+        scheduler_options={"interface": "ib0"},
+        local_directory=str(tmp_path / "scratch"),
+        nanny=True,
+        death_timeout=60,
+        worker_command="distributed.cli.dask_worker",
+        python=sys.executable,
+        shebang="#!/usr/bin/env bash",
+        job_name="cyexm-registration",
+        job_script_prologue=[],
+        job_extra_directives=[],
+        job_directives_skip=[],
+        worker_extra_args=[],
+    )
+    script = modules.job_script_text.replace(old, new)
+
+    with pytest.raises(ValueError, match="rendered SLURM job script"):
+        slurm_module.validate_slurm_job_script(
+            script,
+            _profile(
+                tmp_path,
+                workers=3,
+                mode="fine_grained",
+                cores=30,
+                processes=2,
+                itk_threads=15,
+                blas_threads=15,
+            ),
+        )
 
 
 def test_fine_slurm_starts_candidates_without_slots_then_activates_after_preflight(
@@ -2605,6 +2735,7 @@ def test_slurm_executor_supplies_isolated_jobqueue_launch_configuration(
         "-D/tmp",
         "--resources=round_slot=2",
         "--nthreads=1",
+        "--nworkers=2",
     ),
 )
 def test_slurm_executor_revalidates_direct_profile_before_loading_scheduler(

@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from importlib.metadata import version as package_version
 from typing import Any, cast
 
+from cyexm.config._slurm_resources import derive_slurm_job_resources
 from cyexm.config.execution import _validate_execution_profile
 from cyexm.config.memory import SlurmMemoryQuantity, normalize_slurm_memory
 from cyexm.config.models import ExecutionProfile, SlurmSpec
@@ -1299,6 +1300,7 @@ def _worker_option_values(
 ) -> tuple[dict[str, list[str]], list[str]]:
     valued = {
         "--name",
+        "--nworkers",
         "--nthreads",
         "--memory-limit",
         "--death-timeout",
@@ -1344,7 +1346,12 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> int:
         or scratch is None
     ):
         raise _rendered_script_error("validation requires a complete SLURM profile")
-    memory = normalize_slurm_memory(spec.memory)
+    resources = derive_slurm_job_resources(
+        spec,
+        profile.native_threads,
+        profile.parallelism,
+    )
+    memory = resources.job_memory
     lines = [line.strip() for line in script.splitlines() if line.strip()]
     if not lines or lines[0] != _SHEBANG:
         raise _rendered_script_error(f"expected shebang {_SHEBANG!r}")
@@ -1393,7 +1400,12 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> int:
     values, flags = _worker_option_values(worker_arguments)
     expected_values: dict[str, list[str] | None] = {
         "--name": None,
-        "--nthreads": [str(spec.cores_per_worker)],
+        "--nworkers": (
+            [str(resources.processes_per_job)]
+            if resources.processes_per_job > 1
+            else []
+        ),
+        "--nthreads": [str(resources.cores_per_process)],
         "--memory-limit": None,
         "--death-timeout": [str(_DEATH_TIMEOUT_SECONDS)],
         "--local-directory": [str(scratch)],
@@ -1423,11 +1435,11 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> int:
         ) from error
     if (
         type(worker_memory_bytes) is not int
-        or worker_memory_bytes != memory.scheduler_bytes
+        or worker_memory_bytes != resources.process_memory_bytes
     ):
         raise _rendered_script_error(
-            "worker memory limit must equal the scheduler-normalized request "
-            f"{memory.scheduler_bytes} bytes; got {worker_memory!r} "
+            "worker memory limit must equal the derived per-process request "
+            f"{resources.process_memory_bytes} bytes; got {worker_memory!r} "
             f"({worker_memory_bytes!r} bytes)"
         )
     if flags != ["--nanny"]:
@@ -1823,7 +1835,12 @@ class SlurmExecutor:
         round_tasks: tuple[RoundTask, ...],
     ) -> tuple[RoundResult, ...]:
         spec = self._spec()
-        memory = normalize_slurm_memory(spec.memory)
+        resources = derive_slurm_job_resources(
+            spec,
+            self.profile.native_threads,
+            self.profile.parallelism,
+        )
+        memory = resources.job_memory
         tasks: tuple[WorkflowTask, ...] = (reference_task, *round_tasks)
         validate_distributed_tasks(tasks, executor_name="SlurmExecutor")
         submission_runner = _serialize_workflow_task_runner(self._runner)
@@ -1891,12 +1908,12 @@ class SlurmExecutor:
                 opened_cluster = modules.SLURMCluster(
                     config_name=_CONFIG_NAME,
                     queue=spec.queue,
-                    cores=spec.cores_per_worker,
-                    processes=spec.processes_per_worker,
-                    memory=memory.dask,
+                    cores=resources.cores_per_job,
+                    processes=resources.processes_per_job,
+                    memory=resources.dask_managed_memory,
                     walltime=spec.walltime,
-                    job_cpu=spec.cores_per_worker,
-                    job_mem=memory.scheduler,
+                    job_cpu=resources.cores_per_job,
+                    job_mem=resources.job_memory.scheduler,
                     interface=spec.interface,
                     scheduler_options={"interface": spec.scheduler_interface},
                     local_directory=str(self.profile.paths.worker_local_directory),

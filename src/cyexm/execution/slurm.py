@@ -180,6 +180,20 @@ _FINE_EVIDENCE_KEYS = _EVIDENCE_KEYS | frozenset({"schema_version", "fine_graph"
 _REQUESTED_KEYS = frozenset(
     {"workers", "configured_workers", "startup_timeout", "task_retries", "memory"}
 )
+_FINE_REQUESTED_KEYS = frozenset(
+    {
+        "jobs",
+        "configured_jobs",
+        "processes_per_job",
+        "task_slots_per_job",
+        "max_task_slots",
+        "cores_per_process",
+        "process_memory_bytes",
+        "startup_timeout",
+        "task_retries",
+        "memory",
+    }
+)
 _MEMORY_EVIDENCE_KEYS = frozenset(
     {"profile", "semantic_bytes", "scheduler", "scheduler_bytes", "dask"}
 )
@@ -210,6 +224,16 @@ _STARTUP_PHASES = (
     "complete",
 )
 _CLEANUP_RESOURCES = ("client", "cluster", "configuration")
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestedEvidence:
+    worker_count: int
+    configured_jobs: int | None
+    retries: int | None
+    processes_per_job: int
+    worker_cap: int
+    process_memory_bytes: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +383,7 @@ def _memory_evidence(quantity: SlurmMemoryQuantity) -> dict[str, object]:
     }
 
 
-def _validate_memory_evidence(value: object) -> None:
+def _validate_memory_evidence(value: object) -> SlurmMemoryQuantity:
     location = "execution_evidence.requested.memory"
     memory = _evidence_object(value, location, exact_keys=_MEMORY_EVIDENCE_KEYS)
     profile = _evidence_string(memory["profile"], f"{location}.profile")
@@ -382,11 +406,16 @@ def _validate_memory_evidence(value: object) -> None:
             f"{location} must exactly match normalized profile memory; "
             f"expected {expected!r}, got {memory!r}"
         )
+    return normalize_slurm_memory(profile, f"{location}.profile")
 
 
-def _validate_requested(value: object) -> tuple[int, int | None, int | None]:
+def _validate_requested(
+    value: object,
+    *,
+    fine_mode: bool,
+) -> _RequestedEvidence:
     requested = _evidence_object(value, "execution_evidence.requested")
-    if frozenset(requested) == frozenset({"workers"}):
+    if not fine_mode and frozenset(requested) == frozenset({"workers"}):
         workers = _evidence_integer(
             requested["workers"],
             "execution_evidence.requested.workers",
@@ -396,7 +425,80 @@ def _validate_requested(value: object) -> tuple[int, int | None, int | None]:
             raise ValueError(
                 "minimal requested evidence is valid only for zero workers"
             )
-        return workers, None, None
+        return _RequestedEvidence(workers, None, None, 1, 0, None)
+    if fine_mode:
+        if frozenset(requested) != _FINE_REQUESTED_KEYS:
+            raise ValueError(
+                "fine execution_evidence.requested keys must match the exact "
+                "job/process schema"
+            )
+        jobs = _evidence_integer(
+            requested["jobs"],
+            "execution_evidence.requested.jobs",
+            minimum=1,
+        )
+        configured_jobs = _evidence_integer(
+            requested["configured_jobs"],
+            "execution_evidence.requested.configured_jobs",
+            minimum=1,
+        )
+        processes_per_job = _evidence_integer(
+            requested["processes_per_job"],
+            "execution_evidence.requested.processes_per_job",
+            minimum=1,
+        )
+        task_slots_per_job = _evidence_integer(
+            requested["task_slots_per_job"],
+            "execution_evidence.requested.task_slots_per_job",
+            minimum=1,
+        )
+        max_task_slots = _evidence_integer(
+            requested["max_task_slots"],
+            "execution_evidence.requested.max_task_slots",
+            minimum=1,
+        )
+        _evidence_integer(
+            requested["cores_per_process"],
+            "execution_evidence.requested.cores_per_process",
+            minimum=1,
+        )
+        process_memory_bytes = _evidence_integer(
+            requested["process_memory_bytes"],
+            "execution_evidence.requested.process_memory_bytes",
+            minimum=1,
+        )
+        if jobs > configured_jobs:
+            raise ValueError("requested jobs cannot exceed configured_jobs")
+        if task_slots_per_job != processes_per_job:
+            raise ValueError(
+                "task_slots_per_job must equal processes_per_job"
+            )
+        if max_task_slots != configured_jobs * processes_per_job:
+            raise ValueError(
+                "max_task_slots must equal configured_jobs * processes_per_job"
+            )
+        _evidence_string(
+            requested["startup_timeout"],
+            "execution_evidence.requested.startup_timeout",
+        )
+        retries = _evidence_integer(
+            requested["task_retries"],
+            "execution_evidence.requested.task_retries",
+            minimum=0,
+        )
+        memory = _validate_memory_evidence(requested["memory"])
+        if process_memory_bytes * processes_per_job > memory.scheduler_bytes:
+            raise ValueError(
+                "summed process memory cannot exceed normalized job memory"
+            )
+        return _RequestedEvidence(
+            worker_count=jobs * processes_per_job,
+            configured_jobs=configured_jobs,
+            retries=retries,
+            processes_per_job=processes_per_job,
+            worker_cap=max_task_slots,
+            process_memory_bytes=process_memory_bytes,
+        )
     if frozenset(requested) != _REQUESTED_KEYS:
         raise ValueError(
             "execution_evidence.requested keys must match the accepted SLURM schema"
@@ -422,8 +524,15 @@ def _validate_requested(value: object) -> tuple[int, int | None, int | None]:
         "execution_evidence.requested.task_retries",
         minimum=0,
     )
-    _validate_memory_evidence(requested["memory"])
-    return workers, configured, retries
+    memory = _validate_memory_evidence(requested["memory"])
+    return _RequestedEvidence(
+        worker_count=workers,
+        configured_jobs=configured,
+        retries=retries,
+        processes_per_job=1,
+        worker_cap=configured,
+        process_memory_bytes=memory.scheduler_bytes,
+    )
 
 
 def _validate_rendered(value: object) -> bool:
@@ -883,14 +992,20 @@ def _canonical_execution_evidence(
         and _evidence_integer(
             evidence["schema_version"],
             "execution_evidence.schema_version",
-            minimum=2,
+            minimum=1,
         )
-        != 2
+        != 3
     ):
-        raise ValueError("fine SLURM execution evidence schema_version must equal 2")
+        raise ValueError("fine SLURM execution evidence schema_version must equal 3")
     if _evidence_string(evidence["executor"], "execution_evidence.executor") != "slurm":
         raise ValueError("execution_evidence.executor must be 'slurm'")
-    workers, configured, requested_retries = _validate_requested(evidence["requested"])
+    requested = _validate_requested(
+        evidence["requested"],
+        fine_mode=fine_mode,
+    )
+    workers = requested.worker_count
+    configured = requested.configured_jobs
+    requested_retries = requested.retries
     if requested_retries is not None and requested_retries != retries:
         raise ValueError(
             "execution evidence task_retries does not match the execution profile"
@@ -938,7 +1053,7 @@ def _canonical_execution_evidence(
     _validate_cleanup(evidence["cleanup"], completed_startup=completed)
     if fine_mode:
         if configured is None:
-            raise ValueError("fine SLURM evidence requires configured_workers")
+            raise ValueError("fine SLURM evidence requires configured_jobs")
         exact_fine_types = (
             RoundPreparationTask,
             NonlinearChunkTask,
@@ -957,7 +1072,13 @@ def _canonical_execution_evidence(
         )
         validate_fine_slurm_evidence(
             evidence["fine_graph"],
-            configured_workers=configured,
+            job_cap=configured,
+            processes_per_job=requested.processes_per_job,
+            worker_cap=requested.worker_cap,
+            expected_process_memory_bytes=cast(
+                int,
+                requested.process_memory_bytes,
+            ),
             task_retries=retries,
             cancellation_present=cancellation_present,
             startup_outcome=outcome,
@@ -1743,6 +1864,8 @@ class SlurmExecutor:
         worker_count: int,
         spec: SlurmSpec | None,
         memory: SlurmMemoryQuantity | None,
+        resources: SlurmJobResources | None = None,
+        fine_mode: bool = False,
     ) -> tuple[
         dict[str, object],
         dict[str, object],
@@ -1750,8 +1873,26 @@ class SlurmExecutor:
         dict[str, object],
         dict[str, object],
     ]:
-        requested: dict[str, object] = {"workers": worker_count}
-        if spec is not None and memory is not None:
+        if fine_mode:
+            if spec is None or resources is None:
+                raise ValueError(
+                    "fine SLURM evidence requires validated job resources"
+                )
+            requested: dict[str, object] = {
+                "jobs": worker_count,
+                "configured_jobs": resources.job_cap,
+                "processes_per_job": resources.processes_per_job,
+                "task_slots_per_job": resources.task_slots_per_job,
+                "max_task_slots": resources.max_task_slots,
+                "cores_per_process": resources.cores_per_process,
+                "process_memory_bytes": resources.process_memory_bytes,
+                "startup_timeout": spec.startup_timeout,
+                "task_retries": spec.task_retries,
+                "memory": _memory_evidence(resources.job_memory),
+            }
+        else:
+            requested = {"workers": worker_count}
+        if not fine_mode and spec is not None and memory is not None:
             requested.update(
                 {
                     "configured_workers": spec.workers,
@@ -1858,11 +1999,17 @@ class SlurmExecutor:
             worker_count=worker_count,
             spec=spec,
             memory=memory,
+            resources=resources,
+            fine_mode=fine_mode,
         )
         fine_state: FineSlurmEvidence | None = None
         if fine_mode:
-            fine_state = FineSlurmEvidence(spec.workers)
-            evidence["schema_version"] = 2
+            fine_state = FineSlurmEvidence(
+                job_cap=resources.job_cap,
+                processes_per_job=resources.processes_per_job,
+                worker_cap=resources.max_task_slots,
+            )
+            evidence["schema_version"] = 3
             evidence["fine_graph"] = fine_state.to_dict()
         reference_attempts = [0]
         moving_attempts = [0 for _task in round_tasks]
@@ -2155,7 +2302,7 @@ class SlurmExecutor:
                             execution_client,
                             expected_workers=desired,
                         )
-                        cast(dict[str, object], evidence["requested"])["workers"] = (
+                        cast(dict[str, object], evidence["requested"])["jobs"] = (
                             requested_workers
                         )
                         observed["connected_workers"] = list(next_connected)
@@ -2737,7 +2884,12 @@ class SlurmExecutor:
                 )
                 validate_fine_slurm_evidence(
                     fine_state.to_dict(),
-                    configured_workers=spec.workers,
+                    job_cap=resources.job_cap,
+                    processes_per_job=resources.processes_per_job,
+                    worker_cap=resources.max_task_slots,
+                    expected_process_memory_bytes=(
+                        resources.process_memory_bytes
+                    ),
                     task_retries=spec.task_retries,
                     cancellation_present=False,
                     startup_outcome="succeeded",

@@ -1293,7 +1293,8 @@ def test_fine_slurm_replaces_lost_worker_at_cap_before_retry(
     ]
     fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
     events = cast(list[dict[str, object]], fine["scale_events"])
-    assert [event["requested"] for event in events] == [1, 1]
+    assert [event["requested_jobs"] for event in events] == [1, 1]
+    assert [event["expected_processes"] for event in events] == [1, 1]
     assert events[1]["departed"] == ["tcp://node-a:1234"]
     assert events[1]["activated"] == ["tcp://node-b:1234"]
 
@@ -2435,7 +2436,25 @@ def test_fine_slurm_records_versioned_scale_graph_and_placement_evidence(
     executor.execute(_reference_task(tmp_path), tasks)
 
     evidence = cast(dict[str, object], executor.execution_evidence)
-    assert evidence["schema_version"] == 2
+    assert evidence["schema_version"] == 3
+    assert evidence["requested"] == {
+        "jobs": 2,
+        "configured_jobs": 2,
+        "processes_per_job": 1,
+        "task_slots_per_job": 1,
+        "max_task_slots": 2,
+        "cores_per_process": 72,
+        "process_memory_bytes": 500_363_689_984,
+        "startup_timeout": "15m",
+        "task_retries": 0,
+        "memory": {
+            "profile": "500GB",
+            "semantic_bytes": 500_000_000_000,
+            "scheduler": "466G",
+            "scheduler_bytes": 500_363_689_984,
+            "dask": "466GiB",
+        },
+    }
     fine = cast(dict[str, object], evidence["fine_graph"])
     assert fine["mode"] == "fine_grained"
     assert fine["worker_cap"] == 2
@@ -2448,7 +2467,8 @@ def test_fine_slurm_records_versioned_scale_graph_and_placement_evidence(
         "tcp://node-b:1234",
     ]
     scale_events = cast(list[dict[str, object]], fine["scale_events"])
-    assert [event["requested"] for event in scale_events] == [1, 2]
+    assert [event["requested_jobs"] for event in scale_events] == [1, 2]
+    assert [event["expected_processes"] for event in scale_events] == [1, 2]
     assert all(event["failed"] == [] for event in scale_events)
     assert cast(list[object], fine["task_graph"])
     assert cast(list[object], fine["attempt_counts"])
@@ -2461,7 +2481,10 @@ def test_fine_slurm_records_versioned_scale_graph_and_placement_evidence(
     observed = cast(dict[str, object], evidence["observed"])
     validate_fine_slurm_evidence(
         fine,
-        configured_workers=2,
+        job_cap=2,
+        processes_per_job=1,
+        worker_cap=2,
+        expected_process_memory_bytes=500_363_689_984,
         task_retries=0,
         cancellation_present=False,
         startup_outcome="succeeded",
@@ -2473,6 +2496,14 @@ def test_fine_slurm_records_versioned_scale_graph_and_placement_evidence(
             for item in cast(list[dict[str, object]], observed["worker_probes"])
         ),
     )
+    legacy = deepcopy(evidence)
+    legacy["schema_version"] = 2
+    with pytest.raises(ValueError, match="schema_version must equal 3"):
+        slurm_module._canonical_execution_evidence(
+            legacy,
+            expected_tasks=(_reference_task(tmp_path), *tasks),
+            task_retries=0,
+        )
     encoded = slurm_module._canonical_execution_evidence(
         evidence,
         expected_tasks=(_reference_task(tmp_path), *tasks),
@@ -2482,7 +2513,7 @@ def test_fine_slurm_records_versioned_scale_graph_and_placement_evidence(
 
 
 def test_fine_slurm_typed_evidence_snapshots_are_detached_and_canonical() -> None:
-    state = FineSlurmEvidence(worker_cap=2)
+    state = FineSlurmEvidence(job_cap=2, processes_per_job=1, worker_cap=2)
     event = state.begin_scale(1, "2026-07-23T10:00:00Z")
     event.connected.append("tcp://node-a:1234")
     event.probed.append("tcp://node-a:1234")
@@ -2499,7 +2530,8 @@ def test_fine_slurm_typed_evidence_snapshots_are_detached_and_canonical() -> Non
     assert second["candidate_workers"] == ["tcp://node-a:1234"]
     assert second["scale_events"] == [
         {
-            "requested": 1,
+            "requested_jobs": 1,
+            "expected_processes": 1,
             "connected": ["tcp://node-a:1234"],
             "departed": [],
             "probed": ["tcp://node-a:1234"],
@@ -2510,6 +2542,95 @@ def test_fine_slurm_typed_evidence_snapshots_are_detached_and_canonical() -> Non
             "ended_at": "2026-07-23T10:00:01Z",
         }
     ]
+
+
+def test_fine_slurm_evidence_rejects_inconsistent_job_process_capacity() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"worker_cap must equal job_cap \* processes_per_job",
+    ):
+        FineSlurmEvidence(job_cap=3, processes_per_job=2, worker_cap=3)
+
+
+def test_fine_slurm_evidence_rejects_jobs_above_cap_and_wrong_process_count(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    task = _task(tmp_path, 2)
+    reference = _reference_task(tmp_path)
+    executor = _executor(tmp_path, modules, workers=1, mode="fine_grained")
+    executor.execute(reference, (task,))
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    requested = cast(dict[str, object], evidence["requested"])
+    requested["jobs"] = 2
+
+    with pytest.raises(ValueError, match="cannot exceed configured_jobs"):
+        slurm_module._canonical_execution_evidence(
+            evidence,
+            expected_tasks=(reference, task),
+            task_retries=0,
+        )
+
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    fine = cast(dict[str, object], evidence["fine_graph"])
+    event = cast(list[dict[str, object]], fine["scale_events"])[0]
+    event["expected_processes"] = 2
+    with pytest.raises(
+        ValueError,
+        match="expected_processes must equal",
+    ):
+        slurm_module._canonical_execution_evidence(
+            evidence,
+            expected_tasks=(reference, task),
+            task_retries=0,
+        )
+
+
+def test_fine_slurm_evidence_rejects_incomplete_activated_job_group(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    task = _task(tmp_path, 2)
+    executor = _executor(tmp_path, modules, workers=1, mode="fine_grained")
+    executor.execute(_reference_task(tmp_path), (task,))
+    evidence = deepcopy(cast(dict[str, object], executor.execution_evidence))
+    fine = cast(dict[str, object], evidence["fine_graph"])
+    fine["worker_cap"] = 2
+    events = cast(list[dict[str, object]], fine["scale_events"])
+    for event in events:
+        event["expected_processes"] = cast(int, event["requested_jobs"]) * 2
+        for probe in cast(list[dict[str, object]], event["activated_probes"]):
+            probe["memory_limit_bytes"] = 233 * 1024**3
+    observed = cast(dict[str, object], evidence["observed"])
+    observed_probes = tuple(
+        WorkerProbe.from_dict(
+            {
+                **probe,
+                "memory_limit_bytes": 233 * 1024**3,
+            }
+        )
+        for probe in cast(list[dict[str, object]], observed["worker_probes"])
+    )
+
+    with pytest.raises(ValueError, match="complete SLURM job groups"):
+        validate_fine_slurm_evidence(
+            fine,
+            job_cap=1,
+            processes_per_job=2,
+            worker_cap=2,
+            expected_process_memory_bytes=233 * 1024**3,
+            task_retries=0,
+            cancellation_present=False,
+            startup_outcome="succeeded",
+            reference_attempted=True,
+            round_tasks=(task,),
+            observed_workers=tuple(
+                cast(list[str], observed["connected_workers"])
+            ),
+            observed_probes=observed_probes,
+        )
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
 
+from cyexm.errors import WorkerPreflightError
 from cyexm.execution.dispatcher import (
     FineGraphController,
     canonical_fine_task_key,
@@ -140,7 +141,8 @@ def _fine_keys(value: object, location: str) -> tuple[str, ...]:
 class FineScaleEvent:
     """One deterministic upward-scale transition."""
 
-    requested: int
+    requested_jobs: int
+    expected_processes: int
     started_at: str
     connected: list[str] = field(default_factory=list)
     departed: list[str] = field(default_factory=list)
@@ -156,7 +158,8 @@ class FineScaleEvent:
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
-            "requested": self.requested,
+            "requested_jobs": self.requested_jobs,
+            "expected_processes": self.expected_processes,
             "connected": sorted(self.connected),
             "departed": sorted(self.departed),
             "probed": sorted(self.probed),
@@ -253,6 +256,8 @@ class FinePlacementAttempt:
 class FineSlurmEvidence:
     """Mutable coordinator state with detached JSON snapshots."""
 
+    job_cap: int
+    processes_per_job: int
     worker_cap: int
     candidates: set[str] = field(default_factory=set)
     validated: set[str] = field(default_factory=set)
@@ -266,8 +271,27 @@ class FineSlurmEvidence:
     interruption: tuple[str, str] | None = None
     pre_controller_terminal: PreControllerTerminal | None = None
 
-    def begin_scale(self, requested: int, started_at: str) -> FineScaleEvent:
-        event = FineScaleEvent(requested=requested, started_at=started_at)
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("job_cap", self.job_cap),
+            ("processes_per_job", self.processes_per_job),
+            ("worker_cap", self.worker_cap),
+        ):
+            if type(value) is not int or value < 1:
+                raise TypeError(f"{name} must be a positive built-in integer")
+        if self.worker_cap != self.job_cap * self.processes_per_job:
+            raise ValueError(
+                "worker_cap must equal job_cap * processes_per_job"
+            )
+
+    def begin_scale(self, requested_jobs: int, started_at: str) -> FineScaleEvent:
+        if type(requested_jobs) is not int or not 1 <= requested_jobs <= self.job_cap:
+            raise ValueError("requested_jobs must be within the configured job cap")
+        event = FineScaleEvent(
+            requested_jobs=requested_jobs,
+            expected_processes=requested_jobs * self.processes_per_job,
+            started_at=started_at,
+        )
         self.events.append(event)
         return event
 
@@ -403,7 +427,10 @@ def _decode_task_results(
 def validate_fine_slurm_evidence(
     value: object,
     *,
-    configured_workers: int,
+    job_cap: int,
+    processes_per_job: int,
+    worker_cap: int,
+    expected_process_memory_bytes: int,
     task_retries: int,
     cancellation_present: bool,
     startup_outcome: str,
@@ -413,12 +440,14 @@ def validate_fine_slurm_evidence(
     observed_probes: Sequence[WorkerProbe],
     fine_tasks: tuple[FineWorkflowTask, ...] = (),
 ) -> None:
-    """Strictly validate one version-2 fine SLURM evidence object."""
+    """Strictly validate one version-3 fine SLURM evidence object."""
     graph = _object(value, "execution_evidence.fine_graph", _GRAPH_KEYS)
     if _string(graph["mode"], "fine_graph.mode") != "fine_grained":
         raise ValueError("fine_graph.mode must be 'fine_grained'")
-    if _integer(graph["worker_cap"], "fine_graph.worker_cap", 1) != configured_workers:
-        raise ValueError("fine_graph.worker_cap must match configured_workers")
+    if worker_cap != job_cap * processes_per_job:
+        raise ValueError("worker_cap must equal job_cap * processes_per_job")
+    if _integer(graph["worker_cap"], "fine_graph.worker_cap", 1) != worker_cap:
+        raise ValueError("fine_graph.worker_cap must match max_task_slots")
     candidates = _strings(graph["candidate_workers"], "fine_graph.candidates")
     validated = _strings(graph["validated_workers"], "fine_graph.validated")
     if not set(validated) <= set(candidates):
@@ -443,7 +472,8 @@ def validate_fine_slurm_evidence(
             location,
             frozenset(
                 {
-                    "requested",
+                    "requested_jobs",
+                    "expected_processes",
                     "connected",
                     "departed",
                     "probed",
@@ -455,7 +485,21 @@ def validate_fine_slurm_evidence(
                 }
             ),
         )
-        requested = _integer(event["requested"], f"{location}.requested", 1)
+        requested = _integer(
+            event["requested_jobs"],
+            f"{location}.requested_jobs",
+            1,
+        )
+        expected_processes = _integer(
+            event["expected_processes"],
+            f"{location}.expected_processes",
+            1,
+        )
+        if expected_processes != requested * processes_per_job:
+            raise ValueError(
+                "fine scale expected_processes must equal "
+                "requested_jobs * processes_per_job"
+            )
         event_started = _timestamp(event["started_at"], f"{location}.started_at")
         event_ended = _timestamp(event["ended_at"], f"{location}.ended_at")
         if event_ended < event_started:
@@ -467,7 +511,8 @@ def validate_fine_slurm_evidence(
             requested == previous_request and not replacement and bool(event_failures)
         )
         if (
-            requested > configured_workers
+            requested > job_cap
+            or expected_processes > worker_cap
             or requested < previous_request
             or (
                 requested == previous_request and not replacement and not health_failure
@@ -550,6 +595,19 @@ def validate_fine_slurm_evidence(
             _string(error["type"], f"{location}.failed[{failure_index}].type")
             if type(error["message"]) is not str:
                 raise TypeError("fine scale failure message must be a string")
+        if not event_failures and current_activated_probes:
+            try:
+                validate_slurm_worker_identities(
+                    tuple(current_activated_probes.values()),
+                    processes_per_job=processes_per_job,
+                    expected_process_memory_bytes=(
+                        expected_process_memory_bytes
+                    ),
+                )
+            except WorkerPreflightError as error:
+                raise ValueError(
+                    "fine activated workers do not form complete SLURM job groups"
+                ) from error
         scale_probe_outcomes.append(
             (set(probed), set(event_activated), bool(event_failures))
         )
@@ -696,7 +754,16 @@ def validate_fine_slurm_evidence(
     if not activated_identity_keys <= set(probe_identities):
         raise ValueError("activated probes must be present in raw probe history")
     validated_probes = tuple(current_activated_probes[address] for address in validated)
-    validate_slurm_worker_identities(validated_probes)
+    try:
+        validate_slurm_worker_identities(
+            validated_probes,
+            processes_per_job=processes_per_job,
+            expected_process_memory_bytes=expected_process_memory_bytes,
+        )
+    except WorkerPreflightError as error:
+        raise ValueError(
+            "validated workers do not form complete SLURM job groups"
+        ) from error
     if any(not probe.ok for probe in probes) and not scale_failed:
         raise ValueError("failed worker probe requires a failed scale event")
     if any(

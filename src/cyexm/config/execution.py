@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
+from cyexm.config._slurm_resources import derive_slurm_job_resources
 from cyexm.config._validation import (
     built_in_int,
     nonempty_string,
@@ -418,19 +419,17 @@ def _managed_slurm_short_option(token: str) -> str | None:
 
 def _slurm(value: object) -> SlurmSpec:
     mapping = require_exact_keys(value, _SLURM_KEYS, "slurm")
-    processes_per_worker = mapping["processes_per_worker"]
-    if type(processes_per_worker) is not int or processes_per_worker != 1:
-        raise ConfigurationValidationError(
-            "slurm.processes_per_worker must be the built-in integer 1; "
-            f"got {processes_per_worker!r}"
-        )
     return SlurmSpec(
         queue=nonempty_string(mapping["queue"], "slurm.queue"),
         workers=built_in_int(mapping["workers"], "slurm.workers", minimum=1),
         cores_per_worker=built_in_int(
             mapping["cores_per_worker"], "slurm.cores_per_worker", minimum=1
         ),
-        processes_per_worker=processes_per_worker,
+        processes_per_worker=built_in_int(
+            mapping["processes_per_worker"],
+            "slurm.processes_per_worker",
+            minimum=1,
+        ),
         memory=normalize_slurm_memory(mapping["memory"]).profile,
         walltime=nonempty_string(mapping["walltime"], "slurm.walltime"),
         interface=nonempty_string(mapping["interface"], "slurm.interface"),
@@ -568,6 +567,7 @@ def _validate_execution_profile(profile: ExecutionProfile) -> None:
     )
     if slurm != profile.slurm:
         raise ConfigurationValidationError("slurm settings are invalid")
+    derive_slurm_job_resources(slurm, profile.native_threads, profile.parallelism)
 
 
 def load_execution_profile(path: str | Path) -> ExecutionProfile:

@@ -551,8 +551,8 @@ def test_slurm_resource_counts_require_positive_builtin_integers(
         _load_profile(tmp_path, data)
 
 
-@pytest.mark.parametrize("value", [True, 0, 2, 1.0])
-def test_slurm_process_count_must_be_builtin_integer_one(
+@pytest.mark.parametrize("value", [True, 0, -1, 1.0])
+def test_slurm_process_count_requires_positive_builtin_integer(
     tmp_path: Path, value: object
 ) -> None:
     data = _valid_data("slurm")
@@ -560,8 +560,122 @@ def test_slurm_process_count_must_be_builtin_integer_one(
 
     with pytest.raises(
         ConfigurationValidationError,
-        match=r"slurm\.processes_per_worker must be the built-in integer 1",
+        match=(
+            r"slurm\.processes_per_worker must be a built-in integer >= 1"
+        ),
     ):
+        _load_profile(tmp_path, data)
+
+
+def test_fine_slurm_accepts_two_processes_with_divided_resources(
+    tmp_path: Path,
+) -> None:
+    try:
+        from cyexm.config._slurm_resources import (
+            SlurmJobResources,
+            derive_slurm_job_resources,
+        )
+    except ImportError:
+        pytest.fail("multi-process SLURM resource derivation is missing")
+    from cyexm.config import normalize_slurm_memory
+
+    data = _valid_data("slurm")
+    data["parallelism"] = {"mode": "fine_grained"}
+    data["native_threads"] = {"itk": 15, "blas": 15}
+    slurm = _mapping_at(data, "slurm")
+    slurm["cores_per_worker"] = 30
+    slurm["processes_per_worker"] = 2
+
+    profile = _load_profile(tmp_path, data)
+
+    assert profile.slurm is not None
+    resources = derive_slurm_job_resources(
+        profile.slurm, profile.native_threads, profile.parallelism
+    )
+    assert resources == SlurmJobResources(
+        job_cap=3,
+        processes_per_job=2,
+        cores_per_job=30,
+        cores_per_process=15,
+        task_slots_per_job=2,
+        max_task_slots=6,
+        job_memory=normalize_slurm_memory("500GB"),
+        process_memory_gib=233,
+        process_memory_bytes=233 * 1024**3,
+        process_memory="233GiB",
+        dask_managed_memory="466GiB",
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "cores", "processes", "itk", "blas", "memory", "message"),
+    [
+        (
+            "coarse",
+            30,
+            2,
+            15,
+            15,
+            "500GB",
+            "coarse SLURM execution requires processes_per_worker == 1",
+        ),
+        (
+            "fine_grained",
+            31,
+            2,
+            15,
+            15,
+            "500GB",
+            "cores_per_worker must be evenly divisible",
+        ),
+        (
+            "fine_grained",
+            30,
+            2,
+            16,
+            15,
+            "500GB",
+            "native_threads.itk must not exceed 15 cores per process",
+        ),
+        (
+            "fine_grained",
+            30,
+            2,
+            15,
+            16,
+            "500GB",
+            "native_threads.blas must not exceed 15 cores per process",
+        ),
+        (
+            "fine_grained",
+            30,
+            2,
+            1,
+            1,
+            "1KB",
+            "per-process Dask memory must be at least 1GiB",
+        ),
+    ],
+)
+def test_slurm_rejects_invalid_process_resource_combinations(
+    tmp_path: Path,
+    mode: str,
+    cores: int,
+    processes: int,
+    itk: int,
+    blas: int,
+    memory: str,
+    message: str,
+) -> None:
+    data = _valid_data("slurm")
+    data["parallelism"] = {"mode": mode}
+    data["native_threads"] = {"itk": itk, "blas": blas}
+    slurm = _mapping_at(data, "slurm")
+    slurm["cores_per_worker"] = cores
+    slurm["processes_per_worker"] = processes
+    slurm["memory"] = memory
+
+    with pytest.raises(ConfigurationValidationError, match=message):
         _load_profile(tmp_path, data)
 
 

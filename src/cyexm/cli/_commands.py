@@ -5,7 +5,14 @@ import json
 import signal
 from dataclasses import dataclass
 from types import FrameType
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from cyexm.config.models import (
+        NativeThreadSpec,
+        ParallelismSpec,
+        SlurmSpec,
+    )
 
 
 class _StructuredValue(Protocol):
@@ -21,6 +28,10 @@ class _Paths(Protocol):
 class _NativeThreads(Protocol):
     itk: int
     blas: int
+
+
+class _Parallelism(Protocol):
+    mode: str
 
 
 class _LocalDask(Protocol):
@@ -51,6 +62,7 @@ class _Execution(Protocol):
     executor: str
     paths: _Paths
     native_threads: _NativeThreads
+    parallelism: _Parallelism
     local_dask: _LocalDask | None
     slurm: _Slurm | None
 
@@ -161,7 +173,25 @@ def _resource_request(execution: _Execution) -> dict[str, object]:
         resources["local_dask"] = _local_dask_mapping(local_dask)
     slurm = execution.slurm
     if slurm is not None:
-        resources["slurm"] = _slurm_mapping(slurm)
+        from cyexm.config._slurm_resources import derive_slurm_job_resources
+
+        derived = derive_slurm_job_resources(
+            cast("SlurmSpec", slurm),
+            cast("NativeThreadSpec", native_threads),
+            cast("ParallelismSpec", execution.parallelism),
+        )
+        slurm_mapping = _slurm_mapping(slurm)
+        slurm_mapping["derived"] = {
+            "job_cap": derived.job_cap,
+            "processes_per_job": derived.processes_per_job,
+            "task_slots_per_job": derived.task_slots_per_job,
+            "max_task_slots": derived.max_task_slots,
+            "cores_per_process": derived.cores_per_process,
+            "job_memory": derived.job_memory.scheduler,
+            "process_memory": derived.process_memory,
+            "process_memory_bytes": derived.process_memory_bytes,
+        }
+        resources["slurm"] = slurm_mapping
     return resources
 
 

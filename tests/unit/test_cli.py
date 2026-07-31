@@ -43,6 +43,7 @@ class _FakeWorkflowApi:
                 worker_local_directory=None,
             ),
             native_threads=SimpleNamespace(itk=1, blas=1),
+            parallelism=SimpleNamespace(mode="coarse"),
             local_dask=None,
             slurm=None,
         )
@@ -303,6 +304,64 @@ def test_plan_prints_scientific_plan_and_resource_request(
             "output_root": "/output",
             "worker_local_directory": None,
         },
+    }
+    assert captured.err == ""
+
+
+def test_plan_reports_exact_derived_slurm_process_resources(
+    fake_api: _FakeWorkflowApi,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake_api.execution = SimpleNamespace(
+        executor="slurm",
+        paths=SimpleNamespace(
+            dataset_root=Path("/dataset"),
+            output_root=Path("/output"),
+            worker_local_directory=Path("/scratch"),
+        ),
+        native_threads=SimpleNamespace(itk=15, blas=15),
+        parallelism=SimpleNamespace(mode="fine_grained"),
+        local_dask=None,
+        slurm=SimpleNamespace(
+            queue="512GB",
+            workers=3,
+            cores_per_worker=30,
+            processes_per_worker=2,
+            memory="500GB",
+            walltime="72:00:00",
+            interface="ib0",
+            scheduler_interface="ib0",
+            startup_timeout="15m",
+            task_retries=0,
+            job_name="cyexm-registration",
+            job_extra_directives=(),
+        ),
+    )
+    fake_api.plan.execution = fake_api.execution
+
+    exit_code = main(
+        [
+            "workflow",
+            "plan",
+            "dataset.yaml",
+            "--execution",
+            "execution.yaml",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["resource_request"]["slurm"]["derived"] == {
+        "cores_per_process": 15,
+        "job_cap": 3,
+        "job_memory": "466G",
+        "max_task_slots": 6,
+        "process_memory": "233GiB",
+        "process_memory_bytes": 250181844992,
+        "processes_per_job": 2,
+        "task_slots_per_job": 2,
     }
     assert captured.err == ""
 

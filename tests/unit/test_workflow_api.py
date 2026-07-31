@@ -1365,6 +1365,47 @@ def test_parallelism_mode_is_operational_not_scientific_identity(
     assert fine.execution.parallelism.mode == "fine_grained"
 
 
+def test_slurm_process_count_is_operational_not_scientific_identity(
+    tmp_path: Path,
+) -> None:
+    base = _plan(tmp_path, rounds=(2,))
+    single_execution = replace(
+        _slurm_execution(base, tmp_path),
+        native_threads=NativeThreadSpec(itk=15, blas=15),
+        parallelism=replace(base.execution.parallelism, mode="fine_grained"),
+        slurm=replace(
+            cast(SlurmSpec, _slurm_execution(base, tmp_path).slurm),
+            cores_per_worker=30,
+        ),
+    )
+    assert single_execution.slurm is not None
+    multi_execution = replace(
+        single_execution,
+        source_path=tmp_path / "multi-execution.yaml",
+        paths=replace(
+            single_execution.paths,
+            output_root=tmp_path / "multi-output",
+        ),
+        slurm=replace(single_execution.slurm, processes_per_worker=2),
+    )
+    workflow_api._validate_execution_profile(single_execution)
+    workflow_api._validate_execution_profile(multi_execution)
+    single_plan = replace(base, execution=single_execution)
+    multi_plan = replace(base, execution=multi_execution)
+
+    assert single_plan.scientific_json == multi_plan.scientific_json
+    assert (
+        single_plan.scientific_fingerprint
+        == multi_plan.scientific_fingerprint
+    )
+    slurm_mapping = workflow_api._execution_profile_mapping(multi_execution)[
+        "slurm"
+    ]
+    assert isinstance(slurm_mapping, dict)
+    assert "derived" not in slurm_mapping
+    assert slurm_mapping["processes_per_worker"] == 2
+
+
 def test_run_workflow_fails_closed_when_fine_evidence_is_missing(
     tmp_path: Path,
 ) -> None:

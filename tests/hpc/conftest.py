@@ -21,6 +21,9 @@ from hpc.fixed_affine_chunk_characterization import (
     load_characterization_spec,
     validate_fixed_affine_source,
 )
+from hpc.multi_process_slurm_acceptance import (
+    multi_process_acceptance_profiles,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CLEAREX_ROOT = Path("/project/bioinformatics/Danuser_lab/Dean/dean/git/clearex")
@@ -31,6 +34,14 @@ LIVE_SPHEROID_ROOTS = (
     ),
     Path(
         "/archive/bioinformatics/Danuser_lab/Dean/dean/2026-07-18-spheroid-registration"
+    ),
+    Path(
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/dean/"
+        "2026-07-28-feature-mask-cc-radius4"
+    ),
+    Path(
+        "/archive/bioinformatics/Danuser_lab/Dean/dean/"
+        "2026-07-28-feature-mask-cc-radius4"
     ),
 )
 
@@ -43,6 +54,16 @@ class FineHpcProfiles:
     fine_path: Path
     coarse: ExecutionProfile
     fine: ExecutionProfile
+
+
+@dataclass(frozen=True, slots=True)
+class MultiProcessHpcProfiles:
+    """Two exact operator-approved profiles for process-count acceptance."""
+
+    single_path: Path
+    multi_path: Path
+    single: ExecutionProfile
+    multi: ExecutionProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +117,20 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         metavar="PATH",
         help="approved strict fine-grained SLURM execution profile",
+    )
+    group.addoption(
+        "--cyexm-single-process-execution",
+        action="store",
+        default=None,
+        metavar="PATH",
+        help="approved strict one-process fine SLURM execution profile",
+    )
+    group.addoption(
+        "--cyexm-multi-process-execution",
+        action="store",
+        default=None,
+        metavar="PATH",
+        help="approved strict two-process fine SLURM execution profile",
     )
     group.addoption(
         "--cyexm-characterization",
@@ -215,6 +250,80 @@ def fine_hpc_profiles(
         fine_path=fine_path,
         coarse=coarse,
         fine=fine,
+    )
+
+
+@pytest.fixture(scope="session")
+def multi_process_hpc_profiles(
+    request: pytest.FixtureRequest,
+    hpc_context: HpcAcceptanceContext,
+) -> MultiProcessHpcProfiles:
+    """Load the focused one-process/two-process pair before scheduler access."""
+    raw_single = request.config.getoption("--cyexm-single-process-execution")
+    raw_multi = request.config.getoption("--cyexm-multi-process-execution")
+    if not isinstance(raw_single, str) or not raw_single.strip():
+        raise pytest.UsageError(
+            "multi-process HPC acceptance requires "
+            "--cyexm-single-process-execution PATH"
+        )
+    if not isinstance(raw_multi, str) or not raw_multi.strip():
+        raise pytest.UsageError(
+            "multi-process HPC acceptance requires "
+            "--cyexm-multi-process-execution PATH"
+        )
+    try:
+        single_path = Path(raw_single).resolve(strict=True)
+        multi_path = Path(raw_multi).resolve(strict=True)
+    except OSError as error:
+        raise pytest.UsageError(
+            "multi-process HPC profile paths must be existing files"
+        ) from error
+    if (
+        not single_path.is_file()
+        or not multi_path.is_file()
+        or single_path != hpc_context.execution_path
+        or single_path == multi_path
+    ):
+        raise pytest.UsageError(
+            "--cyexm-execution and --cyexm-single-process-execution must identify "
+            "the same approved file and the multi-process profile must be distinct"
+        )
+    try:
+        validated_path, multi = validate_additional_acceptance_profile(
+            hpc_context,
+            multi_path,
+            repository_root=REPOSITORY_ROOT,
+            protected_roots=(CLEAREX_ROOT, *LIVE_SPHEROID_ROOTS),
+        )
+        if validated_path != multi_path:
+            raise ValueError("multi-process profile identity changed")
+        single, multi = multi_process_acceptance_profiles(
+            hpc_context.profile,
+            multi,
+        )
+        for profile in (single, multi):
+            output = profile.paths.output_root.resolve(strict=True)
+            archive = Path("/archive").resolve(strict=True)
+            if (
+                not output.is_relative_to(archive)
+                or not output.is_dir()
+                or profile.paths.output_root.is_symlink()
+            ):
+                raise ValueError(
+                    "multi-process acceptance output roots must be real existing "
+                    "directories below /archive"
+                )
+            require_coordinator_native_threads(profile)
+    except Exception as error:
+        raise pytest.UsageError(
+            "multi-process HPC profiles failed strict validation: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    return MultiProcessHpcProfiles(
+        single_path=single_path,
+        multi_path=multi_path,
+        single=single,
+        multi=multi,
     )
 
 

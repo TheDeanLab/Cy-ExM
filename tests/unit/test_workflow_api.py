@@ -67,6 +67,8 @@ from cyexm.workflow.fine_models import (
     FineTaskKey,
     FineTaskResult,
     FineWorkflowTask,
+    NonlinearChunkTask,
+    RoundPreparationTask,
     RoundValidationTask,
 )
 from cyexm.workflow.layout import WorkflowLayout
@@ -793,6 +795,46 @@ def _result(task: RoundTask, *, failed: bool = False) -> RoundResult:
 
 
 def _fine_task_result(task: FineWorkflowTask) -> FineTaskResult:
+    identity = {"path": "/tmp/item", "st_size": 1, "st_mtime_ns": 2}
+    prepared_descriptor = (
+        {
+            "format_version": 2,
+            "fixed_scalar": identity,
+            "moving_linear_scalar": identity,
+            "fixed_mask": identity,
+            "moving_linear_mask": identity,
+            "native_fixed": identity,
+            "native_moving": identity,
+            "moving_crop": None,
+            "affine": identity,
+            "geometry": {
+                "shape": [1, 2, 2],
+                "origin": [0.0, 0.0, 0.0],
+                "spacing": [1.0, 1.0, 1.0],
+                "direction": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+            },
+            "scalar_policy": "float32-preserve-registration-values-v1",
+            "mask_policy": (
+                "greater-than-zero-affine-nearest-neighbor-threshold-0.5-float32-v1"
+            ),
+            "native_threads": {
+                "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": task.native_threads.itk,
+                "OMP_NUM_THREADS": task.native_threads.blas,
+            },
+            "pixeltypes": {
+                "fixed_mask": "float",
+                "fixed_scalar": "float",
+                "moving_linear_mask": "float",
+                "moving_linear_scalar": "float",
+            },
+        }
+        if type(task) is RoundPreparationTask
+        else None
+    )
     return FineTaskResult(
         task=task,
         status="completed",
@@ -818,6 +860,7 @@ def _fine_task_result(task: FineWorkflowTask) -> FineTaskResult:
         reused_artifacts=(),
         log_path=str(task.log_path),
         failure=None,
+        prepared_descriptor=prepared_descriptor,
     )
 
 
@@ -1404,6 +1447,193 @@ def test_slurm_process_count_is_operational_not_scientific_identity(
     assert isinstance(slurm_mapping, dict)
     assert "derived" not in slurm_mapping
     assert slurm_mapping["processes_per_worker"] == 2
+
+
+def test_slurm_process_count_preserves_fine_graph_and_chunk_cache_identity(
+    tmp_path: Path,
+) -> None:
+    base = _serial_plan(tmp_path)
+    single_execution = replace(
+        _slurm_execution(base, tmp_path),
+        native_threads=NativeThreadSpec(itk=15, blas=15),
+        parallelism=replace(base.execution.parallelism, mode="fine_grained"),
+        slurm=replace(
+            cast(SlurmSpec, _slurm_execution(base, tmp_path).slurm),
+            cores_per_worker=30,
+        ),
+    )
+    assert single_execution.slurm is not None
+    multi_execution = replace(
+        single_execution,
+        source_path=tmp_path / "multi-execution.yaml",
+        slurm=replace(single_execution.slurm, processes_per_worker=2),
+    )
+    workflow_api._validate_execution_profile(single_execution)
+    workflow_api._validate_execution_profile(multi_execution)
+    single_plan = replace(base, execution=single_execution)
+    multi_plan = replace(base, execution=multi_execution)
+
+    def settle(plan: WorkflowPlan) -> FineGraphController:
+        controller = FineGraphController(plan.tasks)
+        while not controller.terminal:
+            ready = controller.pop_ready(limit=max(1, controller.ready_count))
+            for task in ready:
+                controller.record(task, _fine_task_result(task))
+        return controller
+
+    single_controller = settle(single_plan)
+    multi_controller = settle(multi_plan)
+
+    assert single_plan.scientific_json == multi_plan.scientific_json
+    assert (
+        single_plan.scientific_fingerprint
+        == multi_plan.scientific_fingerprint
+    )
+    assert single_plan.expected_artifacts == multi_plan.expected_artifacts
+    assert single_controller.graph_description == (
+        multi_controller.graph_description
+    )
+    assert single_controller.tasks == multi_controller.tasks
+
+    single_chunk = next(
+        task
+        for task in single_controller.tasks
+        if type(task) is NonlinearChunkTask
+    )
+    multi_chunk = next(
+        task
+        for task in multi_controller.tasks
+        if type(task) is NonlinearChunkTask
+    )
+    assert single_chunk == multi_chunk
+    geometry = crop_geometry(
+        ImageGeometry(
+            shape=(1, 2, 2),
+            origin=(0.0, 0.0, 0.0),
+            spacing=(1.0, 1.0, 1.0),
+            direction=(
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+        ),
+        (
+            single_chunk.chunk.z_start_ext,
+            single_chunk.chunk.z_end_ext,
+            single_chunk.chunk.y_start_ext,
+            single_chunk.chunk.y_end_ext,
+            single_chunk.chunk.x_start_ext,
+            single_chunk.chunk.x_end_ext,
+        ),
+    )
+    single_chunk.round_task.fixed_image.parent.mkdir(parents=True, exist_ok=True)
+    single_chunk.round_task.fixed_image.write_bytes(b"fixed")
+    source_identities = (
+        FileIdentity.from_path(single_chunk.round_task.fixed_image),
+        FileIdentity.from_path(single_chunk.round_task.moving_image),
+    )
+    affine = tmp_path / "accepted-affine.mat"
+    affine.write_bytes(b"affine")
+    parameters = local_chunk_parameters(
+        chunk={
+            field: int(getattr(single_chunk.chunk, field))
+            for field in (
+                "chunk_id",
+                "z_start",
+                "z_end",
+                "y_start",
+                "y_end",
+                "x_start",
+                "x_end",
+                "z_start_ext",
+                "z_end_ext",
+                "y_start_ext",
+                "y_end_ext",
+                "x_start_ext",
+                "x_end_ext",
+            )
+        },
+        chunks=[
+            {
+                field: int(getattr(single_chunk.chunk, field))
+                for field in (
+                    "chunk_id",
+                    "z_start",
+                    "z_end",
+                    "y_start",
+                    "y_end",
+                    "x_start",
+                    "x_end",
+                    "z_start_ext",
+                    "z_end_ext",
+                    "y_start_ext",
+                    "y_end_ext",
+                    "x_start_ext",
+                    "x_end_ext",
+                )
+            }
+        ],
+        chunk_size_zyx=(1, 2, 2),
+        fixed_mask_geometry=geometry,
+        image_shape_zyx=(1, 2, 2),
+        moving_geometry=geometry,
+        moving_mask_geometry=geometry,
+        overlap_fraction=0.0,
+        nonlinear_accuracy=single_chunk.round_task.registration.nonlinear.accuracy,
+        nonlinear_metric=single_chunk.round_task.registration.nonlinear.metric,
+        nonlinear_radius=single_chunk.round_task.registration.nonlinear.radius,
+        scalar_postprocessing_policy=scalar_policy(single_chunk.strategy),
+    )
+    single_request = StageRequest.for_identities(
+        stage="nonlinear-chunk:0",
+        inputs=source_identities,
+        geometry=geometry,
+        method=single_chunk.round_task.registration.nonlinear.type,
+        accuracy=single_chunk.round_task.registration.nonlinear.accuracy,
+        native_threads={name: 15 for name in NATIVE_THREAD_ENV_VARS},
+        upstream=FileIdentity.from_path(affine),
+        parameters=parameters,
+    )
+    multi_request = StageRequest.for_identities(
+        stage="nonlinear-chunk:0",
+        inputs=source_identities,
+        geometry=geometry,
+        method=multi_chunk.round_task.registration.nonlinear.type,
+        accuracy=multi_chunk.round_task.registration.nonlinear.accuracy,
+        native_threads={name: 15 for name in NATIVE_THREAD_ENV_VARS},
+        upstream=FileIdentity.from_path(affine),
+        parameters=parameters,
+    )
+    assert single_request == multi_request
+
+    artifact = single_chunk.output_paths[0]
+    store = ArtifactStore()
+    store.commit(
+        artifact,
+        single_request,
+        lambda path: path.write_bytes(b"accepted-local-warp"),
+        lambda path: path.read_bytes() == b"accepted-local-warp",
+    )
+    assert (
+        store.reuse(artifact, multi_request, Path.read_bytes)
+        == b"accepted-local-warp"
+    )
+    single_record = {
+        "scientific_fingerprint": single_plan.scientific_fingerprint,
+        "execution_profile": workflow_api._execution_profile_mapping(
+            single_execution
+        ),
+    }
+    multi_record = {
+        "scientific_fingerprint": multi_plan.scientific_fingerprint,
+        "execution_profile": workflow_api._execution_profile_mapping(
+            multi_execution
+        ),
+    }
+    assert single_record["scientific_fingerprint"] == (
+        multi_record["scientific_fingerprint"]
+    )
+    assert single_record["execution_profile"] != multi_record["execution_profile"]
 
 
 def test_run_workflow_fails_closed_when_fine_evidence_is_missing(

@@ -172,7 +172,10 @@ Fine-grained SLURM initially requests one candidate job for the reference barrie
 Demand-driven scale-up proceeds in whole jobs, using the number of running plus ready
 tasks to choose no more than the configured job cap. Every expected process in a job must arrive and
 pass preflight as one complete process group before any process in that group receives
-its `round_slot`. Each process still runs one scientific task at a time.
+its `round_slot`. Admission is one scheduler-side transaction: a failure while
+adding any slot restores all resource state from that transaction and commits no
+activation provenance for the group. Each process still runs one scientific task at
+a time.
 
 Processes in one group have a shared SLURM job ID and hostname but distinct worker
 addresses and PIDs. This is expected provenance, not a duplicate identity. A split
@@ -299,6 +302,10 @@ Running two processes per node is not guaranteed to be faster. Memory bandwidth,
 filesystem traffic, task size, and scheduler overhead can dominate. Performance is
 characterization for a specific dataset and cluster; the focused acceptance report
 records timing and memory without imposing a universal speedup threshold.
+That report derives realized job/process peaks from raw scale events, strictly
+decodes full round/channel scientific comparisons, correlates the loss marker with
+the exact task and departure, proves replacement recovery plus healthy-sibling
+liveness, and confines every lineage identity to operation-owned jobs.
 
 On operator cancellation the coordinator stops new admission, cancels unfinished
 futures, records cancellation evidence, closes the client, and then closes its owned

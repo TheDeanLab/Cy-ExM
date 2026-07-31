@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sys
@@ -11,7 +10,7 @@ from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -469,6 +468,18 @@ class _FakeCluster:
 class _FakeScheduler:
     def __init__(self, modules: _FakeSlurmModules) -> None:
         self._modules = modules
+        self.resources: dict[str, dict[str, int]] = {}
+        self.workers: dict[str, SimpleNamespace] = {}
+
+    @property
+    def address(self) -> str:
+        if (
+            self._modules.scheduler_flip_after_resource_calls is not None
+            and len(self._modules.scheduler_resource_calls)
+            >= self._modules.scheduler_flip_after_resource_calls
+        ):
+            return "tcp://impostor-scheduler:8786"
+        return self._modules.scheduler_address
 
     def add_resources(
         self,
@@ -476,8 +487,27 @@ class _FakeScheduler:
         *,
         resources: dict[str, int],
     ) -> None:
+        self._modules.events.append(f"activate:{worker_address}")
+        activation_count = sum(
+            event.startswith("activate:") for event in self._modules.events
+        )
+        if self._modules.hang_activation_call == activation_count:
+            time.sleep(self._modules.hang_seconds)
+        if self._modules.activation_error is not None and (
+            self._modules.activation_error_call is None
+            or activation_count == self._modules.activation_error_call
+        ):
+            raise self._modules.activation_error
+        worker = self.workers.setdefault(
+            worker_address,
+            SimpleNamespace(resources={}, used_resources={}),
+        )
+        worker.resources.update(resources)
+        worker.used_resources = {name: 0 for name in worker.resources}
+        for name, amount in worker.resources.items():
+            self.resources.setdefault(name, {})[worker_address] = amount
         self._modules.scheduler_resource_calls.append((worker_address, resources))
-        self._modules.scheduler_resources[worker_address] = dict(resources)
+        self._modules.scheduler_resources[worker_address] = worker.resources
 
 
 class _FakeClient:
@@ -515,6 +545,15 @@ class _FakeClient:
             and addresses
         ):
             addresses = addresses[:-1]
+        for address in addresses:
+            resources = self._modules.scheduler_resources.setdefault(address, {})
+            state = self._modules.fake_scheduler.workers.setdefault(
+                address,
+                SimpleNamespace(resources=resources, used_resources={}),
+            )
+            if state.resources is not resources:
+                state.resources = resources
+                state.used_resources = {name: 0 for name in resources}
         return {
             "address": (
                 "tcp://impostor-scheduler:8786"
@@ -556,6 +595,24 @@ class _FakeClient:
                 else self._modules.connected_workers
             )
         )
+        if function.__name__ in {
+            "_stage_round_slot",
+            "_rollback_round_slot_stage",
+        }:
+            return {
+                address: function(
+                    dask_worker=self._modules.fake_workers.setdefault(
+                        address,
+                        SimpleNamespace(
+                            state=SimpleNamespace(
+                                total_resources={},
+                                available_resources={},
+                            )
+                        ),
+                    )
+                )
+                for address in addresses
+            }
         if function.__name__ == "_activate_round_slot":
             for address in addresses:
                 self._modules.events.append(f"activate:{address}")
@@ -599,28 +656,45 @@ class _FakeClient:
         self,
         function: Callable[..., object],
         *,
-        worker_address: str,
+        worker_addresses: tuple[str, ...],
+        expected_scheduler: str | None = None,
+        candidates: tuple[str, ...] = (),
+        validated: tuple[str, ...] = (),
     ) -> object:
-        self._modules.events.append(f"activate:{worker_address}")
-        activation_count = sum(
-            event.startswith("activate:") for event in self._modules.events
-        )
-        if self._modules.hang_activation_call == activation_count:
-            time.sleep(self._modules.hang_seconds)
-        if self._modules.activation_error is not None and (
-            self._modules.activation_error_call is None
-            or activation_count == self._modules.activation_error_call
-        ):
-            raise self._modules.activation_error
-        result = function(
-            worker_address=worker_address,
-            dask_scheduler=self._modules.fake_scheduler,
-        )
+        connected = self._modules.connected_workers
+        if self._modules.dynamic_workers:
+            connected = connected[
+                : self._modules.requested_jobs * self._modules.processes_per_job
+            ]
+        self._modules.fake_scheduler.workers = {
+            address: state
+            for address, state in self._modules.fake_scheduler.workers.items()
+            if address in connected
+        }
+        for address in worker_addresses:
+            self._modules.fake_scheduler.workers.setdefault(
+                address,
+                SimpleNamespace(resources={}, used_resources={}),
+            )
+        arguments: dict[str, object] = {
+            "worker_addresses": worker_addresses,
+            "dask_scheduler": self._modules.fake_scheduler,
+        }
+        if function.__name__ == "_activate_round_slot_group":
+            arguments.update(
+                {
+                    "expected_scheduler": expected_scheduler,
+                    "candidates": candidates,
+                    "validated": validated,
+                }
+            )
+        result = function(**arguments)
         if (
             self._modules.hang_post_activation_call is not None
-            and activation_count == self._modules.hang_post_activation_call
+            and sum(event.startswith("activate:") for event in self._modules.events)
+            == self._modules.hang_post_activation_call
         ):
-            self._modules.hang_next_scheduler_info_seconds = self._modules.hang_seconds
+            time.sleep(self._modules.hang_seconds)
         return result
 
     def submit(
@@ -738,6 +812,7 @@ class _FakeSlurmModules:
         self.processes_per_job = 1
         self.scheduler_resources: dict[str, dict[str, int]] = {}
         self.scheduler_resource_calls: list[tuple[str, dict[str, int]]] = []
+        self.fake_workers: dict[str, SimpleNamespace] = {}
         self.activation_error: BaseException | None = None
         self.activation_error_call: int | None = None
         self.fake_scheduler = _FakeScheduler(self)
@@ -1246,19 +1321,71 @@ def test_fine_slurm_starts_candidates_without_slots_then_activates_after_preflig
     assert tuple(result.round for result in results) == (1, 2)
 
 
-def test_fine_worker_activation_updates_worker_and_scheduler_resource_state() -> None:
-    class Worker:
-        def __init__(self) -> None:
-            self.resources: dict[str, int] = {}
+def test_fine_worker_group_activation_rolls_back_every_slot_on_failure() -> None:
+    modules = _FakeSlurmModules()
+    first, second = _two_process_job_addresses(1)
+    modules.connected_workers = (first, second)
+    modules.fake_scheduler.workers = {
+        address: SimpleNamespace(resources={}, used_resources={})
+        for address in (first, second)
+    }
+    modules.activation_error = RuntimeError("second process activation failed")
+    modules.activation_error_call = 2
 
-        async def set_resources(self, **resources: int) -> None:
-            self.resources = resources
+    with pytest.raises(RuntimeError, match="second process activation failed"):
+        slurm_module._activate_round_slot_group(
+            worker_addresses=(first, second),
+            expected_scheduler=modules.scheduler_address,
+            candidates=(),
+            validated=(first, second),
+            dask_scheduler=modules.fake_scheduler,
+        )
 
-    worker = Worker()
+    assert all(
+        resources.get("round_slot", 0) == 0
+        for resources in modules.scheduler_resources.values()
+    )
+    assert modules.fake_scheduler.resources.get("round_slot", {}) == {}
 
-    asyncio.run(slurm_module._activate_round_slot(dask_worker=worker))
 
-    assert worker.resources == {"round_slot": 1}
+def test_fine_slurm_initial_group_activation_failure_never_admits_work(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.connected_workers = _two_process_job_addresses(1)
+    modules.activation_error = RuntimeError("second initial process failed")
+    modules.activation_error_call = 2
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=1,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+    reference = _reference_task(tmp_path)
+    task = _task(tmp_path, 2)
+
+    with pytest.raises(ExecutorStartupError, match="second initial process failed"):
+        executor.execute(reference, (task,))
+
+    assert modules.submit_calls == []
+    assert all(
+        resources.get("round_slot", 0) == 0
+        for resources in modules.scheduler_resources.values()
+    )
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    event = cast(list[dict[str, object]], fine["scale_events"])[0]
+    assert event["activated"] == []
+    assert fine["validated_workers"] == []
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(reference, task),
+        task_retries=0,
+    )
 
 
 def test_fine_slurm_scales_up_from_ready_width_without_scaling_down(
@@ -1317,6 +1444,11 @@ def test_fine_slurm_activates_complete_initial_process_group_before_reference(
     assert initial_event["requested_jobs"] == 1
     assert initial_event["expected_processes"] == 2
     assert initial_event["activated"] == list(first_group)
+    assert all(
+        modules.fake_workers[address].state.total_resources == {"round_slot": 1}
+        and modules.fake_workers[address].state.available_resources == {"round_slot": 1}
+        for address in first_group
+    )
     reference_submission = modules.events.index("submit:1")
     assert all(
         modules.events.index(f"activate:{address}") < reference_submission
@@ -1701,20 +1833,18 @@ def test_fine_slurm_second_replacement_process_activation_failure_cleans_up(
         blas_threads=15,
     )
 
-    with pytest.raises(RuntimeError, match="second process activation failed"):
+    with pytest.raises(WorkerPreflightError, match="second process activation failed"):
         executor.execute(
             _reference_task(tmp_path),
             (_task(tmp_path, 2),),
         )
 
-    assert modules.scheduler_resource_calls == [
-        (initial[0], {"round_slot": 1}),
-        (initial[1], {"round_slot": 1}),
-        (replacement[0], {"round_slot": 1}),
-    ]
+    assert modules.scheduler_resources[initial[0]] == {"round_slot": 1}
+    assert modules.scheduler_resources[initial[1]] == {"round_slot": 1}
+    assert modules.scheduler_resources[replacement[0]] == {}
     fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
     event = cast(list[dict[str, object]], fine["scale_events"])[1]
-    assert event["activated"] == [replacement[0]]
+    assert event["activated"] == []
     assert cast(list[object], event["failed"])
     assert modules.events[-2:] == ["client.close", "cluster.close"]
     slurm_module._canonical_execution_evidence(
@@ -1848,9 +1978,9 @@ def test_fine_slurm_accepts_ready_success_from_just_departed_worker(
     first = placements[0]
     assert first["worker_address"] == "tcp://node-a:1234"
     assert first["placement_accepted"] is True
-    assert (
-        first["coordinator_ready_at"]
-        <= cast(list[dict[str, object]], fine["scale_events"])[1]["started_at"]
+    assert cast(str, first["coordinator_ready_at"]) <= cast(
+        str,
+        cast(list[dict[str, object]], fine["scale_events"])[1]["started_at"],
     )
 
 
@@ -1973,6 +2103,7 @@ def test_fine_slurm_detects_same_address_replacement_identity(
         if not switched and len(modules.submit_calls) >= 3:
             modules.probe_results = {address: replacement}
             modules.scheduler_resources[address] = {}
+            modules.fake_workers.pop(address, None)
             switched = True
 
     modules.scheduler_info_hook = replace_identity_after_first_stage
@@ -2181,8 +2312,8 @@ def test_fine_slurm_connected_replacement_gate_has_one_bounded_deadline(
     assert failure["type"] == "WorkerPreflightError"
     expected_stage = {
         "probe": "replacement worker probe broadcast",
-        "activation": "replacement activation tcp://node-b:1234",
-        "post_snapshot": "post-activation scheduler snapshot",
+        "activation": "replacement group activation ('tcp://node-b:1234',)",
+        "post_snapshot": "replacement group activation ('tcp://node-b:1234',)",
     }[hung_stage]
     assert expected_stage in failure["message"]
     slurm_module._canonical_execution_evidence(
@@ -2215,7 +2346,7 @@ def test_fine_slurm_replacement_stages_share_one_deadline(
 
     with pytest.raises(
         WorkerPreflightError,
-        match="replacement activation tcp://node-b:1234",
+        match="replacement group activation",
     ):
         executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
 
@@ -2328,7 +2459,7 @@ def test_fine_slurm_periodic_snapshot_timeout_is_exact_and_canonical(
     )
 
 
-def test_fine_slurm_partial_multiworker_replacement_activation_is_canonical(
+def test_fine_slurm_failed_multiworker_replacement_activation_is_atomic(
     tmp_path: Path,
 ) -> None:
     modules = _FakeSlurmModules()
@@ -2349,13 +2480,13 @@ def test_fine_slurm_partial_multiworker_replacement_activation_is_canonical(
     reference = _reference_task(tmp_path)
     tasks = (_task(tmp_path, 2), _task(tmp_path, 3))
 
-    with pytest.raises(RuntimeError, match="second replacement activation"):
+    with pytest.raises(WorkerPreflightError, match="second replacement activation"):
         executor.execute(reference, tasks)
 
     fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
     event = cast(list[dict[str, object]], fine["scale_events"])[-1]
-    assert event["activated"] == [replacement_workers[0]]
-    assert fine["validated_workers"] == [replacement_workers[0]]
+    assert event["activated"] == []
+    assert fine["validated_workers"] == []
     slurm_module._canonical_execution_evidence(
         executor.execution_evidence,
         expected_tasks=(reference, *tasks),
@@ -4422,14 +4553,16 @@ def test_fine_slurm_cancellation_binds_settled_sibling_to_live_granular_results(
 
     assert tuple(result.round for result in executor.fine_round_results) == (2,)
     assert {result.round for result in executor.fine_task_results} == {2, 3}
+    fine_reference_result = executor.fine_reference_result
+    assert fine_reference_result is not None
     encoded = slurm_module._canonical_execution_evidence(
         executor.execution_evidence,
         expected_tasks=(reference, *tasks),
         task_retries=0,
         expected_results=(
-            executor.fine_reference_result,
+            fine_reference_result,
             *executor.fine_round_results,
-        ),  # type: ignore[arg-type]
+        ),
         fine_task_results=executor.fine_task_results,
         expected_interruption=(
             type(caught.value).__name__,

@@ -173,3 +173,9 @@
   checksum-bound raw profile, execution, placement, timing/RSS, worker-loss,
   outcome, and empty-queue evidence. Record speedup without a threshold. Never claim
   focused real-HPC acceptance from portable evidence.
+- Derive focused capacity from raw scale/activation history and require the approved
+  three-job/six-process realization. Strictly decode the complete scientific
+  comparison; bind the loss marker's exact task and timestamp to departure,
+  replacement recovery artifacts, and post-loss healthy-sibling placement; require
+  every activated, placed, and replacement job ID to belong to the corresponding
+  operation-owned cleanup outcome. Reject symlinked or out-of-root evidence.

@@ -750,7 +750,10 @@ Preflight checks exact Cy-ExM/dependency versions, hostname and SLURM job identi
 dataset/output visibility, scratch creation and cleanup, all six native-thread
 values, memory evidence, and scheduler/worker network identity. A timeout or mismatch
 closes owned resources and fails as executor startup rather than falling back.
-An incomplete or split process group is never partially admitted.
+An incomplete or split process group is never partially admitted. Group admission
+is one scheduler-side transaction. If adding any process slot fails, Cy-ExM restores
+every resource record in that transaction and records no process in the group as
+activated, so queued or rescheduled work cannot enter a half-admitted group.
 
 The worker job prologue exports all resolved native-thread values before the worker
 command. The coordinator runs in the process that invokes the CLI; a batch-launched
@@ -776,6 +779,13 @@ positive `AllocMem` must cover the normalized request, while malformed or negati
 values fail validation.
 The harness fails closed if neither an authoritative job memory request nor a node
 memory-allocation fact is available.
+
+The focused multi-process acceptance gate also derives realized peak jobs and
+processes from raw scale and activation events. It strictly decodes the complete
+round/channel scientific comparison, binds worker loss to the exact task and
+departure interval, proves recovery artifacts and healthy-sibling liveness, and
+cross-checks every lineage job against the operation-owned cleanup records. Summary
+booleans alone are not acceptance evidence.
 
 Each fine SLURM workflow-run record uses operational evidence schema version 3. It
 records requested jobs, processes per job, total process slots, per-process cores and

@@ -43,6 +43,10 @@
   executing work while a newcomer group is validated. Construction, worker probes,
   and job-script templates are portable evidence only, not proof that a scheduler
   accepted or ran a job.
+- Perform fine group activation as one scheduler-side transaction with full resource
+  rollback on any member failure. Commit `validated_workers`, activated probes, and
+  scale-event activation only after the complete transaction and post-activation
+  scheduler snapshot succeed; failed groups must expose no partial `round_slot`.
 - Default retries are zero. Any configured retry is an executor-managed resubmission
   through ordinary artifact validation. A post-preflight round failure does not
   cancel independent round tasks; settle them before reporting aggregate failure.

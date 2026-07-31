@@ -17,6 +17,7 @@ from cyexm.config.models import (
     RegistrationStageSpec,
 )
 from cyexm.execution.dask import LocalDaskExecutor
+from cyexm.execution.slurm import _activate_preflighted_group
 from cyexm.workflow.models import (
     ChannelTask,
     ReferenceChannelTask,
@@ -34,6 +35,18 @@ from .local_dask_helpers import (
 pytestmark = pytest.mark.integration
 
 type _Runner = Callable[[ReferenceTask | RoundTask], RoundResult]
+
+
+def _local_round_slot_state(*, dask_worker: object) -> dict[str, float]:
+    state = dask_worker.state  # type: ignore[attr-defined]
+    return {
+        "total": state.total_resources["round_slot"],
+        "available": state.available_resources["round_slot"],
+    }
+
+
+def _resource_task() -> str:
+    return "resource-task-completed"
 
 
 def _profile(
@@ -188,6 +201,48 @@ def _overlap(first: dict[str, object], second: dict[str, object]) -> bool:
     return int(first["start_monotonic_ns"]) < int(second["end_monotonic_ns"]) and int(
         second["start_monotonic_ns"]
     ) < int(first["end_monotonic_ns"])
+
+
+def test_slurm_group_admission_updates_real_worker_and_scheduler_state() -> None:
+    from distributed import Client, LocalCluster
+
+    with (
+        LocalCluster(
+            n_workers=2,
+            threads_per_worker=1,
+            processes=False,
+            dashboard_address=None,
+        ) as cluster,
+        Client(cluster) as client,
+    ):
+        info = client.scheduler_info()
+        addresses = tuple(sorted(info["workers"]))
+        scheduler_address = str(info["address"])
+
+        _activate_preflighted_group(
+            client,
+            addresses,
+            expected_scheduler=scheduler_address,
+            candidates=(),
+            validated=addresses,
+        )
+
+        assert client.run(
+            _local_round_slot_state,
+            workers=list(addresses),
+        ) == {address: {"total": 1, "available": 1} for address in addresses}
+        scheduler_workers = client.scheduler_info()["workers"]
+        assert all(
+            scheduler_workers[address]["resources"] == {"round_slot": 1}
+            for address in addresses
+        )
+        assert (
+            client.submit(
+                _resource_task,
+                resources={"round_slot": 1},
+            ).result()
+            == "resource-task-completed"
+        )
 
 
 def test_local_cluster_enforces_one_round_slot_and_preserves_result_order(

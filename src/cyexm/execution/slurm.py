@@ -1571,9 +1571,199 @@ def validate_slurm_job_script(script: str, profile: ExecutionProfile) -> int:
     return worker_memory_bytes
 
 
-async def _activate_round_slot(*, dask_worker: Any) -> None:
-    """Make one preflighted worker eligible in both worker and scheduler state."""
-    await dask_worker.set_resources(**ROUND_RESOURCE)
+def _activate_round_slot_group(
+    *,
+    worker_addresses: tuple[str, ...],
+    expected_scheduler: str,
+    candidates: tuple[str, ...],
+    validated: tuple[str, ...],
+    dask_scheduler: Any,
+) -> tuple[str, ...]:
+    """Atomically make one or more preflighted workers scheduler-eligible."""
+    if (
+        not worker_addresses
+        or len(worker_addresses) != len(set(worker_addresses))
+        or any(type(address) is not str or not address for address in worker_addresses)
+    ):
+        raise WorkerPreflightError(
+            "round-slot activation requires distinct nonempty worker addresses"
+        )
+    try:
+        workers = dask_scheduler.workers
+        scheduler_resources = dask_scheduler.resources
+    except AttributeError as error:
+        raise WorkerPreflightError(
+            "Dask scheduler does not expose worker resource state"
+        ) from error
+    missing = tuple(address for address in worker_addresses if address not in workers)
+    if missing:
+        raise WorkerPreflightError(
+            f"round-slot activation workers disappeared: {missing!r}"
+        )
+    worker_snapshots = {
+        address: (
+            dict(workers[address].resources),
+            dict(workers[address].used_resources),
+        )
+        for address in worker_addresses
+    }
+    scheduler_snapshot = {
+        name: dict(by_worker) for name, by_worker in scheduler_resources.items()
+    }
+    try:
+        for address in worker_addresses:
+            observed = workers[address].resources.get("round_slot", 0)
+            if observed != 0:
+                raise WorkerPreflightError(
+                    f"candidate worker {address!r} already exposes "
+                    f"round_slot={observed!r}"
+                )
+        for address in worker_addresses:
+            dask_scheduler.add_resources(address, resources=dict(ROUND_RESOURCE))
+        if dask_scheduler.address != expected_scheduler:
+            raise WorkerPreflightError(
+                "SLURM scheduler identity changed during atomic group activation"
+            )
+        expected_workers = set(candidates) | set(validated)
+        if set(workers) != expected_workers:
+            raise WorkerPreflightError(
+                "SLURM worker set changed during atomic group activation: "
+                f"expected={sorted(expected_workers)!r}, "
+                f"observed={sorted(workers)!r}"
+            )
+        for address, expected_slot in (
+            *((address, 0) for address in candidates),
+            *((address, 1) for address in validated),
+        ):
+            observed = workers[address].resources.get("round_slot", 0)
+            if observed != expected_slot:
+                raise WorkerPreflightError(
+                    f"Worker {address!r} must expose round_slot={expected_slot}; "
+                    f"got {observed!r}"
+                )
+    except BaseException:
+        for address, (resources, used_resources) in worker_snapshots.items():
+            worker = workers[address]
+            worker.resources.clear()
+            worker.resources.update(resources)
+            worker.used_resources.clear()
+            worker.used_resources.update(used_resources)
+        scheduler_resources.clear()
+        scheduler_resources.update(scheduler_snapshot)
+        raise
+    return worker_addresses
+
+
+def _deactivate_round_slot_group(
+    *,
+    worker_addresses: tuple[str, ...],
+    dask_scheduler: Any,
+) -> tuple[str, ...]:
+    """Remove scheduler visibility for a group whose admission did not commit."""
+    workers = dask_scheduler.workers
+    scheduler_resources = dask_scheduler.resources
+    for address in worker_addresses:
+        worker = workers.get(address)
+        if worker is None:
+            continue
+        worker.resources.pop("round_slot", None)
+        worker.used_resources.pop("round_slot", None)
+    round_slots = scheduler_resources.get("round_slot")
+    if round_slots is not None:
+        for address in worker_addresses:
+            round_slots.pop(address, None)
+        if not round_slots:
+            scheduler_resources.pop("round_slot", None)
+    return worker_addresses
+
+
+def _stage_round_slot(*, dask_worker: Any) -> dict[str, int]:
+    """Stage one local worker slot without publishing scheduler eligibility."""
+    state = dask_worker.state
+    if (
+        "round_slot" in state.total_resources
+        or "round_slot" in state.available_resources
+    ):
+        raise WorkerPreflightError(
+            "candidate worker already has local round_slot resource state"
+        )
+    state.total_resources["round_slot"] = 1
+    state.available_resources["round_slot"] = 1
+    return {"total": 1, "available": 1}
+
+
+def _rollback_round_slot_stage(*, dask_worker: Any) -> dict[str, int]:
+    """Remove an uncommitted local worker slot after failed group admission."""
+    state = dask_worker.state
+    state.total_resources.pop("round_slot", None)
+    state.available_resources.pop("round_slot", None)
+    return {"total": 0, "available": 0}
+
+
+def _activate_preflighted_group(
+    client: Any,
+    addresses: tuple[str, ...],
+    *,
+    expected_scheduler: str,
+    candidates: tuple[str, ...],
+    validated: tuple[str, ...],
+) -> None:
+    """Stage locally, publish atomically, verify, or roll back one whole group."""
+    stage_attempted = False
+    scheduler_attempted = False
+    try:
+        stage_attempted = True
+        staged = client.run(_stage_round_slot, workers=list(addresses))
+        expected_stage = {
+            address: {"total": 1, "available": 1} for address in addresses
+        }
+        if staged != expected_stage:
+            raise WorkerPreflightError(
+                "Dask workers returned invalid local round-slot staging receipts: "
+                f"expected={expected_stage!r}, observed={staged!r}"
+            )
+        scheduler_attempted = True
+        activated = client.run_on_scheduler(
+            _activate_round_slot_group,
+            worker_addresses=addresses,
+            expected_scheduler=expected_scheduler,
+            candidates=candidates,
+            validated=validated,
+        )
+        if activated != addresses:
+            raise WorkerPreflightError(
+                "Dask scheduler returned an invalid round-slot activation receipt: "
+                f"expected={addresses!r}, observed={activated!r}"
+            )
+    except Exception as error:
+        rollback_errors: list[str] = []
+        if scheduler_attempted:
+            try:
+                client.run_on_scheduler(
+                    _deactivate_round_slot_group,
+                    worker_addresses=addresses,
+                )
+            except Exception as rollback_error:
+                rollback_errors.append(
+                    "scheduler rollback failed: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+        if stage_attempted:
+            try:
+                client.run(
+                    _rollback_round_slot_stage,
+                    workers=list(addresses),
+                )
+            except Exception as rollback_error:
+                rollback_errors.append(
+                    "worker rollback failed: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+        suffix = "" if not rollback_errors else "; " + "; ".join(rollback_errors)
+        raise WorkerPreflightError(
+            "Could not atomically activate preflighted SLURM worker group "
+            f"{addresses!r}: {type(error).__name__}: {error}{suffix}"
+        ) from error
 
 
 def _scheduler_snapshot(
@@ -2221,20 +2411,20 @@ class SlurmExecutor:
                 if fine_mode:
                     assert initial_scale_event is not None
                     assert fine_state is not None
-                    validated_probes.update(batch)
+                    _activate_preflighted_group(
+                        opened_client,
+                        connected,
+                        expected_scheduler=scheduler_address,
+                        candidates=(),
+                        validated=connected,
+                    )
                     for address in connected:
-                        opened_client.run(_activate_round_slot, workers=[address])
                         initial_scale_event.activated.append(address)
                         initial_scale_event.activated_probes.append(batch[address])
                         activated_probe_history.append(batch[address])
                         validated_workers.add(address)
                         fine_state.validated.add(address)
-                    _validate_scheduler_resources(
-                        opened_client,
-                        expected_scheduler=scheduler_address,
-                        candidates=(),
-                        validated=tuple(sorted(validated_workers)),
-                    )
+                    validated_probes.update(batch)
                     assert fine_state is not None
                 startup["phase"] = "worker_stability_check"
                 scheduler_after, connected_after = _scheduler_snapshot(
@@ -2381,23 +2571,23 @@ class SlurmExecutor:
                             resources=resources,
                             prior_probes=validated_probes,
                         )
-                        validated_probes.update(new_batch)
+                        prospective_validated = tuple(
+                            sorted((*validated_workers, *newcomers))
+                        )
+                        _activate_preflighted_group(
+                            execution_client,
+                            newcomers,
+                            expected_scheduler=scheduler_address,
+                            candidates=(),
+                            validated=prospective_validated,
+                        )
                         for address in newcomers:
-                            execution_client.run(
-                                _activate_round_slot,
-                                workers=[address],
-                            )
                             event.activated.append(address)
                             event.activated_probes.append(new_batch[address])
                             activated_probe_history.append(new_batch[address])
                             validated_workers.add(address)
                             fine_state.validated.add(address)
-                        _validate_scheduler_resources(
-                            execution_client,
-                            expected_scheduler=scheduler_address,
-                            candidates=(),
-                            validated=tuple(sorted(validated_workers)),
-                        )
+                        validated_probes.update(new_batch)
                     except BaseException as error:
                         event.fail(error, utc_now())
                         raise
@@ -2697,45 +2887,35 @@ class SlurmExecutor:
                                 resources.process_memory_bytes
                             ),
                         )
-                        newcomer_set = set(newcomers)
-                        for group in replacement_groups:
-                            group_newcomers = tuple(
-                                address
-                                for address in group.addresses
-                                if address in newcomer_set
+                        grouped_newcomers = tuple(
+                            address
+                            for group in replacement_groups
+                            for address in group.addresses
+                            if address in set(newcomers)
+                        )
+                        if set(grouped_newcomers) != set(newcomers):
+                            raise WorkerPreflightError(
+                                "replacement identities do not belong to complete "
+                                "validated process groups"
                             )
-                            for address in group_newcomers:
-                                before_deadline(
-                                    f"replacement activation {address}",
-                                    lambda address=address: execution_client.run(
-                                        _activate_round_slot,
-                                        workers=[address],
-                                    ),
-                                )
-                                event.activated.append(address)
-                                event.activated_probes.append(
-                                    replacement_batch[address]
-                                )
-                                activated_probe_history.append(
-                                    replacement_batch[address]
-                                )
-                            validated_workers.update(group_newcomers)
-                            validated_probes.update(
-                                {
-                                    address: replacement_batch[address]
-                                    for address in group_newcomers
-                                }
-                            )
-                            fine_state.validated.update(group_newcomers)
+                        prospective_validated = tuple(sorted((*unchanged, *newcomers)))
                         before_deadline(
-                            "post-activation scheduler snapshot",
-                            lambda: _validate_scheduler_resources(
+                            f"replacement group activation {newcomers!r}",
+                            lambda: _activate_preflighted_group(
                                 execution_client,
                                 expected_scheduler=scheduler_address,
+                                addresses=newcomers,
                                 candidates=(),
-                                validated=tuple(sorted(validated_workers)),
+                                validated=prospective_validated,
                             ),
                         )
+                        for address in newcomers:
+                            event.activated.append(address)
+                            event.activated_probes.append(replacement_batch[address])
+                            activated_probe_history.append(replacement_batch[address])
+                        validated_workers.update(newcomers)
+                        validated_probes.update(replacement_batch)
+                        fine_state.validated.update(newcomers)
                     except BaseException as error:
                         if not isinstance(error, KeyboardInterrupt):
                             record_health_failure(error)

@@ -1007,7 +1007,7 @@ def _validated_scientific_comparison_evidence(
             if (
                 not isinstance(channel["source"], str)
                 or not channel["source"]
-                or channel["interpolation"] not in {"linear", "nearest"}
+                or channel["interpolation"] not in {"linear", "nearestNeighbor"}
             ):
                 raise HpcWorkflowAcceptanceError(
                     f"scientific comparison {location} channel contract changed"

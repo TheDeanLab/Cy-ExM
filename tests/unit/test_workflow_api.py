@@ -1437,13 +1437,8 @@ def test_slurm_process_count_is_operational_not_scientific_identity(
     multi_plan = replace(base, execution=multi_execution)
 
     assert single_plan.scientific_json == multi_plan.scientific_json
-    assert (
-        single_plan.scientific_fingerprint
-        == multi_plan.scientific_fingerprint
-    )
-    slurm_mapping = workflow_api._execution_profile_mapping(multi_execution)[
-        "slurm"
-    ]
+    assert single_plan.scientific_fingerprint == multi_plan.scientific_fingerprint
+    slurm_mapping = workflow_api._execution_profile_mapping(multi_execution)["slurm"]
     assert isinstance(slurm_mapping, dict)
     assert "derived" not in slurm_mapping
     assert slurm_mapping["processes_per_worker"] == 2
@@ -1485,25 +1480,16 @@ def test_slurm_process_count_preserves_fine_graph_and_chunk_cache_identity(
     multi_controller = settle(multi_plan)
 
     assert single_plan.scientific_json == multi_plan.scientific_json
-    assert (
-        single_plan.scientific_fingerprint
-        == multi_plan.scientific_fingerprint
-    )
+    assert single_plan.scientific_fingerprint == multi_plan.scientific_fingerprint
     assert single_plan.expected_artifacts == multi_plan.expected_artifacts
-    assert single_controller.graph_description == (
-        multi_controller.graph_description
-    )
+    assert single_controller.graph_description == (multi_controller.graph_description)
     assert single_controller.tasks == multi_controller.tasks
 
     single_chunk = next(
-        task
-        for task in single_controller.tasks
-        if type(task) is NonlinearChunkTask
+        task for task in single_controller.tasks if type(task) is NonlinearChunkTask
     )
     multi_chunk = next(
-        task
-        for task in multi_controller.tasks
-        if type(task) is NonlinearChunkTask
+        task for task in multi_controller.tasks if type(task) is NonlinearChunkTask
     )
     assert single_chunk == multi_chunk
     geometry = crop_geometry(
@@ -1615,23 +1601,19 @@ def test_slurm_process_count_preserves_fine_graph_and_chunk_cache_identity(
         lambda path: path.read_bytes() == b"accepted-local-warp",
     )
     assert (
-        store.reuse(artifact, multi_request, Path.read_bytes)
-        == b"accepted-local-warp"
+        store.reuse(artifact, multi_request, Path.read_bytes) == b"accepted-local-warp"
     )
     single_record = {
         "scientific_fingerprint": single_plan.scientific_fingerprint,
-        "execution_profile": workflow_api._execution_profile_mapping(
-            single_execution
-        ),
+        "execution_profile": workflow_api._execution_profile_mapping(single_execution),
     }
     multi_record = {
         "scientific_fingerprint": multi_plan.scientific_fingerprint,
-        "execution_profile": workflow_api._execution_profile_mapping(
-            multi_execution
-        ),
+        "execution_profile": workflow_api._execution_profile_mapping(multi_execution),
     }
-    assert single_record["scientific_fingerprint"] == (
-        multi_record["scientific_fingerprint"]
+    assert (
+        single_record["scientific_fingerprint"]
+        == (multi_record["scientific_fingerprint"])
     )
     assert single_record["execution_profile"] != multi_record["execution_profile"]
 

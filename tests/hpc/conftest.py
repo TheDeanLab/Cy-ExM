@@ -268,8 +268,7 @@ def multi_process_hpc_profiles(
         )
     if not isinstance(raw_multi, str) or not raw_multi.strip():
         raise pytest.UsageError(
-            "multi-process HPC acceptance requires "
-            "--cyexm-multi-process-execution PATH"
+            "multi-process HPC acceptance requires --cyexm-multi-process-execution PATH"
         )
     try:
         single_path = Path(raw_single).resolve(strict=True)

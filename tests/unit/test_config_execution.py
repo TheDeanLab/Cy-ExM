@@ -560,9 +560,7 @@ def test_slurm_process_count_requires_positive_builtin_integer(
 
     with pytest.raises(
         ConfigurationValidationError,
-        match=(
-            r"slurm\.processes_per_worker must be a built-in integer >= 1"
-        ),
+        match=(r"slurm\.processes_per_worker must be a built-in integer >= 1"),
     ):
         _load_profile(tmp_path, data)
 

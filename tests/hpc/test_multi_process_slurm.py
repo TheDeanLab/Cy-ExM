@@ -132,13 +132,16 @@ def test_multi_process_slurm_acceptance(
     single_plan = build_workflow_plan(manifest, single_profile)
     multi_plan = build_workflow_plan(manifest, multi_profile)
     replacement_plan = build_workflow_plan(manifest, replacement_profile)
-    if len(
-        {
-            single_plan.scientific_fingerprint,
-            multi_plan.scientific_fingerprint,
-            replacement_plan.scientific_fingerprint,
-        }
-    ) != 1:
+    if (
+        len(
+            {
+                single_plan.scientific_fingerprint,
+                multi_plan.scientific_fingerprint,
+                replacement_plan.scientific_fingerprint,
+            }
+        )
+        != 1
+    ):
         raise HpcMultiProcessAcceptanceError(
             "focused process-count plans changed scientific identity"
         )

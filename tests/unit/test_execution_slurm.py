@@ -507,8 +507,7 @@ class _FakeClient:
         addresses = self._modules.connected_workers
         if self._modules.dynamic_workers:
             addresses = addresses[
-                : self._modules.requested_jobs
-                * self._modules.processes_per_job
+                : self._modules.requested_jobs * self._modules.processes_per_job
             ]
         if (
             self._modules.disappear_after_probe
@@ -551,8 +550,7 @@ class _FakeClient:
             if selected is not None
             else (
                 self._modules.connected_workers[
-                    : self._modules.requested_jobs
-                    * self._modules.processes_per_job
+                    : self._modules.requested_jobs * self._modules.processes_per_job
                 ]
                 if self._modules.dynamic_workers
                 else self._modules.connected_workers
@@ -587,9 +585,7 @@ class _FakeClient:
                 if address in self._modules.probe_results
             }
         process_memory = (
-            (500_363_689_984 // 1024**3)
-            // self._modules.processes_per_job
-            * 1024**3
+            (500_363_689_984 // 1024**3) // self._modules.processes_per_job * 1024**3
         )
         return {
             address: _probe(
@@ -824,9 +820,7 @@ class _FakeSlurmModules:
             if worker_extra_args
             else ""
         )
-        worker_count_fragment = (
-            f"--nworkers {processes} " if processes > 1 else ""
-        )
+        worker_count_fragment = f"--nworkers {processes} " if processes > 1 else ""
         self.job_script_text = (
             f"{kwargs.get('shebang', '#!/bin/bash')}\n"
             f"#SBATCH -J {kwargs['job_name']}\n"
@@ -1329,8 +1323,7 @@ def test_fine_slurm_activates_complete_initial_process_group_before_reference(
         for address in first_group
     )
     assert not any(
-        event.startswith("submit:2")
-        for event in modules.events[:reference_submission]
+        event.startswith("submit:2") for event in modules.events[:reference_submission]
     )
 
 
@@ -1357,8 +1350,7 @@ def test_fine_slurm_scales_five_tasks_to_three_jobs_and_six_processes(
     assert modules.scale_calls == [{"jobs": 1}, {"jobs": 3}]
     assert modules.wait_for_workers_calls == [(2, 900.0), (6, 900.0)]
     assert modules.scheduler_resource_calls == [
-        (address, {"round_slot": 1})
-        for address in modules.connected_workers
+        (address, {"round_slot": 1}) for address in modules.connected_workers
     ]
     fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
     events = cast(list[dict[str, object]], fine["scale_events"])
@@ -1505,9 +1497,7 @@ def test_fine_slurm_replaces_one_complete_two_process_job(
         for address in (*initial, *replacement)
     }
     modules.pending_rounds = {2}
-    modules.outcomes["round-002:whole-image:main"] = [
-        RuntimeError("departed job")
-    ]
+    modules.outcomes["round-002:whole-image:main"] = [RuntimeError("departed job")]
     lost_once = False
 
     def lose_job(_call_number: int) -> None:
@@ -3064,9 +3054,7 @@ def test_fine_slurm_evidence_rejects_incomplete_activated_job_group(
             startup_outcome="succeeded",
             reference_attempted=True,
             round_tasks=(task,),
-            observed_workers=tuple(
-                cast(list[str], observed["connected_workers"])
-            ),
+            observed_workers=tuple(cast(list[str], observed["connected_workers"])),
             observed_probes=observed_probes,
         )
 

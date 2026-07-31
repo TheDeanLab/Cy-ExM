@@ -280,9 +280,7 @@ class FineSlurmEvidence:
             if type(value) is not int or value < 1:
                 raise TypeError(f"{name} must be a positive built-in integer")
         if self.worker_cap != self.job_cap * self.processes_per_job:
-            raise ValueError(
-                "worker_cap must equal job_cap * processes_per_job"
-            )
+            raise ValueError("worker_cap must equal job_cap * processes_per_job")
 
     def begin_scale(self, requested_jobs: int, started_at: str) -> FineScaleEvent:
         if type(requested_jobs) is not int or not 1 <= requested_jobs <= self.job_cap:
@@ -575,10 +573,7 @@ def validate_fine_slurm_evidence(
         event_failed = bool(event_failures)
         candidate_activated_probes = {
             **current_activated_probes,
-            **{
-                probe.worker_address: probe
-                for probe in event_activated_probes
-            },
+            **{probe.worker_address: probe for probe in event_activated_probes},
         }
         activation_complete = not candidate_activated_probes
         if candidate_activated_probes:
@@ -586,9 +581,7 @@ def validate_fine_slurm_evidence(
                 validate_slurm_worker_identities(
                     tuple(candidate_activated_probes.values()),
                     processes_per_job=processes_per_job,
-                    expected_process_memory_bytes=(
-                        expected_process_memory_bytes
-                    ),
+                    expected_process_memory_bytes=(expected_process_memory_bytes),
                 )
             except WorkerPreflightError:
                 activation_complete = False

@@ -731,16 +731,12 @@ def validate_slurm_worker_identities(
         raise TypeError("SLURM worker probes must be an exact tuple of WorkerProbe")
     if type(processes_per_job) is not int or processes_per_job < 1:
         raise TypeError("processes_per_job must be a built-in integer of at least 1")
-    if (
-        expected_process_memory_bytes is not None
-        and (
-            type(expected_process_memory_bytes) is not int
-            or expected_process_memory_bytes < 1
-        )
+    if expected_process_memory_bytes is not None and (
+        type(expected_process_memory_bytes) is not int
+        or expected_process_memory_bytes < 1
     ):
         raise TypeError(
-            "expected_process_memory_bytes must be None or a positive built-in "
-            "integer"
+            "expected_process_memory_bytes must be None or a positive built-in integer"
         )
 
     grouped: dict[str, list[WorkerProbe]] = {}
@@ -752,8 +748,7 @@ def validate_slurm_worker_identities(
             probe.__post_init__()
         except (TypeError, ValueError) as error:
             failures.append(
-                "invalid WorkerProbe payload: "
-                f"{type(error).__name__}: {error}"
+                f"invalid WorkerProbe payload: {type(error).__name__}: {error}"
             )
             continue
         identity = (

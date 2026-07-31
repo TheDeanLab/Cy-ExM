@@ -470,9 +470,7 @@ def _validate_requested(
         if jobs > configured_jobs:
             raise ValueError("requested jobs cannot exceed configured_jobs")
         if task_slots_per_job != processes_per_job:
-            raise ValueError(
-                "task_slots_per_job must equal processes_per_job"
-            )
+            raise ValueError("task_slots_per_job must equal processes_per_job")
         if max_task_slots != configured_jobs * processes_per_job:
             raise ValueError(
                 "max_task_slots must equal configured_jobs * processes_per_job"
@@ -1899,9 +1897,7 @@ class SlurmExecutor:
     ]:
         if fine_mode:
             if spec is None or resources is None:
-                raise ValueError(
-                    "fine SLURM evidence requires validated job resources"
-                )
+                raise ValueError("fine SLURM evidence requires validated job resources")
             requested: dict[str, object] = {
                 "jobs": worker_count,
                 "configured_jobs": resources.job_cap,
@@ -2321,9 +2317,7 @@ class SlurmExecutor:
                     try:
                         opened_cluster.scale(jobs=desired)
                         requested_workers = desired
-                        expected_processes = (
-                            desired * resources.processes_per_job
-                        )
+                        expected_processes = desired * resources.processes_per_job
                         execution_client.wait_for_workers(
                             expected_processes,
                             timeout=modules.parse_timedelta(spec.startup_timeout),
@@ -2510,9 +2504,7 @@ class SlurmExecutor:
                         observed["connected_workers"] = list(addresses)
 
                     observe_connected_workers(next_connected)
-                    expected_processes = (
-                        requested_workers * resources.processes_per_job
-                    )
+                    expected_processes = requested_workers * resources.processes_per_job
                     if len(next_connected) > expected_processes:
                         process_count_error = WorkerPreflightError(
                             "Connected SLURM worker processes exceed the requested "
@@ -2521,10 +2513,9 @@ class SlurmExecutor:
                         )
                         record_health_failure(process_count_error)
                         raise process_count_error
-                    if (
-                        len(next_connected) == expected_processes
-                        and set(next_connected) == set(validated_workers)
-                    ):
+                    if len(next_connected) == expected_processes and set(
+                        next_connected
+                    ) == set(validated_workers):
                         try:
                             before_deadline(
                                 "healthy worker resource snapshot",
@@ -2957,9 +2948,7 @@ class SlurmExecutor:
                     job_cap=resources.job_cap,
                     processes_per_job=resources.processes_per_job,
                     worker_cap=resources.max_task_slots,
-                    expected_process_memory_bytes=(
-                        resources.process_memory_bytes
-                    ),
+                    expected_process_memory_bytes=(resources.process_memory_bytes),
                     task_retries=spec.task_retries,
                     cancellation_present=False,
                     startup_outcome="succeeded",

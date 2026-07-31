@@ -30,9 +30,7 @@ def _resolved(path: Path, role: str, *, directory: bool = False) -> Path:
     try:
         result = path.resolve(strict=True)
     except OSError as error:
-        raise HpcMultiProcessAcceptanceError(
-            f"{role} must exist: {path}"
-        ) from error
+        raise HpcMultiProcessAcceptanceError(f"{role} must exist: {path}") from error
     _require(
         result.is_dir() if directory else result.is_file(),
         f"{role} has the wrong filesystem type: {result}",
@@ -71,8 +69,7 @@ def multi_process_acceptance_profiles(
             ),
         )
         _require(
-            profile.native_threads.itk == 15
-            and profile.native_threads.blas == 15,
+            profile.native_threads.itk == 15 and profile.native_threads.blas == 15,
             f"{label} profile must use 15 ITK and 15 BLAS threads",
         )
         _require(
@@ -95,8 +92,7 @@ def multi_process_acceptance_profiles(
         "single and multi profile paths must be distinct",
     )
     _require(
-        single.paths.dataset_root.resolve()
-        == multi.paths.dataset_root.resolve(),
+        single.paths.dataset_root.resolve() == multi.paths.dataset_root.resolve(),
         "single and multi profiles must use the same dataset root",
     )
     single_scratch = single.paths.worker_local_directory
@@ -215,17 +211,14 @@ def _overlap_evidence(
         for second in accepted[index + 1 :]:
             first_start = _timestamp(first.get("started_at"), "placement.started_at")
             first_end = _timestamp(first.get("ended_at"), "placement.ended_at")
-            second_start = _timestamp(
-                second.get("started_at"), "placement.started_at"
-            )
+            second_start = _timestamp(second.get("started_at"), "placement.started_at")
             second_end = _timestamp(second.get("ended_at"), "placement.ended_at")
             overlap = max(first_start, second_start) < min(first_end, second_end)
             same_job = first.get("slurm_job_id") == second.get("slurm_job_id")
             same_host = first.get("hostname") == second.get("hostname")
-            distinct_process = (
-                first.get("worker_address") != second.get("worker_address")
-                and first.get("pid") != second.get("pid")
-            )
+            distinct_process = first.get("worker_address") != second.get(
+                "worker_address"
+            ) and first.get("pid") != second.get("pid")
             valid_identities = all(
                 type(item.get(name)) is expected
                 for item in (first, second)
@@ -319,9 +312,7 @@ def _performance(
         type(peaks) is dict
         and bool(peaks)
         and all(
-            type(address) is str
-            and type(value) is int
-            and value > 0
+            type(address) is str and type(value) is int and value > 0
             for address, value in cast(dict[object, object], peaks).items()
         ),
         "performance evidence requires per-process peak RSS",
@@ -457,8 +448,7 @@ def build_multi_process_acceptance_report(
         "scientific comparison is missing or rejected",
     )
     _require(
-        comparison.get("comparison_policy")
-        == "stochastic-scientific-equivalence"
+        comparison.get("comparison_policy") == "stochastic-scientific-equivalence"
         and comparison.get("metric_absolute_tolerance") == 0.01
         and type(comparison.get("rounds")) is list
         and bool(comparison.get("rounds")),
@@ -480,9 +470,9 @@ def build_multi_process_acceptance_report(
         ),
         "worker-loss marker is malformed",
     )
-    replacement_placements = cast(
-        dict[str, object], raw_replacement["fine_graph"]
-    ).get("placements")
+    replacement_placements = cast(dict[str, object], raw_replacement["fine_graph"]).get(
+        "placements"
+    )
     _require(
         isinstance(replacement_placements, list)
         and any(
@@ -527,8 +517,7 @@ def build_multi_process_acceptance_report(
         for path in bound_paths
     ]
     _require(
-        len({item["relative_path"] for item in evidence_files})
-        == len(evidence_files),
+        len({item["relative_path"] for item in evidence_files}) == len(evidence_files),
         "checksum-bound evidence paths must be unique",
     )
     return {

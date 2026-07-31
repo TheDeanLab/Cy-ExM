@@ -2494,10 +2494,27 @@ class SlurmExecutor:
                         fine_state.candidates.difference_update(departed_now)
                         fine_state.candidates.update(connected_now)
                         fine_state.validated.difference_update(departed_now)
+                        validated_workers.difference_update(departed_now)
+                        for address in departed_now:
+                            validated_probes.pop(address, None)
                         observed["connected_workers"] = list(addresses)
 
                     observe_connected_workers(next_connected)
-                    if set(next_connected) == set(validated_workers):
+                    expected_processes = (
+                        requested_workers * resources.processes_per_job
+                    )
+                    if len(next_connected) > expected_processes:
+                        process_count_error = WorkerPreflightError(
+                            "Connected SLURM worker processes exceed the requested "
+                            f"job/process target: expected at most "
+                            f"{expected_processes}, got {len(next_connected)}"
+                        )
+                        record_health_failure(process_count_error)
+                        raise process_count_error
+                    if (
+                        len(next_connected) == expected_processes
+                        and set(next_connected) == set(validated_workers)
+                    ):
                         try:
                             before_deadline(
                                 "healthy worker resource snapshot",
@@ -2517,7 +2534,7 @@ class SlurmExecutor:
                             pass
                         else:
                             return
-                    if len(next_connected) < requested_workers:
+                    if len(next_connected) < expected_processes:
                         try:
                             remaining = max(
                                 0.0,
@@ -2526,7 +2543,7 @@ class SlurmExecutor:
                             before_deadline(
                                 "replacement worker arrival",
                                 lambda: execution_client.wait_for_workers(
-                                    requested_workers,
+                                    expected_processes,
                                     timeout=remaining,
                                 ),
                             )
@@ -2546,7 +2563,7 @@ class SlurmExecutor:
                                 "replacement worker snapshot",
                                 lambda: _scheduler_snapshot(
                                     execution_client,
-                                    expected_workers=requested_workers,
+                                    expected_workers=expected_processes,
                                 ),
                             ),
                         )
@@ -2672,20 +2689,43 @@ class SlurmExecutor:
                         observed["worker_probes"] = [
                             probe.to_dict() for probe in observed_probes
                         ]
-                        for address in newcomers:
-                            before_deadline(
-                                f"replacement activation {address}",
-                                lambda address=address: execution_client.run(
-                                    _activate_round_slot,
-                                    workers=[address],
-                                ),
+                        replacement_groups = validate_slurm_worker_identities(
+                            tuple((*prior.values(), *replacement_batch.values())),
+                            processes_per_job=resources.processes_per_job,
+                            expected_process_memory_bytes=(
+                                resources.process_memory_bytes
+                            ),
+                        )
+                        newcomer_set = set(newcomers)
+                        for group in replacement_groups:
+                            group_newcomers = tuple(
+                                address
+                                for address in group.addresses
+                                if address in newcomer_set
                             )
-                            event.activated.append(address)
-                            event.activated_probes.append(replacement_batch[address])
-                            activated_probe_history.append(replacement_batch[address])
-                            validated_workers.add(address)
-                            validated_probes[address] = replacement_batch[address]
-                            fine_state.validated.add(address)
+                            for address in group_newcomers:
+                                before_deadline(
+                                    f"replacement activation {address}",
+                                    lambda address=address: execution_client.run(
+                                        _activate_round_slot,
+                                        workers=[address],
+                                    ),
+                                )
+                                event.activated.append(address)
+                                event.activated_probes.append(
+                                    replacement_batch[address]
+                                )
+                                activated_probe_history.append(
+                                    replacement_batch[address]
+                                )
+                            validated_workers.update(group_newcomers)
+                            validated_probes.update(
+                                {
+                                    address: replacement_batch[address]
+                                    for address in group_newcomers
+                                }
+                            )
+                            fine_state.validated.update(group_newcomers)
                         before_deadline(
                             "post-activation scheduler snapshot",
                             lambda: _validate_scheduler_resources(

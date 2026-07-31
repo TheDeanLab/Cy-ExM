@@ -572,7 +572,34 @@ def validate_fine_slurm_evidence(
                 active_intervals[identity] = (activated_at, event_started)
         connected.update(event_connected)
         probed_workers.update(probed)
-        activated.update(event_activated)
+        event_failed = bool(event_failures)
+        candidate_activated_probes = {
+            **current_activated_probes,
+            **{
+                probe.worker_address: probe
+                for probe in event_activated_probes
+            },
+        }
+        activation_complete = not candidate_activated_probes
+        if candidate_activated_probes:
+            try:
+                validate_slurm_worker_identities(
+                    tuple(candidate_activated_probes.values()),
+                    processes_per_job=processes_per_job,
+                    expected_process_memory_bytes=(
+                        expected_process_memory_bytes
+                    ),
+                )
+            except WorkerPreflightError:
+                activation_complete = False
+            else:
+                activation_complete = True
+        if not event_failed and not activation_complete:
+            raise ValueError(
+                "fine activated workers do not form complete SLURM job groups"
+            )
+        if activation_complete:
+            activated.update(event_activated)
         for probe in event_activated_probes:
             identity = (
                 probe.worker_address,
@@ -582,9 +609,13 @@ def validate_fine_slurm_evidence(
             )
             if identity in active_intervals:
                 raise ValueError("fine activated worker identity cannot be reused")
-            current_activated_probes[probe.worker_address] = probe
             historical_activated_probes.append(probe)
-            active_intervals[identity] = (event_ended, None)
+            active_intervals[identity] = (
+                event_ended,
+                event_ended if event_failed else None,
+            )
+            if activation_complete:
+                current_activated_probes[probe.worker_address] = probe
         for failure_index, failure_value in enumerate(event_failures):
             scale_failed = True
             error = _object(
@@ -595,19 +626,6 @@ def validate_fine_slurm_evidence(
             _string(error["type"], f"{location}.failed[{failure_index}].type")
             if type(error["message"]) is not str:
                 raise TypeError("fine scale failure message must be a string")
-        if not event_failures and current_activated_probes:
-            try:
-                validate_slurm_worker_identities(
-                    tuple(current_activated_probes.values()),
-                    processes_per_job=processes_per_job,
-                    expected_process_memory_bytes=(
-                        expected_process_memory_bytes
-                    ),
-                )
-            except WorkerPreflightError as error:
-                raise ValueError(
-                    "fine activated workers do not form complete SLURM job groups"
-                ) from error
         scale_probe_outcomes.append(
             (set(probed), set(event_activated), bool(event_failures))
         )

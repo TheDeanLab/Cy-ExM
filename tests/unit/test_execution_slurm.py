@@ -486,6 +486,11 @@ class _FakeClient:
 
     def wait_for_workers(self, workers: int, *, timeout: float) -> None:
         self._modules.wait_for_workers_calls.append((workers, timeout))
+        if self._modules.wait_for_workers_hook is not None:
+            self._modules.wait_for_workers_hook(
+                len(self._modules.wait_for_workers_calls),
+                workers,
+            )
         if self._modules.hang_wait_for_workers:
             time.sleep(self._modules.hang_seconds)
         if self._modules.wait_error is not None:
@@ -703,6 +708,7 @@ class _FakeSlurmModules:
         self.cluster_kwargs: dict[str, object] | None = None
         self.scale_calls: list[dict[str, int]] = []
         self.wait_for_workers_calls: list[tuple[int, float]] = []
+        self.wait_for_workers_hook: Callable[[int, int], None] | None = None
         self.client_timeout: str | None = None
         self.as_completed_call: tuple[bool, bool] | None = None
         self.submit_calls: list[_SubmitCall] = []
@@ -1404,6 +1410,331 @@ def test_fine_slurm_replaces_lost_worker_at_cap_before_retry(
     assert [event["expected_processes"] for event in events] == [1, 1]
     assert events[1]["departed"] == ["tcp://node-a:1234"]
     assert events[1]["activated"] == ["tcp://node-b:1234"]
+
+
+def test_fine_slurm_replaces_one_process_and_preserves_healthy_job_sibling(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    first, lost = _two_process_job_addresses(1)
+    replacement = "tcp://node-a:5678"
+    modules.connected_workers = (first, lost)
+    process_memory = 233 * 1024**3
+    modules.probe_results = {
+        address: _probe(address, memory_limit_bytes=process_memory)
+        for address in (first, lost, replacement)
+    }
+    modules.pending_rounds = {2}
+    first_key = "round-002:whole-image:main"
+    modules.outcomes[first_key] = [RuntimeError("departed process")]
+    lost_once = False
+
+    def lose_one_process(_call_number: int) -> None:
+        nonlocal lost_once
+        if not lost_once and len(modules.submit_calls) >= 2:
+            modules.connected_workers = (first,)
+            lost_once = True
+
+    def replace_on_wait(call_number: int, workers: int) -> None:
+        if call_number == 2:
+            assert workers == 2
+            modules.connected_workers = (first, replacement)
+
+    modules.scheduler_info_hook = lose_one_process
+    modules.wait_for_workers_hook = replace_on_wait
+
+    def settle_after_replacement(
+        futures: tuple[_FakeFuture, ...],
+        call_number: int,
+    ) -> None:
+        if call_number >= 2:
+            for future in futures:
+                future._done = True
+
+    modules.wait_hook = settle_after_replacement
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=1,
+        retries=1,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+
+    results = executor.execute(
+        _reference_task(tmp_path),
+        (_task(tmp_path, 2),),
+    )
+
+    assert results[-1].status == "completed"
+    assert modules.wait_for_workers_calls[1][0] == 2
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    events = cast(list[dict[str, object]], fine["scale_events"])
+    replacement_event = events[1]
+    assert replacement_event["departed"] == [lost]
+    assert replacement_event["activated"] == [replacement]
+    assert modules.scheduler_resource_calls[:3] == [
+        (first, {"round_slot": 1}),
+        (lost, {"round_slot": 1}),
+        (replacement, {"round_slot": 1}),
+    ]
+    assert cast(list[str], fine["validated_workers"]) == [
+        first,
+        replacement,
+    ]
+
+
+def test_fine_slurm_replaces_one_complete_two_process_job(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    initial = _two_process_job_addresses(1)
+    replacement = (
+        "tcp://node-b:1234",
+        "tcp://node-b:1235",
+    )
+    modules.connected_workers = initial
+    process_memory = 233 * 1024**3
+    modules.probe_results = {
+        address: _probe(address, memory_limit_bytes=process_memory)
+        for address in (*initial, *replacement)
+    }
+    modules.pending_rounds = {2}
+    modules.outcomes["round-002:whole-image:main"] = [
+        RuntimeError("departed job")
+    ]
+    lost_once = False
+
+    def lose_job(_call_number: int) -> None:
+        nonlocal lost_once
+        if not lost_once and len(modules.submit_calls) >= 2:
+            modules.connected_workers = ()
+            lost_once = True
+
+    def replace_job(call_number: int, workers: int) -> None:
+        if call_number == 2:
+            assert workers == 2
+            modules.connected_workers = replacement
+
+    modules.scheduler_info_hook = lose_job
+    modules.wait_for_workers_hook = replace_job
+
+    def settle_after_replacement(
+        futures: tuple[_FakeFuture, ...],
+        call_number: int,
+    ) -> None:
+        if call_number >= 2:
+            for future in futures:
+                future._done = True
+
+    modules.wait_hook = settle_after_replacement
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=1,
+        retries=1,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+
+    results = executor.execute(
+        _reference_task(tmp_path),
+        (_task(tmp_path, 2),),
+    )
+
+    assert results[-1].status == "completed"
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    event = cast(list[dict[str, object]], fine["scale_events"])[1]
+    assert event["departed"] == list(initial)
+    assert event["activated"] == list(replacement)
+    assert fine["validated_workers"] == list(replacement)
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        ("incomplete", "expected 2 connected workers"),
+        ("split_job", "exactly 2 processes"),
+        ("host_split", "one hostname"),
+        ("memory", "memory limit"),
+    ),
+)
+def test_fine_slurm_rejects_invalid_two_process_replacement_groups(
+    tmp_path: Path,
+    case: str,
+    message: str,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    initial = _two_process_job_addresses(1)
+    if case == "split_job":
+        replacement = ("tcp://node-b:1234", "tcp://node-c:1234")
+    else:
+        replacement = ("tcp://node-b:1234", "tcp://node-b:1235")
+    process_memory = 233 * 1024**3
+    probes = {
+        address: _probe(address, memory_limit_bytes=process_memory)
+        for address in (*initial, *replacement)
+    }
+    if case == "host_split":
+        probes[replacement[1]]["hostname"] = "node-c"
+    elif case == "memory":
+        probes[replacement[1]]["memory_limit_bytes"] = 466 * 1024**3
+    modules.connected_workers = initial
+    modules.probe_results = probes
+    modules.pending_rounds = {2}
+    lost_once = False
+
+    def lose_job(_call_number: int) -> None:
+        nonlocal lost_once
+        if not lost_once and len(modules.submit_calls) >= 2:
+            modules.connected_workers = ()
+            lost_once = True
+
+    def install_replacement(call_number: int, workers: int) -> None:
+        if call_number == 2:
+            assert workers == 2
+            modules.connected_workers = (
+                replacement[:1] if case == "incomplete" else replacement
+            )
+
+    modules.scheduler_info_hook = lose_job
+    modules.wait_for_workers_hook = install_replacement
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=1,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+
+    with pytest.raises(WorkerPreflightError, match=message):
+        executor.execute(
+            _reference_task(tmp_path),
+            (_task(tmp_path, 2),),
+        )
+
+    assert modules.scheduler_resource_calls == [
+        (address, {"round_slot": 1}) for address in initial
+    ]
+    assert modules.events[-2:] == ["client.close", "cluster.close"]
+
+
+def test_fine_slurm_rejects_process_population_above_requested_jobs(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    initial = _two_process_job_addresses(1)
+    extra = "tcp://node-b:1234"
+    modules.connected_workers = initial
+    process_memory = 233 * 1024**3
+    modules.probe_results = {
+        address: _probe(address, memory_limit_bytes=process_memory)
+        for address in (*initial, extra)
+    }
+    modules.pending_rounds = {2}
+    expanded_once = False
+
+    def add_extra_process(_call_number: int) -> None:
+        nonlocal expanded_once
+        if not expanded_once and len(modules.submit_calls) >= 2:
+            modules.connected_workers = (*initial, extra)
+            modules.dynamic_workers = False
+            expanded_once = True
+
+    modules.scheduler_info_hook = add_extra_process
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=1,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+
+    with pytest.raises(WorkerPreflightError, match="exceed"):
+        executor.execute(
+            _reference_task(tmp_path),
+            (_task(tmp_path, 2),),
+        )
+
+    assert modules.events[-2:] == ["client.close", "cluster.close"]
+
+
+def test_fine_slurm_second_replacement_process_activation_failure_cleans_up(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    initial = _two_process_job_addresses(1)
+    replacement = ("tcp://node-b:1234", "tcp://node-b:1235")
+    modules.connected_workers = initial
+    process_memory = 233 * 1024**3
+    modules.probe_results = {
+        address: _probe(address, memory_limit_bytes=process_memory)
+        for address in (*initial, *replacement)
+    }
+    modules.pending_rounds = {2}
+    modules.activation_error = RuntimeError("second process activation failed")
+    modules.activation_error_call = 4
+    lost_once = False
+
+    def lose_job(_call_number: int) -> None:
+        nonlocal lost_once
+        if not lost_once and len(modules.submit_calls) >= 2:
+            modules.connected_workers = replacement
+            lost_once = True
+
+    modules.scheduler_info_hook = lose_job
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=1,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+
+    with pytest.raises(RuntimeError, match="second process activation failed"):
+        executor.execute(
+            _reference_task(tmp_path),
+            (_task(tmp_path, 2),),
+        )
+
+    assert modules.scheduler_resource_calls == [
+        (initial[0], {"round_slot": 1}),
+        (initial[1], {"round_slot": 1}),
+        (replacement[0], {"round_slot": 1}),
+    ]
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    event = cast(list[dict[str, object]], fine["scale_events"])[1]
+    assert event["activated"] == [replacement[0]]
+    assert cast(list[object], event["failed"])
+    assert modules.events[-2:] == ["client.close", "cluster.close"]
+    slurm_module._canonical_execution_evidence(
+        executor.execution_evidence,
+        expected_tasks=(
+            _reference_task(tmp_path),
+            _task(tmp_path, 2),
+        ),
+        task_retries=0,
+    )
 
 
 def test_fine_slurm_replacement_on_same_job_matches_hostname_and_pid(

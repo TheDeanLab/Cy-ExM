@@ -14,6 +14,11 @@
 - Scientific and execution roots are disjoint, neither containing the other.
 - Parallelism is operational execution policy. Omission normalizes to coarse, and no
   scientific manifest or fingerprint may include the parallelism mode.
+- Coarse SLURM requires `processes_per_worker == 1`. Fine SLURM accepts a positive
+  process count only when job cores divide evenly; each native thread count must fit
+  within the derived cores per process. `slurm.workers` is the job cap, not process
+  capacity. Divide scheduler-normalized whole-GiB job memory conservatively into
+  whole-GiB process limits and retain any remainder as job headroom.
 - Parse `slurm.memory` centrally as positive whole decimal memory with exact `KB`,
   `MB`, `GB`, or `TB` suffixes. Reject invalid, fractional, zero, unsupported, or
   signed-64-bit-overflowing semantic and ceiling-normalized quantities.

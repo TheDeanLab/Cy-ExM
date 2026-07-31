@@ -4,8 +4,9 @@
   lifecycle, never registration algorithms or artifact-validity decisions.
 - Sequential, bounded local-Dask, and SLURM execution support coarse and opt-in
   fine-grained admission. The coarse SLURM adapter has Phase 2E acceptance; portable
-  real-ANTs/Local-Dask fine evidence is complete through Task 10, while fine-grained
-  real-SLURM production acceptance remains pending Tasks 12-13.
+  real-ANTs/Local-Dask fine evidence and multi-process SLURM policy are implemented,
+  while fine-grained and focused multi-process real-SLURM production acceptance
+  remain pending explicit external gates.
 - Scheduler imports occur only inside the selected operation.
 - Local Dask uses process-isolated workers. Coarse mode bounds their count to
   `min(pending tasks, configured workers)`; fine mode starts exactly the configured
@@ -22,9 +23,10 @@
   without submitting descendants.
 - Coarse SLURM scales to `min(pending tasks, configured workers)` with one worker
   process and one advertised `round_slot` per job; every submitted coarse task
-  requests that slot. Fine SLURM instead uses the one-reference-candidate and
-  demand-driven newcomer preflight/activation rule below. The reference barrier must
-  not construct or scale a second cluster.
+  requests that slot. Fine SLURM instead uses one complete reference job group and
+  demand-driven whole-job preflight/activation below. `slurm.workers` remains the job
+  cap, while total task capacity is jobs times processes per job. The reference
+  barrier must not construct or scale a second cluster.
   Round semantic profile memory upward to whole binary GiB, pass the `G` spelling to
   SLURM and the matching `GiB` spelling to Dask, and record both semantic and
   scheduler-normalized facts. Never copy a decimal `GB` suffix into `#SBATCH`.
@@ -35,12 +37,12 @@
   its bytes in a production-owned callable. Reconstruct it inside ordinary task
   execution so nested non-production runners do not become worker imports.
   Coarse mode requires all connected workers to pass preflight before any
-  registration task is submitted. In fine mode, each initial or newly connected
-  candidate must pass complete preflight and activation before that worker is
-  eligible for scientific submission; activated workers may already be executing
-  work while a newcomer is validated. Construction, worker probes, and job-script
-  templates are portable evidence only, not proof that a scheduler accepted or ran
-  a job.
+  registration task is submitted. In fine mode, every initial or newly connected
+  job group must pass complete preflight and atomic group activation before its
+  processes are eligible for scientific submission; activated groups may already be
+  executing work while a newcomer group is validated. Construction, worker probes,
+  and job-script templates are portable evidence only, not proof that a scheduler
+  accepted or ran a job.
 - Default retries are zero. Any configured retry is an executor-managed resubmission
   through ordinary artifact validation. A post-preflight round failure does not
   cancel independent round tasks; settle them before reporting aggregate failure.
@@ -70,14 +72,15 @@
   cleanup in one detached scheduler-neutral evidence snapshot. Public workflow
   validation cross-checks that snapshot after scientific work; never reconstruct it
   from lossy round summaries or let it authorize artifact reuse.
-- Fine-grained SLURM starts one candidate worker for the reference barrier and uses
-  demand-driven scale-up only to `min(configured workers, running + ready)`. Candidate
-  workers advertise no `round_slot`; the coordinator must run the complete
-  worker preflight on each exact new address, validate one dedicated SLURM
-  job/worker identity, add exactly one `round_slot` through the worker API so both
-  worker-local and scheduler resource state agree, and verify the exact scheduler
-  identity, worker set, and resources in the post-activation snapshot before
-  scientific submission. Before recording any fine result or
+- Fine-grained SLURM starts one complete candidate job group for the reference
+  barrier and uses demand-driven scale-up in whole jobs only. The target is the
+  ceiling of `(running + ready) / processes_per_job`, bounded by configured jobs.
+  Candidate processes advertise no `round_slot`; the coordinator must run complete
+  worker preflight on each exact new address, validate exactly the configured number
+  of processes sharing one job ID and hostname with distinct addresses/PIDs, add
+  exactly one `round_slot` per process, and verify scheduler identity, worker set,
+  per-process memory, and resources in the post-activation snapshot before any
+  process in the group becomes scientifically eligible. Before recording any fine result or
   releasing descendants, match its SLURM job, worker address, hostname, and PID to
   one activated probe. Record rejected/no-placement outcomes explicitly as failed,
   never as accepted placement evidence. Retain one exact ordered evidence record
@@ -105,8 +108,10 @@
   Treat connected/probed evidence as raw candidate observations, not validated
   identity. A raw candidate with malformed or duplicate SLURM identity may remain
   only when that exact scale event records rejection; it must never appear in the
-  activated/validated set. Enforce unique job/address/host/PID identity on every
-  activated worker and every accepted placement.
+  activated/validated set. Enforce unique address/PID identity on every active
+  process. Job ID and hostname must be identical within one configured process group
+  and distinct across active job groups. Every accepted placement must bind one
+  exact activated process.
   Do not let scheduler evidence authorize scientific artifact reuse.
 - Allow no nested tasks. Permit no nested chunk scheduling or silent fallback.
 - On operator cancellation, stop submission and cancel unfinished futures. Always
@@ -120,18 +125,24 @@
   resources without rebroadcasting the blocking filesystem/import probe to workers
   running scientific kernels. Re-probe every changed or replacement address before
   admitting it.
-  If an activated worker departs, bound only the replacement wait by the configured
-  startup timeout; preflight and resource-gate every
-  replacement before retry or new admission, record the departed identity, and fail
-  closed if replacement validation does not complete. Reconciliation at the current
-  cap must not issue another scale request. Local Dask retains its scheduler-native
-  blocking completion behavior.
+  If an activated process departs, bound only the replacement transaction by the
+  configured startup timeout; preflight and resource-gate the replacement before
+  retry or new admission, record the departed identity, and preserve a healthy
+  sibling when the job remains intact. If the whole job departs, replace and
+  activate only a complete new process group. A partial group is never eligible.
+  Reconciliation at the current job cap must not issue another scale request. Local
+  Dask retains its scheduler-native blocking completion behavior.
 - A nanny restart can replace a worker address and PID inside the same SLURM
   allocation, so historical activated probes may legitimately share one
   `SLURM_JOB_ID`. Resolve a task result against the unique activated
   hostname/PID/job tuple, derive the worker address from that probe, and retain the
   active-interval check. Never reject a valid replacement merely because an older
   departed probe used the same allocation ID.
+- Fine operational evidence is schema version 3 for both one-process and
+  multi-process jobs. Record job/process resource derivation, expected process count
+  for each scale event, complete group probes, departed processes, replacement
+  activation, and exact placement. This evidence is diagnostic; Phase 1 completion
+  records remain the only cache/restart authority.
 - Use one absolute coordinator-owned startup-timeout deadline for the complete
   replacement transaction: health/arrival snapshots, worker arrival, probe
   broadcast, candidate resource checks, every scheduler activation, and the final

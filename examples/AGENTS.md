@@ -22,15 +22,22 @@
   Examples never lead production behavior. Keep each scientific manifest separate from
   its local or HPC execution profile. Real cluster claims require explicitly selected
   HPC acceptance with operator-approved inputs and allocation.
-- The four current workflow examples are `examples/spheroid-dataset.yaml`,
+- The workflow examples include `examples/spheroid-dataset.yaml`,
   `examples/execution-sequential.yaml`, `examples/execution-local-dask.yaml`, and
-  `examples/execution-slurm-512gb.yaml`. Keep them strict-loader compatible and preserve
-  their separation between reusable scientific settings and editable machine resources.
+  both `examples/execution-slurm-512gb.yaml` and
+  `examples/execution-slurm-512gb-multi-process.yaml`. Keep them strict-loader
+  compatible and preserve their separation between reusable scientific settings and
+  editable machine resources.
 - Load every checked-in YAML through the production strict loader. Declare
   `parallelism.mode` explicitly: the sequential example remains `coarse`, while
   Local Dask and the editable 512-GB SLURM example use `fine_grained`. State that
   fine real-SLURM production acceptance remains pending; examples never upgrade an
   implementation milestone.
+- The multi-process example remains fine-only: three jobs are a job/node cap, two
+  processes per job provide six slots, 30 job cores divide into 15 per process, and
+  normalized 466-GiB job memory divides into two 233-GiB process limits. Label all
+  paths and resources as site-editable and do not imply the pending focused HPC gate
+  has passed.
 - Scientific-manifest examples declare `reference.registration_channel` and every
   intended `reference.channels[].file`; do not use the retired singular
   `reference.channel` field. Reference declaration order is preserved in outputs.

@@ -30,6 +30,7 @@ EXAMPLE_PATHS = (
     "examples/execution-sequential.yaml",
     "examples/execution-local-dask.yaml",
     "examples/execution-slurm-512gb.yaml",
+    "examples/execution-slurm-512gb-multi-process.yaml",
 )
 
 
@@ -246,3 +247,25 @@ def test_slurm_example_records_editable_512gb_resources() -> None:
         "Every resource below is site-specific and editable",
     ):
         assert guidance in text
+
+
+def test_multi_process_slurm_example_derives_six_fine_task_slots() -> None:
+    profile = load_execution_profile(REPOSITORY_ROOT / EXAMPLE_PATHS[4])
+
+    assert profile.parallelism == ParallelismSpec(mode="fine_grained")
+    assert profile.native_threads == NativeThreadSpec(itk=15, blas=15)
+    assert profile.slurm is not None
+    assert profile.slurm == SlurmSpec(
+        queue="512GB",
+        workers=3,
+        cores_per_worker=30,
+        processes_per_worker=2,
+        memory="500GB",
+        walltime="72:00:00",
+        interface="ib0",
+        scheduler_interface="ib0",
+        startup_timeout="15m",
+        task_retries=0,
+        job_name="cyexm-registration-multiprocess",
+        job_extra_directives=("--exclusive",),
+    )

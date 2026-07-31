@@ -240,6 +240,21 @@ an unrelated request compatible with old evidence or weaken artifact validation.
 Recovery normally means rerunning the exact same command with the same inputs and
 options. Temporary sibling files are removed automatically.
 
+Scheduler topology is not cache identity. In fine SLURM mode, operational evidence
+schema version 3 records the job cap, processes per job, per-process CPU/memory,
+shared SLURM job IDs, distinct worker addresses/PIDs, process-group activation,
+departures, replacements, placement attempts, and cleanup. None of those facts can
+authorize reuse. A completion record with an exact `StageRequest` and current
+artifact identity remains the only authority.
+
+Consequently, a lost process, a lost whole job, or a partial replacement process
+group can interrupt execution without invalidating already committed scientific
+artifacts. The executor may keep a healthy sibling active, or revalidate a complete
+replacement group, but every retried task still enters this document's ordinary
+completion-record checks. If the bounded replacement transaction fails, Cy-ExM
+records the failure stage and closes owned resources; rerunning the same command
+reuses only independently valid commits.
+
 ### Affine failure
 
 If affine estimation or validation fails before commit, there is no valid

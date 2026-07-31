@@ -54,3 +54,7 @@
 - Preserve exact format-3 behavior when feature masking is omitted. Format-4 tests
   must validate binary/nonempty arrays, physical policy, realized counts/fractions,
   producer/reader agreement, and full-volume-before-chunk morphology.
+- Multi-process SLURM unit tests must cover coarse rejection, exact fine resource
+  division, complete same-job process groups, partial/split/duplicate identities,
+  process and whole-job replacement, version-3 provenance, cache-identity invariance,
+  and fail-closed focused-HPC report decoding without scheduler contact.

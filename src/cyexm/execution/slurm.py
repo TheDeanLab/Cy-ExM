@@ -1757,16 +1757,19 @@ class SlurmExecutor:
     """Execute coarse rounds or fine stages through an owned ``SLURMCluster``.
 
     The normalized profile selects the existing round-level runner or the shared
-    coordinator-owned fine graph. This class owns cluster scaling, worker
-    preflight, resource activation, task placement, cancellation, and cleanup;
-    workers execute one immutable task and never submit descendants.
+    coordinator-owned fine graph. This class owns whole-job cluster scaling,
+    process-group preflight, resource activation, task placement, reconciliation,
+    cancellation, and cleanup; workers execute one immutable task and never submit
+    descendants.
 
     Parameters
     ----------
     profile : ExecutionProfile
-        Exact normalized ``slurm`` profile. ``slurm.workers`` is the global cap,
-        and fine candidates receive a scheduler task slot only after exact
-        preflight and identity validation.
+        Exact normalized ``slurm`` profile. ``slurm.workers`` is the job cap.
+        Coarse mode requires one process per job. Fine mode derives process-slot,
+        CPU, and memory capacity from ``processes_per_worker``; candidates receive
+        one scheduler task slot per process only after their complete job group
+        passes exact preflight and identity validation.
 
     Raises
     ------
@@ -1782,13 +1785,20 @@ class SlurmExecutor:
         Execute the same normalized graph without scheduler resources.
     LocalDaskExecutor :
         Execute the same graph in a bounded local process cluster.
+    FineGraphController :
+        Own scheduler-neutral fine task readiness and dependency transitions.
+    cyexm.registration.ArtifactStore :
+        Authorize scientific reuse independently of execution evidence.
 
     Notes
     -----
     The reference barrier and all moving work share one owned scheduler lifecycle.
-    Fine mode records every scale event and settled placement attempt, including
-    rejected or retried attempts, before cleanup. This operational evidence never
-    authorizes scientific artifact reuse.
+    Fine mode scales only in whole jobs, admits only complete process groups, and
+    reconciles a departed process or whole job before retry or new admission. It
+    records version-3 job/process resources, scale events, group activation,
+    replacement, and every settled placement attempt, including rejected or retried
+    attempts, before ordered cleanup. This operational evidence never authorizes
+    scientific artifact reuse.
     """
 
     def __init__(

@@ -2,16 +2,18 @@
 
 - Describe current behavior by separating the accepted coarse Phase 2E runtime from
   opt-in fine-grained execution. Portable real-ANTs/Local-Dask fine evidence is
-  complete through Task 10; fine-grained real SLURM production acceptance remains
-  pending Tasks 12-13. Never generalize the accepted coarse Phase 2 audit to fine
-  placement, failure, cancellation, cleanup, or performance.
+  complete and multi-process SLURM policy is implemented; fine-grained and focused
+  multi-process real SLURM production acceptance remain pending explicit external
+  gates. Never generalize the accepted coarse Phase 2 audit to fine placement,
+  failure, cancellation, cleanup, or performance.
 - Design and plan documents may describe later Phase 2 decisions when they label
   status and assumptions explicitly. User guides and API examples describe only the
   runtime available on the referenced branch.
 - Fine-grained examples must remain exact-schema loader compatible and declare mode
   explicitly: sequential is coarse, while Local Dask and the editable 512-GB SLURM
-  example are fine-grained. Describe one task per slot/node today and multiple
-  workers per node only as a future optimization.
+  examples are fine-grained. Coarse uses one process per job. Fine may use several
+  isolated processes per job, with one task per process slot; distinguish job cap
+  from total slot capacity and implementation from pending real-HPC acceptance.
 - Keep API examples synchronized with signatures in `src/cyexm`. Use public XYZ
   spacing, explicit native-thread configuration, and exact artifact filenames.
 - Artifact and restart claims must follow the implementation: a data file alone is
@@ -54,3 +56,10 @@ raw → crop → feature estimate → transform raw boundary. State that diagnos
 and metrics are raw-derived, optional feature masks affect registration metrics only,
 sigmas are NumPy ZYX voxel counts, morphology uses physical micrometers, and feature
 images are never public TIFFs.
+
+Multi-process SLURM documentation must explain whole-job scaling and cleanup,
+complete job-group preflight, per-process CPU/memory derivation, shared job/host plus
+distinct address/PID provenance, process versus whole-job loss, partial-group
+failure, bounded replacement, sibling liveness, and schema-version-3 evidence.
+Operational evidence never authorizes cache reuse, and performance is
+characterization unless an explicit scientific gate says otherwise.

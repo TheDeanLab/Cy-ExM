@@ -28,6 +28,15 @@ executor is the numerical and restart reference. The bounded local-Dask executor
 uses a process-based local cluster, and the SLURM executor lazily constructs one
 owned `SLURMCluster`. Every worker has one eligible task slot.
 
+For SLURM, `slurm.workers` always means the maximum number of jobs/nodes. Coarse
+mode requires one process in each job. Fine mode may set
+`processes_per_worker` above one; each process receives one slot after its complete
+job group passes identity and resource preflight. For example, three jobs with two
+processes each provide at most six concurrent fine tasks. Job cores must divide
+evenly among processes, native threads must fit within the per-process cores, and
+the normalized job memory is divided conservatively into per-process Dask limits.
+Cy-ExM scales and cleans up whole jobs, not fractional process groups.
+
 The execution profile selects the granularity:
 
 ```yaml
@@ -73,3 +82,7 @@ complete for the fine graph through implementation Task 10. Fine-grained real-SL
 production acceptance remains pending explicitly selected `hpc` tests with an
 operator-approved allocation, inputs, external operational evidence, scientific
 parity, task placement, cancellation, cleanup, and performance measurements.
+Multi-process fine execution is implemented and covered by portable policy,
+reconciliation, and evidence tests. Its focused real-SLURM comparison and
+worker-loss gate remains pending fresh operator-owned one-process and two-process
+profiles; measured speedup is characterization rather than an acceptance threshold.

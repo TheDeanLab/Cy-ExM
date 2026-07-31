@@ -271,13 +271,14 @@ runtimes are imported lazily only at the selected execution boundary.
 
 ### Checked-in YAML examples
 
-The repository provides five version-1 starting points:
+The repository provides six version-1 starting points:
 
 - [Spheroid scientific dataset manifest](examples/spheroid-dataset.yaml)
 - [Preprocessed spheroid scientific manifest](examples/preprocessed-spheroid-dataset.yaml)
 - [Sequential execution profile](examples/execution-sequential.yaml)
 - [Local-Dask execution profile](examples/execution-local-dask.yaml)
 - [Editable 512-GB SLURM profile](examples/execution-slurm-512gb.yaml)
+- [Editable multi-process 512-GB SLURM profile](examples/execution-slurm-512gb-multi-process.yaml)
 
 The manifest contains no lab-specific root. Edit each execution profile's paths and
 resources before use. In particular, do not run the SLURM placeholders unchanged.
@@ -425,9 +426,9 @@ The `executor` controls which one matching resource section is present:
 | `local_dask` / `startup_timeout` | non-empty single-line string | Bounds only Dask `Client` connection and `wait_for_workers`. |
 | `local_dask` / `task_retries` | nonnegative built-in integer | Executor-managed retry count after the first attempt. |
 | `slurm` / `queue` | non-empty single-line string | SLURM queue/partition. |
-| `slurm` / `workers` | positive built-in integer | Maximum number of worker jobs. |
+| `slurm` / `workers` | positive built-in integer | Maximum number of worker jobs/nodes, not Dask process slots. |
 | `slurm` / `cores_per_worker` | positive built-in integer | Requested cores and job CPU count. |
-| `slurm` / `processes_per_worker` | built-in integer `1` | One Dask worker process per SLURM job; `processes_per_worker` must be exactly `1`. |
+| `slurm` / `processes_per_worker` | positive built-in integer | Processes per job: coarse requires `1`; fine divides job cores and memory across the processes. |
 | `slurm` / `memory` | positive whole decimal `KB`, `MB`, `GB`, or `TB` string | Semantic memory request; the executor rounds up to whole binary GiB for SLURM and Dask. |
 | `slurm` / `walltime` | non-empty single-line string | Job walltime. |
 | `slurm` / `interface` | non-empty single-line string | Worker network interface. |
@@ -459,6 +460,16 @@ to whole binary GiB, passes the matching `GiB` quantity to Dask, and never passe
 500,363,689,984 bytes, and Dask receives `466GiB`. Invalid, fractional, zero,
 unsupported, or overflowing values fail configuration. Operational evidence records
 both semantic and scheduler-normalized memory.
+
+Coarse mode requires `processes_per_worker: 1`. Fine mode requires exact core
+divisibility: `cores_per_worker` must divide evenly across the process count. The
+native thread count must not exceed the cores per process for either ITK or BLAS.
+`slurm.workers` is the job cap and `workers * processes_per_worker` is the total
+process-slot capacity. These are reported separately so the job cap and total
+process-slot capacity cannot be confused. Scheduler-normalized memory remains the
+total job request. Fine mode divides its whole binary GiB conservatively among
+processes; any remainder is job headroom, and the per-process Dask memory limits
+never sum above the job request.
 
 Every other SLURM text value is a non-empty single-line string.
 `job_extra_directives` cannot conflict with
@@ -715,17 +726,21 @@ interruption.
 
 #### SLURM
 
-`slurm` lazily constructs one owned dask-jobqueue `SLURMCluster`. Coarse mode scales
-to `min(pending tasks, configured workers)`. Fine mode starts one candidate worker
-for the reference barrier, then scales on demand to no more than the configured
-worker cap. It requests one process per job. Fine candidates advertise no eligible
-slot until the complete preflight succeeds; the coordinator then activates exactly
-one `round_slot`. Reference preparation and every submitted moving round or fine
-scientific task consume one slot. The reference barrier does not create a second
-cluster. Today this is one worker/job per dedicated node and one task per worker;
-multiple workers per node remain a future optimization. Dedicated-node truth still
-depends on site allocation/exclusivity policy and must be confirmed by exact-commit
-real-SLURM acceptance.
+`slurm` lazily constructs one owned dask-jobqueue `SLURMCluster`. Coarse mode uses
+one process per job and scales to `min(pending tasks, configured workers)`. Fine mode
+can run multiple process-isolated workers per job. It starts one complete candidate
+job for the reference barrier, then scales in whole jobs on demand without exceeding
+the configured job cap. Fine candidates advertise no eligible slot until preflight
+accepts the complete process group; the coordinator then activates exactly one
+`round_slot` per process. Reference preparation and every submitted moving round or
+fine scientific task consume one slot. The reference barrier does not create a
+second cluster, and active jobs are not scaled down before ordered cleanup.
+
+Every complete process group shares one SLURM job ID and hostname while each process
+has a distinct worker address and PID. CPU and Dask-memory evidence is validated per
+process as well as per job. Dedicated-node truth still depends on site
+allocation/exclusivity policy and must be confirmed by exact-commit real-SLURM
+acceptance.
 
 In coarse mode, every connected worker must pass preflight before any registration
 submission. In fine mode, the initial candidate and every later newcomer must pass
@@ -735,6 +750,7 @@ Preflight checks exact Cy-ExM/dependency versions, hostname and SLURM job identi
 dataset/output visibility, scratch creation and cleanup, all six native-thread
 values, memory evidence, and scheduler/worker network identity. A timeout or mismatch
 closes owned resources and fails as executor startup rather than falling back.
+An incomplete or split process group is never partially admitted.
 
 The worker job prologue exports all resolved native-thread values before the worker
 command. The coordinator runs in the process that invokes the CLI; a batch-launched
@@ -761,12 +777,13 @@ values fail validation.
 The harness fails closed if neither an authoritative job memory request nor a node
 memory-allocation fact is available.
 
-Each SLURM workflow-run record carries versioned operational evidence: requested
-workers/retries/timeouts, the rendered job-script template, connected worker and
-preflight observations, task attempt counts, startup phase/outcome, timestamps,
-cancellation evidence when applicable, and ordered client/cluster/configuration
-cleanup results. This evidence is diagnostic only and never replaces artifact
-completion records.
+Each fine SLURM workflow-run record uses operational evidence schema version 3. It
+records requested jobs, processes per job, total process slots, per-process cores and
+memory, whole-job scale events, connected/probed/activated process groups, shared job
+IDs, distinct worker addresses and PIDs, placement attempts, replacements,
+cancellation, and ordered client/cluster/configuration cleanup. This provenance is
+diagnostic only. The `ArtifactStore` remains the only restart authority; operational
+evidence never replaces artifact completion records.
 
 ### Failures, retries, cancellation, and exit codes
 
@@ -791,6 +808,15 @@ each attempt re-enters ordinary Phase 1 artifact validation. Use a small bounded
 value only for plausible transient failures. Diagnose deterministic registration
 errors and out-of-memory failures instead of repeatedly retrying them.
 
+Fine SLURM distinguishes a lost process from a lost whole job. A lost process can be
+replaced while a healthy sibling process continues; a lost job replaces and
+revalidates the whole process group. A partially arrived replacement group remains
+ineligible. One absolute replacement timeout covers arrival, probe, group validation,
+activation, and final verification. If that transaction fails, Cy-ExM records the
+exact failed stage, cancels active work best-effort, and performs ordered cleanup.
+Committed chunks and channels survive either failure and are reconsidered only
+through their completion records on retry or a later run.
+
 On `KeyboardInterrupt` or CLI termination, distributed executors cancel unfinished
 futures and close the owned client and cluster. The SLURM adapter also leaves its
 temporary Dask configuration. These steps preserve committed artifacts, write a
@@ -807,14 +833,20 @@ artifact validation.
 
 ### 512-GB SLURM example and acceptance boundary
 
-The checked-in profile currently proposes queue `512GB`, three workers, 72 cores per
-worker, one process per worker, a semantic `500GB` memory profile (normalized to
+The single-process checked-in profile proposes queue `512GB`, three workers, 72 cores
+per worker, one process per worker, and a semantic `500GB` memory profile (normalized to
 `466G` for SLURM and `466GiB` for Dask), a 72-hour walltime, `ib0`
 worker/scheduler interfaces, a 15-minute startup timeout, and zero retries. These
 512GB values are site-specific and editable. They are not unconditional facts about
 the current cluster; verify partition availability, exclusive-node policy, usable
 memory, interfaces, account/QoS directives, shared mounts, scratch, and coordinator
 policy before submission.
+
+The multi-process example keeps the three-job/node cap but requests 30 cores and two
+processes in each job, with 15 ITK and 15 BLAS threads per process. It therefore has
+six task slots. The normalized 466-GiB job request becomes two conservative 233-GiB
+per-process Dask limits. Any arithmetic remainder remains job headroom. This example
+is fine-only; the same process count is rejected in coarse mode.
 
 Portable fake-based SLURM construction, job-template rendering, preflight policy,
 failure mapping, evidence validation, cancellation, and cleanup are tested. Real
@@ -841,13 +873,17 @@ implementation Task 10. Fine-grained real-SLURM production acceptance remains
 pending its own exact-commit two-tier scientific and operational gate; the coarse
 Phase 2 audit must not be read as acceptance of fine chunk/channel placement or
 performance.
+Focused multi-process real-SLURM acceptance remains pending fresh operator-approved
+one-process and two-process profiles. Portable checks prove the policy and evidence
+decoder, not scheduler execution. Its timing result is performance characterization
+without a required speedup threshold.
 
 ### Remaining non-goals
 
 Phase 2 intentionally does not provide `ParallelChunkedImageRegistration`, chunked
-or parallel whole-image affine estimation, nested multiprocessing, multiple workers
-per node, job arrays, cross-dataset scheduling, cloud or Kubernetes executors, or
-automatic resource optimization. Whole-image affine remains the preparation boundary
+or parallel whole-image affine estimation, nested multiprocessing, job arrays,
+cross-dataset scheduling, cloud or Kubernetes executors, or automatic resource
+optimization. Whole-image affine remains the preparation boundary
 even when nonlinear chunks and dependent channels run as fine tasks. It does not
 recreate ClearEx's GUI, pipeline, TRE, or general analysis framework, and it never
 silently changes executor: no silent fallback is permitted.

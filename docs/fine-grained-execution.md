@@ -99,6 +99,44 @@ All paths and SLURM resources above are placeholders to edit and validate agains
 the current site. Native ITK and BLAS threads default conservatively to one; larger
 counts require dataset-specific scientific and stability validation.
 
+The companion multi-process profile uses the same three-job cap while providing two
+isolated process slots in each job:
+
+```yaml
+schema_version: 1
+executor: slurm
+parallelism:
+  mode: fine_grained
+paths:
+  dataset_root: /archive/path/to/dataset
+  output_root: /archive/path/to/results
+  worker_local_directory: /project/path/to/cyexm-worker
+native_threads:
+  itk: 15
+  blas: 15
+slurm:
+  queue: 512GB
+  workers: 3
+  cores_per_worker: 30
+  processes_per_worker: 2
+  memory: 500GB
+  walltime: "72:00:00"
+  interface: ib0
+  scheduler_interface: ib0
+  startup_timeout: "15m"
+  task_retries: 0
+  job_name: cyexm-registration-multiprocess
+  job_extra_directives: [--exclusive]
+```
+
+`slurm.workers` is a job cap; `processes_per_worker` is a process count per
+job. This example therefore has at most three jobs/nodes and six task slots.
+The 30 job cores divide into 15 cores per process. The semantic 500-GB request
+normalizes to 466 GiB for the whole job, then to two conservative 233-GiB Dask
+limits. Any division remainder remains job headroom. Coarse mode always requires one
+process per job. Fine mode additionally requires even core division and ITK/BLAS
+thread counts no larger than the cores per process.
+
 ## Coordinator-owned graph
 
 The coordinator, and only the coordinator, expands and admits this task graph:
@@ -130,12 +168,17 @@ has ready work it may use all available capacity. Local Dask starts the configur
 number of process workers, and each advertises one `round_slot`; `workers` is the
 configured worker cap.
 
-Fine-grained SLURM initially requests one candidate worker for the reference barrier.
-A candidate receives the complete worker preflight before the coordinator activates
-its `round_slot`. Scale-up is demand-driven to no more than the configured cap, and
-each newly connected worker must pass the same gate before scientific admission.
-Today there is one worker/job per dedicated node and one scientific task per worker
-slot. Multiple workers per node are a future optimization, not current behavior.
+Fine-grained SLURM initially requests one candidate job for the reference barrier.
+Demand-driven scale-up proceeds in whole jobs, using the number of running plus ready
+tasks to choose no more than the configured job cap. Every expected process in a job must arrive and
+pass preflight as one complete process group before any process in that group receives
+its `round_slot`. Each process still runs one scientific task at a time.
+
+Processes in one group have a shared SLURM job ID and hostname but distinct worker
+addresses and PIDs. This is expected provenance, not a duplicate identity. A split
+job ID, split hostname, repeated address or PID, incorrect process memory, or partial
+group fails before scientific admission. Activated jobs are not scaled down while
+work remains; the client and complete owned cluster close in order at the end.
 
 ## Prepared fixed-grid data
 
@@ -220,6 +263,14 @@ native threads, failures, cancellation, and cleanup. These records explain an
 execution but never authorize scientific reuse. Workers never own scheduler
 lifecycle or submit child work.
 
+Fine SLURM uses operational evidence schema version 3. It distinguishes the job cap
+from process-slot capacity and records job/process resource derivation, whole-job
+scale requests, complete activated groups, shared job/host identities, distinct
+worker addresses and PIDs, departed processes, replacements, every placement
+attempt, and ordered cleanup. The ArtifactStore remains the only restart authority;
+changing `processes_per_worker` does not change a scientific fingerprint,
+`StageRequest`, or completion record.
+
 ## Failure, cancellation, and restart
 
 A failed task blocks only its descendants. Submitted siblings settle: already
@@ -227,6 +278,27 @@ submitted sibling chunks or channels and independent rounds are allowed to finis
 so their valid atomic commits remain useful. A configured retry resubmits the same immutable task through ordinary
 artifact validation. No synthetic success is created for descendants that were
 never eligible.
+
+A lost process does not automatically invalidate its healthy sibling process. The
+departed process is removed from admission, its unfinished task follows ordinary
+retry policy, and a replacement process must pass the complete identity/resource
+gate before receiving a slot. A lost whole job removes both processes and requires a
+complete new process group. If only part of that group arrives, the partial process
+group remains ineligible; no half-group scientific work is admitted.
+
+One replacement timeout covers worker arrival, probing, group validation, resource
+activation, and final verification. On timeout or malformed replacement, the exact
+failure stage is preserved in provenance, active work is cancelled best-effort, and
+the client closes before the cluster. A sibling process can remain healthy and finish
+an already admitted commit while replacement proceeds. Regardless of executor
+evidence, the ArtifactStore remains the only restart authority: valid affine, chunk,
+assembly, and channel completion records are reused, while missing or stale work is
+resubmitted.
+
+Running two processes per node is not guaranteed to be faster. Memory bandwidth,
+filesystem traffic, task size, and scheduler overhead can dominate. Performance is
+characterization for a specific dataset and cluster; the focused acceptance report
+records timing and memory without imposing a universal speedup threshold.
 
 On operator cancellation the coordinator stops new admission, cancels unfinished
 futures, records cancellation evidence, closes the client, and then closes its owned
@@ -299,3 +371,9 @@ equivalence and seeded one-thread strict parity, plus placement, fairness,
 failure/recovery, cancellation, cleanup, and performance evidence. The earlier
 [Phase 2 acceptance audit](phase-2-acceptance.md) remains the accepted coarse
 round-level SLURM baseline.
+
+The multi-process implementation also has a focused, explicitly selected HPC gate
+that compares one process with two processes per job, proves same-job overlap,
+injects one process loss, and records cleanup, timing, and peak RSS. That real-SLURM
+gate remains pending until an operator supplies fresh approved profiles and evidence
+storage; portable evidence is not a substitute.

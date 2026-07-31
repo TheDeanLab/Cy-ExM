@@ -10,6 +10,7 @@ EXAMPLE_PATHS = (
     "examples/execution-sequential.yaml",
     "examples/execution-local-dask.yaml",
     "examples/execution-slurm-512gb.yaml",
+    "examples/execution-slurm-512gb-multi-process.yaml",
 )
 
 
@@ -180,7 +181,10 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "| `local_dask` / `task_retries` | nonnegative built-in integer | "
         "Executor-managed retry count after the first attempt. |",
         "| `slurm` / `workers` | positive built-in integer | Maximum number of "
-        "worker jobs. |",
+        "worker jobs/nodes, not Dask process slots. |",
+        "| `slurm` / `processes_per_worker` | positive built-in integer | "
+        "Processes per job: coarse requires `1`; fine divides job cores and "
+        "memory across the processes. |",
         "| `slurm` / `memory` | positive whole decimal `KB`, `MB`, `GB`, or `TB` "
         "string | Semantic memory request; the executor rounds up to whole binary "
         "GiB for SLURM and Dask. |",
@@ -201,7 +205,11 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "inherited environment",
         "one-thread default",
         "`processes` must be `true`",
-        "`processes_per_worker` must be exactly `1`",
+        "coarse mode requires `processes_per_worker: 1`",
+        "fine mode requires exact core divisibility",
+        "native thread count must not exceed the cores per process",
+        "job cap and total process-slot capacity",
+        "per-process dask memory",
         "conflict with managed slurm options",
         "exactly one executor-specific section",
         "`500gb` becomes `466g`",
@@ -322,7 +330,10 @@ def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> No
         "process-based `localcluster`",
         "min(pending tasks, configured workers)",
         "one `round_slot`",
-        "one process per job",
+        "coarse mode uses one process per job",
+        "fine mode can run multiple process-isolated workers per job",
+        "scales in whole jobs",
+        "complete process group",
         "coarse mode, every connected worker must pass preflight before any "
         "registration submission",
         "every later newcomer must pass preflight and activation before that worker "
@@ -374,7 +385,7 @@ def test_readme_states_hpc_acceptance_scope_and_remaining_non_goals() -> None:
         "fine-grained real-slurm production acceptance remains pending",
         "portable real-ants/local-dask evidence is complete",
         "whole-image affine remains",
-        "multiple workers per node",
+        "focused multi-process real-slurm acceptance remains pending",
         "job arrays",
         "cloud or kubernetes executors",
         "automatic resource optimization",
@@ -401,16 +412,21 @@ def test_fine_grained_guide_documents_the_exact_graph_and_resource_contract() ->
         "later ids overwrite earlier values",
         "one immutable scientific task at a time",
         "worker may execute multiple tasks sequentially",
-        "one candidate worker",
+        "one candidate job",
         "preflight",
         "`round_slot`",
         "demand-driven",
         "round-robin",
         "configured worker cap",
-        "one worker/job per dedicated node",
+        "`slurm.workers` is a job cap",
+        "`processes_per_worker` is a process count per job",
+        "six task slots",
+        "466 gib",
+        "233-gib",
+        "scale-up proceeds in whole jobs",
+        "shared slurm job id",
+        "distinct worker addresses and pids",
         "workers never create schedulers",
-        "multiple workers per node",
-        "future optimization",
     ):
         assert required in guide
 
@@ -444,6 +460,14 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
         "legacy clearex/ants behavior",
         "portable real-ants/local-dask evidence is complete",
         "real slurm production acceptance remains pending",
+        "schema version 3",
+        "lost process",
+        "lost whole job",
+        "partial process group",
+        "sibling process",
+        "replacement timeout",
+        "artifactstore remains the only restart authority",
+        "performance is characterization",
         "`format_version` is exactly `2`",
         "`pixeltypes`",
         "`fixed_mask`",

@@ -40,10 +40,13 @@
   a hard reference barrier in the same owned execution lifecycle; reference failure
   prevents moving submission. Forcing the reference round propagates to every moving
   descendant.
-  Worker-backed executors expose one `round_slot` per worker; each coarse round or
-  fine scientific task consumes one slot. Fine SLURM uses one process and one task
-  per dedicated job/node today; multiple workers per node require separate scientific
-  and operational acceptance.
+  Worker-backed executors expose one `round_slot` per process; each coarse round or
+  fine scientific task consumes one slot. Coarse SLURM requires one process per job.
+  Fine SLURM may run a complete group of process-isolated workers in each job, with
+  one slot per validated process. `slurm.workers` remains the job/node cap; scale
+  and cleanup own whole jobs. Focused real-HPC multi-process acceptance remains
+  pending operator-approved inputs even though the runtime and portable gates are
+  implemented.
 - `clearex.registration.pipeline` and `clearex.registration.tre` remain out of scope;
   do not recreate unrelated ClearEx surfaces in this repository.
 - Child `AGENTS.md` files add scope-specific guidance and inherit, rather than repeat,

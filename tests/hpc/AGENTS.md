@@ -162,3 +162,14 @@
   changes. Its report may supplement prior exact-commit gates, but it does not by
   itself replace the complete fine-grained scientific, durability, cancellation,
   deterministic-parity, and performance acceptance matrix.
+- The focused multi-process gate requires exact
+  `--cyexm-single-process-execution` and
+  `--cyexm-multi-process-execution` inputs in addition to the legacy approved
+  profile option. Both profiles are fine-grained, use the same dataset and exactly
+  three 30-core exclusive 500-GB jobs with 15/15 native threads, and differ only in
+  one versus two processes plus disjoint source/output/scratch/job-name identities.
+- Accept multi-process placement only when two accepted task intervals overlap in
+  distinct addresses and PIDs on one shared SLURM job ID and hostname. Require
+  checksum-bound raw profile, execution, placement, timing/RSS, worker-loss,
+  outcome, and empty-queue evidence. Record speedup without a threshold. Never claim
+  focused real-HPC acceptance from portable evidence.

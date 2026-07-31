@@ -13,3 +13,6 @@
 - One worker slot runs one scientific task at a time in fine-grained execution.
   Native-thread ownership remains per worker process and must not be confused with
   Dask worker-slot capacity, SLURM cores, or scheduler scaling.
+- For multi-process fine SLURM, apply the same explicit native-thread policy
+  independently in every process. Counts must fit the derived cores per process;
+  they are not multiplied into one process or shared implicitly across a job.

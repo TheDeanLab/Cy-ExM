@@ -58,3 +58,7 @@
   bounded local-scheduler coverage must use synthetic tasks. Actual SLURM submission
   remains `hpc` and requires an explicit cluster allocation, cleanup assertions, and
   machine-readable job evidence.
+- Process count is operational. Scheduler-neutral scientific integration must remain
+  identical across compatible one-process and multi-process fine profiles; actual
+  shared-node placement, loss, replacement, and performance belong only in the
+  explicit HPC gate.

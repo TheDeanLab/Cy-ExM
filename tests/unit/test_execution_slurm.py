@@ -325,15 +325,21 @@ def _fine_result(
     )
 
 
-def _probe(address: str, *, ok: bool = True) -> dict[str, object]:
+def _probe(
+    address: str,
+    *,
+    ok: bool = True,
+    memory_limit_bytes: int = 500_363_689_984,
+) -> dict[str, object]:
     errors = () if ok else ("injected preflight failure",)
     host = address.removeprefix("tcp://").split(":", 1)[0]
+    port = int(address.rsplit(":", 1)[1])
     job_id = str(9001 + max(0, ord(host[-1]) - ord("a")))
     return WorkerProbe(
         ok=ok,
         worker_address=address,
         hostname=host,
-        pid=123,
+        pid=123 + max(0, port - 1234),
         slurm_job_id=job_id,
         package_versions=tuple(sorted((name, "test-version") for name in _PACKAGES)),
         native_threads=tuple(
@@ -345,7 +351,7 @@ def _probe(address: str, *, ok: bool = True) -> dict[str, object]:
         dataset_visible=ok,
         output_writable=ok,
         scratch_usable=ok,
-        memory_limit_bytes=500_363_689_984 if ok else 0,
+        memory_limit_bytes=memory_limit_bytes if ok else 0,
         network_host=host,
         errors=errors,
     ).to_dict()
@@ -495,7 +501,10 @@ class _FakeClient:
             self._modules.scheduler_info_hook(self._modules.scheduler_info_calls)
         addresses = self._modules.connected_workers
         if self._modules.dynamic_workers:
-            addresses = addresses[: self._modules.requested_jobs]
+            addresses = addresses[
+                : self._modules.requested_jobs
+                * self._modules.processes_per_job
+            ]
         if (
             self._modules.disappear_after_probe
             and self._modules.run_calls
@@ -536,7 +545,10 @@ class _FakeClient:
             tuple(cast(list[str], selected))
             if selected is not None
             else (
-                self._modules.connected_workers[: self._modules.requested_jobs]
+                self._modules.connected_workers[
+                    : self._modules.requested_jobs
+                    * self._modules.processes_per_job
+                ]
                 if self._modules.dynamic_workers
                 else self._modules.connected_workers
             )
@@ -569,7 +581,18 @@ class _FakeClient:
                 for address in addresses
                 if address in self._modules.probe_results
             }
-        return {address: _probe(address) for address in addresses}
+        process_memory = (
+            (500_363_689_984 // 1024**3)
+            // self._modules.processes_per_job
+            * 1024**3
+        )
+        return {
+            address: _probe(
+                address,
+                memory_limit_bytes=process_memory,
+            )
+            for address in addresses
+        }
 
     def run_on_scheduler(
         self,
@@ -710,6 +733,7 @@ class _FakeSlurmModules:
         )
         self.dynamic_workers = False
         self.requested_jobs = 0
+        self.processes_per_job = 1
         self.scheduler_resources: dict[str, dict[str, int]] = {}
         self.scheduler_resource_calls: list[tuple[str, dict[str, int]]] = []
         self.activation_error: BaseException | None = None
@@ -765,6 +789,7 @@ class _FakeSlurmModules:
         if self.cluster_error is not None:
             raise self.cluster_error
         self.cluster_kwargs = kwargs
+        self.processes_per_job = cast(int, kwargs["processes"])
         prologue = "\n".join(cast(list[str], kwargs.get("job_script_prologue", [])))
         directives = "\n".join(
             f"#SBATCH {directive}"
@@ -888,6 +913,14 @@ def _executor(
         ),
         _modules=lambda: modules,
         _version=lambda name: "test-version" if name in _PACKAGES else "unexpected",
+    )
+
+
+def _two_process_job_addresses(job_count: int) -> tuple[str, ...]:
+    return tuple(
+        f"tcp://node-{chr(ord('a') + job_index)}:{1234 + process_index}"
+        for job_index in range(job_count)
+        for process_index in range(2)
     )
 
 
@@ -1252,6 +1285,80 @@ def test_fine_slurm_scales_up_from_ready_width_without_scaling_down(
         ("tcp://node-a:1234", {"round_slot": 1}),
         ("tcp://node-b:1234", {"round_slot": 1}),
     ]
+
+
+def test_fine_slurm_activates_complete_initial_process_group_before_reference(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.connected_workers = _two_process_job_addresses(3)
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=3,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+
+    executor.execute(_reference_task(tmp_path), (_task(tmp_path, 2),))
+
+    first_group = modules.connected_workers[:2]
+    assert modules.scale_calls[0] == {"jobs": 1}
+    assert modules.wait_for_workers_calls[0] == (2, 900.0)
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    initial_event = cast(
+        list[dict[str, object]],
+        fine["scale_events"],
+    )[0]
+    assert initial_event["requested_jobs"] == 1
+    assert initial_event["expected_processes"] == 2
+    assert initial_event["activated"] == list(first_group)
+    reference_submission = modules.events.index("submit:1")
+    assert all(
+        modules.events.index(f"activate:{address}") < reference_submission
+        for address in first_group
+    )
+    assert not any(
+        event.startswith("submit:2")
+        for event in modules.events[:reference_submission]
+    )
+
+
+def test_fine_slurm_scales_five_tasks_to_three_jobs_and_six_processes(
+    tmp_path: Path,
+) -> None:
+    modules = _FakeSlurmModules()
+    modules.dynamic_workers = True
+    modules.connected_workers = _two_process_job_addresses(3)
+    tasks = tuple(_task(tmp_path, number) for number in range(2, 7))
+    executor = _executor(
+        tmp_path,
+        modules,
+        workers=3,
+        mode="fine_grained",
+        cores=30,
+        processes=2,
+        itk_threads=15,
+        blas_threads=15,
+    )
+
+    executor.execute(_reference_task(tmp_path), tasks)
+
+    assert modules.scale_calls == [{"jobs": 1}, {"jobs": 3}]
+    assert modules.wait_for_workers_calls == [(2, 900.0), (6, 900.0)]
+    assert modules.scheduler_resource_calls == [
+        (address, {"round_slot": 1})
+        for address in modules.connected_workers
+    ]
+    fine = cast(dict[str, object], executor.execution_evidence["fine_graph"])
+    events = cast(list[dict[str, object]], fine["scale_events"])
+    assert [event["requested_jobs"] for event in events] == [1, 3]
+    assert [event["expected_processes"] for event in events] == [2, 6]
+    assert events[1]["activated"] == list(modules.connected_workers[2:])
 
 
 def test_fine_slurm_replaces_lost_worker_at_cap_before_retry(

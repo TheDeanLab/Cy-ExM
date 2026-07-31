@@ -1739,6 +1739,20 @@ def _validated_probe_batch(
     return dict(zip(expected_addresses, probes, strict=True))
 
 
+def _desired_slurm_jobs(
+    *,
+    running_tasks: int,
+    ready_tasks: int,
+    resources: SlurmJobResources,
+) -> int:
+    """Return the whole-job target required for current fine-task demand."""
+    demand = running_tasks + ready_tasks
+    required_jobs = (
+        demand + resources.processes_per_job - 1
+    ) // resources.processes_per_job
+    return max(1, min(resources.job_cap, required_jobs))
+
+
 class SlurmExecutor:
     """Execute coarse rounds or fine stages through an owned ``SLURMCluster``.
 
@@ -2116,8 +2130,13 @@ class SlurmExecutor:
                 )
                 client = opened_client
                 startup["phase"] = "worker_wait"
+                expected_worker_processes = (
+                    worker_count * resources.processes_per_job
+                    if fine_mode
+                    else worker_count
+                )
                 opened_client.wait_for_workers(
-                    worker_count,
+                    expected_worker_processes,
                     timeout=modules.parse_timedelta(spec.startup_timeout),
                 )
 
@@ -2127,7 +2146,7 @@ class SlurmExecutor:
                 startup["phase"] = "worker_snapshot"
                 scheduler_address, connected = _scheduler_snapshot(
                     opened_client,
-                    expected_workers=worker_count,
+                    expected_workers=expected_worker_processes,
                 )
                 observed["scheduler_address"] = scheduler_address
                 observed["connected_workers"] = list(connected)
@@ -2281,12 +2300,10 @@ class SlurmExecutor:
                     running_count: int,
                 ) -> int:
                     nonlocal requested_workers
-                    desired = max(
-                        1,
-                        min(
-                            spec.workers,
-                            running_count + controller.ready_count,
-                        ),
+                    desired = _desired_slurm_jobs(
+                        running_tasks=running_count,
+                        ready_tasks=controller.ready_count,
+                        resources=resources,
                     )
                     if desired <= requested_workers:
                         return len(validated_workers)
@@ -2294,13 +2311,16 @@ class SlurmExecutor:
                     try:
                         opened_cluster.scale(jobs=desired)
                         requested_workers = desired
+                        expected_processes = (
+                            desired * resources.processes_per_job
+                        )
                         execution_client.wait_for_workers(
-                            desired,
+                            expected_processes,
                             timeout=modules.parse_timedelta(spec.startup_timeout),
                         )
                         next_scheduler, next_connected = _scheduler_snapshot(
                             execution_client,
-                            expected_workers=desired,
+                            expected_workers=expected_processes,
                         )
                         cast(dict[str, object], evidence["requested"])["jobs"] = (
                             requested_workers
@@ -2857,7 +2877,7 @@ class SlurmExecutor:
                         client=execution_client,
                         as_completed=modules.as_completed,
                         task_retries=spec.task_retries,
-                        capacity=spec.workers,
+                        capacity=resources.max_task_slots,
                         active=active,
                         capacity_provider=eligible_capacity,
                         active_wait=lambda futures: reconcile_or_cancel(

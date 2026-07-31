@@ -24,6 +24,7 @@ PHASE_TWO_EXAMPLE_PATHS = (
     "examples/execution-sequential.yaml",
     "examples/execution-local-dask.yaml",
     "examples/execution-slurm-512gb.yaml",
+    "examples/execution-slurm-512gb-multi-process.yaml",
 )
 AGENT_GUIDANCE_PATHS = frozenset(
     {
@@ -108,7 +109,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "no nested chunk scheduling or silent fallback",
         "coarse mode requires all connected workers to pass preflight before any "
         "registration task is submitted",
-        "before that worker is eligible for scientific submission",
+        "before its processes are eligible for scientific submission",
         "post-preflight round failure does not cancel independent round tasks",
         "cancel unfinished futures",
         "client before its owned cluster",
@@ -118,7 +119,7 @@ PHASE_TWO_GUIDANCE_REQUIRED_FRAGMENTS = {
         "before the first scale call",
         "whole binary gib",
         "production-owned callable",
-        "fine-grained real-slurm production acceptance remains pending tasks 12-13",
+        "focused multi-process real-slurm production acceptance remain pending",
     ),
     "src/cyexm/workflow/AGENTS.md": (
         "phase 2b binds sequential execution to the real round worker",
@@ -292,9 +293,11 @@ def test_root_guidance_tracks_current_phase_two_runtime() -> None:
         "real scheduler-neutral round runner",
         "restart-safe transformed-channel artifacts",
         "coordinator-owned immutable fine graph",
-        "one `round_slot` per worker",
-        "one process and one task per dedicated job/node",
+        "one `round_slot` per process",
+        "coarse slurm requires one process per job",
+        "fine slurm may run a complete group of process-isolated workers",
         "fine-grained real slurm production acceptance remains pending",
+        "focused real-hpc multi-process acceptance remains pending",
         "portable ci installs the hpc python extra",
         "never contacts an external scheduler",
         "explicitly selected `hpc` tests",
@@ -339,10 +342,12 @@ def test_documentation_and_examples_track_the_current_phase_two_boundary() -> No
         "accepted coarse phase 2e runtime",
         "opt-in fine-grained execution",
         "portable real-ants/local-dask fine evidence",
-        "fine-grained real slurm production acceptance remains pending",
+        "fine-grained and focused multi-process real slurm production acceptance "
+        "remain pending",
         "never generalize the accepted coarse phase 2 audit",
         "exact-schema loader compatible",
-        "multiple workers per node only as a future optimization",
+        "fine may use several isolated processes per job",
+        "schema-version-3 evidence",
     ):
         assert required in documentation
 

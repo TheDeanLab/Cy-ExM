@@ -27,6 +27,10 @@ from active characterization work.
 The [brightness-dependence investigation](brightness-dependence-investigation.md)
 documents why dim regions can be harder to register and the evidence supporting
 local cross-correlation for nonlinear SyN. The
+[asinh preprocessing registration investigation](asinh-preprocessing-registration-investigation.md)
+traces a subsequent preprocessing regression to unstable feature-based affine
+estimation while separating verified implementation behavior from candidate
+scientific explanations. The
 [CC SyN radius characterization](cc-syn-radius-characterization.md) is explicitly
 a dataset-specific completed sweep and is not a statement of a universally
 optimized default. The

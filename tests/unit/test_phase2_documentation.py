@@ -59,6 +59,48 @@ def _normalized_readme() -> str:
     return " ".join(_readme().split()).lower()
 
 
+def test_readme_is_a_concise_first_use_guide() -> None:
+    readme = _readme()
+    headings = [line for line in readme.splitlines() if line.startswith("## ")]
+    assert headings == [
+        "## Installation",
+        "## Register two images",
+        "## Register multiple imaging rounds",
+        "## Documentation",
+        "## License",
+    ]
+    assert 100 <= len(readme.splitlines()) <= 150
+    for required in (
+        "git clone https://github.com/TheDeanLab/Cy-ExM.git",
+        "uv sync --locked --no-dev",
+        "from cyexm.registration import register_round",
+        'fixed_image_path=Path("data/reference.tif")',
+        'moving_image_path=Path("data/moving.tif")',
+        "https://thedeanlab.github.io/Cy-ExM/",
+        "examples/spheroid-dataset.yaml",
+        "examples/execution-sequential.yaml",
+        "LICENSE.md",
+    ):
+        assert required in readme
+
+
+def test_readme_omits_advanced_and_historical_material() -> None:
+    readme = _normalized_readme()
+    for forbidden in (
+        "phase 1",
+        "phase 2",
+        "observed threading benchmark",
+        "dask-jobqueue",
+        "slurmcluster",
+        "development checks",
+        "acceptance audit",
+        "`worker_local_directory`",
+        "`job_extra_directives`",
+        "`startup_timeout`",
+    ):
+        assert forbidden not in readme
+
+
 def test_public_documentation_home_routes_readers_by_task() -> None:
     index = _normalized_document("index.md")
     for required in (

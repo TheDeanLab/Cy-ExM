@@ -1262,11 +1262,30 @@ def test_nested_example_and_documentation_guidance_is_specific() -> None:
             assert phrase in text, f"{phrase!r} missing from {path}"
 
 
-def test_user_documentation_matches_phase_one_contract() -> None:
+def test_user_documentation_preserves_registration_contract() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     for phrase in (
-        "uv sync --no-dev --extra examples",
-        "uv sync --group dev --extra examples",
+        "git clone https://github.com/TheDeanLab/Cy-ExM.git",
+        "uv sync --locked --no-dev",
+        "register_round",
+        "docs/getting-started.md",
+        "docs/registration-foundations.md",
+        "docs/workflow-guide.md",
+        "LICENSE.md",
+    ):
+        assert phrase in readme
+
+    documentation = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in (
+            "README.md",
+            "docs/registration-foundations.md",
+            "docs/native-threading.md",
+            "docs/registration-artifacts.md",
+            "docs/architecture.md",
+        )
+    )
+    for phrase in (
         "NativeThreadConfig",
         "(x, y, z)",
         "ChunkedImageRegistration",
@@ -1274,11 +1293,8 @@ def test_user_documentation_matches_phase_one_contract() -> None:
         "restart",
         "Dask",
         "SLURM",
-        "Phase 2",
-        "docs/migration-from-clearex.md",
-        "docs/registration-artifacts.md",
     ):
-        assert phrase in readme
+        assert phrase in documentation
 
     migration = Path("docs/migration-from-clearex.md").read_text(encoding="utf-8")
     for phrase in (

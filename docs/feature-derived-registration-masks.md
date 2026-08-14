@@ -9,6 +9,9 @@ This option changes only where transforms are estimated. It never thresholds the
 registration channel, changes a dependent channel, or replaces public output with a
 feature image.
 
+For the preprocessing choices, raw-output boundary, cache effects, and dataset-level
+evaluation, start with the [Preprocessing overview](preprocessing.md).
+
 ## Enabling the mask
 
 Feature masking is nested under enabled preprocessing:

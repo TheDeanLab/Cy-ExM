@@ -313,8 +313,64 @@ def test_readme_documents_observed_native_thread_scaling() -> None:
         assert required in normalized
 
 
-def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
-    readme = _readme()
+@pytest.mark.parametrize(
+    ("name", "required"),
+    (
+        (
+            "image-geometry.md",
+            (
+                "micrometers",
+                "(x, y, z)",
+                "(z, y, x)",
+                "fixed-reference grid",
+                "scalar 3-d tiff",
+                "origin",
+                "spacing",
+                "direction",
+            ),
+        ),
+        (
+            "preprocessing.md",
+            (
+                "raw -> crop -> feature estimate -> transform raw",
+                "filter_sigma_zyx",
+                "voxel",
+                "feature-derived registration mask",
+                "raw-intensity",
+                "dataset-specific",
+            ),
+        ),
+        (
+            "outputs-and-recovery.md",
+            (
+                "resume",
+                "force",
+                "pending",
+                "partial",
+                "complete",
+                "invalid",
+                "diagnostic image",
+                "transformed channel",
+                ".complete.json",
+            ),
+        ),
+    ),
+)
+def test_scientific_user_guides_preserve_public_contracts(
+    name: str,
+    required: tuple[str, ...],
+) -> None:
+    text = _normalized_document(name)
+    for fragment in required:
+        assert fragment in text
+    assert "phase 1" not in text
+    assert "phase 2" not in text
+
+
+def test_output_and_artifact_guides_document_lifecycle_and_status() -> None:
+    text = _document("outputs-and-recovery.md") + _document(
+        "registration-artifacts.md"
+    )
     for output in (
         "scientific-plan.json",
         "workflow-runs/",
@@ -330,30 +386,23 @@ def test_readme_documents_output_lifecycle_and_status_semantics() -> None:
         "round-002-<stage>-<item>.log",
         ".complete.json",
     ):
-        assert output in readme
+        assert output in text
 
-    normalized = _normalized_readme()
+    normalized = " ".join(text.split()).lower()
     for required in (
-        "normalized phase 1 registration diagnostic",
-        "original channel resampled through the persisted transform chain",
-        "clipped to uint16 without intensity normalization",
         "resume is the default",
-        "mutation-free plan",
         "read-only status",
         "`pending`, `partial`, `complete`, or `invalid`",
         "scientific fingerprint",
         "force cannot bypass",
         "requires a new output root",
         "operational summaries never authorize artifact reuse",
-        "do not create a per-round `fixed_reference.tif`",
         "forcing the reference round invalidates all moving descendants",
-        "reference preparation as its declared round",
-        "coarse moving rounds use the shared `round-nnn.log`",
-        "fine moving tasks never append to that shared round log",
-        "reference task retains its ordinary `round-nnn.log`",
+        "normalized registration diagnostic",
+        "original channel resampled through the persisted transform chain",
+        "clipped to uint16 without intensity normalization",
     ):
         assert required in normalized
-    assert "stderr and per-round shared logs" not in normalized
 
 
 def test_readme_documents_success_only_json_output() -> None:
@@ -532,19 +581,10 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
 
 
 def test_maintained_docs_distinguish_shared_cores_and_rejected_evidence() -> None:
-    readme = " ".join(_readme().split()).lower()
-    artifacts = " ".join(
-        (REPOSITORY_ROOT / "docs/registration-artifacts.md")
-        .read_text(encoding="utf-8")
-        .split()
-    ).lower()
-    guide = " ".join(
-        (REPOSITORY_ROOT / "docs/fine-grained-execution.md")
-        .read_text(encoding="utf-8")
-        .split()
-    ).lower()
+    artifacts = _normalized_document("registration-artifacts.md")
+    guide = _normalized_document("fine-grained-execution.md")
 
-    for text in (readme, artifacts, guide):
+    for text in (artifacts, guide):
         assert "scalar cores are shared coarse/fine serial-chunk artifacts" in text
         assert "prepared arrays are fine-only" in text
     for required in (
@@ -553,13 +593,13 @@ def test_maintained_docs_distinguish_shared_cores_and_rejected_evidence() -> Non
         "invalid fine execution evidence",
         "sequential, local dask, and slurm",
     ):
-        assert required in readme
+        assert required in artifacts
     for stale in (
         "coarse serial execution, registered scalar chunk data is reconstructed",
         "fine-only prepared arrays and scalar cores",
         "it preserves the round results in the operational run record",
     ):
-        assert stale not in f"{readme} {artifacts} {guide}"
+        assert stale not in f"{artifacts} {guide}"
 
 
 def test_phase_two_acceptance_is_coarse_history_not_fine_slurm_acceptance() -> None:

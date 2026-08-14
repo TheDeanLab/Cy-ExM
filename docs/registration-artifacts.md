@@ -4,6 +4,9 @@ Cy-ExM treats a registration output as a committed cache entry only when the art
 and its own completion JSON are both present, readable, and consistent with the
 current request. Filename existence by itself never proves completion.
 
+For a conceptual guide to outputs, ordinary resume, force, status, and recovery, see
+the [user-facing recovery guide](outputs-and-recovery.md).
+
 Use a dedicated output directory for each fixed/moving registration request. The
 transform and registered-image names include `{round}`, while the fixed reference and
 metric filenames do not; mixing different round requests in one directory therefore
@@ -69,8 +72,8 @@ morphology policy and realized fixed/moving foreground evidence:
 These arrays are uncompressed C-contiguous float32 files. Chunk workers validate the
 manifest and completion records, memory-map the arrays read-only, and copy only one
 extended region. Unequal native source shapes along Z, Y, and X are supported because
-affine application is the first exact fixed-grid boundary, matching legacy
-ClearEx/ANTs behavior.
+affine application is the first exact fixed-grid boundary, matching current
+Cy-ExM/ANTs geometry behavior.
 
 Each serial chunk commits both its local warp and scalar core. Fine scheduling can
 run those shared chunk stages independently; coarse scheduling invokes the same
@@ -234,6 +237,12 @@ The workflow scripts expose `--force`, which maps to `force_override=True`. Use 
 only when intentionally recomputing the same request. Force skips normal cache reuse,
 commits replacements atomically, and invalidates dependent records. It does not make
 an unrelated request compatible with old evidence or weaken artifact validation.
+
+If fine execution evidence is invalid, unauthenticated current-run summaries are
+omitted from durable `rounds`; pre-run authenticated reuse remains available through
+ordinary completion-record validation. This rejection applies to sequential, Local
+Dask, and SLURM execution. Valid committed scientific artifacts remain restartable,
+but invalid fine execution evidence never authorizes reuse.
 
 ## Recovery examples
 

@@ -10,10 +10,15 @@ project:
         - file: getting-started.md
         - file: registration-foundations.md
         - file: workflow-guide.md
-    - title: Scientific and technical foundations
+    - title: User guide
+      children:
+        - file: image-geometry.md
+        - file: preprocessing.md
+        - file: feature-derived-registration-masks.md
+        - file: outputs-and-recovery.md
+    - title: Advanced usage
       children:
         - file: registration-artifacts.md
-        - file: feature-derived-registration-masks.md
         - file: fine-grained-execution.md
     - title: Characterization and evidence
       children:

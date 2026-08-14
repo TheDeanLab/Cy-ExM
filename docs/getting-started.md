@@ -56,8 +56,8 @@ the environment created for this checkout.
 Your caller-provided inputs are scalar 3-D TIFFs for a fixed reference and a moving
 image, plus their physical voxel spacing. The public spacing order is micrometers in
 `(x, y, z)`; NumPy volumes use `(z, y, x)`. For the current detailed guidance, read
-[image geometry, voxel spacing, and axes](registration-artifacts.md) and
-[outputs, restart, and recovery](registration-artifacts.md).
+[image geometry, voxel spacing, and axes](image-geometry.md) and
+[outputs, restart, and recovery](outputs-and-recovery.md).
 
 ## Register two images
 

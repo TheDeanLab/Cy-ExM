@@ -1,32 +1,62 @@
-# Registration foundations
+# Choosing a registration strategy
 
-Cy-ExM keeps scientific geometry and transform decisions explicit. Its accepted invariants state that public pixel sizes are micrometers in `(x, y, z)` order; NumPy volumes are `(z, y, x)`; and affine application is the first fixed-grid boundary. Native reference, registration-channel, and dependent-channel shapes can differ, but the scalar and mask outputs, nonlinear inputs and outputs, full warp, and transformed dependent channels use the fixed-reference geometry.
+## The shared registration pipeline
 
-The same invariants state that masks use values greater than zero; affine precedes nonlinear registration; scalar data use linear interpolation and masks use nearest-neighbor interpolation; affine is TRSAA/Mattes with 32 bins; and nonlinear registration is SyNOnly. These choices are part of the registration contract rather than display-only defaults.
+Cy-ExM keeps the fixed reference and moving-image roles distinct: the fixed image
+defines the target geometry, and the moving image is transformed onto it. Both
+strategies estimate a whole-image affine transform before nonlinear registration.
+Applying that affine is the first fixed-grid boundary, so nonlinear inputs and
+outputs use the fixed-reference geometry.
 
-The nonlinear metric may be Mattes or `CC`. CC radius is one positive scalar voxel radius, and omitted CC radius uses provisional value 4. A CC radius is not a per-axis physical radius. On anisotropic data, equal voxel extents produce an anisotropic physical neighborhood, so radius selection requires characterization rather than an assumed universal optimum.
+Public physical voxel spacing is expressed in micrometers in `(x, y, z)` order,
+while NumPy volumes use `(z, y, x)` order. Scalar images use linear interpolation;
+masks use nearest-neighbor interpolation. Accepted transforms are applied to the raw
+registration image and each dependent channel rather than replacing those outputs
+with registration features.
 
-Finally, native ITK/BLAS-family threads default to one unless inherited or configured explicitly. Keep native-thread settings explicit in execution profiles when comparing runtimes or operating worker-backed executors.
+## Whole-image registration
 
-## Optional background-subtracted asinh features
+Whole-image registration estimates the nonlinear transform over the complete fixed
+grid. It is a practical starting point when the volume and its working data fit the
+available memory. Validated stage artifacts can be reused after interruption only
+when their matching completion records remain valid.
 
-Schema version 1 permits an optional `registration.preprocessing` mapping. Omission
-disables preprocessing. An empty mapping enables the default
-`filter_sigma_zyx: [12, 12, 12]`; a positive scalar expands to all axes, and a
-three-value form is interpreted in NumPy `(z, y, x)` voxel order. These sigma values
-are voxel counts, not micrometers.
+## Serial-chunked registration
 
-Cy-ExM crops raw images first, creates greater-than-zero masks from those raw values,
-and then computes a feature independently for the fixed and moving registration
-channels. It deterministically samples each signed Gaussian-background residual as
-`residual.ravel()[::max(1, residual.size // 2_000_000)]` before clipping, and uses
-its MAD to calculate `max(1.4826 × MAD(sample), float32 epsilon)`. The feature is
-the positive portion of the full signed residual divided by that scale and passed
-through `asinh`. The Gaussian boundary mode is reflective. TRSAA and nonlinear
-registration see the float32 features and raw-derived masks.
+Serial-chunked registration uses the same whole-image affine stage, then processes
+overlapping nonlinear regions serially. It is the memory-conscious option for larger
+volumes. Each successful local nonlinear chunk has validated artifacts, so a rerun
+can continue from valid work rather than repeat every chunk. Serial chunk execution
+is the numerical and restart reference.
 
-Transforms remain the scientific result. The accepted affine and warp are applied to
-the original raw registration channel; dependent channels are likewise transformed
-from their original sources. Pre-, linear-, and nonlinear-registration metrics use
-raw intensities. The public registered TIFF is clipped to uint16 without intensity
-normalization. No normalized feature TIFF is a public artifact.
+## Comparison
+
+| Strategy | Nonlinear domain | Memory pressure | Restart unit | Chunk-size and overlap requirements | Appropriate starting use |
+| --- | --- | --- | --- | --- | --- |
+| Whole-image | Complete fixed grid | Higher for larger volumes | Validated whole-image stage | None | Volumes that fit available memory |
+| Serial-chunked | Overlapping regions of the fixed grid | Bounded per nonlinear chunk | Validated local nonlinear chunk | Choose chunk size in NumPy `(z, y, x)` order and an overlap fraction | Larger volumes or memory-conscious registration |
+
+## Registration strategy versus execution
+
+Scientific registration strategy selects whole-image or serial-chunked registration
+for one moving round. It is separate from the execution environment, which can be
+sequential, local process-based, or SLURM. Task granularity is a second operational
+axis: coarse or fine-grained controls how workflow work is admitted to an executor,
+not the transform strategy. See the [workflow guide](workflow-guide.md) and
+[fine-grained execution guide](fine-grained-execution.md) for those operational
+choices.
+
+## Scientific choices shared by both strategies
+
+Do not change fixed and moving roles to accommodate an execution environment. In
+both strategies, affine registration precedes nonlinear registration, affine
+application establishes the fixed grid, scalar data use linear interpolation, and
+mask data use nearest-neighbor interpolation. Restart safety depends on matching
+artifact completion records, not on a filename or executor summary alone.
+
+## Next steps
+
+Start with [Getting started](getting-started.md) for the whole-image API example.
+For detailed geometry, artifacts, and recovery behavior, see
+[Registration artifacts and restart behavior](registration-artifacts.md). Use the
+[workflow guide](workflow-guide.md) when you are ready to register multiple rounds.

@@ -5,15 +5,15 @@ project:
   github: TheDeanLab/Cy-ExM
   toc:
     - file: index.md
-    - title: Getting started
+    - title: Start here
       children:
         - file: getting-started.md
+        - file: registration-foundations.md
+        - file: workflow-guide.md
     - title: Scientific and technical foundations
       children:
-        - file: registration-foundations.md
         - file: registration-artifacts.md
         - file: feature-derived-registration-masks.md
-        - file: workflow-guide.md
         - file: fine-grained-execution.md
     - title: Characterization and evidence
       children:

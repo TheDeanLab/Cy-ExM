@@ -1,46 +1,38 @@
 # Cy-ExM
 
-Cy-ExM provides reusable cyclic expansion microscopy registration workflows.
-It is an independent implementation with restart-safe whole-image and serial
-chunked registration, plus a deterministic Phase 2 runtime for planning and
-executing round-level work.
+Cy-ExM registers volumetric images acquired across cyclic expansion microscopy
+rounds. It supports whole-image and memory-conscious serial-chunked registration,
+applies accepted transforms to additional channels, and resumes validated
+intermediate work after interruption.
 
-The documentation focuses on using the software responsibly and understanding
-the scientific choices that affect its output. It distinguishes accepted behavior
-from active characterization work.
+Cy-ExM requires Python 3.12 and is distributed under academic-research-use terms.
 
-## Start here
+## What do you want to do?
 
-- Follow [Getting started](getting-started.md) to install Cy-ExM and run the
-  smallest supported workflow.
-- Read [Registration foundations](registration-foundations.md) before changing
-  transforms, metrics, masks, interpolation, or native-thread settings.
-- Use [Artifact recovery and reproducibility](registration-artifacts.md) to
-  understand restart-safe output reuse.
-- Use [Fine-grained registration](fine-grained-execution.md) to configure the
-  opt-in chunk/channel task graph and understand its current acceptance boundary.
-- Read [Feature-derived registration masks](feature-derived-registration-masks.md)
-  before excluding zero-valued asinh support from transform estimation.
+- **[Register two images](getting-started.md):** install from source and run the
+  smallest supported registration.
+- **[Choose a registration strategy](registration-foundations.md):** compare
+  whole-image and serial-chunked registration.
+- **[Run multiple imaging rounds](workflow-guide.md):** use the workflow tutorial.
+- **[Configure advanced or HPC execution](fine-grained-execution.md):** understand
+  the available execution choices.
+- **[Contribute to Cy-ExM](agentic-api-documentation.md):** follow the current API
+  and documentation conventions.
 
-## Scientific characterization
+## Three separate decisions
 
-The [brightness-dependence investigation](brightness-dependence-investigation.md)
-documents why dim regions can be harder to register and the evidence supporting
-local cross-correlation for nonlinear SyN. The
-[asinh preprocessing registration investigation](asinh-preprocessing-registration-investigation.md)
-traces a subsequent preprocessing regression to unstable feature-based affine
-estimation while separating verified implementation behavior from candidate
-scientific explanations. The
-[CC SyN radius characterization](cc-syn-radius-characterization.md) is explicitly
-a dataset-specific completed sweep and is not a statement of a universally
-optimized default. The
-[fixed-affine nonlinear chunk-size characterization](fixed-affine-chunk-size-characterization.md)
-then isolates nonlinear spatial support while holding the accepted affine state
-constant.
+| Decision | Choices | What it controls |
+| --- | --- | --- |
+| Scientific registration strategy | Whole-image or serial-chunked | How one moving round is registered |
+| Execution environment | Sequential, local process-based, or SLURM | Where workflow tasks run |
+| Task granularity | Coarse or fine-grained | How workflow work is admitted to the executor |
 
-## Acceptance evidence
+## Scientific evidence
 
-The [Phase 1 acceptance audit](phase-1-acceptance.md) records the portable
-registration-library baseline. The [Phase 2 acceptance audit](phase-2-acceptance.md)
-records the real-cluster orchestration, scientific-equivalence, deterministic-parity,
-restart, cancellation, cleanup, and output-ownership gates.
+- Registration behavior and parameter choices: [brightness](brightness-dependence-investigation.md),
+  [asinh preprocessing](asinh-preprocessing-registration-investigation.md),
+  [CC radius](cc-syn-radius-characterization.md), and
+  [fixed-affine chunk size](fixed-affine-chunk-size-characterization.md)
+  characterizations.
+- Registration-library validation: [Registration-library acceptance](phase-1-acceptance.md).
+- Workflow execution validation: [Workflow-runtime acceptance](phase-2-acceptance.md).

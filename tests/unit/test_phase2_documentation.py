@@ -5,6 +5,7 @@ import pytest
 pytestmark = pytest.mark.unit
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+DOCS_ROOT = REPOSITORY_ROOT / "docs"
 EXAMPLE_PATHS = (
     "examples/spheroid-dataset.yaml",
     "examples/execution-sequential.yaml",
@@ -18,8 +19,64 @@ def _readme() -> str:
     return (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
 
 
+def _document(name: str) -> str:
+    return (DOCS_ROOT / name).read_text(encoding="utf-8")
+
+
+def _normalized_document(name: str) -> str:
+    return " ".join(_document(name).split()).lower()
+
+
 def _normalized_readme() -> str:
     return " ".join(_readme().split()).lower()
+
+
+def test_public_documentation_home_routes_readers_by_task() -> None:
+    index = _normalized_document("index.md")
+    for required in (
+        "register two images",
+        "choose a registration strategy",
+        "run multiple imaging rounds",
+        "configure advanced or hpc execution",
+        "contribute to cy-exm",
+    ):
+        assert required in index
+    assert "phase 1" not in index
+    assert "phase 2" not in index
+
+
+def test_registration_foundations_separates_science_from_execution() -> None:
+    guide = _normalized_document("registration-foundations.md")
+    for required in (
+        "whole-image registration",
+        "serial-chunked registration",
+        "scientific registration strategy",
+        "execution environment",
+        "task granularity",
+        "affine",
+        "nonlinear",
+        "memory",
+        "restart",
+    ):
+        assert required in guide
+    assert guide.index("scientific registration strategy") < guide.index(
+        "execution environment"
+    )
+    assert "phase 1" not in guide
+    assert "phase 2" not in guide
+
+
+def test_getting_started_gives_a_complete_source_checkout() -> None:
+    guide = _document("getting-started.md")
+    for required in (
+        "git clone https://github.com/TheDeanLab/Cy-ExM.git",
+        "cd Cy-ExM",
+        "uv sync --locked --no-dev",
+        "uv run",
+        "Python 3.12",
+        "caller-provided",
+    ):
+        assert required in guide
 
 
 def test_readme_documents_every_workflow_command_option_and_example() -> None:
@@ -61,8 +118,8 @@ def test_readme_workflow_command_blocks_use_the_uv_managed_environment() -> None
     assert "all workflow commands below use `uv run`" in normalized
 
 
-def test_readme_documents_installation_and_scheduler_neutral_architecture() -> None:
-    readme = _normalized_readme()
+def test_getting_started_documents_installation_choices() -> None:
+    guide = _normalized_document("getting-started.md")
     for command in (
         "uv sync --locked",
         "uv sync --locked --extra workflow",
@@ -71,24 +128,7 @@ def test_readme_documents_installation_and_scheduler_neutral_architecture() -> N
         "uv sync --no-dev --extra examples",
         "uv sync --group dev --extra examples",
     ):
-        assert command in readme
-    for required in (
-        "scientific dataset manifest",
-        "execution profile",
-        "one immutable `referencetask`",
-        "one immutable `roundtask` per moving round",
-        "hard executor barrier",
-        "serial inside each moving-round task",
-        "phase 1 completion records are the only restart authority",
-        "no nested chunk multiprocessing",
-        "planning is mutation-free",
-        "`parallelism.mode`",
-        "`coarse`",
-        "`fine_grained`",
-        "omitting `parallelism` normalizes to `coarse`",
-        "scientific fingerprint is unchanged",
-    ):
-        assert required in readme
+        assert command in guide
 
 
 def test_readme_documents_every_scientific_manifest_field_and_rule() -> None:

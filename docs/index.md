@@ -9,11 +9,12 @@ Cy-ExM requires Python 3.12 and is distributed under academic-research-use terms
 
 ## What do you want to do?
 
-- **[Register two images](getting-started.md):** install from source and run the
-  smallest supported registration.
+- **[Register two images](getting-started.md):** use the Python API to register a
+  fixed reference and a moving image.
 - **[Choose a registration strategy](registration-foundations.md):** compare
   whole-image and serial-chunked registration.
-- **[Run multiple imaging rounds](workflow-guide.md):** use the workflow tutorial.
+- **[Run multiple imaging rounds](workflow-guide.md):** use YAML manifests and the
+  workflow tutorial.
 - **[Configure advanced or HPC execution](fine-grained-execution.md):** understand
   the available execution choices.
 - **[Contribute to Cy-ExM](agentic-api-documentation.md):** follow the current API

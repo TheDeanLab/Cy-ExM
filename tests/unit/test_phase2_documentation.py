@@ -41,6 +41,13 @@ def test_public_documentation_home_routes_readers_by_task() -> None:
         "contribute to cy-exm",
     ):
         assert required in index
+    assert (
+        "**[register two images](getting-started.md):** use the python api" in index
+    )
+    assert (
+        "**[run multiple imaging rounds](workflow-guide.md):** use yaml manifests"
+        in index
+    )
     assert "phase 1" not in index
     assert "phase 2" not in index
 

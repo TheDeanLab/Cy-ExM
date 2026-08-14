@@ -414,6 +414,15 @@ def test_cli_reference_documents_success_only_json_output() -> None:
         assert required in normalized
 
 
+def test_cli_reference_links_to_an_existing_operational_guide() -> None:
+    reference = _document("cli-reference.md")
+    target = "fine-grained-execution.md"
+
+    assert f"]({target})" in reference
+    assert (DOCS_ROOT / target).is_file()
+    assert "parallel-hpc.md" not in reference
+
+
 def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> None:
     readme = _readme()
     normalized = _normalized_readme()

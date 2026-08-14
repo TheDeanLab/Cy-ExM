@@ -115,7 +115,7 @@ preflight errors abort before expensive tasks. Independent round failures do not
 cancel other submitted rounds; all submitted work settles, successful artifacts stay
 committed, a failed operational summary is written, and the workflow reports the
 failed round numbers. For executor, preflight, cancellation, and site-specific
-interpretation, see [Local parallel and HPC execution](parallel-hpc.md).
+interpretation, see [Fine-grained execution](fine-grained-execution.md).
 
 | Exit code | Meaning |
 | --- | --- |

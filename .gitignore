@@ -4,3 +4,5 @@ __pycache__/
 
 # Documentation build output
 docs/_build/
+/.idea
+cy_exm.egg-info/

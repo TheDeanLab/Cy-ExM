@@ -41,9 +41,7 @@ def test_public_documentation_home_routes_readers_by_task() -> None:
         "contribute to cy-exm",
     ):
         assert required in index
-    assert (
-        "**[register two images](getting-started.md):** use the python api" in index
-    )
+    assert "**[register two images](getting-started.md):** use the python api" in index
     assert (
         "**[run multiple imaging rounds](workflow-guide.md):** use yaml manifests"
         in index
@@ -86,8 +84,8 @@ def test_getting_started_gives_a_complete_source_checkout() -> None:
         assert required in guide
 
 
-def test_readme_documents_every_workflow_command_option_and_example() -> None:
-    readme = _readme()
+def test_workflow_and_cli_docs_cover_every_command_option_and_example() -> None:
+    text = _document("workflow-guide.md") + _document("cli-reference.md")
     for command in (
         "uv run cyexm workflow validate",
         "uv run cyexm workflow plan",
@@ -99,15 +97,15 @@ def test_readme_documents_every_workflow_command_option_and_example() -> None:
         "--log-level",
         "--version",
     ):
-        assert command in readme
+        assert command in text
     for path in EXAMPLE_PATHS:
-        assert f"]({path})" in readme
+        assert f"](../{path})" in text
 
-    assert not any(line.startswith("cyexm ") for line in readme.splitlines())
+    assert not any(line.startswith("cyexm ") for line in text.splitlines())
 
 
-def test_readme_workflow_command_blocks_use_the_uv_managed_environment() -> None:
-    readme = _readme()
+def test_workflow_guide_uses_the_uv_managed_environment() -> None:
+    guide = _document("workflow-guide.md")
     for command_block in (
         "uv run cyexm workflow validate examples/spheroid-dataset.yaml \\\n"
         "  --execution examples/execution-sequential.yaml",
@@ -118,9 +116,9 @@ def test_readme_workflow_command_blocks_use_the_uv_managed_environment() -> None
         "uv run cyexm workflow status results spheroid-registration-example",
         "uv run cyexm --version",
     ):
-        assert command_block in readme
+        assert command_block in guide
 
-    normalized = _normalized_readme()
+    normalized = _normalized_document("workflow-guide.md")
     assert "`uv sync` does not activate `.venv`" in normalized
     assert "all workflow commands below use `uv run`" in normalized
 
@@ -138,8 +136,8 @@ def test_getting_started_documents_installation_choices() -> None:
         assert command in guide
 
 
-def test_readme_documents_every_scientific_manifest_field_and_rule() -> None:
-    readme = _readme()
+def test_dataset_manifest_reference_documents_every_field_and_rule() -> None:
+    reference = _document("dataset-manifest.md")
     for field in (
         "schema_version",
         "dataset_id",
@@ -164,9 +162,9 @@ def test_readme_documents_every_scientific_manifest_field_and_rule() -> None:
         "chunk_size_zyx",
         "overlap_fraction",
     ):
-        assert f"`{field}`" in readme
+        assert f"`{field}`" in reference
 
-    normalized = _normalized_readme()
+    normalized = _normalized_document("dataset-manifest.md")
     for rule in (
         "micrometers in xyz order",
         "`whole_image` or `serial_chunked`",
@@ -368,9 +366,7 @@ def test_scientific_user_guides_preserve_public_contracts(
 
 
 def test_output_and_artifact_guides_document_lifecycle_and_status() -> None:
-    text = _document("outputs-and-recovery.md") + _document(
-        "registration-artifacts.md"
-    )
+    text = _document("outputs-and-recovery.md") + _document("registration-artifacts.md")
     for output in (
         "scientific-plan.json",
         "workflow-runs/",
@@ -405,8 +401,8 @@ def test_output_and_artifact_guides_document_lifecycle_and_status() -> None:
         assert required in normalized
 
 
-def test_readme_documents_success_only_json_output() -> None:
-    normalized = _normalized_readme()
+def test_cli_reference_documents_success_only_json_output() -> None:
+    normalized = _normalized_document("cli-reference.md")
     for required in (
         "`--json` is success-only",
         "failures return before result emission",

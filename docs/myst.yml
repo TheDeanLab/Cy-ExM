@@ -18,8 +18,10 @@ project:
         - file: outputs-and-recovery.md
     - title: Advanced usage
       children:
-        - file: registration-artifacts.md
+        - file: dataset-manifest.md
+        - file: cli-reference.md
         - file: fine-grained-execution.md
+        - file: registration-artifacts.md
     - title: Characterization and evidence
       children:
         - file: brightness-dependence-investigation.md

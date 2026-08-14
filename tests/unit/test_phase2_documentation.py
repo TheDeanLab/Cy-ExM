@@ -1,5 +1,7 @@
 import re
+from fnmatch import fnmatchcase
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -14,33 +16,80 @@ EXAMPLE_PATHS = (
     "examples/execution-slurm-512gb.yaml",
     "examples/execution-slurm-512gb-multi-process.yaml",
 )
-PUBLIC_BOOK_DOCUMENTS = (
-    "index.md",
-    "getting-started.md",
-    "registration-foundations.md",
-    "workflow-guide.md",
-    "image-geometry.md",
-    "preprocessing.md",
-    "feature-derived-registration-masks.md",
-    "outputs-and-recovery.md",
-    "dataset-manifest.md",
-    "execution-profile.md",
-    "cli-reference.md",
-    "native-threading.md",
-    "parallel-hpc.md",
-    "fine-grained-execution.md",
-    "registration-artifacts.md",
-    "development.md",
-    "architecture.md",
-    "agentic-api-documentation.md",
-    "brightness-dependence-investigation.md",
-    "asinh-preprocessing-registration-investigation.md",
-    "cc-syn-radius-characterization.md",
-    "fixed-affine-chunk-size-characterization.md",
-    "phase2e-multithreaded-registration-reproducibility.md",
-    "phase-1-acceptance.md",
-    "phase-2-acceptance.md",
-)
+
+
+def _myst_toc_documents() -> tuple[str, ...]:
+    navigation = (DOCS_ROOT / "myst.yml").read_text(encoding="utf-8")
+    return tuple(
+        match.group(1)
+        for line in navigation.splitlines()
+        if (match := re.fullmatch(r"\s*- file:\s*(\S+)\s*", line))
+    )
+
+
+def _myst_exclude_patterns() -> tuple[str, ...]:
+    navigation = (DOCS_ROOT / "myst.yml").read_text(encoding="utf-8")
+    patterns: list[str] = []
+    in_excludes = False
+    for line in navigation.splitlines():
+        if line.strip() == "exclude:":
+            in_excludes = True
+            continue
+        if not in_excludes:
+            continue
+        match = re.fullmatch(r"\s*-\s+(\S+)\s*", line)
+        if match is not None:
+            patterns.append(match.group(1))
+            continue
+        if line and not line.startswith("    "):
+            break
+    return tuple(patterns)
+
+
+PUBLIC_BOOK_DOCUMENTS = _myst_toc_documents()
+
+
+def _markdown_link_targets(text: str) -> tuple[str, ...]:
+    targets: list[str] = []
+    for match in re.finditer(r"(?<!!)\[[^\]\n]+\]\(([^)\n]+)\)", text):
+        raw = match.group(1).strip()
+        if raw.startswith("<") and ">" in raw:
+            targets.append(raw[1 : raw.index(">")])
+        else:
+            targets.append(raw.split(maxsplit=1)[0])
+    return tuple(targets)
+
+
+def _markdown_fragment_ids(path: Path) -> frozenset[str]:
+    identifiers: set[str] = set()
+    slug_counts: dict[str, int] = {}
+    in_fence = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if re.match(r"^\s*(```|~~~)", line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if match := re.fullmatch(r"\(([^)]+)\)=\s*", line):
+            identifiers.add(match.group(1))
+            continue
+        match = re.match(r"^#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if match is None:
+            continue
+        heading = match.group(1)
+        if explicit := re.search(r"\{#([^}]+)\}\s*$", heading):
+            identifiers.add(explicit.group(1))
+            heading = heading[: explicit.start()]
+        heading = re.sub(r"<[^>]+>", "", heading)
+        heading = re.sub(r"!\[([^]]*)\]\([^)]+\)", r"\1", heading)
+        heading = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", heading)
+        heading = heading.replace("`", "").lower().strip()
+        slug = re.sub(r"[^\w\- ]", "", heading)
+        slug = re.sub(r"\s", "-", slug)
+        duplicate_index = slug_counts.get(slug, 0)
+        slug_counts[slug] = duplicate_index + 1
+        identifiers.add(slug if duplicate_index == 0 else f"{slug}-{duplicate_index}")
+    return frozenset(identifiers)
 
 
 def _readme() -> str:
@@ -139,30 +188,59 @@ def test_developer_guide_preserves_maintenance_contract() -> None:
         assert required in guide
 
 
-def test_public_navigation_contains_every_approved_page() -> None:
-    navigation = _document("myst.yml")
-    for page in (
-        "getting-started.md",
-        "registration-foundations.md",
-        "workflow-guide.md",
-        "image-geometry.md",
-        "preprocessing.md",
-        "feature-derived-registration-masks.md",
-        "outputs-and-recovery.md",
-        "dataset-manifest.md",
-        "execution-profile.md",
-        "cli-reference.md",
-        "native-threading.md",
-        "parallel-hpc.md",
-        "fine-grained-execution.md",
-        "registration-artifacts.md",
-        "development.md",
-        "architecture.md",
-        "phase2e-multithreaded-registration-reproducibility.md",
-        "phase-1-acceptance.md",
-        "phase-2-acceptance.md",
-    ):
-        assert f"file: {page}" in navigation
+def test_public_toc_and_local_links_are_resolvable() -> None:
+    toc_documents = _myst_toc_documents()
+    assert toc_documents
+    assert len(toc_documents) == len(set(toc_documents)), toc_documents
+
+    public_paths = [REPOSITORY_ROOT / "README.md"]
+    for document in toc_documents:
+        path = (DOCS_ROOT / document).resolve()
+        assert path.is_relative_to(DOCS_ROOT.resolve()), document
+        assert path.is_file(), document
+        public_paths.append(path)
+
+    exclude_patterns = _myst_exclude_patterns()
+    assert set(exclude_patterns) == {
+        "AGENTS.md",
+        "legacy-*-report.md",
+        "migration-from-clearex.md",
+        "superpowers/**",
+    }
+    excluded_paths: set[Path] = set()
+    for pattern in exclude_patterns:
+        matches = {
+            path.resolve()
+            for path in DOCS_ROOT.rglob("*")
+            if path.is_file()
+            and fnmatchcase(path.relative_to(DOCS_ROOT).as_posix(), pattern)
+        }
+        assert matches, f"docs/myst.yml exclude pattern matches nothing: {pattern!r}"
+        excluded_paths.update(matches)
+    assert not excluded_paths.intersection(public_paths)
+
+    for source in public_paths:
+        for target in _markdown_link_targets(source.read_text(encoding="utf-8")):
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or target.startswith("/"):
+                continue
+            destination = (
+                source
+                if not parsed.path
+                else (source.parent / unquote(parsed.path)).resolve()
+            )
+            assert destination.is_relative_to(REPOSITORY_ROOT.resolve()), (
+                f"{source}: local target escapes the repository: {target!r}"
+            )
+            assert destination.exists(), f"{source}: missing local target {target!r}"
+            assert destination not in excluded_paths, (
+                f"{source}: public link targets excluded page {target!r}"
+            )
+            if parsed.fragment and destination.suffix.lower() == ".md":
+                fragment = unquote(parsed.fragment)
+                assert fragment in _markdown_fragment_ids(destination), (
+                    f"{source}: missing fragment {fragment!r} in {destination}"
+                )
 
 
 def test_architecture_records_supported_non_goals() -> None:
@@ -211,14 +289,6 @@ def test_public_book_omits_historical_source_repository_references() -> None:
         assert "/project/bioinformatics" not in text, page
 
 
-def test_public_markdown_links_do_not_target_excluded_internal_docs() -> None:
-    for page in PUBLIC_BOOK_DOCUMENTS:
-        targets = re.findall(r"\]\(([^)#]+)", _document(page))
-        assert not any(
-            target.lstrip("./").startswith("superpowers/") for target in targets
-        ), page
-
-
 def test_registration_foundations_separates_science_from_execution() -> None:
     guide = _normalized_document("registration-foundations.md")
     for required in (
@@ -251,6 +321,24 @@ def test_getting_started_gives_a_complete_source_checkout() -> None:
         "caller-provided",
     ):
         assert required in guide
+
+
+def test_registration_foundations_owns_direct_python_scientific_defaults() -> None:
+    guide = _normalized_document("registration-foundations.md")
+    for required in (
+        "direct-python scientific defaults",
+        "`trsaa` with the `low` linear preset",
+        "`synonly` with the `high` nonlinear preset",
+        "omitted `nonlinear_metric` uses `mattes` with 32 bins",
+        "selects `cc` explicitly",
+        "omitted `nonlinear_radius` uses the provisional scalar voxel radius 4",
+        "manifest requires an explicit nonlinear `metric`",
+    ):
+        assert required in guide
+    assert (
+        "(registration-foundations.md#direct-python-scientific-defaults)"
+        in _document("getting-started.md")
+    )
 
 
 def test_workflow_and_cli_docs_cover_every_command_option_and_example() -> None:
@@ -343,6 +431,7 @@ def test_dataset_manifest_reference_documents_every_field_and_rule() -> None:
         "`linear` or `nearestneighbor`",
         "safe relative posix path",
         "registration channel must be listed",
+        "moving-channel output basenames must be unique within each round",
         "retired singular `reference.channel` form is rejected",
         "scientifically identical bounds",
         "moving rounds are unique",
@@ -403,7 +492,8 @@ def test_execution_profile_reference_documents_every_field_and_rule() -> None:
         "string | Semantic memory request; the executor rounds up to whole binary "
         "GiB for SLURM and Dask. |",
         "| `slurm` / `startup_timeout` | non-empty single-line string | Bounds "
-        "only Dask `Client` connection and `wait_for_workers`. |",
+        "initial Dask connection/worker waiting and the absolute active fine-SLURM "
+        "replacement/reconciliation deadline. |",
         "| `slurm` / `task_retries` | nonnegative built-in integer | "
         "Executor-managed retry count after the first attempt. |",
     ):
@@ -444,11 +534,30 @@ def test_execution_profile_documents_the_exact_startup_timeout_scope() -> None:
     normalized = _normalized_document("execution-profile.md")
     for required in (
         "`startup_timeout` is not an end-to-end startup deadline",
-        "does not bound `localcluster` or `slurmcluster` construction",
-        "does not bound `scheduler_info()` calls",
-        "does not bound the `client.run()` worker-preflight rpc",
+        "initial dask `client` connection and `wait_for_workers()`",
+        "initial `localcluster` or `slurmcluster` construction",
+        "initial worker snapshots through `scheduler_info()`",
+        "initial `client.run()` worker-preflight rpc",
+        "no cy-exm wall-clock timeout",
+        "active fine-slurm replacement and reconciliation",
+        "one absolute deadline",
+        "worker health and replacement snapshots",
+        "replacement worker arrival",
+        "replacement worker probe broadcast",
+        "resource validation",
+        "whole-group activation and final receipt verification",
+        "does not reset between steps",
     ):
         assert required in normalized
+
+    hpc = _normalized_document("parallel-hpc.md")
+    for required in (
+        "`slurm.startup_timeout`",
+        "one absolute replacement/reconciliation deadline",
+        "initial cluster construction, scheduler snapshots, and worker-preflight rpc",
+        "no cy-exm wall-clock timeout",
+    ):
+        assert required in hpc
 
 
 def test_native_threading_documents_planning_and_worker_boundaries() -> None:
@@ -584,11 +693,22 @@ def test_cli_reference_documents_success_only_json_output() -> None:
 
 def test_cli_reference_links_to_an_existing_operational_guide() -> None:
     reference = _document("cli-reference.md")
-    target = "fine-grained-execution.md"
+    target = "parallel-hpc.md"
 
     assert f"]({target})" in reference
     assert (DOCS_ROOT / target).is_file()
-    assert "parallel-hpc.md" not in reference
+    assert "general executor startup, preflight, cancellation, cleanup" in reference
+    assert "](fine-grained-execution.md" in reference
+
+
+def test_workflow_and_cli_document_reference_round_forcing() -> None:
+    for name in ("workflow-guide.md", "cli-reference.md"):
+        guide = _normalized_document(name)
+        for required in (
+            "selected rounds, including the reference round",
+            "forcing the reference round propagates to every moving descendant",
+        ):
+            assert required in guide, name
 
 
 def test_parallel_hpc_guide_documents_executor_lifecycle() -> None:
@@ -734,7 +854,9 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
         "replacement timeout",
         "artifactstore remains the only restart authority",
         "performance is characterization",
-        "`format_version` is exactly `2`",
+        "`format_version: 2` when preprocessing is disabled",
+        "`format_version: 3` for unmasked asinh features",
+        "`format_version: 4` for feature-derived masks",
         "`pixeltypes`",
         "`fixed_mask`",
         "`fixed_scalar`",
@@ -751,6 +873,20 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
     assert "clearex" not in guide
     assert "phase 1" not in guide
     assert "phase 2" not in guide
+
+
+def test_registration_artifact_inventories_name_their_execution_surface() -> None:
+    guide = _normalized_document("registration-artifacts.md")
+    for required in (
+        "standalone direct-python",
+        "`imageregistration`",
+        "`chunkedimageregistration`",
+        "yaml workflow layout",
+        "`rounds/round-002/registration/`",
+        "`reference_crop_indices.json`",
+        "[outputs, restart, and recovery](outputs-and-recovery.md)",
+    ):
+        assert required in guide
 
 
 def test_maintained_docs_distinguish_shared_cores_and_rejected_evidence() -> None:

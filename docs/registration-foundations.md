@@ -54,6 +54,19 @@ application establishes the fixed grid, scalar data use linear interpolation, an
 mask data use nearest-neighbor interpolation. Restart safety depends on matching
 artifact completion records, not on a filename or executor summary alone.
 
+## Direct-Python scientific defaults
+
+The standalone direct-Python API uses `TRSAA` with the `low` linear preset, followed
+by `SyNOnly` with the `high` nonlinear preset. In standalone direct Python, an
+omitted `nonlinear_metric` uses `mattes` with 32 bins. The Getting started example
+selects `CC` explicitly. Its omitted `nonlinear_radius` uses the provisional scalar
+voxel radius 4. That radius is one positive voxel count, not a per-axis physical
+radius or a claim of dataset-specific optimality.
+
+The YAML route is intentionally stricter: the scientific dataset manifest requires
+an explicit nonlinear `metric` of `CC` or `mattes`. If that explicit choice is `CC`,
+an omitted radius likewise normalizes to the provisional scalar voxel radius 4.
+
 ## Next steps
 
 Start with [Getting started](getting-started.md) for the whole-image API example.

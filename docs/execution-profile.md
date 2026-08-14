@@ -40,7 +40,7 @@ The `executor` controls which one matching resource section is present:
 | `slurm` / `walltime` | non-empty single-line string | Job walltime. |
 | `slurm` / `interface` | non-empty single-line string | Worker network interface. |
 | `slurm` / `scheduler_interface` | non-empty single-line string | Coordinator/scheduler network interface. |
-| `slurm` / `startup_timeout` | non-empty single-line string | Bounds only Dask `Client` connection and `wait_for_workers`. |
+| `slurm` / `startup_timeout` | non-empty single-line string | Bounds initial Dask connection/worker waiting and the absolute active fine-SLURM replacement/reconciliation deadline. |
 | `slurm` / `task_retries` | nonnegative built-in integer | Executor-managed retry count after the first attempt. |
 | `slurm` / `job_name` | non-empty single-line string | Owned worker-job name. |
 | `slurm` / `job_extra_directives` | list of non-empty single-line strings | Site additions that do not conflict with managed SLURM options. |
@@ -129,13 +129,31 @@ the per-process Dask memory limits never sum above the job request.
 
 ## Startup-timeout boundary
 
-`startup_timeout` is not an end-to-end startup deadline. It bounds only Dask
-`Client` connection and `wait_for_workers`; it does not bound `LocalCluster` or
-`SLURMCluster` construction, does not bound `scheduler_info()` calls, and does not
-bound the `Client.run()` worker-preflight RPC. Those operations currently have no
-Cy-ExM wall-clock timeout, so a stalled constructor or preflight RPC can outlive the
-configured value. Treat this as an operational limitation when choosing where to run
-the coordinator.
+`startup_timeout` is not an end-to-end startup deadline. During initial Local-Dask
+or SLURM startup, it bounds the initial Dask `Client` connection and
+`wait_for_workers()`. Initial `LocalCluster` or `SLURMCluster` construction, initial
+worker snapshots through `scheduler_info()`, and the initial `Client.run()`
+worker-preflight RPC have no Cy-ExM wall-clock timeout. A stalled constructor,
+snapshot, or preflight RPC can therefore outlive the configured value.
+
+Demand-driven fine-SLURM scale-up also applies the value to
+`wait_for_workers()`. Its subsequent scheduler snapshot, probe, resource check, and
+activation do not share an additional Cy-ExM wall-clock deadline in that scale-up
+path.
+
+Active fine-SLURM replacement and reconciliation gives
+`slurm.startup_timeout` a separate, stronger role. Cy-ExM parses it once at the start
+of a reconciliation pass and establishes one absolute deadline. The remaining
+budget covers worker health and replacement snapshots, replacement worker arrival,
+the replacement worker probe broadcast, scheduler resource validation, and
+whole-group activation and final receipt verification. The deadline does not reset
+between steps. If any covered blocking control-plane call consumes the remaining
+budget, the replacement transaction fails, active work is cancelled best-effort,
+and owned resources enter ordered cleanup.
+
+Treat both the unbounded initial/scale-up operations and the bounded active-recovery
+transaction as operational limitations when choosing the coordinator location and
+timeout value.
 
 ## Strict YAML validation
 

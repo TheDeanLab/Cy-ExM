@@ -58,6 +58,11 @@ Reference-channel `file` values and their output basenames must both be unique. 
 reference task copies each declared source into its shared channels directory; it
 never moves or modifies the source file.
 
+Moving-channel output basenames must be unique within each round as well. Distinct
+relative paths such as `nested-a/same.tif` and `nested-b/same.tif` have different
+`file` values but both map to `channels/same.tif`; planning rejects that output
+collision before execution.
+
 ## Reference and moving geometry
 
 All declared reference channels must have identical native shape, origin, spacing,

@@ -207,8 +207,10 @@ For a moving round `{round}`, fine preparation commits this internal bundle bene
 
 The arrays are uncompressed, C-contiguous, non-object float32 data. Workers open them
 read-only with memory-mapped regional access and copy only an extended chunk into
-process-owned memory. The strict prepared manifest's `format_version` is exactly `2`.
-Its `pixeltypes` mapping has exactly four canonical roles: `fixed_mask`,
+process-owned memory. The strict prepared manifest uses `format_version: 2` when
+preprocessing is disabled, `format_version: 3` for unmasked asinh features, and
+`format_version: 4` for feature-derived masks. Its `pixeltypes` mapping has exactly
+four canonical roles: `fixed_mask`,
 `fixed_scalar`, `moving_linear_mask`, and `moving_linear_scalar`. Each value is the
 actual accepted ANTs image type for that role and must be exactly `unsigned char`,
 `unsigned int`, `float`, or `double`. It is recorded scientific/cache evidence, not a

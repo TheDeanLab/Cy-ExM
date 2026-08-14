@@ -4,17 +4,23 @@ Cy-ExM treats a registration output as a committed cache entry only when the art
 and its own completion JSON are both present, readable, and consistent with the
 current request. Filename existence by itself never proves completion.
 
-For a conceptual guide to outputs, ordinary resume, force, status, and recovery, see
-the [user-facing recovery guide](outputs-and-recovery.md).
+The exact inventories below describe standalone direct-Python
+`ImageRegistration` and `ChunkedImageRegistration` artifacts written inside their
+dedicated save directory. The YAML workflow layout nests a moving round's equivalent
+registration artifacts under `rounds/round-002/registration/`, manages reference and
+transformed channels in per-round `channels/` directories, and names the shared
+reference crop `reference_crop_indices.json`. See [Outputs, restart, and
+recovery](outputs-and-recovery.md) for that dataset-level layout, ordinary resume,
+force, status, and recovery.
 
 Use a dedicated output directory for each fixed/moving registration request. The
 transform and registered-image names include `{round}`, while the fixed reference and
 metric filenames do not; mixing different round requests in one directory therefore
 produces a deliberate cache-request mismatch instead of silent reuse.
 
-## Whole-image artifact inventory
+## Standalone whole-image artifact inventory
 
-For imaging round `{round}`, the workflow may create:
+For imaging round `{round}`, direct `ImageRegistration` may create:
 
 | Artifact | Purpose | Completion record |
 | --- | --- | --- |
@@ -34,10 +40,10 @@ registration:
 | `fixed_crop_indices_{round}.json` | exclusive fixed ZYX crop bounds | `fixed_crop_indices_{round}.json.complete.json` |
 | `moving_crop_indices_{round}.json` | exclusive moving ZYX crop bounds | `moving_crop_indices_{round}.json.complete.json` |
 
-## Serial chunk artifact inventory
+## Standalone serial chunk artifact inventory
 
-Serial chunking creates the whole-image artifacts above plus local nonlinear evidence
-under `round_{round}_chunks/`:
+Direct `ChunkedImageRegistration` creates the whole-image artifacts above plus local
+nonlinear evidence under `round_{round}_chunks/`:
 
 | Artifact | Purpose | Completion record |
 | --- | --- | --- |

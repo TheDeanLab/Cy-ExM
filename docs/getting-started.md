@@ -81,6 +81,10 @@ register_round(
 )
 ```
 
+Before adapting this call, review the [direct-Python scientific
+defaults](registration-foundations.md#direct-python-scientific-defaults), including
+the transform presets and the metric/radius behavior implied by omitted arguments.
+
 ## Where to go next
 
 Read [Choosing a registration strategy](registration-foundations.md) to decide

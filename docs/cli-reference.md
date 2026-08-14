@@ -62,8 +62,9 @@ $ cyexm workflow run DATASET_YAML --execution EXECUTION_YAML \
 
 Execute pending work. Ordinary resume is the default: only matching artifact
 completion records authorize reuse. `--force-round N` is repeatable and requests
-recomputation of selected moving rounds; `--force-all` requests all rounds. The
-options are mutually exclusive, and an unknown forced round is an error.
+recomputation of selected rounds, including the reference round. Forcing the
+reference round propagates to every moving descendant; `--force-all` requests all
+rounds. The options are mutually exclusive, and an unknown forced round is an error.
 
 ```bash
 uv run cyexm workflow run examples/spheroid-dataset.yaml \
@@ -95,9 +96,10 @@ uv run cyexm workflow status results spheroid-registration-example
 
 Force affects only a compatible scientific plan. It cannot bypass a scientific-plan
 fingerprint mismatch; a scientifically incompatible plan requires a new output root.
-Forcing the reference round invalidates all moving descendants because their
-fixed-input provenance changes. See [Outputs, restart, and recovery](outputs-and-recovery.md)
-for artifact authority, status states, and safe recovery.
+Forcing the reference round propagates to every moving descendant because their
+fixed-input provenance changes. See [Outputs, restart, and
+recovery](outputs-and-recovery.md) for artifact authority, status states, and safe
+recovery.
 
 ## Structured JSON and logging
 
@@ -114,8 +116,10 @@ Configuration and plan errors occur before executor construction. Startup and
 preflight errors abort before expensive tasks. Independent round failures do not
 cancel other submitted rounds; all submitted work settles, successful artifacts stay
 committed, a failed operational summary is written, and the workflow reports the
-failed round numbers. For executor, preflight, cancellation, and site-specific
-interpretation, see [Fine-grained execution](fine-grained-execution.md).
+failed round numbers. For general executor startup, preflight, cancellation, cleanup,
+and site-specific interpretation, see [Local parallel and HPC
+execution](parallel-hpc.md). For fine execution-evidence details, see
+[Fine-grained execution](fine-grained-execution.md#completion-cache-identity-and-status).
 
 | Exit code | Meaning |
 | --- | --- |

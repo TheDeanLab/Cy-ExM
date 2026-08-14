@@ -136,9 +136,12 @@ Preflight checks exact Cy-ExM and dependency versions, hostname and SLURM job
 identity, dataset/output visibility, scratch creation and cleanup, all six
 native-thread values, memory evidence, and scheduler/worker network identity. A
 timeout or mismatch closes owned resources and fails as executor startup rather than
-falling back to a different executor. `startup_timeout` does not bound cluster
-construction, scheduler snapshots, or worker-preflight RPC; its exact scope is in
-the [execution-profile reference](execution-profile.md#startup-timeout-boundary).
+falling back to a different executor. During initial startup,
+`slurm.startup_timeout` bounds Dask client connection and worker arrival. Initial
+cluster construction, scheduler snapshots, and worker-preflight RPC have no Cy-ExM
+wall-clock timeout; demand-driven fine scale-up has the same unbounded follow-up
+operations after its bounded worker wait. The exact scope is in the
+[execution-profile reference](execution-profile.md#startup-timeout-boundary).
 
 ## Retry, cancellation, and cleanup
 
@@ -152,8 +155,11 @@ Independent round failures do not cancel other submitted rounds; submitted work
 settles and successful artifacts remain committed. A lost fine-process can be
 replaced while a healthy sibling continues; a lost whole job replaces and
 revalidates the whole process group. A partially arrived replacement group remains
-ineligible. One replacement timeout covers arrival, probe, group validation,
-activation, and final verification. A failed transaction records its exact stage,
+ineligible. During active fine-SLURM recovery, `slurm.startup_timeout` supplies one
+absolute replacement/reconciliation deadline for worker health and replacement
+snapshots, replacement arrival, the replacement probe broadcast, resource
+validation, and whole-group activation with final receipt verification. The budget
+does not reset between these steps. A failed transaction records its exact stage,
 cancels active work best-effort, and performs ordered cleanup.
 
 On `KeyboardInterrupt` or CLI termination, distributed executors cancel unfinished

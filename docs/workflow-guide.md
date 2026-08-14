@@ -81,11 +81,13 @@ uv run cyexm workflow status results spheroid-registration-example
 
 ## Recompute selected work
 
-Use `--force-round` to request recomputation of one or more moving rounds in a
-compatible scientific plan. It is repeatable. Use `--force-all` to request
-recomputation of every round in that compatible plan; the two options are mutually
-exclusive. An unknown forced round is an error. Force cannot bypass a scientific-plan
-fingerprint mismatch, which requires a new output root.
+Use `--force-round` to request recomputation of one or more selected rounds,
+including the reference round, in a compatible scientific plan. It is repeatable.
+Forcing the reference round propagates to every moving descendant because each
+depends on its prepared fixed input. Use `--force-all` to request recomputation of
+every round in that compatible plan; the two options are mutually exclusive. An
+unknown forced round is an error. Force cannot bypass a scientific-plan fingerprint
+mismatch, which requires a new output root.
 
 ```bash
 uv run cyexm workflow run examples/spheroid-dataset.yaml \

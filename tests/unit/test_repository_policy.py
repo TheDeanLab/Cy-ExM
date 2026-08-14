@@ -796,14 +796,16 @@ def test_acceptance_audit_records_the_implementation_baseline_and_scope() -> Non
     ):
         assert stale_snapshot not in acceptance
 
-    readme = _read_repository_file("README.md")
-    assert "[Phase 1 acceptance audit](docs/phase-1-acceptance.md)" in readme
+    navigation = _read_repository_file("docs/myst.yml")
+    assert "file: phase-1-acceptance.md" in navigation
+    assert "file: phase-2-acceptance.md" in navigation
     unit_command = 'uv run pytest -m "unit and not hpc" tests/unit -v'
     integration_command = (
         'uv run pytest -m "integration and not hpc" tests/integration -v'
     )
-    assert unit_command in readme
-    assert integration_command in readme
+    development = _read_repository_file("docs/development.md")
+    assert unit_command in development
+    assert integration_command in development
     root_guidance = _read_repository_file("AGENTS.md")
     assert unit_command in root_guidance
     assert integration_command in root_guidance
@@ -875,11 +877,12 @@ def test_phase_two_acceptance_audit_records_external_two_tier_evidence() -> None
     ):
         assert forbidden not in normalized, forbidden
 
-    readme = _read_repository_file("README.md")
-    assert "[Phase 2 acceptance audit](docs/phase-2-acceptance.md)" in readme
+    navigation = _read_repository_file("docs/myst.yml")
+    assert "file: phase-1-acceptance.md" in navigation
+    assert "file: phase-2-acceptance.md" in navigation
     for stale in (
         "real-cluster acceptance is still pending",
         "Real SLURM submission and HPC acceptance remain pending",
         "Until that evidence is recorded",
     ):
-        assert stale not in readme
+        assert stale not in acceptance

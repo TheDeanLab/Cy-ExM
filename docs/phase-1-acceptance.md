@@ -1,4 +1,6 @@
-# Phase 1 acceptance audit
+# Registration-library acceptance
+
+This evidence record retains the historical Phase 1 label.
 
 ## Audit identity
 
@@ -65,7 +67,7 @@ CI fixes all six native-thread variables at the job level before Python starts:
 `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS`, `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, and
 `VECLIB_MAXIMUM_THREADS`. Its selectors are explicitly `unit and not hpc` and
-`integration and not hpc`; the workflow contains no ClearEx, Dask, SLURM, lab path,
+`integration and not hpc`; the workflow contains no external-source dependency, Dask, SLURM, lab path,
 or lab-storage access.
 
 Collection-time policy requires every test to have exactly one `unit`, `integration`,
@@ -76,8 +78,8 @@ and 7 integration modules.
 
 ## Acceptance evidence
 
-- **Legacy parity:** historical extraction evidence records the ClearEx comparison,
-  tolerances, source pin, and characterized corrections.
+- **Legacy parity:** historical extraction evidence records the retained source
+  snapshot comparison, tolerances, source pin, and characterized corrections.
 - **Import side effects:** all four tests in `test_import_contract.py` passed. They
   confirmed lightweight package/runtime/registration imports, unchanged environment
   and root logging state, no filesystem work during construction, and no eager ANTs,
@@ -128,11 +130,11 @@ and 7 integration modules.
   fixed-image identity.
 - **Examples migrated:** the exact inventory test passed for five parameterized
   scripts and six cleared notebooks. The all-files policy checks also confirmed that
-  examples use Cy-ExM and contain no lab paths, ClearEx imports, Dask, SLURM, or YAML
+  examples use Cy-ExM and contain no lab paths, external-source imports, Dask, SLURM, or YAML
   workflow configuration.
 - **Forbidden dependencies and exports:** executable audits confirmed that
   `cyexm.registration` does not expose `ParallelChunkedImageRegistration` and that
-  Cy-ExM declares no direct ClearEx, Dask, distributed, dask-jobqueue, or PyYAML
+  Cy-ExM declares no direct Dask, distributed, dask-jobqueue, or PyYAML
   dependency. The prescribed source search returned ten hits; inspection found only
   negative tests and `AGENTS.md` policy text, with no runtime import or dependency.
 

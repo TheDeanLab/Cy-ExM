@@ -47,6 +47,7 @@ dev = [
 docs = ["jupyter-book==2.1.6"]
 
 [project.urls]
+Documentation = "https://thedeanlab.github.io/Cy-ExM/"
 Source = "https://github.com/TheDeanLab/Cy-ExM"
 
 [tool.uv]

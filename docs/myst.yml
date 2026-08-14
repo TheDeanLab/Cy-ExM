@@ -25,12 +25,18 @@ project:
         - file: parallel-hpc.md
         - file: fine-grained-execution.md
         - file: registration-artifacts.md
+    - title: Developer guide
+      children:
+        - file: development.md
+        - file: architecture.md
+        - file: agentic-api-documentation.md
     - title: Characterization and evidence
       children:
         - file: brightness-dependence-investigation.md
         - file: asinh-preprocessing-registration-investigation.md
         - file: cc-syn-radius-characterization.md
         - file: fixed-affine-chunk-size-characterization.md
+        - file: phase2e-multithreaded-registration-reproducibility.md
         - file: phase-1-acceptance.md
         - file: phase-2-acceptance.md
   exclude:

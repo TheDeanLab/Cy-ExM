@@ -50,6 +50,123 @@ def test_public_documentation_home_routes_readers_by_task() -> None:
     assert "phase 2" not in index
 
 
+def test_developer_guide_preserves_maintenance_contract() -> None:
+    guide = _document("development.md")
+    for required in (
+        "uv sync --locked --group dev --extra examples --extra hpc",
+        'uv run pytest -m "unit and not hpc" tests/unit -v',
+        'uv run pytest -m "integration and not hpc" tests/integration -v',
+        "uv run ruff check .",
+        "uv run ruff format --check .",
+        "uv run basedpyright",
+        "uv run pre-commit run --all-files",
+        "jupyter book build --html",
+        "Dask/distributed 2025.1.0",
+        "dask-jobqueue 0.9.0",
+        "fresh compatibility evidence",
+        "agentic-api-documentation.md",
+    ):
+        assert required in guide
+
+
+def test_public_navigation_contains_every_approved_page() -> None:
+    navigation = _document("myst.yml")
+    for page in (
+        "getting-started.md",
+        "registration-foundations.md",
+        "workflow-guide.md",
+        "image-geometry.md",
+        "preprocessing.md",
+        "feature-derived-registration-masks.md",
+        "outputs-and-recovery.md",
+        "dataset-manifest.md",
+        "execution-profile.md",
+        "cli-reference.md",
+        "native-threading.md",
+        "parallel-hpc.md",
+        "fine-grained-execution.md",
+        "registration-artifacts.md",
+        "development.md",
+        "architecture.md",
+        "phase2e-multithreaded-registration-reproducibility.md",
+        "phase-1-acceptance.md",
+        "phase-2-acceptance.md",
+    ):
+        assert f"file: {page}" in navigation
+
+
+def test_architecture_records_supported_non_goals() -> None:
+    guide = _normalized_document("architecture.md")
+    for required in (
+        "parallelchunkedimageregistration",
+        "job arrays",
+        "cloud or kubernetes executors",
+        "automatic resource optimization",
+        "no silent fallback",
+    ):
+        assert required in guide
+
+
+def test_architecture_and_workflow_preserve_scheduler_neutral_contract() -> None:
+    text = _normalized_document("architecture.md") + _normalized_document(
+        "workflow-guide.md"
+    )
+    for required in (
+        "scientific dataset manifest",
+        "execution profile",
+        "one immutable `referencetask`",
+        "one immutable `roundtask` per moving round",
+        "hard executor barrier",
+        "serial inside each moving-round task",
+        "completion records are the only restart authority",
+        "no nested chunk multiprocessing",
+        "planning is mutation-free",
+        "`parallelism.mode`",
+        "`coarse`",
+        "`fine_grained`",
+        "scientific fingerprint is unchanged",
+    ):
+        assert required in text
+
+
+def test_package_metadata_advertises_the_documentation_site() -> None:
+    pyproject = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'Documentation = "https://thedeanlab.github.io/Cy-ExM/"' in pyproject
+
+
+def test_public_book_omits_historical_source_repository_references() -> None:
+    for page in (
+        "index.md",
+        "getting-started.md",
+        "registration-foundations.md",
+        "workflow-guide.md",
+        "image-geometry.md",
+        "preprocessing.md",
+        "feature-derived-registration-masks.md",
+        "outputs-and-recovery.md",
+        "dataset-manifest.md",
+        "execution-profile.md",
+        "cli-reference.md",
+        "native-threading.md",
+        "parallel-hpc.md",
+        "fine-grained-execution.md",
+        "registration-artifacts.md",
+        "development.md",
+        "architecture.md",
+        "agentic-api-documentation.md",
+        "brightness-dependence-investigation.md",
+        "asinh-preprocessing-registration-investigation.md",
+        "cc-syn-radius-characterization.md",
+        "fixed-affine-chunk-size-characterization.md",
+        "phase2e-multithreaded-registration-reproducibility.md",
+        "phase-1-acceptance.md",
+        "phase-2-acceptance.md",
+    ):
+        text = _document(page).lower()
+        assert "clearex" not in text, page
+        assert "/project/bioinformatics" not in text, page
+
+
 def test_registration_foundations_separates_science_from_execution() -> None:
     guide = _normalized_document("registration-foundations.md")
     for required in (

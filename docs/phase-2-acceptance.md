@@ -1,4 +1,6 @@
-# Phase 2 acceptance audit
+# Workflow-runtime acceptance
+
+This evidence record retains the historical Phase 2 label.
 
 ## Audit identity and scope
 

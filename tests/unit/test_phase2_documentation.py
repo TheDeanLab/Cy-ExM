@@ -187,8 +187,8 @@ def test_dataset_manifest_reference_documents_every_field_and_rule() -> None:
         assert rule in normalized
 
 
-def test_readme_documents_every_execution_profile_field_and_rule() -> None:
-    readme = _readme()
+def test_execution_profile_reference_documents_every_field_and_rule() -> None:
+    reference = _document("execution-profile.md")
     for field in (
         "executor",
         "paths",
@@ -216,7 +216,7 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "job_name",
         "job_extra_directives",
     ):
-        assert f"`{field}`" in readme
+        assert f"`{field}`" in reference
 
     for exact_row in (
         "| `local_dask` / `workers` | positive built-in integer | Maximum local "
@@ -238,9 +238,9 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         "| `slurm` / `task_retries` | nonnegative built-in integer | "
         "Executor-managed retry count after the first attempt. |",
     ):
-        assert exact_row in readme
+        assert exact_row in reference
 
-    normalized = _normalized_readme()
+    normalized = _normalized_document("execution-profile.md")
     for rule in (
         "`sequential`, `local_dask`, or `slurm`",
         "relative paths resolve from the execution-profile file",
@@ -271,8 +271,8 @@ def test_readme_documents_every_execution_profile_field_and_rule() -> None:
         assert rule in normalized
 
 
-def test_readme_documents_the_exact_startup_timeout_scope() -> None:
-    normalized = _normalized_readme()
+def test_execution_profile_documents_the_exact_startup_timeout_scope() -> None:
+    normalized = _normalized_document("execution-profile.md")
     for required in (
         "`startup_timeout` is not an end-to-end startup deadline",
         "does not bound `localcluster` or `slurmcluster` construction",
@@ -282,8 +282,8 @@ def test_readme_documents_the_exact_startup_timeout_scope() -> None:
         assert required in normalized
 
 
-def test_readme_documents_planning_and_execution_thread_boundaries() -> None:
-    normalized = _normalized_readme()
+def test_native_threading_documents_planning_and_worker_boundaries() -> None:
+    normalized = _normalized_document("native-threading.md")
     for required in (
         "tiff header inspection runs in an isolated read-only probe process",
         "does not import numpy or tifffile in the coordinator",
@@ -296,10 +296,9 @@ def test_readme_documents_planning_and_execution_thread_boundaries() -> None:
         assert required in normalized
 
 
-def test_readme_documents_observed_native_thread_scaling() -> None:
-    normalized = _normalized_readme()
+def test_native_threading_documents_observed_scaling() -> None:
+    text = _normalized_document("native-threading.md")
     for required in (
-        "observed threading benchmark",
         "| 1 / 1 | 310.5 s | 1.00x |",
         "| 8 / 8 | 88.3 s | 3.52x |",
         "| 30 / 30 | 69.5 s | 4.47x |",
@@ -308,7 +307,7 @@ def test_readme_documents_observed_native_thread_scaling() -> None:
         "one thread remains the conservative default",
         "full-volume stability evidence",
     ):
-        assert required in normalized
+        assert required in text
 
 
 @pytest.mark.parametrize(
@@ -423,9 +422,9 @@ def test_cli_reference_links_to_an_existing_operational_guide() -> None:
     assert "parallel-hpc.md" not in reference
 
 
-def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> None:
-    readme = _readme()
-    normalized = _normalized_readme()
+def test_parallel_hpc_guide_documents_executor_lifecycle() -> None:
+    text = _document("parallel-hpc.md") + _document("cli-reference.md")
+    normalized = " ".join(text.split()).lower()
     for required in (
         "sequential executor is the numerical and restart reference",
         "process-based `localcluster`",
@@ -462,37 +461,31 @@ def test_readme_documents_executor_retry_cancellation_and_exit_contracts() -> No
         "| `4` | At least one round failed after execution began. |",
         "| `130` | Operator interruption or termination through the CLI run handler. |",
     ):
-        assert exact_row in readme
+        assert exact_row in text
 
     for required in (
         "invalid fine execution evidence",
         "unauthenticated current-run summaries are omitted from durable `rounds`",
         "pre-run authenticated reuse remains",
-        "valid phase 1 artifacts committed before rejection remain restartable",
+        "valid committed artifacts before rejection remain restartable",
     ):
         assert required in normalized
 
 
-def test_readme_states_hpc_acceptance_scope_and_remaining_non_goals() -> None:
-    normalized = _normalized_readme()
+def test_parallel_hpc_guide_states_acceptance_boundaries() -> None:
+    text = _normalized_document("parallel-hpc.md")
     for required in (
         "portable fake-based slurm construction",
         "real slurm submission and hpc acceptance completed on the audited lab "
         "partition",
-        "phase 2 acceptance audit",
         "`-m hpc`",
         "explicit allocation",
-        "parallelchunkedimageregistration",
         "fine-grained real-slurm production acceptance remains pending",
         "portable real-ants/local-dask evidence is complete",
-        "whole-image affine remains",
         "focused multi-process real-slurm acceptance remains pending",
-        "job arrays",
-        "cloud or kubernetes executors",
-        "automatic resource optimization",
         "no silent fallback",
     ):
-        assert required in normalized
+        assert required in text
 
 
 def test_fine_grained_guide_documents_the_exact_graph_and_resource_contract() -> None:
@@ -501,6 +494,9 @@ def test_fine_grained_guide_documents_the_exact_graph_and_resource_contract() ->
     guide = " ".join(guide_path.read_text(encoding="utf-8").split()).lower()
 
     for required in (
+        "fine-grained task admission",
+        "choosing a registration strategy",
+        "local parallel and hpc execution",
         "reference barrier",
         "whole-image affine",
         "prepared fixed-grid bundle",
@@ -558,7 +554,7 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
         "ordinary later run",
         "unequal",
         "z, y, and x",
-        "legacy clearex/ants behavior",
+        "accepted ants behavior",
         "portable real-ants/local-dask evidence is complete",
         "real slurm production acceptance remains pending",
         "schema version 3",
@@ -583,6 +579,9 @@ def test_fine_grained_guide_documents_artifact_authority_and_recovery() -> None:
         "fails closed",
     ):
         assert required in guide
+    assert "clearex" not in guide
+    assert "phase 1" not in guide
+    assert "phase 2" not in guide
 
 
 def test_maintained_docs_distinguish_shared_cores_and_rejected_evidence() -> None:

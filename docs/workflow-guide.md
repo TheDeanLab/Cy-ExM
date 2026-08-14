@@ -16,8 +16,9 @@ registration strategy. It is portable scientific identity.
 An execution profile describes the machine-specific environment: caller-owned input
 and output roots, native thread counts, and the selected executor and resources. The
 same manifest can be used with a different compatible profile without changing the
-scientific identity. Until the execution-profile reference is available, start from
-one of the checked-in profiles linked below and edit it for your machine.
+scientific identity. Read the [execution-profile reference](execution-profile.md)
+for the strict machine and resource schema, then start from one of the checked-in
+profiles linked below and edit it for your machine.
 
 ## Start from the checked-in examples
 
@@ -106,9 +107,10 @@ manifest's scientific choices.
 ## Exact references
 
 Read the [dataset manifest reference](dataset-manifest.md) for the complete
-scientific schema and strict YAML rules. Read the [command-line reference](cli-reference.md)
-for every command option, structured output, logging behavior, and exit code. To
-print the installed Cy-ExM version, run:
+scientific schema and strict YAML rules. Read the [execution-profile
+reference](execution-profile.md) for the complete operational schema. Read the
+[command-line reference](cli-reference.md) for every command option, structured
+output, logging behavior, and exit code. To print the installed Cy-ExM version, run:
 
 ```bash
 uv run cyexm --version

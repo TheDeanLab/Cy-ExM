@@ -1,10 +1,14 @@
-# Fine-grained registration
+# Fine-grained execution
 
-Fine-grained execution is an opt-in scheduling mode for Cy-ExM's existing
-registration science. It changes where accepted work runs, not fixed and moving
-roles, transforms, interpolation, chunk geometry, scalar policies, scientific
-fingerprints, or public TIFF outputs. Coarse execution remains the production
-default while fine-grained real SLURM production acceptance remains pending.
+Fine-grained task admission is an opt-in scheduling mode for Cy-ExM's existing
+registration science. It lets the coordinator admit preparation, nonlinear chunk,
+assembly, and channel tasks independently when they are ready. It changes neither
+fixed and moving roles, transforms, interpolation, chunk geometry, scalar policies,
+scientific fingerprints, nor public TIFF outputs. Coarse execution remains the
+production default while fine-grained real SLURM production acceptance remains
+pending. First choose a scientific strategy in [Choosing a registration
+strategy](registration-foundations.md), then choose the execution environment in
+[Local parallel and HPC execution](parallel-hpc.md).
 
 ## Select an execution mode
 
@@ -153,7 +157,7 @@ reference barrier
 
 A `whole_image` moving round uses a whole-image registration task instead of chunk
 tasks and assembly. The scientific strategy name remains `serial_chunked` because it
-describes the accepted ClearEx-compatible chunk grid, local SyN calls, histogram
+describes the accepted chunk grid, local SyN calls, histogram
 policy, and scalar stitching semantics. In fine-grained mode the executor schedules
 those canonical chunks independently; this is not a new scientific strategy.
 
@@ -185,7 +189,7 @@ work remains; the client and complete owned cluster close in order at the end.
 
 ## Prepared fixed-grid data
 
-Preparation preserves the legacy ClearEx/ANTs behavior for unequal inputs. Native
+Preparation preserves the accepted ANTs behavior for unequal inputs. Native
 fixed, moving registration-channel, and dependent-channel images may differ along
 any spatial axis—Z, Y, and X. Affine application is the first fixed-grid boundary:
 moving scalar and mask data are resampled to the exact fixed-reference grid before
@@ -369,15 +373,15 @@ uses that fine graph to isolate nonlinear spatial support, including regional
 residuals, seam behavior, deformation validity, and four-node runtime. It is
 characterization evidence rather than a new production chunk-size default.
 
-Portable real-ANTs/Local-Dask evidence is complete through implementation Task 10,
+Portable real-ANTs/Local-Dask evidence is complete through the implemented graph,
 including scientific equivalence to the sequential fine graph, multiple chunks and
 channels, unequal native shapes, resume, cancellation, and cleanup. That evidence is
 not a production SLURM claim. Fine-grained real SLURM production acceptance remains
 pending the exact-commit two-tier gate: representative multithreaded scientific
 equivalence and seeded one-thread strict parity, plus placement, fairness,
 failure/recovery, cancellation, cleanup, and performance evidence. The earlier
-[Phase 2 acceptance audit](phase-2-acceptance.md) remains the accepted coarse
-round-level SLURM baseline.
+[coarse round-level SLURM acceptance record](phase-2-acceptance.md) remains the
+accepted coarse baseline.
 
 The multi-process implementation also has a focused, explicitly selected HPC gate
 that compares one process with two processes per job, proves same-job overlap,

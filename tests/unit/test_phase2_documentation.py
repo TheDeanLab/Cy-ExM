@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,33 @@ EXAMPLE_PATHS = (
     "examples/execution-local-dask.yaml",
     "examples/execution-slurm-512gb.yaml",
     "examples/execution-slurm-512gb-multi-process.yaml",
+)
+PUBLIC_BOOK_DOCUMENTS = (
+    "index.md",
+    "getting-started.md",
+    "registration-foundations.md",
+    "workflow-guide.md",
+    "image-geometry.md",
+    "preprocessing.md",
+    "feature-derived-registration-masks.md",
+    "outputs-and-recovery.md",
+    "dataset-manifest.md",
+    "execution-profile.md",
+    "cli-reference.md",
+    "native-threading.md",
+    "parallel-hpc.md",
+    "fine-grained-execution.md",
+    "registration-artifacts.md",
+    "development.md",
+    "architecture.md",
+    "agentic-api-documentation.md",
+    "brightness-dependence-investigation.md",
+    "asinh-preprocessing-registration-investigation.md",
+    "cc-syn-radius-characterization.md",
+    "fixed-affine-chunk-size-characterization.md",
+    "phase2e-multithreaded-registration-reproducibility.md",
+    "phase-1-acceptance.md",
+    "phase-2-acceptance.md",
 )
 
 
@@ -135,36 +163,18 @@ def test_package_metadata_advertises_the_documentation_site() -> None:
 
 
 def test_public_book_omits_historical_source_repository_references() -> None:
-    for page in (
-        "index.md",
-        "getting-started.md",
-        "registration-foundations.md",
-        "workflow-guide.md",
-        "image-geometry.md",
-        "preprocessing.md",
-        "feature-derived-registration-masks.md",
-        "outputs-and-recovery.md",
-        "dataset-manifest.md",
-        "execution-profile.md",
-        "cli-reference.md",
-        "native-threading.md",
-        "parallel-hpc.md",
-        "fine-grained-execution.md",
-        "registration-artifacts.md",
-        "development.md",
-        "architecture.md",
-        "agentic-api-documentation.md",
-        "brightness-dependence-investigation.md",
-        "asinh-preprocessing-registration-investigation.md",
-        "cc-syn-radius-characterization.md",
-        "fixed-affine-chunk-size-characterization.md",
-        "phase2e-multithreaded-registration-reproducibility.md",
-        "phase-1-acceptance.md",
-        "phase-2-acceptance.md",
-    ):
-        text = _document(page).lower()
+    for page in ("README.md", *PUBLIC_BOOK_DOCUMENTS):
+        text = (_readme() if page == "README.md" else _document(page)).lower()
         assert "clearex" not in text, page
         assert "/project/bioinformatics" not in text, page
+
+
+def test_public_markdown_links_do_not_target_excluded_internal_docs() -> None:
+    for page in PUBLIC_BOOK_DOCUMENTS:
+        targets = re.findall(r"\]\(([^)#]+)", _document(page))
+        assert not any(
+            target.lstrip("./").startswith("superpowers/") for target in targets
+        ), page
 
 
 def test_registration_foundations_separates_science_from_execution() -> None:

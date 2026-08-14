@@ -1,7 +1,6 @@
 # Cy-ExM
 
-Cy-ExM provides reusable cyclic expansion microscopy registration without a runtime
-dependency on ClearEx. Its Phase 1 API supports restartable whole-image registration
+Cy-ExM provides reusable cyclic expansion microscopy registration. Its Phase 1 API supports restartable whole-image registration
 and a restartable **serial** chunked nonlinear workflow. Its Phase 2 workflow adds
 strict YAML configuration, immutable round planning, sequential and local-Dask
 execution, and a coarse round-level SLURM adapter accepted on the audited lab
@@ -205,10 +204,9 @@ filename, cache-validation rule, stale marker, and recovery case.
 Five parameterized scripts live in `examples/scripts`; six cleared notebooks live in
 `examples/notebooks`. They require caller-provided paths and do not download data.
 
-Existing users should consult [migration from ClearEx](docs/migration-from-clearex.md)
-for the import map, downstream consumer note, moved examples, and intentionally
-corrected legacy behavior. The numerical extraction evidence is recorded in the
-[legacy parity report](docs/legacy-parity-report.md).
+Existing users should consult the migration record for the import map, downstream
+consumer note, moved examples, and intentionally corrected legacy behavior. The
+numerical extraction evidence is recorded in the legacy parity report.
 The complete portable gate and measured Phase 1 evidence are recorded in the
 [Phase 1 acceptance audit](docs/phase-1-acceptance.md).
 The real-cluster orchestration and scientific evidence are recorded in the
@@ -895,7 +893,7 @@ or parallel whole-image affine estimation, nested multiprocessing, job arrays,
 cross-dataset scheduling, cloud or Kubernetes executors, or automatic resource
 optimization. Whole-image affine remains the preparation boundary
 even when nonlinear chunks and dependent channels run as fine tasks. It does not
-recreate ClearEx's GUI, pipeline, TRE, or general analysis framework, and it never
+recreate a GUI, pipeline, TRE, or general analysis framework, and it never
 silently changes executor: no silent fallback is permitted.
 Reference-round channels are materialized as shared TIFF outputs, with one identical
 crop applied to all of them when requested. Export to other file formats remains a

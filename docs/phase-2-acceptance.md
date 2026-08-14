@@ -102,8 +102,8 @@ be identical and are retained as characterization only.
 
 That distinction follows the measured behavior documented in the
 [multithreaded registration reproducibility note](phase2e-multithreaded-registration-reproducibility.md)
-and the approved
-[two-tier correction design](superpowers/specs/2026-07-22-phase2e-stochastic-parity-design.md).
+and the approved two-tier correction design,
+`2026-07-22-phase2e-stochastic-parity-design.md`.
 A fixed seed does not make multithreaded ANTs registration numerically exact.
 
 ### Tier 2: deterministic executor parity

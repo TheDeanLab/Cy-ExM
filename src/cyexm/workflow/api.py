@@ -801,7 +801,10 @@ def _write_run_record(
         payload["operational_failure"] = dict(operational_failure)
     if execution_evidence_error is not None:
         payload["execution_evidence_error"] = dict(execution_evidence_error)
-    _write_text_atomically(path, canonical_json(payload) + "\n")
+    _write_text_atomically(
+        path,
+        json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _executor_execution_evidence_json(

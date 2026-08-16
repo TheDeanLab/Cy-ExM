@@ -1288,10 +1288,13 @@ def test_run_workflow_writes_scientific_snapshot_before_execution(
     )
 
     assert result.succeeded
-    assert Path(result.run_record).is_file()
-    assert (
-        json.loads(Path(result.run_record).read_text(encoding="utf-8"))["status"]
-        == "completed"
+    run_record_path = Path(result.run_record)
+    assert run_record_path.is_file()
+    encoded_run_record = run_record_path.read_text(encoding="utf-8")
+    run_record = json.loads(encoded_run_record)
+    assert run_record["status"] == "completed"
+    assert encoded_run_record == (
+        json.dumps(run_record, allow_nan=False, indent=2, sort_keys=True) + "\n"
     )
     assert not tuple(layout.root.rglob(".*.tmp*"))
 

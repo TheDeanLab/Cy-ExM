@@ -213,3 +213,17 @@ the corrected round while retaining exact provenance for the original series.
 - All five LAMP1 cells have authoritative registered artifacts for all intended
   acquisition rounds, with Cell 3 round 1 explicitly sourced from the correction
   dataset.
+
+## Implementation erratum: minimum coarsest support count
+
+The repository-wide characterization gate exposed that requiring all eight samples
+of the smallest `2x2x2` coarsest lattice was too strict: one legitimate raw-mask
+zero at the lattice origin left seven samples with full two-coordinate span on every
+axis and incorrectly selected identity. The implemented minimum is therefore four
+coarsest support voxels plus at least two occupied coordinates along each axis.
+Four is the smallest count that can describe a noncoplanar three-dimensional support;
+the independent span requirement remains the decisive condition for both production
+failures. Cell 1 round 5 chunk 17 still fails X span (`1`), and Cell 3 round 3 chunk
+32 still fails Y span (`1`) and has only five coarsest voxels. This correction avoids
+classifying a nearly full minimal lattice as insufficient without weakening the
+observed edge-sliver classification.

@@ -238,6 +238,35 @@ def test_chunk_support_accepts_the_minimum_coarsest_3d_lattice(
     assert evidence.coarsest_span_zyx == (2, 2, 2)
 
 
+def test_chunk_support_accepts_a_nearly_full_minimum_3d_lattice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, _artifacts, region, _chunk = _capture_chunk_inputs(
+        tmp_path,
+        monkeypatch,
+    )
+    nearly_full = np.ones((8, 8, 8), dtype=np.float32)
+    nearly_full[0, 0, 0] = 0.0
+    nearly_full_region = replace(
+        region,
+        fixed_mask=fake_image(data=nearly_full),
+        moving_mask=fake_image(data=nearly_full),
+    )
+
+    evidence = _chunk_support_evidence(
+        np,
+        context.backend,
+        nearly_full_region,
+        context.nonlinear_accuracy,
+    )
+
+    assert evidence is not None
+    assert evidence.insufficient is False
+    assert evidence.coarsest_common_voxels == 7
+    assert evidence.coarsest_span_zyx == (2, 2, 2)
+
+
 def test_chunk_support_is_unassessed_when_either_mask_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

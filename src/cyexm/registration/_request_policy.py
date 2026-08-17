@@ -28,6 +28,7 @@ FEATURE_MASK_POLICY = "positive-support-components-physical-dilation-v1"
 RAW_RECONSTRUCTED_SCALAR_POLICY = "feature-estimation-raw-warp-affine-clip-v1"
 INSUFFICIENT_CHUNK_SUPPORT_POLICY = "common-mask-coarsest-2x2x2-v1"
 INSUFFICIENT_CHUNK_SUPPORT_DECISION = "identity-insufficient-support"
+MINIMUM_COARSEST_CHUNK_SUPPORT_VOXELS = 4
 
 _LINEAR_ITERATIONS = {
     "high": [1000, 500, 250, 100],
@@ -468,7 +469,9 @@ def validate_insufficient_chunk_support_parameters(
         raise ValueError("empty coarsest support and span must agree")
     if coarse > 0 and (any(item == 0 for item in span) or coarse > math.prod(span)):
         raise ValueError("coarsest support count and span are inconsistent")
-    if coarse >= 8 and all(item >= 2 for item in span):
+    if coarse >= MINIMUM_COARSEST_CHUNK_SUPPORT_VOXELS and all(
+        item >= 2 for item in span
+    ):
         raise ValueError("support evidence does not authorize identity")
     return {
         "coarsest_common_voxels": coarse,
@@ -542,6 +545,7 @@ __all__ = [
     "FEATURE_PREPARED_MASK_POLICY",
     "INSUFFICIENT_CHUNK_SUPPORT_DECISION",
     "INSUFFICIENT_CHUNK_SUPPORT_POLICY",
+    "MINIMUM_COARSEST_CHUNK_SUPPORT_VOXELS",
     "OUTPUT_FORMAT_POLICY",
     "PREPARED_MASK_POLICY",
     "PREPARED_SCALAR_POLICY",

@@ -19,6 +19,7 @@ from cyexm.metrics import read_metrics, write_metrics
 from cyexm.registration._native_paths import discard_path
 from cyexm.registration._request_policy import (
     CHUNK_SCALAR_POLICY,
+    MINIMUM_COARSEST_CHUNK_SUPPORT_VOXELS,
     canonical_compact_json,
     chunk_manifest_parameters,
     chunk_manifest_payload,
@@ -227,7 +228,10 @@ def _chunk_support_evidence(
         coarsest_common_voxels=coarse_count,
         coarsest_shrink_factor=factor,
         coarsest_span_zyx=span,
-        insufficient=coarse_count < 8 or any(value < 2 for value in span),
+        insufficient=(
+            coarse_count < MINIMUM_COARSEST_CHUNK_SUPPORT_VOXELS
+            or any(value < 2 for value in span)
+        ),
     )
 
 

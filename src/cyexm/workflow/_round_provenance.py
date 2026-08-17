@@ -23,10 +23,12 @@ from cyexm.registration._request_policy import (
     feature_mask_parameters,
     fixed_reference_parameters,
     local_chunk_parameters,
+    nonlinear_parameters,
     nonlinear_stage_parameters,
     registered_image_parameters,
     registration_feature_parameters,
     scalar_policy,
+    validate_insufficient_chunk_support_parameters,
 )
 from cyexm.registration.artifacts import CompletionRecord, FileIdentity, StageRequest
 from cyexm.runtime import NATIVE_THREAD_ENV_VARS
@@ -505,6 +507,25 @@ def _serial_chunk_evidence(
             nonlinear_radius=task.registration.nonlinear.radius,
             scalar_postprocessing_policy=scalar_policy(task.strategy),
         )
+        if snapshot is not None:
+            fallback = snapshot[0].request.parameters.get("insufficient_support")
+            if fallback is not None:
+                iterations = nonlinear_parameters(
+                    task.registration.nonlinear.accuracy,
+                    task.registration.nonlinear.metric,
+                    task.registration.nonlinear.radius,
+                )["reg_iterations"]
+                if not isinstance(iterations, list) or not iterations:
+                    return None
+                try:
+                    parameters["insufficient_support"] = (
+                        validate_insufficient_chunk_support_parameters(
+                            fallback,
+                            expected_shrink_factor=2 ** (len(iterations) - 1),
+                        )
+                    )
+                except (TypeError, ValueError):
+                    return None
         if preprocessing is not None:
             parameters["preprocessing"] = preprocessing
         if not _request_matches(

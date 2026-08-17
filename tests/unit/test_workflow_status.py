@@ -381,7 +381,11 @@ def _replace_fixed_reference_geometry(path: Path, geometry: ImageGeometry) -> No
     )
 
 
-def _commit_serial_round(output_root: Path) -> tuple[Path, ...]:
+def _commit_serial_round(
+    output_root: Path,
+    *,
+    insufficient_support: dict[str, object] | None = None,
+) -> tuple[Path, ...]:
     round_number = 2
     dataset_root = output_root.parent / "dataset"
     fixed = _commit_reference(output_root)
@@ -460,6 +464,9 @@ def _commit_serial_round(output_root: Path) -> tuple[Path, ...]:
                     overlap_fraction=overlap,
                     nonlinear_accuracy="high",
                     scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+                    insufficient_support=(
+                        insufficient_support if chunk["chunk_id"] == 0 else None
+                    ),
                 ),
             ),
         )
@@ -1337,6 +1344,100 @@ def test_status_accepts_only_a_complete_serial_chunk_provenance_chain(
     assert stale.status == "invalid"
     assert stale.complete_artifacts == (str(artifacts[0]),)
     assert stale.invalid_artifacts == tuple(map(str, artifacts[1:]))
+
+
+def _serial_scientific_plan(output_root: Path) -> None:
+    scientific = _scientific_mapping(output_root)
+    scientific_round = scientific["rounds"][0]  # type: ignore[index]
+    scientific_round["strategy"] = "serial_chunked"
+    scientific_round["chunk_size_zyx"] = [4, 8, 8]
+    scientific_round["overlap_fraction"] = 0.0
+    plan_path = WorkflowLayout.for_dataset(output_root, "dataset-1").plan_path
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text(canonical_json(scientific), encoding="utf-8")
+
+
+def _canonical_insufficient_support() -> dict[str, object]:
+    return {
+        "coarsest_common_voxels": 4,
+        "coarsest_shrink_factor": 4,
+        "coarsest_span_zyx": [1, 2, 2],
+        "decision": "identity-insufficient-support",
+        "fine_common_voxels": 128,
+        "fine_total_voxels": 256,
+        "policy": "common-mask-coarsest-2x2x2-v1",
+    }
+
+
+def test_status_accepts_canonical_insufficient_support_identity_evidence(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _serial_scientific_plan(output_root)
+    artifacts = _commit_serial_round(
+        output_root,
+        insufficient_support=_canonical_insufficient_support(),
+    )
+
+    status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
+
+    assert status.status == "complete"
+    assert status.complete_artifacts == tuple(map(str, artifacts))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("policy", "unknown", id="unknown-policy"),
+        pytest.param("decision", "estimated-nonlinear", id="wrong-decision"),
+        pytest.param("coarsest_span_zyx", [1.0, 2, 2], id="float-span"),
+        pytest.param("fine_common_voxels", -1, id="negative-fine-count"),
+        pytest.param("coarsest_shrink_factor", 2, id="wrong-schedule-factor"),
+    ],
+)
+def test_status_rejects_noncanonical_insufficient_support_identity_evidence(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    output_root = tmp_path / "output"
+    _serial_scientific_plan(output_root)
+    evidence = _canonical_insufficient_support()
+    evidence[field] = value
+    _commit_serial_round(output_root, insufficient_support=evidence)
+
+    status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
+
+    assert status.status == "invalid"
+
+
+def test_status_rejects_unknown_insufficient_support_evidence_fields(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _serial_scientific_plan(output_root)
+    evidence = _canonical_insufficient_support()
+    evidence["unexpected"] = True
+    _commit_serial_round(output_root, insufficient_support=evidence)
+
+    status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
+
+    assert status.status == "invalid"
+
+
+def test_status_rejects_identity_evidence_for_sufficient_support(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _serial_scientific_plan(output_root)
+    evidence = _canonical_insufficient_support()
+    evidence["coarsest_common_voxels"] = 8
+    evidence["coarsest_span_zyx"] = [2, 2, 2]
+    _commit_serial_round(output_root, insufficient_support=evidence)
+
+    status = inspect_workflow_status(output_root, "dataset-1").rounds[1]
+
+    assert status.status == "invalid"
 
 
 def test_status_requires_the_complete_crop_provenance_chain(tmp_path: Path) -> None:

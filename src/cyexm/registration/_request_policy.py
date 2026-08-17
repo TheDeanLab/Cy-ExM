@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from numbers import Integral
 from typing import Literal
@@ -25,6 +26,8 @@ FEATURE_PREPARED_MASK_POLICY = (
 REGISTRATION_FEATURE_POLICY = "gaussian-background-mad-asinh-float32-v1"
 FEATURE_MASK_POLICY = "positive-support-components-physical-dilation-v1"
 RAW_RECONSTRUCTED_SCALAR_POLICY = "feature-estimation-raw-warp-affine-clip-v1"
+INSUFFICIENT_CHUNK_SUPPORT_POLICY = "common-mask-coarsest-2x2x2-v1"
+INSUFFICIENT_CHUNK_SUPPORT_DECISION = "identity-insufficient-support"
 
 _LINEAR_ITERATIONS = {
     "high": [1000, 500, 250, 100],
@@ -361,6 +364,7 @@ def local_chunk_parameters(
     nonlinear_metric: object = "mattes",
     nonlinear_radius: object = None,
     scalar_postprocessing_policy: str,
+    insufficient_support: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Return canonical local-warp parameters."""
     parameters: dict[str, object] = {
@@ -385,7 +389,96 @@ def local_chunk_parameters(
         ),
         "scalar_postprocessing_policy": scalar_postprocessing_policy,
     }
+    if insufficient_support is not None:
+        parameters["insufficient_support"] = dict(insufficient_support)
     return parameters
+
+
+def insufficient_chunk_support_parameters(
+    *,
+    fine_common_voxels: int,
+    fine_total_voxels: int,
+    coarsest_common_voxels: int,
+    coarsest_shrink_factor: int,
+    coarsest_span_zyx: Sequence[int],
+) -> dict[str, object]:
+    """Return canonical evidence for one support-triggered identity warp."""
+    parameters: dict[str, object] = {
+        "coarsest_common_voxels": coarsest_common_voxels,
+        "coarsest_shrink_factor": coarsest_shrink_factor,
+        "coarsest_span_zyx": list(coarsest_span_zyx),
+        "decision": INSUFFICIENT_CHUNK_SUPPORT_DECISION,
+        "fine_common_voxels": fine_common_voxels,
+        "fine_total_voxels": fine_total_voxels,
+        "policy": INSUFFICIENT_CHUNK_SUPPORT_POLICY,
+    }
+    return validate_insufficient_chunk_support_parameters(
+        parameters,
+        expected_shrink_factor=coarsest_shrink_factor,
+    )
+
+
+def validate_insufficient_chunk_support_parameters(
+    value: object,
+    *,
+    expected_shrink_factor: int,
+) -> dict[str, object]:
+    """Validate canonical support-triggered identity evidence."""
+    if not isinstance(value, Mapping):
+        raise TypeError("insufficient support evidence must be a mapping")
+    expected_keys = {
+        "coarsest_common_voxels",
+        "coarsest_shrink_factor",
+        "coarsest_span_zyx",
+        "decision",
+        "fine_common_voxels",
+        "fine_total_voxels",
+        "policy",
+    }
+    if set(value) != expected_keys:
+        raise ValueError("insufficient support evidence keys are not canonical")
+    if value["policy"] != INSUFFICIENT_CHUNK_SUPPORT_POLICY:
+        raise ValueError("insufficient support policy is not supported")
+    if value["decision"] != INSUFFICIENT_CHUNK_SUPPORT_DECISION:
+        raise ValueError("insufficient support decision is not canonical")
+    counts = (
+        value["fine_common_voxels"],
+        value["fine_total_voxels"],
+        value["coarsest_common_voxels"],
+        value["coarsest_shrink_factor"],
+    )
+    if any(type(item) is not int for item in counts):
+        raise TypeError("insufficient support counts must be built-in integers")
+    fine, total, coarse, factor = (int(item) for item in counts)
+    if total <= 0 or fine < 0 or fine > total:
+        raise ValueError("fine support counts are not canonical")
+    if coarse < 0 or coarse > fine:
+        raise ValueError("coarsest support count is not canonical")
+    if type(expected_shrink_factor) is not int or expected_shrink_factor <= 0:
+        raise ValueError("expected shrink factor must be a positive integer")
+    if factor != expected_shrink_factor:
+        raise ValueError("coarsest support shrink factor does not match the schedule")
+    span_value = value["coarsest_span_zyx"]
+    if not isinstance(span_value, list) or len(span_value) != 3:
+        raise TypeError("coarsest support span must be a three-item list")
+    if any(type(item) is not int or item < 0 for item in span_value):
+        raise TypeError("coarsest support span must contain non-negative integers")
+    span = tuple(int(item) for item in span_value)
+    if (coarse == 0) != (span == (0, 0, 0)):
+        raise ValueError("empty coarsest support and span must agree")
+    if coarse > 0 and (any(item == 0 for item in span) or coarse > math.prod(span)):
+        raise ValueError("coarsest support count and span are inconsistent")
+    if coarse >= 8 and all(item >= 2 for item in span):
+        raise ValueError("support evidence does not authorize identity")
+    return {
+        "coarsest_common_voxels": coarse,
+        "coarsest_shrink_factor": factor,
+        "coarsest_span_zyx": list(span),
+        "decision": INSUFFICIENT_CHUNK_SUPPORT_DECISION,
+        "fine_common_voxels": fine,
+        "fine_total_voxels": total,
+        "policy": INSUFFICIENT_CHUNK_SUPPORT_POLICY,
+    }
 
 
 def chunk_manifest_payload(
@@ -447,6 +540,8 @@ __all__ = [
     "CHUNK_SCALAR_POLICY",
     "FEATURE_MASK_POLICY",
     "FEATURE_PREPARED_MASK_POLICY",
+    "INSUFFICIENT_CHUNK_SUPPORT_DECISION",
+    "INSUFFICIENT_CHUNK_SUPPORT_POLICY",
     "OUTPUT_FORMAT_POLICY",
     "PREPARED_MASK_POLICY",
     "PREPARED_SCALAR_POLICY",
@@ -466,10 +561,12 @@ __all__ = [
     "feature_mask_config_parameters",
     "feature_mask_parameters",
     "fixed_reference_parameters",
+    "insufficient_chunk_support_parameters",
     "linear_parameters",
     "local_chunk_parameters",
     "nonlinear_parameters",
     "nonlinear_stage_parameters",
     "registered_image_parameters",
     "scalar_policy",
+    "validate_insufficient_chunk_support_parameters",
 ]

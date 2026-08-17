@@ -24,9 +24,12 @@ from cyexm.registration._request_policy import (
     chunk_manifest_payload,
     common_parameters,
     crop_geometry,
+    insufficient_chunk_support_parameters,
     local_chunk_parameters,
+    nonlinear_parameters,
     nonlinear_stage_parameters,
     registered_image_parameters,
+    validate_insufficient_chunk_support_parameters,
 )
 from cyexm.registration.artifacts import (
     ArtifactStore,
@@ -40,6 +43,16 @@ from cyexm.spatial import ImageGeometry, PixelSize, geometry_compatible
 
 class ChunkOutputValidationError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkSupportEvidence:
+    fine_common_voxels: int
+    fine_total_voxels: int
+    coarsest_common_voxels: int
+    coarsest_shrink_factor: int
+    coarsest_span_zyx: tuple[int, int, int]
+    insufficient: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +182,55 @@ def _validated_scalar_array(
     return array
 
 
+def _chunk_support_evidence(
+    np: Any,
+    backend: RegistrationBackend,
+    region: ChunkRegion,
+    nonlinear_accuracy: str,
+) -> _ChunkSupportEvidence | None:
+    if region.fixed_mask is None or region.moving_mask is None:
+        return None
+    expected_shape = tuple(int(value) for value in np.asarray(region.fixed_array).shape)
+    if len(expected_shape) != 3:
+        raise ChunkOutputValidationError(
+            "fixed scalar chunk must have exactly three dimensions"
+        )
+    fixed = _validated_scalar_array(
+        np,
+        backend,
+        region.fixed_mask,
+        expected_shape,
+        "fixed mask chunk",
+    )
+    moving = _validated_scalar_array(
+        np,
+        backend,
+        region.moving_mask,
+        expected_shape,
+        "moving mask chunk",
+    )
+    iterations = nonlinear_parameters(nonlinear_accuracy)["reg_iterations"]
+    if not isinstance(iterations, list) or not iterations:
+        raise ValueError("nonlinear iteration schedule must contain at least one level")
+    factor = 2 ** (len(iterations) - 1)
+    common = (fixed > 0.5) & (moving > 0.5)
+    coarse = common[::factor, ::factor, ::factor]
+    coarse_count = int(coarse.sum())
+    if coarse_count == 0:
+        span = (0, 0, 0)
+    else:
+        indices = np.where(coarse)
+        span = tuple(int(axis.max() - axis.min() + 1) for axis in indices)
+    return _ChunkSupportEvidence(
+        fine_common_voxels=int(common.sum()),
+        fine_total_voxels=int(common.size),
+        coarsest_common_voxels=coarse_count,
+        coarsest_shrink_factor=factor,
+        coarsest_span_zyx=span,
+        insufficient=coarse_count < 8 or any(value < 2 for value in span),
+    )
+
+
 def _read_local_warp(
     np: Any,
     backend: RegistrationBackend,
@@ -222,6 +284,7 @@ def _local_request(
     context: ChunkStageContext,
     region: ChunkRegion,
     chunk: ChunkInfo,
+    support: _ChunkSupportEvidence | None,
 ) -> StageRequest:
     context.verify_sources()
     parameters = local_chunk_parameters(
@@ -245,6 +308,17 @@ def _local_request(
         nonlinear_metric=context.nonlinear_metric,
         nonlinear_radius=context.nonlinear_radius,
         scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
+        insufficient_support=(
+            None
+            if support is None or not support.insufficient
+            else insufficient_chunk_support_parameters(
+                fine_common_voxels=support.fine_common_voxels,
+                fine_total_voxels=support.fine_total_voxels,
+                coarsest_common_voxels=support.coarsest_common_voxels,
+                coarsest_shrink_factor=support.coarsest_shrink_factor,
+                coarsest_span_zyx=support.coarsest_span_zyx,
+            )
+        ),
     )
     if context.preprocessing is not None:
         parameters["preprocessing"] = context.preprocessing
@@ -318,9 +392,15 @@ def run_nonlinear_chunk(
     ):
         raise ValueError("fixed and moving chunk values must all be finite")
     low_variance = bool(np.std(fixed_array) < 1e-6 or np.std(moving_array) < 1e-6)
+    support = _chunk_support_evidence(
+        np,
+        backend,
+        region,
+        context.nonlinear_accuracy,
+    )
     warp_path = context.warp_path(chunk.chunk_id)
     expected_geometry = backend.geometry(region.fixed)
-    request = _local_request(context, region, chunk)
+    request = _local_request(context, region, chunk, support)
 
     def read_warp(path: Path) -> tuple[object, Any]:
         return _read_local_warp(np, backend, path, expected_geometry)
@@ -338,24 +418,42 @@ def run_nonlinear_chunk(
             )
         temporary_warp: Path | None = None
         try:
-            if low_variance:
+            identity = support is not None and support.insufficient
+            if not identity and not low_variance:
+                try:
+                    _candidate_scalar, temporary_warp = backend.nonlinear(
+                        moving_image=region.moving,
+                        fixed_image=region.fixed,
+                        fixed_mask=region.fixed_mask,
+                        moving_mask=region.moving_mask,
+                        registration_type=context.nonlinear_type,
+                        accuracy=context.nonlinear_accuracy,
+                        metric=context.nonlinear_metric,
+                        radius=context.nonlinear_radius,
+                        verbose=True,
+                    )
+                    read_warp(temporary_warp)
+                except RuntimeError as error:
+                    if str(error) != "Registration failed with error code 1":
+                        raise
+                    recovered = _chunk_support_evidence(
+                        np,
+                        backend,
+                        region,
+                        context.nonlinear_accuracy,
+                    )
+                    if recovered is None or not recovered.insufficient:
+                        raise
+                    support = recovered
+                    request = _local_request(context, region, chunk, support)
+                    identity = True
+
+            if identity or low_variance:
 
                 def writer(path: Path) -> None:
                     backend.write_identity_warp(region.fixed, path)
 
             else:
-                _candidate_scalar, temporary_warp = backend.nonlinear(
-                    moving_image=region.moving,
-                    fixed_image=region.fixed,
-                    fixed_mask=region.fixed_mask,
-                    moving_mask=region.moving_mask,
-                    registration_type=context.nonlinear_type,
-                    accuracy=context.nonlinear_accuracy,
-                    metric=context.nonlinear_metric,
-                    radius=context.nonlinear_radius,
-                    verbose=True,
-                )
-                read_warp(temporary_warp)
 
                 def writer(path: Path) -> None:
                     if temporary_warp is None:
@@ -562,6 +660,7 @@ def _validate_chunk_records(
         chunk.x_end_ext,
     )
     geometry = crop_geometry(context.fixed_geometry, bounds)
+    warp_record = CompletionRecord.read(context.store.record_path(artifact.warp_path))
     warp_parameters = local_chunk_parameters(
         chunk=_chunk_dict(chunk),
         chunks=[_chunk_dict(item) for item in context.chunks],
@@ -576,6 +675,19 @@ def _validate_chunk_records(
         nonlinear_radius=context.nonlinear_radius,
         scalar_postprocessing_policy=CHUNK_SCALAR_POLICY,
     )
+    actual_fallback = warp_record.request.parameters.get("insufficient_support")
+    if actual_fallback is not None:
+        iterations = nonlinear_parameters(context.nonlinear_accuracy)["reg_iterations"]
+        if not isinstance(iterations, list) or not iterations:
+            raise ValueError(
+                "nonlinear iteration schedule must contain at least one level"
+            )
+        warp_parameters["insufficient_support"] = (
+            validate_insufficient_chunk_support_parameters(
+                actual_fallback,
+                expected_shrink_factor=2 ** (len(iterations) - 1),
+            )
+        )
     if context.preprocessing is not None:
         warp_parameters["preprocessing"] = context.preprocessing
     expected_warp = StageRequest.for_identities(
@@ -588,7 +700,6 @@ def _validate_chunk_records(
         upstream=context.affine_identity,
         parameters=warp_parameters,
     )
-    warp_record = CompletionRecord.read(context.store.record_path(artifact.warp_path))
     if warp_record.request != expected_warp or warp_record.artifact != (
         artifact.warp_identity
     ):

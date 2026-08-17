@@ -18,6 +18,7 @@ from cyexm.registration.chunk_stages import (
     ChunkRegion,
     ChunkStageArtifacts,
     ChunkStageContext,
+    _chunk_support_evidence,
     _require_complete_coverage,
     assemble_nonlinear_chunks,
     run_nonlinear_chunk,
@@ -175,6 +176,240 @@ def test_shared_chunk_stage_interfaces_are_internal_values() -> None:
     assert vars(AssembledNonlinear)["__dataclass_params__"].frozen
     assert callable(run_nonlinear_chunk)
     assert callable(assemble_nonlinear_chunks)
+
+
+def test_chunk_support_rejects_a_nonzero_coarsest_axis_sliver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, _artifacts, region, _chunk = _capture_chunk_inputs(
+        tmp_path,
+        monkeypatch,
+    )
+    thin = np.zeros((8, 8, 8), dtype=np.float32)
+    thin[:, :, :2] = 1.0
+    thin_region = replace(
+        region,
+        fixed_mask=fake_image(data=thin),
+        moving_mask=fake_image(data=thin),
+    )
+
+    evidence = _chunk_support_evidence(
+        np,
+        context.backend,
+        thin_region,
+        context.nonlinear_accuracy,
+    )
+
+    assert evidence is not None
+    assert evidence.insufficient is True
+    assert evidence.fine_common_voxels == 128
+    assert evidence.fine_total_voxels == 512
+    assert evidence.coarsest_common_voxels == 4
+    assert evidence.coarsest_shrink_factor == 4
+    assert evidence.coarsest_span_zyx == (2, 2, 1)
+
+
+def test_chunk_support_accepts_the_minimum_coarsest_3d_lattice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, _artifacts, region, _chunk = _capture_chunk_inputs(
+        tmp_path,
+        monkeypatch,
+    )
+    full = np.ones((8, 8, 8), dtype=np.float32)
+    full_region = replace(
+        region,
+        fixed_mask=fake_image(data=full),
+        moving_mask=fake_image(data=full),
+    )
+
+    evidence = _chunk_support_evidence(
+        np,
+        context.backend,
+        full_region,
+        context.nonlinear_accuracy,
+    )
+
+    assert evidence is not None
+    assert evidence.insufficient is False
+    assert evidence.coarsest_common_voxels == 8
+    assert evidence.coarsest_span_zyx == (2, 2, 2)
+
+
+def test_chunk_support_is_unassessed_when_either_mask_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, _artifacts, region, _chunk = _capture_chunk_inputs(
+        tmp_path,
+        monkeypatch,
+    )
+
+    assert (
+        _chunk_support_evidence(
+            np,
+            context.backend,
+            replace(region, moving_mask=None),
+            context.nonlinear_accuracy,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "mask, message",
+    [
+        pytest.param(
+            np.ones((7, 8, 8), dtype=np.float32),
+            "shape",
+            id="wrong-shape",
+        ),
+        pytest.param(
+            np.full((8, 8, 8), np.nan, dtype=np.float32),
+            "finite",
+            id="nonfinite",
+        ),
+    ],
+)
+def test_chunk_support_rejects_malformed_masks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mask: np.ndarray,
+    message: str,
+) -> None:
+    context, _artifacts, region, _chunk = _capture_chunk_inputs(
+        tmp_path,
+        monkeypatch,
+    )
+    malformed = replace(region, moving_mask=fake_image(data=mask))
+
+    with pytest.raises(ValueError, match=message):
+        _chunk_support_evidence(
+            np,
+            context.backend,
+            malformed,
+            context.nonlinear_accuracy,
+        )
+
+
+def test_nonzero_insufficient_support_commits_identity_without_calling_ants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, _artifacts, region, chunk = _capture_chunk_inputs(
+        tmp_path,
+        monkeypatch,
+    )
+    thin = np.zeros(chunk.extended_shape, dtype=np.float32)
+    thin[:, :, :2] = 1.0
+    thin_region = replace(
+        region,
+        fixed_mask=fake_image(data=thin),
+        moving_mask=fake_image(data=thin),
+    )
+    isolated = replace(
+        context,
+        force=True,
+        output_directory=tmp_path / "insufficient-support",
+    )
+    backend = context.backend
+    calls_before = backend.nonlinear_calls  # type: ignore[attr-defined]
+    identities_before = len(backend.identity_chunk_ids)  # type: ignore[attr-defined]
+
+    artifact = run_nonlinear_chunk(isolated, thin_region, chunk)
+
+    assert backend.nonlinear_calls == calls_before  # type: ignore[attr-defined]
+    assert backend.identity_chunk_ids[identities_before:] == [  # type: ignore[attr-defined]
+        chunk.chunk_id
+    ]
+    request = CompletionRecord.read(
+        isolated.store.record_path(artifact.warp_path)
+    ).request
+    assert request.parameters["insufficient_support"] == {
+        "coarsest_common_voxels": 4,
+        "coarsest_shrink_factor": 4,
+        "coarsest_span_zyx": [2, 2, 1],
+        "decision": "identity-insufficient-support",
+        "fine_common_voxels": 128,
+        "fine_total_voxels": 512,
+        "policy": "common-mask-coarsest-2x2x2-v1",
+    }
+
+
+def test_sufficient_support_preserves_the_historical_request_and_calls_ants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, _artifacts, region, chunk = _capture_chunk_inputs(
+        tmp_path,
+        monkeypatch,
+    )
+    full = np.ones(chunk.extended_shape, dtype=np.float32)
+    full_region = replace(
+        region,
+        fixed_mask=fake_image(data=full),
+        moving_mask=fake_image(data=full),
+    )
+    isolated = replace(
+        context,
+        force=True,
+        output_directory=tmp_path / "sufficient-support",
+    )
+    backend = context.backend
+    calls_before = backend.nonlinear_calls  # type: ignore[attr-defined]
+
+    artifact = run_nonlinear_chunk(isolated, full_region, chunk)
+
+    assert backend.nonlinear_calls == calls_before + 1  # type: ignore[attr-defined]
+    request = CompletionRecord.read(
+        isolated.store.record_path(artifact.warp_path)
+    ).request
+    assert "insufficient_support" not in request.parameters
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            RuntimeError("Registration failed with error code 1"),
+            id="generic-ants-code-one",
+        ),
+        pytest.param(RuntimeError("different runtime failure"), id="other-runtime"),
+        pytest.param(ValueError("invalid backend geometry"), id="other-type"),
+    ],
+)
+def test_sufficient_support_never_turns_backend_failures_into_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    context, _artifacts, region, chunk = _capture_chunk_inputs(
+        tmp_path,
+        monkeypatch,
+    )
+    full = np.ones(chunk.extended_shape, dtype=np.float32)
+    full_region = replace(
+        region,
+        fixed_mask=fake_image(data=full),
+        moving_mask=fake_image(data=full),
+    )
+    isolated = replace(
+        context,
+        force=True,
+        output_directory=tmp_path / f"propagate-{type(error).__name__}",
+    )
+
+    def fail_nonlinear(**_kwargs: object) -> tuple[object, Path]:
+        raise error
+
+    monkeypatch.setattr(context.backend, "nonlinear", fail_nonlinear)
+
+    with pytest.raises(type(error), match=str(error)) as raised:
+        run_nonlinear_chunk(isolated, full_region, chunk)
+
+    assert raised.value is error
 
 
 def test_serial_registration_commits_float32_scalar_cores(tmp_path: Path) -> None:

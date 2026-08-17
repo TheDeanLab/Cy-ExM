@@ -217,11 +217,16 @@ def _chunk_support_evidence(
     common = (fixed > 0.5) & (moving > 0.5)
     coarse = common[::factor, ::factor, ::factor]
     coarse_count = int(coarse.sum())
+    span: tuple[int, int, int]
     if coarse_count == 0:
         span = (0, 0, 0)
     else:
         indices = np.where(coarse)
-        span = tuple(int(axis.max() - axis.min() + 1) for axis in indices)
+        span = (
+            int(indices[0].max() - indices[0].min() + 1),
+            int(indices[1].max() - indices[1].min() + 1),
+            int(indices[2].max() - indices[2].min() + 1),
+        )
     return _ChunkSupportEvidence(
         fine_common_voxels=int(common.sum()),
         fine_total_voxels=int(common.size),

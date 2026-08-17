@@ -6,3 +6,5 @@ __pycache__/
 docs/_build/
 /.idea
 cy_exm.egg-info/
+*.out
+*.err

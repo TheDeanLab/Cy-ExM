@@ -56,7 +56,11 @@ def test_estimator_recovers_xy_rotation_correction(applied_angle: float) -> None
 
     assert estimate.accepted is True
     assert estimate.rejection_reason is None
-    assert estimate.angle_deg == pytest.approx(-applied_angle, abs=0.25)
+    # SciPy uses row-down display coordinates, so its positive display angle is
+    # the negative of the manifest's physical +Z right-hand rotation. The
+    # correction returned by the estimator is therefore the same signed value
+    # as the angle used here to construct the misalignment.
+    assert estimate.angle_deg == pytest.approx(applied_angle, abs=0.25)
     assert estimate.policy == ROTATION_ESTIMATOR_POLICY
     assert estimate.coarse_scores
     assert estimate.refined_scores

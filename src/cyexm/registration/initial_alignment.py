@@ -181,9 +181,13 @@ def _score_angle(
     moving_footprint: Any,
     angle: float,
 ) -> RotationScore | None:
+    # Candidate angles use the public physical +Z right-hand convention.
+    # scipy.ndimage.rotate uses row-down display coordinates, whose sign is
+    # opposite for an identity physical direction matrix.
+    display_angle = -angle
     rotated = ndimage.rotate(
         moving,
-        angle=angle,
+        angle=display_angle,
         reshape=False,
         order=1,
         mode="constant",
@@ -192,7 +196,7 @@ def _score_angle(
     )
     rotated_footprint = ndimage.rotate(
         moving_footprint,
-        angle=angle,
+        angle=display_angle,
         reshape=False,
         order=0,
         mode="constant",
@@ -451,7 +455,7 @@ def render_initial_alignment_qc(
     if estimate.angle_deg is not None and estimate.translation_yx_px is not None:
         aligned = ndimage.rotate(
             moving,
-            angle=estimate.angle_deg,
+            angle=-estimate.angle_deg,
             reshape=False,
             order=1,
             mode="constant",

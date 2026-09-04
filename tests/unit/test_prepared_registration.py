@@ -19,6 +19,10 @@ from cyexm.registration.artifacts import (
     StageRequest,
 )
 from cyexm.registration.chunked import ChunkInfo
+from cyexm.registration.initial_alignment import (
+    ExplicitXYRotationPolicy,
+    InitialAlignmentPolicy,
+)
 from cyexm.registration.prepared import (
     PreparedManifest,
     PreparedRoundPaths,
@@ -100,6 +104,23 @@ def test_prepared_paths_use_exact_internal_bundle_names(tmp_path: Path) -> None:
     assert paths.fixed_mask == paths.directory / "fixed_mask.npy"
     assert paths.moving_linear_mask == paths.directory / "moving_linear_mask.npy"
     assert paths.manifest == paths.directory / "manifest.json"
+
+
+def test_rotation_prepared_manifest_uses_strict_format_five(tmp_path: Path) -> None:
+    registration = _registration(tmp_path)
+    registration.initial_alignment = InitialAlignmentPolicy(
+        ExplicitXYRotationPolicy(angle_deg=27.7)
+    )
+
+    manifest = commit_prepared_round(registration)
+
+    assert manifest.format_version == 5
+    assert manifest.initial_alignment is not None
+    assert manifest.initial_alignment["realized"]["angle_deg"] == 27.7
+    assert manifest.initial_alignment_json is not None
+    assert manifest.initial_alignment_transform is not None
+    assert manifest.initial_alignment_qc is not None
+    assert PreparedManifest.from_dict(manifest.to_dict()) == manifest
 
 
 def test_disabled_preparation_retains_exact_manifest_v2(tmp_path: Path) -> None:

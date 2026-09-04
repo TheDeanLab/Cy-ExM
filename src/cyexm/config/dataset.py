@@ -18,7 +18,10 @@ from cyexm.config.models import (
     ChannelSpec,
     ChunkSizeZYX,
     DatasetManifest,
+    EstimatedXYRotationSpec,
+    ExplicitXYRotationSpec,
     FeatureMaskSpec,
+    InitialAlignmentSpec,
     NonlinearRegistrationStageSpec,
     PixelSpacingXYZ,
     ReferenceChannelSpec,
@@ -63,6 +66,18 @@ _SERIAL_CHUNKED_ROUND_KEYS = _WHOLE_IMAGE_ROUND_KEYS | frozenset(
     {"chunk_size_zyx", "overlap_fraction"}
 )
 _CHANNEL_KEYS = frozenset({"file", "interpolation"})
+_INITIAL_ALIGNMENT_KEYS = frozenset({"xy_rotation"})
+_EXPLICIT_XY_ROTATION_KEYS = frozenset({"mode", "angle_deg"})
+_ESTIMATED_XY_ROTATION_KEYS = frozenset(
+    {
+        "mode",
+        "search_range_deg",
+        "coarse_step_deg",
+        "refinement_step_deg",
+        "minimum_score_gain",
+        "minimum_peak_margin",
+    }
+)
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -326,6 +341,97 @@ def _overlap_fraction(value: object, yaml_path: str) -> float:
     return overlap
 
 
+def _finite_float(value: object, yaml_path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ConfigurationValidationError(
+            f"{yaml_path} must be a finite number; got {value!r}"
+        )
+    result = float(value)
+    if not math.isfinite(result):
+        raise ConfigurationValidationError(
+            f"{yaml_path} must be a finite number; got {value!r}"
+        )
+    return result
+
+
+def _xy_rotation(value: object, yaml_path: str) -> object:
+    if not isinstance(value, Mapping):
+        raise ConfigurationValidationError(
+            f"{yaml_path} must be a mapping; got {value!r}"
+        )
+    mode = value.get("mode")
+    if mode == "explicit":
+        mapping = require_exact_keys(value, _EXPLICIT_XY_ROTATION_KEYS, yaml_path)
+        angle = _finite_float(mapping["angle_deg"], f"{yaml_path}.angle_deg")
+        if not -180.0 <= angle <= 180.0:
+            raise ConfigurationValidationError(
+                f"{yaml_path}.angle_deg must be within [-180, 180]; got {angle!r}"
+            )
+        return ExplicitXYRotationSpec(mode="explicit", angle_deg=angle)
+    if mode != "estimate":
+        raise ConfigurationValidationError(
+            f"{yaml_path}.mode must be one of ['estimate', 'explicit']; got {mode!r}"
+        )
+    actual = frozenset(value)
+    if not all(isinstance(key, str) for key in value) or not actual.issubset(
+        _ESTIMATED_XY_ROTATION_KEYS
+    ):
+        raise ConfigurationValidationError(
+            f"{yaml_path} keys must be exactly a subset of "
+            f"{sorted(_ESTIMATED_XY_ROTATION_KEYS)!r}; got {sorted(actual)!r}"
+        )
+    search_value = value.get("search_range_deg", [-45.0, 45.0])
+    search = _list(search_value, f"{yaml_path}.search_range_deg")
+    if len(search) != 2:
+        raise ConfigurationValidationError(
+            f"{yaml_path}.search_range_deg must contain exactly two values; "
+            f"got {search_value!r}"
+        )
+    lower = _finite_float(search[0], f"{yaml_path}.search_range_deg[0]")
+    upper = _finite_float(search[1], f"{yaml_path}.search_range_deg[1]")
+    if lower < -180.0 or upper > 180.0 or lower >= upper:
+        raise ConfigurationValidationError(
+            f"{yaml_path}.search_range_deg must be strictly increasing within "
+            f"[-180, 180]; got {search_value!r}"
+        )
+    coarse = finite_positive_float(
+        value.get("coarse_step_deg", 1.0), f"{yaml_path}.coarse_step_deg"
+    )
+    refinement = finite_positive_float(
+        value.get("refinement_step_deg", 0.1),
+        f"{yaml_path}.refinement_step_deg",
+    )
+    if refinement >= coarse:
+        raise ConfigurationValidationError(
+            f"{yaml_path}.refinement_step_deg must be smaller than "
+            f"coarse_step_deg; got {refinement!r} >= {coarse!r}"
+        )
+    return EstimatedXYRotationSpec(
+        mode="estimate",
+        search_range_deg=(lower, upper),
+        coarse_step_deg=coarse,
+        refinement_step_deg=refinement,
+        minimum_score_gain=finite_positive_float(
+            value.get("minimum_score_gain", 0.01),
+            f"{yaml_path}.minimum_score_gain",
+        ),
+        minimum_peak_margin=finite_positive_float(
+            value.get("minimum_peak_margin", 0.01),
+            f"{yaml_path}.minimum_peak_margin",
+        ),
+    )
+
+
+def _initial_alignment(value: object, yaml_path: str) -> InitialAlignmentSpec:
+    mapping = require_exact_keys(value, _INITIAL_ALIGNMENT_KEYS, yaml_path)
+    return InitialAlignmentSpec(
+        xy_rotation=cast(
+            ExplicitXYRotationSpec | EstimatedXYRotationSpec,
+            _xy_rotation(mapping["xy_rotation"], f"{yaml_path}.xy_rotation"),
+        )
+    )
+
+
 def _round(value: object, index: int) -> RoundSpec:
     yaml_path = f"rounds[{index}]"
     if isinstance(value, Mapping) and "strategy" in value:
@@ -344,6 +450,8 @@ def _round(value: object, index: int) -> RoundSpec:
         if strategy == "serial_chunked"
         else _WHOLE_IMAGE_ROUND_KEYS
     )
+    if isinstance(value, Mapping) and "initial_alignment" in value:
+        expected_keys |= frozenset({"initial_alignment"})
     mapping = require_exact_keys(value, expected_keys, yaml_path)
     channels = tuple(
         _channel(item, f"{yaml_path}.channels[{channel_index}]")
@@ -382,6 +490,13 @@ def _round(value: object, index: int) -> RoundSpec:
         channels=channels,
         chunk_size_zyx=chunk_size_zyx,
         overlap_fraction=overlap_fraction,
+        initial_alignment=(
+            _initial_alignment(
+                mapping["initial_alignment"], f"{yaml_path}.initial_alignment"
+            )
+            if "initial_alignment" in mapping
+            else None
+        ),
     )
 
 
@@ -637,6 +752,49 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
             ),
             "channels": channels,
         }
+        initial_alignment = round_spec.initial_alignment
+        if initial_alignment is not None:
+            if type(initial_alignment) is not InitialAlignmentSpec:
+                raise ConfigurationValidationError(
+                    f"{round_path}.initial_alignment must be an "
+                    f"InitialAlignmentSpec or null; got {initial_alignment!r}"
+                )
+            rotation = initial_alignment.xy_rotation
+            if type(rotation) is ExplicitXYRotationSpec:
+                if type(rotation.mode) is not str or rotation.mode != "explicit":
+                    raise ConfigurationValidationError(
+                        f"{round_path}.initial_alignment.xy_rotation.mode must be "
+                        f"the built-in string 'explicit'; got {rotation.mode!r}"
+                    )
+                if type(rotation.angle_deg) is not float:
+                    raise ConfigurationValidationError(
+                        f"{round_path}.initial_alignment.xy_rotation.angle_deg must "
+                        f"be a built-in float; got {rotation.angle_deg!r}"
+                    )
+                rotation_mapping: dict[str, object] = {
+                    "mode": rotation.mode,
+                    "angle_deg": rotation.angle_deg,
+                }
+            elif type(rotation) is EstimatedXYRotationSpec:
+                if type(rotation.mode) is not str or rotation.mode != "estimate":
+                    raise ConfigurationValidationError(
+                        f"{round_path}.initial_alignment.xy_rotation.mode must be "
+                        f"the built-in string 'estimate'; got {rotation.mode!r}"
+                    )
+                rotation_mapping = {
+                    "mode": rotation.mode,
+                    "search_range_deg": list(rotation.search_range_deg),
+                    "coarse_step_deg": rotation.coarse_step_deg,
+                    "refinement_step_deg": rotation.refinement_step_deg,
+                    "minimum_score_gain": rotation.minimum_score_gain,
+                    "minimum_peak_margin": rotation.minimum_peak_margin,
+                }
+            else:
+                raise ConfigurationValidationError(
+                    f"{round_path}.initial_alignment.xy_rotation has an unsupported "
+                    f"type; got {rotation!r}"
+                )
+            round_mapping["initial_alignment"] = {"xy_rotation": rotation_mapping}
         if round_spec.strategy == "serial_chunked":
             chunk_size = round_spec.chunk_size_zyx
             if type(chunk_size) is not tuple or len(chunk_size) != 3:

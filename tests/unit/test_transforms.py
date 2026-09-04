@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from fakes import fake_image, install_fake_ants
 
@@ -11,14 +13,183 @@ from cyexm.registration.transforms import (
     apply_affine,
     apply_transform_chain,
     apply_warp,
+    compose_affine_transforms,
+    create_xy_rotation_transform,
     export_affine_transform,
     import_affine_transform,
     set_origin_and_spacing,
     transform_image,
 )
 from cyexm.runtime import NativeThreadConfig
+from cyexm.spatial import ImageGeometry
 
 pytestmark = pytest.mark.unit
+
+
+def test_create_xy_rotation_transform_uses_physical_center_and_inverse_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    def create_ants_transform(**kwargs: object) -> object:
+        calls.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        transforms,
+        "_scientific_runtime",
+        lambda: (SimpleNamespace(create_ants_transform=create_ants_transform), np),
+    )
+    monkeypatch.setattr(
+        transforms,
+        "configure_native_threads",
+        lambda config: SimpleNamespace(describe=lambda: "threads"),
+    )
+    geometry = ImageGeometry(
+        shape=(5, 7, 9),
+        origin=(10.0, 20.0, 30.0),
+        spacing=(2.0, 3.0, 4.0),
+        direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+
+    result = create_xy_rotation_transform(
+        geometry=geometry,
+        angle_deg=90.0,
+        translation_yx_px=(2.0, -3.0),
+    )
+
+    assert result is not None
+    assert calls["transform_type"] == "AffineTransform"
+    assert calls["dimension"] == 3
+    np.testing.assert_allclose(calls["center"], (1.0, 28.0, 38.0))
+    np.testing.assert_allclose(
+        calls["matrix"],
+        ((0.0, 1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(calls["translation"], (6.0, -6.0, 0.0), atol=1e-12)
+
+
+def test_create_xy_rotation_transform_rotates_about_directed_image_z_axis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        transforms,
+        "_scientific_runtime",
+        lambda: (
+            SimpleNamespace(
+                create_ants_transform=lambda **kwargs: calls.update(kwargs)
+            ),
+            np,
+        ),
+    )
+    monkeypatch.setattr(
+        transforms,
+        "configure_native_threads",
+        lambda config: SimpleNamespace(describe=lambda: "threads"),
+    )
+    direction = np.asarray(((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)))
+    geometry = ImageGeometry(
+        shape=(5, 7, 9),
+        origin=(0.0, 0.0, 0.0),
+        spacing=(1.0, 1.0, 1.0),
+        direction=tuple(tuple(float(value) for value in row) for row in direction),
+    )
+
+    create_xy_rotation_transform(geometry=geometry, angle_deg=90.0)
+
+    local_inverse_rotation = np.asarray(
+        ((0.0, 1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+    )
+    np.testing.assert_allclose(
+        calls["matrix"],
+        direction @ local_inverse_rotation @ direction.T,
+        atol=1e-12,
+    )
+
+
+def test_create_xy_rotation_transform_maps_between_physical_image_centers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        transforms,
+        "_scientific_runtime",
+        lambda: (
+            SimpleNamespace(
+                create_ants_transform=lambda **kwargs: calls.update(kwargs)
+            ),
+            np,
+        ),
+    )
+    monkeypatch.setattr(
+        transforms,
+        "configure_native_threads",
+        lambda config: SimpleNamespace(describe=lambda: "threads"),
+    )
+    fixed = ImageGeometry(
+        shape=(5, 7, 9),
+        origin=(1.0, 2.0, 3.0),
+        spacing=(2.0, 3.0, 4.0),
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    moving = ImageGeometry(
+        shape=fixed.shape,
+        origin=(11.0, -3.0, 5.0),
+        spacing=fixed.spacing,
+        direction=fixed.direction,
+    )
+
+    create_xy_rotation_transform(
+        fixed_geometry=fixed,
+        geometry=moving,
+        angle_deg=0.0,
+    )
+
+    np.testing.assert_allclose(calls["matrix"], np.eye(3), atol=1e-12)
+    np.testing.assert_allclose(calls["translation"], (10.0, -5.0, 2.0), atol=1e-12)
+
+
+def test_compose_affine_transforms_flattens_application_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    def create_ants_transform(**kwargs: object) -> object:
+        calls.update(kwargs)
+        return "complete"
+
+    monkeypatch.setattr(
+        transforms,
+        "_scientific_runtime",
+        lambda: (SimpleNamespace(create_ants_transform=create_ants_transform), np),
+    )
+    monkeypatch.setattr(
+        transforms,
+        "configure_native_threads",
+        lambda config: SimpleNamespace(describe=lambda: "threads"),
+    )
+    translate = SimpleNamespace(
+        parameters=np.concatenate((np.eye(3).ravel(), np.array((10.0, 0.0, 0.0)))),
+        fixed_parameters=np.zeros(3),
+        dimension=3,
+        transform_type="AffineTransform",
+    )
+    scale = SimpleNamespace(
+        parameters=np.concatenate((np.diag((2.0, 1.0, 1.0)).ravel(), np.zeros(3))),
+        fixed_parameters=np.zeros(3),
+        dimension=3,
+        transform_type="AffineTransform",
+    )
+
+    result = compose_affine_transforms((translate, scale))
+
+    assert result == "complete"
+    np.testing.assert_allclose(calls["matrix"], np.diag((2.0, 1.0, 1.0)))
+    np.testing.assert_allclose(calls["translation"], (20.0, 0.0, 0.0))
+    np.testing.assert_allclose(calls["center"], (0.0, 0.0, 0.0))
 
 
 def test_transform_chain_uses_warp_then_affine(

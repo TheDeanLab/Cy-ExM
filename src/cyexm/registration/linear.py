@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from cyexm.io.images import external_to_ants_array
+from cyexm.registration.transforms import compose_affine_transforms
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ def register_image(
     verbose: bool = False,
     *,
     native_threads: NativeThreadConfig | None = None,
+    initial_transform: str | os.PathLike[str] | None = None,
 ) -> tuple[object, object | None, object]:
     """Return transformed scalar image, optional transformed mask, and affine."""
     _validate_policy(registration_type, accuracy)
@@ -108,6 +110,8 @@ def register_image(
         kwargs["aff_smoothing_sigmas"] = (0,)
         kwargs["aff_shrink_factors"] = (8,)
         kwargs["aff_random_sampling_rate"] = 0.1
+    if initial_transform is not None:
+        kwargs["initial_transform"] = [str(initial_transform)]
 
     iterations = kwargs.get("reg_iterations", kwargs.get("aff_iterations"))
     if iterations is None:
@@ -126,7 +130,20 @@ def register_image(
         workspace = Path(workspace_text)
         kwargs["outprefix"] = str(workspace / "ants-")
         registered = ants.registration(**kwargs)
-        transform = ants.read_transform(filename=registered["fwdtransforms"][0])
+        forward_paths = [Path(value) for value in registered["fwdtransforms"]]
+        transform: Any
+        if initial_transform is None:
+            transform = ants.read_transform(filename=str(forward_paths[0]))
+        else:
+            seed_path = Path(initial_transform)
+            if all(path.resolve() != seed_path.resolve() for path in forward_paths):
+                forward_paths.append(seed_path)
+            transform = compose_affine_transforms(
+                tuple(
+                    ants.read_transform(filename=str(path)) for path in forward_paths
+                ),
+                native_threads=native_threads,
+            )
         transformed_image = transform.apply_to_image(
             image=moving_image,
             reference=fixed_image,

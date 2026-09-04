@@ -11,11 +11,48 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DOCS_ROOT = REPOSITORY_ROOT / "docs"
 EXAMPLE_PATHS = (
     "examples/spheroid-dataset.yaml",
+    "examples/explicit-rotation-dataset.yaml",
+    "examples/estimated-rotation-dataset.yaml",
     "examples/execution-sequential.yaml",
     "examples/execution-local-dask.yaml",
     "examples/execution-slurm-512gb.yaml",
     "examples/execution-slurm-512gb-multi-process.yaml",
 )
+
+
+def test_initial_alignment_guide_and_examples_cover_the_public_contract() -> None:
+    guide = (DOCS_ROOT / "initial-alignment.md").read_text(encoding="utf-8")
+    manifest = (DOCS_ROOT / "dataset-manifest.md").read_text(encoding="utf-8")
+    for phrase in (
+        "target-blind",
+        "physical +Z",
+        "appears clockwise",
+        "initial_alignment_{round}.json",
+        "Automatic rejection",
+        "one resampling pass",
+    ):
+        assert phrase in guide
+    for key in (
+        "initial_alignment",
+        "xy_rotation",
+        "angle_deg",
+        "search_range_deg",
+        "coarse_step_deg",
+        "refinement_step_deg",
+        "minimum_score_gain",
+        "minimum_peak_margin",
+    ):
+        assert key in manifest
+
+    from cyexm.config import load_dataset_manifest
+
+    for name in (
+        "explicit-rotation-dataset.yaml",
+        "estimated-rotation-dataset.yaml",
+    ):
+        parsed = load_dataset_manifest(REPOSITORY_ROOT / "examples" / name)
+        assert parsed.reference.round == 2
+        assert parsed.rounds[0].initial_alignment is not None
 
 
 def _myst_toc_documents() -> tuple[str, ...]:

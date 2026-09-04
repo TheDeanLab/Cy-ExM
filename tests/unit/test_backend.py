@@ -34,6 +34,14 @@ def test_registration_backend_declares_every_required_operation() -> None:
             "pixeltype",
         ),
         "crop_image": ("self", "image", "bounds_zyx"),
+        "create_xy_rotation_seed": (
+            "self",
+            "fixed_geometry",
+            "geometry",
+            "angle_deg",
+            "translation_yx_px",
+        ),
+        "compose_affines": ("self", "transforms"),
         "linear": ("self", "kwargs"),
         "nonlinear": ("self", "kwargs"),
         "apply_affine": (

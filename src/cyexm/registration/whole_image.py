@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -24,6 +25,7 @@ from cyexm.registration._request_policy import (
     RAW_RECONSTRUCTED_SCALAR_POLICY,
     WHOLE_SCALAR_POLICY,
     affine_parameters,
+    canonical_compact_json,
     common_parameters,
     crop_parameters,
     feature_mask_config_parameters,
@@ -43,6 +45,19 @@ from cyexm.registration.crop import (
     estimate_bounds,
     read_bounds,
     validate_bounds,
+)
+from cyexm.registration.initial_alignment import (
+    EXPLICIT_ROTATION_POLICY,
+    ROTATION_ESTIMATOR_POLICY,
+    EstimatedXYRotationPolicy,
+    ExplicitXYRotationPolicy,
+    InitialAlignmentPolicy,
+    XYRotationEstimate,
+    estimate_xy_rotation,
+    initial_alignment_config_parameters,
+    initial_alignment_result_parameters,
+    parse_initial_alignment_result,
+    render_initial_alignment_qc,
 )
 from cyexm.runtime import (
     NativeThreadConfig,
@@ -149,6 +164,9 @@ class RegistrationPaths:
     nonlinear_metrics: Path
     fixed_crop: Path
     moving_crop: Path
+    initial_alignment_transform: Path
+    initial_alignment_json: Path
+    initial_alignment_qc: Path
 
     @classmethod
     def for_round(cls, output: Path, round_number: int) -> RegistrationPaths:
@@ -163,6 +181,11 @@ class RegistrationPaths:
             nonlinear_metrics=output / "image_metrics_nonlinear-registered.txt",
             fixed_crop=output / f"fixed_crop_indices_{round_number}.json",
             moving_crop=output / f"moving_crop_indices_{round_number}.json",
+            initial_alignment_transform=(
+                output / f"initial_alignment_{round_number}.mat"
+            ),
+            initial_alignment_json=output / f"initial_alignment_{round_number}.json",
+            initial_alignment_qc=(output / f"initial_alignment_qc_{round_number}.png"),
         )
 
 
@@ -193,6 +216,69 @@ class ImageRegistration:
     derive transform-estimation masks from positive feature support; raw-image masks
     remain diagnostic, and the final registered output remains raw intensity data.
     YAML scalar expansion occurs before this Python API.
+
+    ``initial_alignment`` optionally resolves a physical XY rotation correction
+    from the raw cropped registration channels before feature construction. The
+    seed is supplied to the existing linear registrar and composed into the one
+    persisted complete affine; dependent channels retain the established
+    warp-plus-affine resampling path.
+
+    Parameters
+    ----------
+    fixed_image_path, moving_image_path : str or path-like
+        Fixed and moving scalar 3-D TIFF inputs.
+    save_directory : str or path-like
+        Dedicated artifact directory, created when needed.
+    imaging_round : int, optional
+        Nonnegative moving-round identifier used in artifact names.
+    pixel_size : tuple of float, optional
+        Positive physical spacing in ``(x, y, z)`` micrometers.
+    crop : bool, optional
+        Estimate and apply foreground crops before registration.
+    enable_logging : bool, optional
+        Emit stage information through the module logger.
+    force_override : bool, optional
+        Recompute this request and invalidate its descendants.
+    prepared_fixed : bool, optional
+        Treat the supplied fixed image as an already prepared reference artifact.
+    native_threads : NativeThreadConfig, optional
+        Explicit ITK and BLAS-family native thread limits.
+    linear_type, linear_accuracy : str, optional
+        Supported linear transform family and schedule.
+    nonlinear_type, nonlinear_accuracy : str, optional
+        Supported nonlinear transform family and schedule.
+    nonlinear_metric, nonlinear_radius : object, optional
+        Exact nonlinear metric and optional CC voxel radius.
+    preprocess_filter_sigma_zyx : tuple of float, optional
+        Gaussian feature sigma in NumPy ``(z, y, x)`` voxel units.
+    preprocess_feature_mask : FeatureMaskSpec, optional
+        Physical component filtering and dilation for feature-derived masks.
+    initial_alignment : InitialAlignmentPolicy, optional
+        Per-moving-image physical XY rotation policy. Positive angles follow the
+        right-hand rule about physical +Z and appear clockwise in an
+        identity-direction row-down display. Automatic confidence rejection writes
+        JSON and QC evidence, then raises before linear registration.
+
+    Raises
+    ------
+    TypeError, ValueError
+        If configuration does not satisfy the strict public contract.
+    RegistrationStageError
+        If a registration stage or automatic initialization fails.
+    CacheValidationError
+        If an existing artifact cannot be authenticated for this request.
+
+    See Also
+    --------
+    register_round :
+        Convenience entry point that runs this complete lifecycle once.
+    cyexm.registration.ChunkedImageRegistration :
+        Reuse the same affine preparation with serial nonlinear chunks.
+
+    Notes
+    -----
+    Artifacts and completion records are committed atomically. Omission of
+    ``initial_alignment`` preserves the historical request and artifact set.
     """
 
     def __init__(
@@ -216,6 +302,7 @@ class ImageRegistration:
         nonlinear_radius: object = None,
         preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
         preprocess_feature_mask: FeatureMaskSpec | None = None,
+        initial_alignment: InitialAlignmentPolicy | None = None,
         _backend: RegistrationBackend | None = None,
         _artifact_store: ArtifactStore | None = None,
     ) -> None:
@@ -251,6 +338,14 @@ class ImageRegistration:
         )
         self.preprocess_feature_mask = _validated_feature_mask(preprocess_feature_mask)
         if (
+            initial_alignment is not None
+            and type(initial_alignment) is not InitialAlignmentPolicy
+        ):
+            raise TypeError(
+                "initial_alignment must be an InitialAlignmentPolicy or None"
+            )
+        self.initial_alignment = initial_alignment
+        if (
             self.preprocess_feature_mask is not None
             and self.preprocess_filter_sigma_zyx is None
         ):
@@ -267,6 +362,8 @@ class ImageRegistration:
         self._prepare_nonlinear_before_reuse = False
         self._source_paths: tuple[Path, Path] | None = None
         self._source_identities: tuple[FileIdentity, FileIdentity] | None = None
+        self._initial_alignment_evidence: dict[str, object] | None = None
+        self._initial_transform_path: Path | None = None
 
     def _prepare_linear_state(self) -> _LinearPreparation:
         resolved = configure_native_threads(self.native_threads)
@@ -300,6 +397,9 @@ class ImageRegistration:
         self._verify_source_identities()
         raw_fixed, raw_moving = self._crop_if_requested(
             backend, fixed, moving, paths, resolved
+        )
+        self._initial_transform_path = self._load_or_resolve_initial_alignment(
+            backend, raw_fixed, raw_moving, paths, resolved
         )
         raw_fixed_mask = backend.zero_mask(raw_fixed)
         raw_moving_mask = backend.zero_mask(raw_moving)
@@ -955,6 +1055,8 @@ class ImageRegistration:
             )
             if preprocessing is not None:
                 parameters["preprocessing"] = preprocessing
+            if self._initial_alignment_evidence is not None:
+                parameters["initial_alignment"] = self._initial_alignment_evidence
             request = self._request(
                 backend,
                 fixed,
@@ -994,6 +1096,245 @@ class ImageRegistration:
         except Exception as error:
             raise RegistrationStageError(f"{stage} metrics stage failed") from error
 
+    def _load_or_resolve_initial_alignment(
+        self,
+        backend: RegistrationBackend,
+        fixed: object,
+        moving: object,
+        paths: RegistrationPaths,
+        resolved: ResolvedNativeThreads,
+    ) -> Path | None:
+        policy = self.initial_alignment
+        self._initial_alignment_evidence = None
+        if policy is None:
+            return None
+        configured = initial_alignment_config_parameters(policy)
+        rotation = policy.xy_rotation
+        algorithm = (
+            EXPLICIT_ROTATION_POLICY
+            if type(rotation) is ExplicitXYRotationPolicy
+            else ROTATION_ESTIMATOR_POLICY
+        )
+        source = (
+            "explicit" if type(rotation) is ExplicitXYRotationPolicy else "estimated"
+        )
+        fixed_geometry = backend.geometry(fixed)
+        moving_geometry = backend.geometry(moving)
+        if type(rotation) is ExplicitXYRotationPolicy and any(
+            not math.isclose(fixed_value, moving_value, rel_tol=0.0, abs_tol=1e-8)
+            for fixed_row, moving_row in zip(
+                fixed_geometry.direction, moving_geometry.direction, strict=True
+            )
+            for fixed_value, moving_value in zip(fixed_row, moving_row, strict=True)
+        ):
+            raise RegistrationStageError(
+                "explicit XY rotation requires matching fixed and moving "
+                "direction matrices"
+            )
+        fixed_source, moving_source = self._input_identity_snapshot()
+        crop_evidence: dict[str, object] = {"enabled": self.crop}
+        if self.crop:
+
+            def crop_artifact(path: Path) -> dict[str, object]:
+                text = path.read_text(encoding="utf-8")
+                bounds = json.loads(text)
+                if (
+                    not isinstance(bounds, list)
+                    or len(bounds) != 6
+                    or any(
+                        isinstance(value, bool) or not isinstance(value, int)
+                        for value in bounds
+                    )
+                    or canonical_compact_json(bounds) != text
+                ):
+                    raise ValueError("initial alignment crop evidence is invalid")
+                return {
+                    "bounds": bounds,
+                    "identity": FileIdentity.from_path(path).to_dict(),
+                }
+
+            crop_evidence["moving"] = {
+                **crop_artifact(paths.moving_crop),
+            }
+            crop_evidence["fixed"] = (
+                {"prepared_fixed": True}
+                if self.prepared_fixed
+                else crop_artifact(paths.fixed_crop)
+            )
+        context: dict[str, object] = {
+            "sources": {
+                "fixed": fixed_source.to_dict(),
+                "moving": moving_source.to_dict(),
+            },
+            "geometries": {
+                "fixed": fixed_geometry.to_dict(),
+                "moving": moving_geometry.to_dict(),
+            },
+            "crop": crop_evidence,
+        }
+        evidence_request = self._request(
+            backend,
+            fixed,
+            resolved,
+            stage="initial-alignment:evidence",
+            method="xy-rotation",
+            accuracy="deterministic",
+            upstream=None,
+            parameters={
+                "configured": configured,
+                "algorithm": algorithm,
+                **context,
+            },
+        )
+
+        def read_evidence(path: Path) -> dict[str, object]:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(value, dict)
+                or set(value)
+                != {"configured", "sources", "geometries", "crop", "realized"}
+                or value.get("configured") != configured
+                or any(value.get(key) != expected for key, expected in context.items())
+            ):
+                raise ValueError("initial alignment evidence is not canonical")
+            result = parse_initial_alignment_result(value.get("realized"), policy)
+            if (
+                result.policy != algorithm
+                or value["realized"].get("source") != source
+                or initial_alignment_result_parameters(result) != value.get("realized")
+            ):
+                raise ValueError("initial alignment result is not canonical")
+            if path.read_text(encoding="utf-8") != canonical_compact_json(value):
+                raise ValueError("initial alignment evidence JSON is not canonical")
+            return value
+
+        evidence: dict[str, object] | None = None
+        if not self.force_override:
+            evidence = self._reuse_artifact(
+                paths.initial_alignment_json, evidence_request, read_evidence
+            )
+        if evidence is None:
+            if type(rotation) is ExplicitXYRotationPolicy:
+                result = XYRotationEstimate(
+                    policy=EXPLICIT_ROTATION_POLICY,
+                    accepted=True,
+                    rejection_reason=None,
+                    angle_deg=rotation.angle_deg,
+                    translation_yx_px=(0.0, 0.0),
+                    zero_angle_score=None,
+                    score_gain=None,
+                    peak_margin=None,
+                    valid_overlap_fraction=None,
+                    coarse_scores=(),
+                    refined_scores=(),
+                )
+            elif type(rotation) is EstimatedXYRotationPolicy:
+                result = estimate_xy_rotation(
+                    backend.to_array(fixed),
+                    backend.to_array(moving),
+                    rotation,
+                    fixed_geometry=fixed_geometry,
+                    moving_geometry=moving_geometry,
+                )
+            else:  # pragma: no cover - protected by InitialAlignmentPolicy
+                raise TypeError("unsupported initial alignment policy")
+            evidence = {
+                "configured": configured,
+                **context,
+                "realized": initial_alignment_result_parameters(result),
+            }
+
+            def write_evidence(path: Path) -> None:
+                path.write_text(canonical_compact_json(evidence), encoding="utf-8")
+
+            self._commit_artifact(
+                paths.initial_alignment_json,
+                evidence_request,
+                writer=write_evidence,
+                validator=lambda path: read_evidence(path) == evidence,
+            )
+        result = parse_initial_alignment_result(evidence["realized"], policy)
+        evidence_identity = FileIdentity.from_path(paths.initial_alignment_json)
+        qc_request = self._request(
+            backend,
+            fixed,
+            resolved,
+            stage="initial-alignment:qc",
+            method="xy-rotation-montage",
+            accuracy="deterministic",
+            upstream=evidence_identity,
+            parameters=evidence,
+        )
+
+        def read_qc(path: Path) -> tuple[str, tuple[int, int]]:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                image.load()
+                return image.mode, image.size
+
+        if (
+            self.force_override
+            or self._reuse_artifact(paths.initial_alignment_qc, qc_request, read_qc)
+            is None
+        ):
+            qc = render_initial_alignment_qc(
+                backend.to_array(fixed),
+                backend.to_array(moving),
+                result,
+                fixed_geometry=backend.geometry(fixed),
+                moving_geometry=backend.geometry(moving),
+            )
+
+            def write_qc(path: Path) -> None:
+                from PIL import Image
+
+                Image.fromarray(qc, mode="L").save(path, format="PNG")
+
+            self._commit_artifact(
+                paths.initial_alignment_qc,
+                qc_request,
+                writer=write_qc,
+                validator=lambda path: read_qc(path) == ("L", (768, 512)),
+            )
+        self._initial_alignment_evidence = evidence
+        if not result.accepted or result.angle_deg is None:
+            raise RegistrationStageError(
+                "initial-alignment rejected for round "
+                f"{self.imaging_round}; inspect {paths.initial_alignment_json}"
+            )
+        transform_request = self._request(
+            backend,
+            moving,
+            resolved,
+            stage="initial-alignment:transform",
+            method="xy-rotation",
+            accuracy="exact",
+            upstream=evidence_identity,
+            parameters=evidence,
+        )
+        if not self.force_override:
+            cached = self._reuse_artifact(
+                paths.initial_alignment_transform,
+                transform_request,
+                backend.read_affine,
+            )
+            if cached is not None:
+                return paths.initial_alignment_transform
+        transform = backend.create_xy_rotation_seed(
+            fixed_geometry=fixed_geometry,
+            geometry=moving_geometry,
+            angle_deg=result.angle_deg,
+            translation_yx_px=result.translation_yx_px or (0.0, 0.0),
+        )
+        self._commit_artifact(
+            paths.initial_alignment_transform,
+            transform_request,
+            writer=lambda path: backend.write_affine(transform, path),
+            validator=lambda path: bool(backend.read_affine(path)),
+        )
+        return paths.initial_alignment_transform
+
     def _load_or_estimate_affine(
         self,
         backend: RegistrationBackend,
@@ -1013,6 +1354,8 @@ class ImageRegistration:
             preprocessing = self._preprocessing_parameters(derived=True)
             if preprocessing is not None:
                 parameters["preprocessing"] = preprocessing
+            if self._initial_alignment_evidence is not None:
+                parameters["initial_alignment"] = self._initial_alignment_evidence
             request = self._request(
                 backend,
                 fixed,
@@ -1020,7 +1363,11 @@ class ImageRegistration:
                 stage="affine",
                 method=self.linear_type,
                 accuracy=self.linear_accuracy,
-                upstream=None,
+                upstream=(
+                    None
+                    if self._initial_transform_path is None
+                    else FileIdentity.from_path(self._initial_transform_path)
+                ),
                 parameters=parameters,
             )
         except RegistrationStageError:
@@ -1061,14 +1408,19 @@ class ImageRegistration:
                 return transform, moving_linear, moving_linear_mask
 
         try:
+            linear_arguments: dict[str, object] = {
+                "moving_image": moving,
+                "fixed_image": fixed,
+                "fixed_mask": fixed_mask,
+                "moving_mask": moving_mask,
+                "registration_type": self.linear_type,
+                "accuracy": self.linear_accuracy,
+                "verbose": True,
+            }
+            if self._initial_transform_path is not None:
+                linear_arguments["initial_transform"] = self._initial_transform_path
             moving_linear, moving_linear_mask, transform = backend.linear(
-                moving_image=moving,
-                fixed_image=fixed,
-                fixed_mask=fixed_mask,
-                moving_mask=moving_mask,
-                registration_type=self.linear_type,
-                accuracy=self.linear_accuracy,
-                verbose=True,
+                **linear_arguments
             )
             if moving_linear_mask is None:
                 moving_linear_mask = backend.threshold_mask(
@@ -1454,7 +1806,45 @@ def register_round(
     nonlinear_radius: object = None,
     preprocess_filter_sigma_zyx: tuple[float, float, float] | None = None,
     preprocess_feature_mask: FeatureMaskSpec | None = None,
+    initial_alignment: InitialAlignmentPolicy | None = None,
 ) -> None:
+    """Register one moving round and persist restart-safe artifacts.
+
+    This convenience function constructs :class:`ImageRegistration` with the
+    supplied scientific policy and immediately runs its lifecycle. Parameter units,
+    validation, output ownership, and failure behavior are identical to that class.
+
+    Parameters
+    ----------
+    fixed_image_path, moving_image_path, save_directory : str or path-like
+        Fixed input, moving input, and dedicated output directory.
+    imaging_round : int, optional
+        Nonnegative round identifier.
+    crop, enable_logging, force_override : bool, optional
+        Crop, logging, and forced-recomputation controls.
+    pixel_size : tuple of float, optional
+        Physical spacing in ``(x, y, z)`` micrometers.
+    native_threads : NativeThreadConfig, optional
+        Native ITK and BLAS-family limits.
+    linear_type, linear_accuracy, nonlinear_type, nonlinear_accuracy : str, optional
+        Registration methods and schedules.
+    nonlinear_metric, nonlinear_radius : object, optional
+        Nonlinear similarity policy.
+    preprocess_filter_sigma_zyx : tuple of float, optional
+        Feature filter sigma in NumPy ``(z, y, x)`` voxels.
+    preprocess_feature_mask : FeatureMaskSpec, optional
+        Optional feature-derived mask policy.
+    initial_alignment : InitialAlignmentPolicy, optional
+        Physical XY rotation seed policy for this moving round.
+
+    See Also
+    --------
+    ImageRegistration :
+        Stateful owner of the registration and artifact lifecycle.
+    """
+    optional_arguments: dict[str, Any] = {}
+    if initial_alignment is not None:
+        optional_arguments["initial_alignment"] = initial_alignment
     ImageRegistration(
         fixed_image_path,
         moving_image_path,
@@ -1473,6 +1863,7 @@ def register_round(
         nonlinear_radius=nonlinear_radius,
         preprocess_filter_sigma_zyx=preprocess_filter_sigma_zyx,
         preprocess_feature_mask=preprocess_feature_mask,
+        **optional_arguments,
     ).register()
 
 

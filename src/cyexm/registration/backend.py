@@ -78,6 +78,19 @@ class RegistrationBackend(Protocol):
     ) -> object:
         raise NotImplementedError
 
+    def create_xy_rotation_seed(
+        self,
+        *,
+        fixed_geometry: ImageGeometry,
+        geometry: ImageGeometry,
+        angle_deg: float,
+        translation_yx_px: tuple[float, float],
+    ) -> object:
+        raise NotImplementedError
+
+    def compose_affines(self, transforms: tuple[object, ...]) -> object:
+        raise NotImplementedError
+
     def linear(self, **kwargs: object) -> tuple[object, object | None, object]:
         raise NotImplementedError
 
@@ -287,6 +300,28 @@ class AntsRegistrationBackend:
             spacing=runtime_image.spacing,
             direction=runtime_image.direction,
             has_components=bool(getattr(runtime_image, "has_components", False)),
+        )
+
+    def create_xy_rotation_seed(
+        self,
+        *,
+        fixed_geometry: ImageGeometry,
+        geometry: ImageGeometry,
+        angle_deg: float,
+        translation_yx_px: tuple[float, float],
+    ) -> object:
+        return transform_helpers.create_xy_rotation_transform(
+            fixed_geometry=fixed_geometry,
+            geometry=geometry,
+            angle_deg=angle_deg,
+            translation_yx_px=translation_yx_px,
+            native_threads=self.native_threads,
+        )
+
+    def compose_affines(self, transforms: tuple[object, ...]) -> object:
+        return transform_helpers.compose_affine_transforms(
+            transforms,
+            native_threads=self.native_threads,
         )
 
     def linear(self, **kwargs: object) -> tuple[object, object | None, object]:

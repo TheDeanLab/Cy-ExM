@@ -111,9 +111,12 @@ def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
     assert config.__all__ == (
         "ChannelSpec",
         "DatasetManifest",
+        "EstimatedXYRotationSpec",
         "ExecutionPaths",
         "ExecutionProfile",
+        "ExplicitXYRotationSpec",
         "FeatureMaskSpec",
+        "InitialAlignmentSpec",
         "LocalDaskSpec",
         "NativeThreadSpec",
         "NonlinearRegistrationStageSpec",
@@ -127,10 +130,153 @@ def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
         "RoundSpec",
         "SlurmMemoryQuantity",
         "SlurmSpec",
+        "XYRotationSpec",
         "load_dataset_manifest",
         "load_execution_profile",
         "normalize_slurm_memory",
     )
+
+
+def test_initial_alignment_omission_preserves_disabled_round(tmp_path: Path) -> None:
+    manifest = _load_data(tmp_path, _valid_data())
+
+    assert manifest.rounds[0].initial_alignment is None
+
+
+def test_explicit_xy_rotation_normalizes_per_round(tmp_path: Path) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 0))["initial_alignment"] = {
+        "xy_rotation": {"mode": "explicit", "angle_deg": -27.7}
+    }
+
+    manifest = _load_data(tmp_path, data)
+
+    assert manifest.rounds[0].initial_alignment == config.InitialAlignmentSpec(
+        xy_rotation=config.ExplicitXYRotationSpec(
+            mode="explicit",
+            angle_deg=-27.7,
+        )
+    )
+
+
+def test_estimated_xy_rotation_normalizes_defaults(tmp_path: Path) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 1))["initial_alignment"] = {
+        "xy_rotation": {"mode": "estimate"}
+    }
+
+    manifest = _load_data(tmp_path, data)
+
+    assert manifest.rounds[1].initial_alignment == config.InitialAlignmentSpec(
+        xy_rotation=config.EstimatedXYRotationSpec(
+            mode="estimate",
+            search_range_deg=(-45.0, 45.0),
+            coarse_step_deg=1.0,
+            refinement_step_deg=0.1,
+            minimum_score_gain=0.01,
+            minimum_peak_margin=0.01,
+        )
+    )
+
+
+def test_estimated_xy_rotation_normalizes_overrides_and_round_trips(
+    tmp_path: Path,
+) -> None:
+    from cyexm.config.dataset import _validate_dataset_manifest
+
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 0))["initial_alignment"] = {
+        "xy_rotation": {
+            "mode": "estimate",
+            "search_range_deg": [-60, 30],
+            "coarse_step_deg": 2,
+            "refinement_step_deg": 0.25,
+            "minimum_score_gain": 0.02,
+            "minimum_peak_margin": 0.03,
+        }
+    }
+
+    manifest = _load_data(tmp_path, data)
+    rotation = manifest.rounds[0].initial_alignment.xy_rotation  # type: ignore[union-attr]
+
+    assert rotation == config.EstimatedXYRotationSpec(
+        mode="estimate",
+        search_range_deg=(-60.0, 30.0),
+        coarse_step_deg=2.0,
+        refinement_step_deg=0.25,
+        minimum_score_gain=0.02,
+        minimum_peak_margin=0.03,
+    )
+    _validate_dataset_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    "xy_rotation",
+    [
+        {"mode": "explicit"},
+        {"mode": "explicit", "angle_deg": True},
+        {"mode": "explicit", "angle_deg": 181},
+        {"mode": "explicit", "angle_deg": 1, "coarse_step_deg": 1},
+        {"mode": "estimate", "angle_deg": 1},
+        {"mode": "estimate", "search_range_deg": [30, 30]},
+        {"mode": "estimate", "search_range_deg": [-181, 45]},
+        {"mode": "estimate", "coarse_step_deg": 0},
+        {
+            "mode": "estimate",
+            "coarse_step_deg": 0.1,
+            "refinement_step_deg": 0.1,
+        },
+        {"mode": "estimate", "minimum_score_gain": float("nan")},
+        {"mode": "estimate", "minimum_peak_margin": 0},
+        {"mode": "unknown"},
+    ],
+)
+def test_initial_alignment_rejects_invalid_xy_rotation(
+    tmp_path: Path,
+    xy_rotation: dict[str, object],
+) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 0))["initial_alignment"] = {"xy_rotation": xy_rotation}
+
+    with pytest.raises(ConfigurationValidationError, match="initial_alignment"):
+        _load_data(tmp_path, data)
+
+
+def test_initial_alignment_rejects_unknown_mapping_keys(tmp_path: Path) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 0))["initial_alignment"] = {
+        "xy_rotation": {"mode": "explicit", "angle_deg": 10},
+        "unexpected": True,
+    }
+
+    with pytest.raises(ConfigurationValidationError, match="keys must be exactly"):
+        _load_data(tmp_path, data)
+
+
+def test_direct_manifest_rejects_noncanonical_xy_rotation_float(
+    tmp_path: Path,
+) -> None:
+    from cyexm.config.dataset import _validate_dataset_manifest
+
+    manifest = _load_data(tmp_path, _valid_data())
+    direct = replace(
+        manifest,
+        rounds=(
+            replace(
+                manifest.rounds[0],
+                initial_alignment=config.InitialAlignmentSpec(
+                    xy_rotation=config.ExplicitXYRotationSpec(
+                        mode="explicit",
+                        angle_deg=-30,  # type: ignore[arg-type]
+                    )
+                ),
+            ),
+            manifest.rounds[1],
+        ),
+    )
+
+    with pytest.raises(ConfigurationValidationError, match="built-in float"):
+        _validate_dataset_manifest(direct)
 
 
 def test_load_dataset_manifest_normalizes_xyz_and_zyx_fields(tmp_path: Path) -> None:

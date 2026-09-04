@@ -16,7 +16,9 @@ from cyexm.config.models import (
     DatasetManifest,
     ExecutionPaths,
     ExecutionProfile,
+    ExplicitXYRotationSpec,
     FeatureMaskSpec,
+    InitialAlignmentSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
     ReferenceChannelSpec,
@@ -1059,6 +1061,40 @@ def test_scientific_fingerprint_contains_complete_policy_but_not_execution_choic
             )
         ),
     )
+
+
+def test_initial_alignment_is_scientific_and_adds_planned_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    base = _manifest(round_order=(2,))
+    rotation = InitialAlignmentSpec(
+        ExplicitXYRotationSpec(mode="explicit", angle_deg=27.7)
+    )
+    manifest = replace(
+        base,
+        rounds=(replace(base.rounds[0], initial_alignment=rotation),),
+    )
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    plan = build_workflow_plan(manifest, execution)
+    scientific = json.loads(plan.scientific_json)
+
+    assert plan.tasks[0].initial_alignment == rotation
+    assert scientific["rounds"][0]["initial_alignment"] == {
+        "xy_rotation": {"mode": "explicit", "angle_deg": 27.7}
+    }
+    names = {path.name for path in plan.expected_artifacts}
+    assert {
+        "initial_alignment_2.mat",
+        "initial_alignment_2.json",
+        "initial_alignment_qc_2.png",
+    } <= names
 
 
 def test_preprocessing_is_optional_canonical_scientific_identity(

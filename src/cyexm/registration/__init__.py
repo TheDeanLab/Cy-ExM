@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from cyexm.registration.channels import transform_channel
     from cyexm.registration.chunked import ChunkedImageRegistration
+    from cyexm.registration.initial_alignment import (
+        EstimatedXYRotationPolicy,
+        ExplicitXYRotationPolicy,
+        InitialAlignmentPolicy,
+    )
     from cyexm.registration.whole_image import ImageRegistration, register_round
 
 
@@ -23,6 +28,14 @@ def __getattr__(name: str) -> object:
         from cyexm.registration import whole_image
 
         value = getattr(whole_image, name)
+    elif name in {
+        "EstimatedXYRotationPolicy",
+        "ExplicitXYRotationPolicy",
+        "InitialAlignmentPolicy",
+    }:
+        from cyexm.registration import initial_alignment
+
+        value = getattr(initial_alignment, name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value
@@ -35,7 +48,10 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "ChunkedImageRegistration",
+    "EstimatedXYRotationPolicy",
+    "ExplicitXYRotationPolicy",
     "ImageRegistration",
+    "InitialAlignmentPolicy",
     "register_round",
     "transform_channel",
 ]

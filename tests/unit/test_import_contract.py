@@ -215,7 +215,10 @@ import cyexm.registration as registration
 
 assert registration.__all__ == [
     "ChunkedImageRegistration",
+    "EstimatedXYRotationPolicy",
+    "ExplicitXYRotationPolicy",
     "ImageRegistration",
+    "InitialAlignmentPolicy",
     "register_round",
     "transform_channel",
 ]

@@ -222,6 +222,11 @@ def _preparation_outputs(round_task: RoundTask) -> tuple[Path, ...]:
     prepared = _prepared_paths(round_task)
     registration = _registration_paths(round_task)
     return (
+        *(
+            registration.initial_alignment_artifacts
+            if round_task.initial_alignment is not None
+            else ()
+        ),
         registration.affine,
         registration.pre_metrics,
         registration.linear_metrics,
@@ -234,6 +239,11 @@ def _preparation_outputs(round_task: RoundTask) -> tuple[Path, ...]:
 def _whole_outputs(round_task: RoundTask) -> tuple[Path, ...]:
     paths = _registration_paths(round_task)
     return (
+        *(
+            paths.initial_alignment_artifacts
+            if round_task.initial_alignment is not None
+            else ()
+        ),
         paths.affine,
         paths.warp,
         paths.registered,
@@ -247,6 +257,11 @@ def _whole_outputs(round_task: RoundTask) -> tuple[Path, ...]:
 def _validation_outputs(round_task: RoundTask) -> tuple[Path, ...]:
     paths = _registration_paths(round_task)
     return (
+        *(
+            paths.initial_alignment_artifacts
+            if round_task.initial_alignment is not None
+            else ()
+        ),
         *paths.public_registration_artifacts,
         *(channel.output for channel in round_task.channels),
     )

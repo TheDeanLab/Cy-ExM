@@ -62,6 +62,9 @@ class RegistrationArtifactPaths:
     nonlinear_metrics: Path
     fixed_crop: Path
     moving_crop: Path
+    initial_alignment_transform: Path
+    initial_alignment_json: Path
+    initial_alignment_qc: Path
 
     @classmethod
     def for_round(cls, output: Path, round_number: int) -> Self:
@@ -76,11 +79,24 @@ class RegistrationArtifactPaths:
             nonlinear_metrics=output / "image_metrics_nonlinear-registered.txt",
             fixed_crop=output / f"fixed_crop_indices_{round_number}.json",
             moving_crop=output / f"moving_crop_indices_{round_number}.json",
+            initial_alignment_transform=(
+                output / f"initial_alignment_{round_number}.mat"
+            ),
+            initial_alignment_json=output / f"initial_alignment_{round_number}.json",
+            initial_alignment_qc=(output / f"initial_alignment_qc_{round_number}.png"),
         )
 
     @property
     def public_registration_artifacts(self) -> tuple[Path, Path, Path]:
         return self.affine, self.warp, self.registered
+
+    @property
+    def initial_alignment_artifacts(self) -> tuple[Path, Path, Path]:
+        return (
+            self.initial_alignment_transform,
+            self.initial_alignment_json,
+            self.initial_alignment_qc,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +441,7 @@ def _affine_snapshot(
     geometries: SourceGeometries,
     inputs: tuple[FileIdentity, FileIdentity],
     snapshot_reader: SnapshotReader,
+    initial_alignment: tuple[dict[str, object], FileIdentity] | None = None,
 ) -> ArtifactSnapshot | None:
     snapshot = snapshot_reader(path)
     preprocessing = _feature_evidence(task, snapshot)
@@ -437,6 +454,8 @@ def _affine_snapshot(
     )
     if preprocessing is not None:
         parameters["preprocessing"] = preprocessing
+    if initial_alignment is not None:
+        parameters["initial_alignment"] = initial_alignment[0]
     if not _request_matches(
         snapshot,
         stage="affine",
@@ -445,7 +464,7 @@ def _affine_snapshot(
         method=task.registration.linear.type,
         accuracy=task.registration.linear.accuracy,
         task=task,
-        upstream=None,
+        upstream=None if initial_alignment is None else initial_alignment[1],
         parameters={
             **_common(task),
             **parameters,
@@ -453,6 +472,217 @@ def _affine_snapshot(
     ):
         return None
     return snapshot
+
+
+def _validated_initial_alignment_evidence(
+    task: RoundTask,
+    paths: RegistrationArtifactPaths,
+    geometries: SourceGeometries,
+    inputs: tuple[FileIdentity, FileIdentity],
+    snapshot_reader: SnapshotReader,
+) -> tuple[dict[str, object], FileIdentity, bool] | None:
+    configured = task.initial_alignment
+    if configured is None:
+        return None
+    from dataclasses import asdict
+
+    rotation = {
+        key: list(value) if isinstance(value, tuple) else value
+        for key, value in asdict(configured.xy_rotation).items()
+    }
+    configured_mapping = {"xy_rotation": rotation}
+    from cyexm.config.models import EstimatedXYRotationSpec, ExplicitXYRotationSpec
+    from cyexm.registration.initial_alignment import (
+        EXPLICIT_ROTATION_POLICY,
+        ROTATION_ESTIMATOR_POLICY,
+        EstimatedXYRotationPolicy,
+        ExplicitXYRotationPolicy,
+        InitialAlignmentPolicy,
+        parse_initial_alignment_result,
+    )
+
+    configured_rotation = configured.xy_rotation
+    if type(configured_rotation) is ExplicitXYRotationSpec:
+        algorithm = EXPLICIT_ROTATION_POLICY
+        runtime_rotation = ExplicitXYRotationPolicy(configured_rotation.angle_deg)
+    elif type(configured_rotation) is EstimatedXYRotationSpec:
+        algorithm = ROTATION_ESTIMATOR_POLICY
+        runtime_rotation = EstimatedXYRotationPolicy(
+            search_range_deg=configured_rotation.search_range_deg,  # type: ignore[union-attr]
+            coarse_step_deg=configured_rotation.coarse_step_deg,  # type: ignore[union-attr]
+            refinement_step_deg=configured_rotation.refinement_step_deg,  # type: ignore[union-attr]
+            minimum_score_gain=configured_rotation.minimum_score_gain,  # type: ignore[union-attr]
+            minimum_peak_margin=configured_rotation.minimum_peak_margin,  # type: ignore[union-attr]
+        )
+    else:  # pragma: no cover - RoundTask validation owns this boundary
+        return None
+    runtime_policy = InitialAlignmentPolicy(runtime_rotation)
+    crop_evidence: dict[str, object] = {"enabled": task.registration.crop}
+    if task.registration.crop:
+        try:
+            text = paths.moving_crop.read_text(encoding="utf-8")
+            bounds = json.loads(text)
+            if (
+                not isinstance(bounds, list)
+                or len(bounds) != 6
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in bounds
+                )
+                or canonical_compact_json(bounds) != text
+            ):
+                return None
+            crop_evidence["moving"] = {
+                "bounds": bounds,
+                "identity": FileIdentity.from_path(paths.moving_crop).to_dict(),
+            }
+        except (OSError, TypeError, ValueError):
+            return None
+        crop_evidence["fixed"] = {"prepared_fixed": True}
+    context = {
+        "sources": {
+            "fixed": inputs[0].to_dict(),
+            "moving": inputs[1].to_dict(),
+        },
+        "geometries": {
+            "fixed": geometries.fixed.to_dict(),
+            "moving": geometries.moving.to_dict(),
+        },
+        "crop": crop_evidence,
+    }
+    evidence_snapshot = snapshot_reader(paths.initial_alignment_json)
+    if not _request_matches(
+        evidence_snapshot,
+        stage="initial-alignment:evidence",
+        inputs=inputs,
+        geometry=geometries.fixed,
+        method="xy-rotation",
+        accuracy="deterministic",
+        task=task,
+        upstream=None,
+        parameters={
+            **_common(task),
+            "configured": configured_mapping,
+            "algorithm": algorithm,
+            **context,
+        },
+    ):
+        return None
+    try:
+        evidence = json.loads(paths.initial_alignment_json.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {"configured", "sources", "geometries", "crop", "realized"}
+        or evidence.get("configured") != configured_mapping
+        or any(evidence.get(key) != value for key, value in context.items())
+    ):
+        return None
+    try:
+        realized = parse_initial_alignment_result(
+            evidence.get("realized"), runtime_policy
+        )
+    except (KeyError, OverflowError, TypeError, ValueError):
+        return None
+    evidence_identity = evidence_snapshot[1]  # type: ignore[index]
+    return evidence, evidence_identity, realized.accepted
+
+
+def _initial_alignment_snapshots(
+    task: RoundTask,
+    paths: RegistrationArtifactPaths,
+    geometries: SourceGeometries,
+    inputs: tuple[FileIdentity, FileIdentity],
+    snapshot_reader: SnapshotReader,
+) -> tuple[dict[str, object], FileIdentity] | None:
+    validated = _validated_initial_alignment_evidence(
+        task, paths, geometries, inputs, snapshot_reader
+    )
+    if validated is None:
+        return None
+    evidence, evidence_identity, accepted = validated
+    if not accepted:
+        return None
+    for path, stage, method, geometry in (
+        (
+            paths.initial_alignment_qc,
+            "initial-alignment:qc",
+            "xy-rotation-montage",
+            geometries.fixed,
+        ),
+        (
+            paths.initial_alignment_transform,
+            "initial-alignment:transform",
+            "xy-rotation",
+            geometries.moving,
+        ),
+    ):
+        if not _request_matches(
+            snapshot_reader(path),
+            stage=stage,
+            inputs=inputs,
+            geometry=geometry,
+            method=method,
+            accuracy="deterministic" if stage.endswith(":qc") else "exact",
+            task=task,
+            upstream=evidence_identity,
+            parameters={**_common(task), **evidence},
+        ):
+            return None
+    transform = snapshot_reader(paths.initial_alignment_transform)
+    if transform is None:
+        return None
+    return evidence, transform[1]
+
+
+def initial_alignment_evidence(
+    task: RoundTask,
+    paths: RegistrationArtifactPaths,
+    source_geometries: SourceGeometries,
+    *,
+    snapshot_reader: SnapshotReader = completion_snapshot,
+) -> dict[str, object] | None:
+    """Return request-authenticated alignment evidence, including rejections."""
+    inputs = _registration_inputs(task)
+    if inputs is None:
+        return None
+    effective = _effective_geometries(
+        task,
+        paths,
+        source_geometries,
+        inputs,
+        snapshot_reader=snapshot_reader,
+    )
+    if effective is None:
+        return None
+    validated = _validated_initial_alignment_evidence(
+        task, paths, effective, inputs, snapshot_reader
+    )
+    return None if validated is None else validated[0]
+
+
+def initial_alignment_artifacts(
+    task: RoundTask,
+    paths: RegistrationArtifactPaths,
+    source_geometries: SourceGeometries,
+    *,
+    snapshot_reader: SnapshotReader = completion_snapshot,
+) -> tuple[dict[str, object], FileIdentity] | None:
+    """Return a request-authenticated accepted alignment artifact bundle."""
+    inputs = _registration_inputs(task)
+    if inputs is None:
+        return None
+    effective = _effective_geometries(
+        task,
+        paths,
+        source_geometries,
+        inputs,
+        snapshot_reader=snapshot_reader,
+    )
+    if effective is None:
+        return None
+    return _initial_alignment_snapshots(task, paths, effective, inputs, snapshot_reader)
 
 
 def _serial_chunk_evidence(
@@ -797,12 +1027,24 @@ def completion_evidence(
     ):
         return RoundCompletionEvidence(artifacts=(), affine=None, warp=None)
     complete: list[Path] = []
+    initial_alignment = _initial_alignment_snapshots(
+        task,
+        paths,
+        effective,
+        inputs,
+        snapshot_reader,
+    )
+    if task.initial_alignment is not None:
+        if initial_alignment is None:
+            return RoundCompletionEvidence(artifacts=(), affine=None, warp=None)
+        complete.extend(paths.initial_alignment_artifacts)
     affine = _affine_snapshot(
         task,
         paths.affine,
         effective,
         inputs,
         snapshot_reader,
+        initial_alignment,
     )
     if affine is None:
         return RoundCompletionEvidence(artifacts=(), affine=None, warp=None)

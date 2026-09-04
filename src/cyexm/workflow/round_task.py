@@ -43,6 +43,9 @@ class _RuntimeRegistrationPaths(Protocol):
     linear_metrics: str | os.PathLike[str]
     nonlinear_metrics: str | os.PathLike[str]
     moving_crop: str | os.PathLike[str]
+    initial_alignment_transform: str | os.PathLike[str]
+    initial_alignment_json: str | os.PathLike[str]
+    initial_alignment_qc: str | os.PathLike[str]
 
 
 def _utc_now() -> str:
@@ -83,6 +86,11 @@ def _planned_artifacts(
     task: RoundTask, paths: RegistrationArtifactPaths
 ) -> tuple[Path, ...]:
     return (
+        *(
+            paths.initial_alignment_artifacts
+            if task.initial_alignment is not None
+            else ()
+        ),
         *paths.public_registration_artifacts,
         *(channel.output for channel in task.channels),
     )
@@ -133,6 +141,9 @@ def _registration_paths(
         or paths.linear_metrics != Path(value.linear_metrics)
         or paths.nonlinear_metrics != Path(value.nonlinear_metrics)
         or paths.moving_crop != Path(value.moving_crop)
+        or paths.initial_alignment_transform != Path(value.initial_alignment_transform)
+        or paths.initial_alignment_json != Path(value.initial_alignment_json)
+        or paths.initial_alignment_qc != Path(value.initial_alignment_qc)
     ):
         raise RuntimeError(
             "runtime registration paths do not match the workflow layout"
@@ -148,6 +159,33 @@ def _preprocess_sigma(task: RoundTask) -> tuple[float, float, float] | None:
 def _preprocess_feature_mask(task: RoundTask) -> object | None:
     preprocessing = task.registration.preprocessing
     return None if preprocessing is None else preprocessing.feature_mask
+
+
+def _initial_alignment(task: RoundTask) -> object | None:
+    configured = task.initial_alignment
+    if configured is None:
+        return None
+    from cyexm.config.models import EstimatedXYRotationSpec, ExplicitXYRotationSpec
+    from cyexm.registration.initial_alignment import (
+        EstimatedXYRotationPolicy,
+        ExplicitXYRotationPolicy,
+        InitialAlignmentPolicy,
+    )
+
+    rotation = configured.xy_rotation
+    if type(rotation) is ExplicitXYRotationSpec:
+        runtime = ExplicitXYRotationPolicy(angle_deg=rotation.angle_deg)
+    elif type(rotation) is EstimatedXYRotationSpec:
+        runtime = EstimatedXYRotationPolicy(
+            search_range_deg=rotation.search_range_deg,
+            coarse_step_deg=rotation.coarse_step_deg,
+            refinement_step_deg=rotation.refinement_step_deg,
+            minimum_score_gain=rotation.minimum_score_gain,
+            minimum_peak_margin=rotation.minimum_peak_margin,
+        )
+    else:  # pragma: no cover - parser and RoundTask type protect this boundary
+        raise TypeError("unsupported initial alignment configuration")
+    return InitialAlignmentPolicy(runtime)
 
 
 def _reused_artifacts(
@@ -306,6 +344,9 @@ def run_round_task(task: RoundTask) -> RoundResult:
             "preprocess_filter_sigma_zyx": _preprocess_sigma(task),
             "preprocess_feature_mask": _preprocess_feature_mask(task),
         }
+        initial_alignment = _initial_alignment(task)
+        if initial_alignment is not None:
+            registration_arguments["initial_alignment"] = initial_alignment
         stage = "registration"
         if task.strategy == "whole_image":
             registration = ImageRegistration(**registration_arguments)

@@ -32,6 +32,15 @@ For imaging round `{round}`, direct `ImageRegistration` may create:
 | `image_metrics_nonlinear-registered.txt` | similarity after nonlinear application | `image_metrics_nonlinear-registered.txt.complete.json` |
 | `nonlinear_registered_{round}.tif` | final uint16 registered intensity image | `nonlinear_registered_{round}.tif.complete.json` |
 
+When XY rotation initialization is enabled, three artifacts are committed before
+the affine stage:
+
+| Conditional artifact | Purpose | Completion record |
+| --- | --- | --- |
+| `initial_alignment_{round}.json` | configured and realized angle, translation, scores, and confidence evidence | `initial_alignment_{round}.json.complete.json` |
+| `initial_alignment_{round}.mat` | exact affine seed supplied to TRSAA | `initial_alignment_{round}.mat.complete.json` |
+| `initial_alignment_qc_{round}.png` | fixed/moving/initialized montage and score plot | `initial_alignment_qc_{round}.png.complete.json` |
+
 When `crop=True`, two additional conditional artifacts are committed before
 registration:
 
@@ -66,6 +75,9 @@ format-version-2 manifest. Feature-enabled bundles use strict format version 3 a
 add the canonical preprocessing policy plus measured fixed and moving robust scales.
 Feature-masked bundles use strict format version 4 and additionally bind the physical
 morphology policy and realized fixed/moving foreground evidence:
+
+Rotation-enabled raw, feature, and feature-mask bundles use strict format versions
+5, 6, and 7 and additionally bind all initialization evidence identities.
 
 | Artifact | Internal role |
 | --- | --- |

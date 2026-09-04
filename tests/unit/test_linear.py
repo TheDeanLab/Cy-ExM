@@ -124,6 +124,40 @@ def test_linear_trsaa_preserves_established_registration_parameters(
     assert "shrink_factors" not in calls.registration
 
 
+def test_linear_prepends_initial_transform_and_returns_complete_affine(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = install_fake_ants(monkeypatch, "cyexm.registration.linear", tmp_path)
+    seed_path = tmp_path / "initial.mat"
+    residual_path = tmp_path / "residual.mat"
+    seed_path.write_bytes(b"seed")
+    residual_path.write_bytes(b"residual")
+    calls.forward_transforms = [residual_path, seed_path]
+    residual = object()
+    seed = object()
+    complete = fake_image()
+    fake_ants, _ = linear._scientific_runtime()
+    monkeypatch.setattr(
+        fake_ants,
+        "read_transform",
+        lambda filename: residual if filename == str(residual_path) else seed,
+    )
+    compose = Mock(return_value=complete)
+    monkeypatch.setattr(linear, "compose_affine_transforms", compose)
+
+    transformed, _, transform = register_image(
+        moving_image=fake_image(),
+        fixed_image=fake_image(),
+        initial_transform=seed_path,
+    )
+
+    assert calls.registration["initial_transform"] == [str(seed_path)]
+    compose.assert_called_once_with((residual, seed), native_threads=None)
+    assert transform is complete
+    assert transformed is not complete
+
+
 def test_linear_registration_converts_external_zyx_arrays_to_ants_xyz(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

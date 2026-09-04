@@ -492,6 +492,9 @@ def _registration_paths(task: RoundTask) -> SimpleNamespace:
         nonlinear_metrics=directory / "image_metrics_nonlinear-registered.txt",
         fixed_crop=directory / f"fixed_crop_indices_{task.round}.json",
         moving_crop=directory / f"moving_crop_indices_{task.round}.json",
+        initial_alignment_transform=(directory / f"initial_alignment_{task.round}.mat"),
+        initial_alignment_json=directory / f"initial_alignment_{task.round}.json",
+        initial_alignment_qc=(directory / f"initial_alignment_qc_{task.round}.png"),
     )
 
 

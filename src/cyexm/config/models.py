@@ -19,6 +19,36 @@ class ChannelSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class ExplicitXYRotationSpec:
+    """Explicit physical XY rotation correction for one moving round."""
+
+    mode: Literal["explicit"]
+    angle_deg: float
+
+
+@dataclass(frozen=True, slots=True)
+class EstimatedXYRotationSpec:
+    """Target-blind XY rotation estimation settings for one moving round."""
+
+    mode: Literal["estimate"]
+    search_range_deg: tuple[float, float] = (-45.0, 45.0)
+    coarse_step_deg: float = 1.0
+    refinement_step_deg: float = 0.1
+    minimum_score_gain: float = 0.01
+    minimum_peak_margin: float = 0.01
+
+
+type XYRotationSpec = ExplicitXYRotationSpec | EstimatedXYRotationSpec
+
+
+@dataclass(frozen=True, slots=True)
+class InitialAlignmentSpec:
+    """Optional geometric initialization for one moving round."""
+
+    xy_rotation: XYRotationSpec
+
+
+@dataclass(frozen=True, slots=True)
 class RoundSpec:
     round: int
     strategy: RegistrationStrategy
@@ -26,6 +56,7 @@ class RoundSpec:
     channels: tuple[ChannelSpec, ...]
     chunk_size_zyx: ChunkSizeZYX | None = None
     overlap_fraction: float | None = None
+    initial_alignment: InitialAlignmentSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)

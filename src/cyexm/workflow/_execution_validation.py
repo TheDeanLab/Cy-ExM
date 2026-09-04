@@ -252,6 +252,13 @@ def _validate_round_task_value(
         raise error_type(f"{location}.prepared_fixed must be a built-in boolean")
     if type(task.force) is not bool:
         raise error_type(f"{location}.force must be a built-in boolean")
+    if task.initial_alignment is not None:
+        from cyexm.config.models import InitialAlignmentSpec
+
+        if type(task.initial_alignment) is not InitialAlignmentSpec:
+            raise error_type(
+                f"{location}.initial_alignment must be an InitialAlignmentSpec or null"
+            )
 
 
 def _validate_round_task_structure(task: object, index: int) -> None:
@@ -339,12 +346,29 @@ def _validate_executor_reference_task(task: object) -> None:
 
 
 def _planned_task_artifacts(task: WorkflowTask) -> tuple[str, ...]:
-    if type(task) is ReferenceTask:
+    if isinstance(task, ReferenceTask):
         return (
             *(() if task.crop_bounds_path is None else (str(task.crop_bounds_path),)),
             *(str(channel.output) for channel in task.channels),
         )
+    round_task = task if isinstance(task, RoundTask) else task.round_task
     return (
+        *(
+            (
+                str(
+                    task.registration_directory / f"initial_alignment_{task.round}.mat"
+                ),
+                str(
+                    task.registration_directory / f"initial_alignment_{task.round}.json"
+                ),
+                str(
+                    task.registration_directory
+                    / f"initial_alignment_qc_{task.round}.png"
+                ),
+            )
+            if round_task.initial_alignment is not None
+            else ()
+        ),
         str(task.registration_directory / f"linear_transform_{task.round}.mat"),
         str(task.registration_directory / f"nonlinear_warp_{task.round}.nii.gz"),
         str(task.registration_directory / f"nonlinear_registered_{task.round}.tif"),

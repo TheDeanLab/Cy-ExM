@@ -934,7 +934,10 @@ def test_registration_namespace_exports_the_accepted_channel_operation() -> None
     assert registration_namespace.transform_channel is transform_channel
     assert registration_namespace.__all__ == [
         "ChunkedImageRegistration",
+        "EstimatedXYRotationPolicy",
+        "ExplicitXYRotationPolicy",
         "ImageRegistration",
+        "InitialAlignmentPolicy",
         "register_round",
         "transform_channel",
     ]

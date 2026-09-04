@@ -81,6 +81,7 @@ class RegistrationBackend(Protocol):
     def create_xy_rotation_seed(
         self,
         *,
+        fixed_geometry: ImageGeometry,
         geometry: ImageGeometry,
         angle_deg: float,
         translation_yx_px: tuple[float, float],
@@ -304,11 +305,13 @@ class AntsRegistrationBackend:
     def create_xy_rotation_seed(
         self,
         *,
+        fixed_geometry: ImageGeometry,
         geometry: ImageGeometry,
         angle_deg: float,
         translation_yx_px: tuple[float, float],
     ) -> object:
         return transform_helpers.create_xy_rotation_transform(
+            fixed_geometry=fixed_geometry,
             geometry=geometry,
             angle_deg=angle_deg,
             translation_yx_px=translation_yx_px,

@@ -84,6 +84,8 @@ register_round(
 Before adapting this call, review the [direct-Python scientific
 defaults](registration-foundations.md#direct-python-scientific-defaults), including
 the transform presets and the metric/radius behavior implied by omitted arguments.
+If inspection shows a large in-plane rotation, read [XY rotation initial
+alignment](initial-alignment.md) before selecting an explicit or estimated seed.
 
 ## Where to go next
 

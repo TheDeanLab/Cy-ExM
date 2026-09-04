@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 _FORMAT_VERSION_DISABLED = 2
 _FORMAT_VERSION_FEATURES = 3
 _FORMAT_VERSION_FEATURE_MASK = 4
+_FORMAT_VERSION_ROTATION_DISABLED = 5
+_FORMAT_VERSION_ROTATION_FEATURES = 6
+_FORMAT_VERSION_ROTATION_FEATURE_MASK = 7
 _PIXELTYPE_ROLES = (
     "fixed_mask",
     "fixed_scalar",
@@ -70,6 +73,17 @@ _MANIFEST_KEYS_V3 = _MANIFEST_KEYS_V2 | frozenset(
     }
 )
 _MANIFEST_KEYS_V4 = _MANIFEST_KEYS_V3
+_ROTATION_KEYS = frozenset(
+    {
+        "initial_alignment",
+        "initial_alignment_json",
+        "initial_alignment_transform",
+        "initial_alignment_qc",
+    }
+)
+_MANIFEST_KEYS_V5 = _MANIFEST_KEYS_V2 | _ROTATION_KEYS
+_MANIFEST_KEYS_V6 = _MANIFEST_KEYS_V3 | _ROTATION_KEYS
+_MANIFEST_KEYS_V7 = _MANIFEST_KEYS_V4 | _ROTATION_KEYS
 
 
 def _scientific_runtime() -> Any:
@@ -154,17 +168,35 @@ class PreparedManifest:
     preprocessing: dict[str, object] | None = None
     fixed_feature_scale: float | None = None
     moving_feature_scale: float | None = None
+    initial_alignment: dict[str, object] | None = None
+    initial_alignment_json: FileIdentity | None = None
+    initial_alignment_transform: FileIdentity | None = None
+    initial_alignment_qc: FileIdentity | None = None
 
     def __post_init__(self) -> None:
         if self.format_version not in {
             _FORMAT_VERSION_DISABLED,
             _FORMAT_VERSION_FEATURES,
             _FORMAT_VERSION_FEATURE_MASK,
+            _FORMAT_VERSION_ROTATION_DISABLED,
+            _FORMAT_VERSION_ROTATION_FEATURES,
+            _FORMAT_VERSION_ROTATION_FEATURE_MASK,
         }:
             raise ValueError(
                 f"Unsupported prepared format version: {self.format_version}"
             )
-        if self.format_version == _FORMAT_VERSION_DISABLED:
+        feature_versions = {
+            _FORMAT_VERSION_FEATURES,
+            _FORMAT_VERSION_FEATURE_MASK,
+            _FORMAT_VERSION_ROTATION_FEATURES,
+            _FORMAT_VERSION_ROTATION_FEATURE_MASK,
+        }
+        rotation_versions = {
+            _FORMAT_VERSION_ROTATION_DISABLED,
+            _FORMAT_VERSION_ROTATION_FEATURES,
+            _FORMAT_VERSION_ROTATION_FEATURE_MASK,
+        }
+        if self.format_version not in feature_versions:
             if (
                 self.preprocessing is not None
                 or self.fixed_feature_scale is not None
@@ -202,7 +234,10 @@ class PreparedManifest:
             )
             if static_preprocessing != canonical:
                 raise ValueError("prepared preprocessing policy is not canonical")
-            if self.format_version == _FORMAT_VERSION_FEATURES:
+            if self.format_version in {
+                _FORMAT_VERSION_FEATURES,
+                _FORMAT_VERSION_ROTATION_FEATURES,
+            }:
                 if feature_mask is not None:
                     raise ValueError(
                         "prepared format version 3 must not declare a feature mask"
@@ -213,6 +248,37 @@ class PreparedManifest:
                 scale = getattr(self, name)
                 if type(scale) is not float or not math.isfinite(scale) or scale <= 0.0:
                     raise ValueError(f"{name} must be a positive finite float")
+        alignment_values = (
+            self.initial_alignment,
+            self.initial_alignment_json,
+            self.initial_alignment_transform,
+            self.initial_alignment_qc,
+        )
+        if self.format_version in rotation_versions:
+            if not isinstance(self.initial_alignment, dict):
+                raise TypeError("rotation prepared format requires initial_alignment")
+            if set(self.initial_alignment) != {
+                "configured",
+                "sources",
+                "geometries",
+                "crop",
+                "realized",
+            }:
+                raise ValueError("prepared initial_alignment keys are not canonical")
+            for name in (
+                "initial_alignment_json",
+                "initial_alignment_transform",
+                "initial_alignment_qc",
+            ):
+                identity = getattr(self, name)
+                if type(identity) is not FileIdentity:
+                    raise TypeError(f"rotation prepared format requires {name}")
+                if FileIdentity.from_dict(identity.to_dict(), name=name) != identity:
+                    raise ValueError(f"{name} identity is not canonical")
+        elif any(value is not None for value in alignment_values):
+            raise ValueError(
+                "legacy prepared formats must not declare initial alignment"
+            )
         for name in (
             "fixed_scalar",
             "moving_linear_scalar",
@@ -236,7 +302,8 @@ class PreparedManifest:
             raise ValueError("unsupported prepared scalar policy")
         expected_mask_policy = (
             FEATURE_PREPARED_MASK_POLICY
-            if self.format_version == _FORMAT_VERSION_FEATURE_MASK
+            if self.format_version
+            in {_FORMAT_VERSION_FEATURE_MASK, _FORMAT_VERSION_ROTATION_FEATURE_MASK}
             else PREPARED_MASK_POLICY
         )
         if self.mask_policy != expected_mask_policy:
@@ -346,11 +413,26 @@ class PreparedManifest:
         if self.format_version in {
             _FORMAT_VERSION_FEATURES,
             _FORMAT_VERSION_FEATURE_MASK,
+            _FORMAT_VERSION_ROTATION_FEATURES,
+            _FORMAT_VERSION_ROTATION_FEATURE_MASK,
         }:
             payload.update(
                 preprocessing=dict(self.preprocessing or {}),
                 fixed_feature_scale=self.fixed_feature_scale,
                 moving_feature_scale=self.moving_feature_scale,
+            )
+        if self.format_version in {
+            _FORMAT_VERSION_ROTATION_DISABLED,
+            _FORMAT_VERSION_ROTATION_FEATURES,
+            _FORMAT_VERSION_ROTATION_FEATURE_MASK,
+        }:
+            payload.update(
+                initial_alignment=dict(self.initial_alignment or {}),
+                initial_alignment_json=self.initial_alignment_json.to_dict(),  # type: ignore[union-attr]
+                initial_alignment_transform=(
+                    self.initial_alignment_transform.to_dict()  # type: ignore[union-attr]
+                ),
+                initial_alignment_qc=self.initial_alignment_qc.to_dict(),  # type: ignore[union-attr]
             )
         return payload
 
@@ -363,6 +445,9 @@ class PreparedManifest:
             _FORMAT_VERSION_DISABLED: _MANIFEST_KEYS_V2,
             _FORMAT_VERSION_FEATURES: _MANIFEST_KEYS_V3,
             _FORMAT_VERSION_FEATURE_MASK: _MANIFEST_KEYS_V4,
+            _FORMAT_VERSION_ROTATION_DISABLED: _MANIFEST_KEYS_V5,
+            _FORMAT_VERSION_ROTATION_FEATURES: _MANIFEST_KEYS_V6,
+            _FORMAT_VERSION_ROTATION_FEATURE_MASK: _MANIFEST_KEYS_V7,
         }.get(format_version)
         if expected_keys is None:
             raise ValueError(f"Unsupported prepared format version: {format_version}")
@@ -405,18 +490,46 @@ class PreparedManifest:
             },
             preprocessing=(
                 None
-                if format_version == _FORMAT_VERSION_DISABLED
+                if format_version
+                in {_FORMAT_VERSION_DISABLED, _FORMAT_VERSION_ROTATION_DISABLED}
                 else dict(_mapping(payload["preprocessing"], "preprocessing"))
             ),
             fixed_feature_scale=(
                 None
-                if format_version == _FORMAT_VERSION_DISABLED
+                if format_version
+                in {_FORMAT_VERSION_DISABLED, _FORMAT_VERSION_ROTATION_DISABLED}
                 else payload["fixed_feature_scale"]  # type: ignore[arg-type]
             ),
             moving_feature_scale=(
                 None
-                if format_version == _FORMAT_VERSION_DISABLED
+                if format_version
+                in {_FORMAT_VERSION_DISABLED, _FORMAT_VERSION_ROTATION_DISABLED}
                 else payload["moving_feature_scale"]  # type: ignore[arg-type]
+            ),
+            initial_alignment=(
+                None
+                if format_version < _FORMAT_VERSION_ROTATION_DISABLED
+                else dict(_mapping(payload["initial_alignment"], "initial_alignment"))
+            ),
+            initial_alignment_json=(
+                None
+                if format_version < _FORMAT_VERSION_ROTATION_DISABLED
+                else _identity(
+                    payload["initial_alignment_json"], "initial_alignment_json"
+                )
+            ),
+            initial_alignment_transform=(
+                None
+                if format_version < _FORMAT_VERSION_ROTATION_DISABLED
+                else _identity(
+                    payload["initial_alignment_transform"],
+                    "initial_alignment_transform",
+                )
+            ),
+            initial_alignment_qc=(
+                None
+                if format_version < _FORMAT_VERSION_ROTATION_DISABLED
+                else _identity(payload["initial_alignment_qc"], "initial_alignment_qc")
             ),
         )
 
@@ -520,7 +633,8 @@ def _array_request(
             "scalar_policy": PREPARED_SCALAR_POLICY,
             "mask_policy": (
                 FEATURE_PREPARED_MASK_POLICY
-                if format_version == _FORMAT_VERSION_FEATURE_MASK
+                if format_version
+                in {_FORMAT_VERSION_FEATURE_MASK, _FORMAT_VERSION_ROTATION_FEATURE_MASK}
                 else PREPARED_MASK_POLICY
             ),
             "ants_pixeltype": pixeltype,
@@ -528,6 +642,8 @@ def _array_request(
     )
     if preprocessing is not None:
         parameters["preprocessing"] = preprocessing
+    if registration._initial_alignment_evidence is not None:
+        parameters["initial_alignment"] = registration._initial_alignment_evidence
     return StageRequest.for_identities(
         stage=f"prepared:{role}",
         inputs=registration._input_identity_snapshot(),
@@ -659,6 +775,19 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
             if registration.preprocess_feature_mask is not None
             else _FORMAT_VERSION_FEATURES
         )
+    initial_alignment = registration._initial_alignment_evidence
+    initial_alignment_json: FileIdentity | None = None
+    initial_alignment_transform: FileIdentity | None = None
+    initial_alignment_qc: FileIdentity | None = None
+    if initial_alignment is not None:
+        format_version += 3
+        initial_alignment_json = FileIdentity.from_path(
+            state.paths.initial_alignment_json
+        )
+        initial_alignment_transform = FileIdentity.from_path(
+            state.paths.initial_alignment_transform
+        )
+        initial_alignment_qc = FileIdentity.from_path(state.paths.initial_alignment_qc)
     moving_crop = (
         FileIdentity.from_path(state.paths.moving_crop) if registration.crop else None
     )
@@ -755,7 +884,8 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
         scalar_policy=PREPARED_SCALAR_POLICY,
         mask_policy=(
             FEATURE_PREPARED_MASK_POLICY
-            if format_version == _FORMAT_VERSION_FEATURE_MASK
+            if format_version
+            in {_FORMAT_VERSION_FEATURE_MASK, _FORMAT_VERSION_ROTATION_FEATURE_MASK}
             else PREPARED_MASK_POLICY
         ),
         native_threads=dict(sorted(state.resolved.values.items())),
@@ -763,16 +893,33 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
         preprocessing=preprocessing,
         fixed_feature_scale=state.fixed_feature_scale,
         moving_feature_scale=state.moving_feature_scale,
+        initial_alignment=(
+            None if initial_alignment is None else dict(initial_alignment)
+        ),
+        initial_alignment_json=initial_alignment_json,
+        initial_alignment_transform=initial_alignment_transform,
+        initial_alignment_qc=initial_alignment_qc,
     )
     effective_mask_policy = manifest.mask_policy
+    manifest_inputs = [
+        native_fixed,
+        native_moving,
+        *manifest.array_identities,
+        *(() if moving_crop is None else (moving_crop,)),
+    ]
+    if initial_alignment_json is not None:
+        if initial_alignment_transform is None or initial_alignment_qc is None:
+            raise RuntimeError("initial alignment identities are incomplete")
+        manifest_inputs.extend(
+            (
+                initial_alignment_json,
+                initial_alignment_transform,
+                initial_alignment_qc,
+            )
+        )
     manifest_request = StageRequest.for_identities(
         stage="prepared:manifest",
-        inputs=(
-            native_fixed,
-            native_moving,
-            *(identity for identity in manifest.array_identities),
-            *(() if moving_crop is None else (moving_crop,)),
-        ),
+        inputs=manifest_inputs,
         geometry=geometry,
         method=registration.linear_type,
         accuracy=registration.linear_accuracy,
@@ -787,6 +934,11 @@ def commit_prepared_round(registration: ImageRegistration) -> PreparedManifest:
                 {}
                 if preprocessing_with_scales is None
                 else {"preprocessing": preprocessing_with_scales}
+            ),
+            **(
+                {}
+                if initial_alignment is None
+                else {"initial_alignment": initial_alignment}
             ),
         },
     )

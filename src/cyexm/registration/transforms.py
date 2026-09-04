@@ -46,6 +46,7 @@ def apply_affine(
 def create_xy_rotation_transform(
     *,
     geometry: ImageGeometry,
+    fixed_geometry: ImageGeometry | None = None,
     angle_deg: float,
     translation_yx_px: tuple[float, float] = (0.0, 0.0),
     native_threads: NativeThreadConfig | None = None,
@@ -54,6 +55,10 @@ def create_xy_rotation_transform(
     ants, np = _configured_runtime(native_threads)
     if type(geometry) is not ImageGeometry:
         raise TypeError("geometry must be an ImageGeometry")
+    if fixed_geometry is None:
+        fixed_geometry = geometry
+    if type(fixed_geometry) is not ImageGeometry:
+        raise TypeError("fixed_geometry must be an ImageGeometry")
     angle = float(angle_deg)
     shift_y, shift_x = (float(value) for value in translation_yx_px)
     if not all(math.isfinite(value) for value in (angle, shift_y, shift_x)):
@@ -63,18 +68,26 @@ def create_xy_rotation_transform(
     direction = np.asarray(geometry.direction, dtype=np.float64)
     origin = np.asarray(geometry.origin, dtype=np.float64)
     center = origin + direction @ (spacing * (shape_xyz - 1.0) / 2.0)
+    fixed_shape_xyz = np.asarray(fixed_geometry.shape[::-1], dtype=np.float64)
+    fixed_spacing = np.asarray(fixed_geometry.spacing, dtype=np.float64)
+    fixed_direction = np.asarray(fixed_geometry.direction, dtype=np.float64)
+    fixed_origin = np.asarray(fixed_geometry.origin, dtype=np.float64)
+    fixed_center = fixed_origin + fixed_direction @ (
+        fixed_spacing * (fixed_shape_xyz - 1.0) / 2.0
+    )
 
     radians = math.radians(-angle)
     cosine = math.cos(radians)
     sine = math.sin(radians)
-    matrix = np.asarray(
+    local_matrix = np.asarray(
         ((cosine, -sine, 0.0), (sine, cosine, 0.0), (0.0, 0.0, 1.0)),
         dtype=np.float64,
     )
+    matrix = direction @ local_matrix @ direction.T
     visible_shift = direction @ (
         spacing * np.asarray((shift_x, shift_y, 0.0), dtype=np.float64)
     )
-    transform_translation = -(matrix @ visible_shift)
+    transform_translation = matrix @ (center - fixed_center - visible_shift)
     return ants.create_ants_transform(
         transform_type="AffineTransform",
         dimension=3,

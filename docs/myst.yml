@@ -14,6 +14,7 @@ project:
       children:
         - file: image-geometry.md
         - file: preprocessing.md
+        - file: initial-alignment.md
         - file: feature-derived-registration-masks.md
         - file: outputs-and-recovery.md
     - title: Advanced usage

@@ -7,10 +7,16 @@ from scipy import ndimage
 from cyexm.registration.initial_alignment import (
     ROTATION_ESTIMATOR_POLICY,
     EstimatedXYRotationPolicy,
+    ExplicitXYRotationPolicy,
+    InitialAlignmentPolicy,
+    XYRotationEstimate,
     estimate_xy_rotation,
     initial_alignment_parameters,
+    initial_alignment_result_parameters,
+    parse_initial_alignment_result,
     render_initial_alignment_qc,
 )
+from cyexm.spatial import ImageGeometry
 
 pytestmark = pytest.mark.unit
 
@@ -83,6 +89,39 @@ def test_estimator_recovers_translation_at_zero_rotation() -> None:
     assert estimate.accepted is True
     assert estimate.angle_deg == pytest.approx(0.0, abs=0.25)
     assert estimate.translation_yx_px == pytest.approx((-5.0, 7.0), abs=1.0)
+
+
+def test_estimator_scores_rotation_in_physical_xy_space() -> None:
+    isotropic = _asymmetric_volume()
+    fixed = isotropic[:, :, ::2]
+    moving_isotropic = ndimage.rotate(
+        isotropic,
+        angle=18.0,
+        axes=(1, 2),
+        reshape=False,
+        order=1,
+        mode="constant",
+        cval=0.0,
+        prefilter=False,
+    )
+    moving = moving_isotropic[:, :, ::2]
+    geometry = ImageGeometry(
+        shape=fixed.shape,
+        origin=(0.0, 0.0, 0.0),
+        spacing=(2.0, 1.0, 1.0),
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+
+    estimate = estimate_xy_rotation(
+        fixed,
+        moving,
+        _policy(),
+        fixed_geometry=geometry,
+        moving_geometry=geometry,
+    )
+
+    assert estimate.accepted is True
+    assert estimate.angle_deg == pytest.approx(18.0, abs=0.5)
 
 
 def test_estimator_normalizes_substep_rotation_to_zero() -> None:
@@ -186,6 +225,68 @@ def test_qc_raster_is_deterministic_uint8_evidence() -> None:
     assert np.array_equal(first, second)
     assert np.count_nonzero(first) > 1000
     assert np.count_nonzero(first[:, 512:]) > 100
+
+
+def test_realized_evidence_parser_rejects_explicit_angle_drift() -> None:
+    policy = InitialAlignmentPolicy(ExplicitXYRotationPolicy(angle_deg=27.7))
+    result = XYRotationEstimate(
+        policy="explicit-xy-rotation-v1",
+        accepted=True,
+        rejection_reason=None,
+        angle_deg=27.7,
+        translation_yx_px=(0.0, 0.0),
+        zero_angle_score=None,
+        score_gain=None,
+        peak_margin=None,
+        valid_overlap_fraction=None,
+        coarse_scores=(),
+        refined_scores=(),
+    )
+    payload = initial_alignment_result_parameters(result)
+
+    assert parse_initial_alignment_result(payload, policy) == result
+    payload["angle_deg"] = 12.0
+    with pytest.raises(ValueError, match=r"explicit.*inconsistent"):
+        parse_initial_alignment_result(payload, policy)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"accepted": True, "rejection_reason": None}, "confidence policy"),
+        ({"valid_overlap_fraction": 1.1}, r"overlap.*\[0, 1\]"),
+        ({"angle_deg": 7.0}, "winner disagrees"),
+        ({"score_gain": 0.5}, "score gain disagrees"),
+        ({"peak_margin": 0.5}, "peak margin disagrees"),
+    ],
+)
+def test_realized_evidence_parser_rejects_forged_estimate_decisions(
+    mutation: dict[str, object], message: str
+) -> None:
+    fixed = _asymmetric_volume()
+    moving = ndimage.rotate(fixed, 10.0, axes=(1, 2), reshape=False, order=1)
+    policy = InitialAlignmentPolicy(_policy(minimum_score_gain=2.0))
+    result = estimate_xy_rotation(fixed, moving, policy.xy_rotation)
+    assert result.accepted is False
+    payload = initial_alignment_result_parameters(result)
+    payload.update(mutation)
+
+    with pytest.raises(ValueError, match=message):
+        parse_initial_alignment_result(payload, policy)
+
+
+def test_realized_evidence_parser_accepts_estimator_output() -> None:
+    fixed = _asymmetric_volume()
+    moving = ndimage.rotate(fixed, 10.0, axes=(1, 2), reshape=False, order=1)
+    policy = InitialAlignmentPolicy(_policy())
+    result = estimate_xy_rotation(fixed, moving, policy.xy_rotation)
+
+    assert (
+        parse_initial_alignment_result(
+            initial_alignment_result_parameters(result), policy
+        )
+        == result
+    )
 
 
 def test_policy_and_estimate_are_immutable() -> None:

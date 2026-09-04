@@ -37,6 +37,14 @@ nonlinear-metric normalization is CC's documented optional radius default.
 | `registration` / `nonlinear` / `radius` | positive built-in integer | Optional only for `CC`; omission normalizes to the provisional default 4. Rejected for `mattes`, which uses 32 bins. |
 | `rounds` | non-empty list | Moving-round objects; moving rounds are unique and cannot equal the reference round. |
 | moving `round` | nonnegative built-in integer | Round identifier used in task and output names. |
+| moving `initial_alignment` | optional exact mapping | Per-round geometric seed; omission preserves the historical workflow. |
+| `initial_alignment` / `xy_rotation` / `mode` | `explicit` or `estimate` | Selects a reviewed angle or target-blind registration-channel estimate. |
+| explicit `angle_deg` | finite number in `[-180, 180]` | Physical +Z right-hand correction; positive appears clockwise in an identity-direction row-down display. |
+| estimate `search_range_deg` | two increasing finite numbers within `[-180, 180]`; default `[-45, 45]` | Inclusive physical-angle search interval. |
+| estimate `coarse_step_deg` | positive finite number; default `1.0` | Coarse search spacing in degrees. |
+| estimate `refinement_step_deg` | positive finite number smaller than coarse step; default `0.1` | Local refinement spacing in degrees. |
+| estimate `minimum_score_gain` | positive finite number; default `0.01` | Required improvement over zero for a nonzero estimate. |
+| estimate `minimum_peak_margin` | positive finite number; default `0.01` | Required separation from competing angles. |
 | `strategy` | `whole_image` or `serial_chunked` | Selects the registration implementation. |
 | `registration_channel` | safe relative POSIX path | The moving image used to estimate transforms. The registration channel must be listed in that round's `channels`. |
 | `channels` | list with unique `file` values | Original moving channels resampled through the round transform, in manifest order. |
@@ -120,6 +128,8 @@ preprocessing:
 For the preprocessing boundary, mask behavior, and dataset-specific interpretation,
 see [Registration preprocessing](preprocessing.md) and
 [Feature-derived registration masks](feature-derived-registration-masks.md).
+For geometric initialization, its physical angle convention, confidence failures,
+and restart artifacts, see [XY rotation initial alignment](initial-alignment.md).
 
 ## Nonlinear metrics and CC radius
 

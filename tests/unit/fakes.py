@@ -275,6 +275,9 @@ class FakeBackend:
     clipped_tiff_images: list[FakeImage] = field(default_factory=list)
     clipped_tiff_values: list[np.ndarray] = field(default_factory=list)
     crop_bounds: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
+    rotation_seeds: list[tuple[ImageGeometry, float, tuple[float, float]]] = field(
+        default_factory=list
+    )
     temporary_warps: list[Path] = field(default_factory=list)
     nonlinear_candidates: list[FakeImage] = field(default_factory=list)
     _test_directory: Path | None = None
@@ -399,6 +402,23 @@ class FakeBackend:
             origin=origin,
             spacing=source.spacing,
             direction=source.direction,
+        )
+
+    def create_xy_rotation_seed(
+        self,
+        *,
+        fixed_geometry: ImageGeometry,
+        geometry: ImageGeometry,
+        angle_deg: float,
+        translation_yx_px: tuple[float, float],
+    ) -> object:
+        self.rotation_seeds.append((geometry, angle_deg, translation_yx_px))
+        assert type(fixed_geometry) is ImageGeometry
+        return b"affine-seed"
+
+    def compose_affines(self, transforms: tuple[object, ...]) -> object:
+        return b"affine-composed:" + b":".join(
+            value for value in transforms if isinstance(value, bytes)
         )
 
     def linear(self, **kwargs: object) -> tuple[object, object | None, object]:

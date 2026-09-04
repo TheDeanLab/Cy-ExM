@@ -5,7 +5,7 @@ import math
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from cyexm._nonlinear_metric import MATTES_BINS
@@ -432,6 +432,27 @@ def _final_artifacts(
         round_label = f"rounds[{round_indexes[task.round]}]"
         artifacts.extend(
             (
+                *(
+                    (
+                        _FinalArtifact(
+                            task.registration_directory
+                            / f"initial_alignment_{task.round}.mat",
+                            f"{round_label} initial alignment transform",
+                        ),
+                        _FinalArtifact(
+                            task.registration_directory
+                            / f"initial_alignment_{task.round}.json",
+                            f"{round_label} initial alignment evidence",
+                        ),
+                        _FinalArtifact(
+                            task.registration_directory
+                            / f"initial_alignment_qc_{task.round}.png",
+                            f"{round_label} initial alignment QC",
+                        ),
+                    )
+                    if task.initial_alignment is not None
+                    else ()
+                ),
                 _FinalArtifact(
                     task.registration_directory / f"linear_transform_{task.round}.mat",
                     f"{round_label} registration affine",
@@ -559,6 +580,7 @@ def _round_tasks(
                 ),
                 chunk_size_zyx=round_spec.chunk_size_zyx,
                 overlap_fraction=round_spec.overlap_fraction,
+                initial_alignment=round_spec.initial_alignment,
             )
         )
     return tuple(tasks)
@@ -744,6 +766,22 @@ def _scientific_mapping(
                         strict=True,
                     )
                 ],
+                **(
+                    {}
+                    if round_spec.initial_alignment is None
+                    else {
+                        "initial_alignment": {
+                            "xy_rotation": {
+                                field: (
+                                    list(value) if isinstance(value, tuple) else value
+                                )
+                                for field, value in asdict(
+                                    round_spec.initial_alignment.xy_rotation
+                                ).items()
+                            }
+                        }
+                    }
+                ),
             }
             for round_spec in sorted(manifest.rounds, key=lambda item: item.round)
         ],

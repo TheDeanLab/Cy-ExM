@@ -12,6 +12,8 @@ import pytest
 
 from cyexm.chunking import compute_chunk_grid
 from cyexm.config.models import (
+    ExplicitXYRotationSpec,
+    InitialAlignmentSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
     RegistrationSpec,
@@ -130,6 +132,28 @@ def _tasks(tmp_path: Path) -> tuple[object, ...]:
         ),
     )
     return preparation, chunk, assembly, whole, channel, validation
+
+
+def test_rotation_initialization_outputs_have_durable_progress_signatures(
+    tmp_path: Path,
+) -> None:
+    import cyexm.workflow.fine_task as worker
+
+    round_task = replace(
+        _round_task(tmp_path, strategy="whole_image"),
+        initial_alignment=InitialAlignmentSpec(
+            xy_rotation=ExplicitXYRotationSpec(mode="explicit", angle_deg=15.0)
+        ),
+    )
+    task = WholeImageRegistrationTask.create(round_task)
+
+    assert tuple(
+        worker._progress_signature(task, path) for path in task.output_paths[:3]
+    ) == (
+        ("initial-alignment:transform", "xy-rotation", "exact"),
+        ("initial-alignment:evidence", "xy-rotation", "deterministic"),
+        ("initial-alignment:qc", "xy-rotation-montage", "deterministic"),
+    )
 
 
 def _resolved(task: object) -> ResolvedNativeThreads:

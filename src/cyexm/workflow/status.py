@@ -5,13 +5,14 @@ import math
 import re
 import stat
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
 from cyexm._nonlinear_metric import MATTES_BINS, NonlinearMetricName
 from cyexm.config.models import (
     FeatureMaskSpec,
+    InitialAlignmentSpec,
     NativeThreadSpec,
     NonlinearRegistrationStageSpec,
     RegistrationPreprocessingSpec,
@@ -36,6 +37,7 @@ from cyexm.workflow._round_provenance import (
     SourceGeometries,
     completion_evidence,
     completion_snapshot,
+    initial_alignment_evidence,
 )
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import (
@@ -109,12 +111,19 @@ _ROUND_KEYS = frozenset(
         "channels",
     }
 )
+_ROUND_KEYS_WITH_INITIAL_ALIGNMENT = _ROUND_KEYS | {"initial_alignment"}
 _CHANNEL_KEYS = frozenset({"file", "manifest_file", "output", "interpolation"})
 _POLICY_KEYS = frozenset({"axis_convention", "output_format", "postprocessing"})
 _LINEAR_TYPES = frozenset({"Translation", "Rigid", "Similarity", "Affine", "TRSAA"})
 _NONLINEAR_TYPES = frozenset({"Elastic", "SyNOnly", "SyN"})
 _ACCURACIES = frozenset({"high", "medium", "low", "dry run"})
-type ArtifactRole = Literal["affine", "warp", "registered", "channel"]
+type ArtifactRole = Literal[
+    "initial_alignment",
+    "affine",
+    "warp",
+    "registered",
+    "channel",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +168,7 @@ class _RoundContract:
     overlap_fraction: float | None
     channels: tuple[_ChannelContract, ...]
     artifacts: tuple[_ArtifactExpectation, ...]
+    initial_alignment: InitialAlignmentSpec | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -617,7 +627,18 @@ def _parse_round(
     index: int,
 ) -> _RoundContract:
     location = f"scientific plan rounds[{index}]"
-    mapping = _exact_mapping(value, _ROUND_KEYS, location)
+    if isinstance(value, Mapping) and "initial_alignment" in value:
+        expected_keys = _ROUND_KEYS_WITH_INITIAL_ALIGNMENT
+    else:
+        expected_keys = _ROUND_KEYS
+    mapping = _exact_mapping(value, expected_keys, location)
+    initial_alignment = None
+    if "initial_alignment" in mapping:
+        from cyexm.config.dataset import _initial_alignment
+
+        initial_alignment = _initial_alignment(
+            mapping["initial_alignment"], f"{location}.initial_alignment"
+        )
     round_number = _integer(mapping["round"], f"{location}.round")
     strategy = _choice(
         mapping["strategy"],
@@ -695,6 +716,26 @@ def _parse_round(
             )
     round_layout = layout.round(round_number)
     artifacts = (
+        *(
+            (
+                _ArtifactExpectation(
+                    round_layout.registration / f"initial_alignment_{round_number}.mat",
+                    "initial_alignment",
+                ),
+                _ArtifactExpectation(
+                    round_layout.registration
+                    / f"initial_alignment_{round_number}.json",
+                    "initial_alignment",
+                ),
+                _ArtifactExpectation(
+                    round_layout.registration
+                    / f"initial_alignment_qc_{round_number}.png",
+                    "initial_alignment",
+                ),
+            )
+            if initial_alignment is not None
+            else ()
+        ),
         _ArtifactExpectation(
             _safe_descendant(
                 round_layout.registration / f"linear_transform_{round_number}.mat",
@@ -733,6 +774,7 @@ def _parse_round(
         overlap_fraction=overlap,
         channels=channels,
         artifacts=artifacts,
+        initial_alignment=initial_alignment,
     )
 
 
@@ -1105,6 +1147,7 @@ def _task_from_snapshot(
         ),
         chunk_size_zyx=round_contract.chunk_size_zyx,
         overlap_fraction=round_contract.overlap_fraction,
+        initial_alignment=round_contract.initial_alignment,
     )
 
 
@@ -1164,6 +1207,7 @@ def _round_status(
     ) -> ImageGeometry:
         return _read_uint16_tiff_geometry_without_runtime(path)
 
+    prepared_fixed_geometry: ImageGeometry | None = None
     try:
         prepared_fixed_geometry = geometry_reader(
             snapshot.fixed_output,
@@ -1202,12 +1246,40 @@ def _round_status(
         status = "partial"
     else:
         status = "pending"
+    initial_alignment: dict[str, object] | None = None
+    if round_contract.initial_alignment is not None:
+        rotation = {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in asdict(
+                round_contract.initial_alignment.xy_rotation
+            ).items()
+        }
+        initial_alignment = {
+            "configured": {"xy_rotation": rotation},
+            "realized": None,
+        }
+        evidence = (
+            None
+            if prepared_fixed_geometry is None
+            else initial_alignment_evidence(
+                task,
+                paths,
+                SourceGeometries(
+                    fixed=prepared_fixed_geometry,
+                    moving=round_contract.registration_source.geometry,
+                ),
+                snapshot_reader=snapshot_reader,
+            )
+        )
+        if evidence is not None:
+            initial_alignment["realized"] = evidence["realized"]
     return RoundStatus(
         round=round_contract.round,
         status=status,
         complete_artifacts=tuple(complete),
         incomplete_artifacts=tuple(incomplete),
         invalid_artifacts=tuple(invalid),
+        initial_alignment=initial_alignment,
     )
 
 

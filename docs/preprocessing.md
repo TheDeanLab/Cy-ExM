@@ -63,6 +63,11 @@ raw-intensity products; the separately named registration diagnostic retains its
 established diagnostic postprocessing. Feature images are internal evidence, not
 public image exports.
 
+Large geometric offsets are handled separately by per-round
+[`initial_alignment.xy_rotation`](initial-alignment.md). Rotation initialization is
+resolved from raw cropped registration channels before feature construction; it is
+not an intensity-preprocessing option.
+
 ## Optional feature-derived masks
 
 To use a feature-derived registration mask, nest `feature_mask` under enabled
@@ -94,6 +99,9 @@ realized foreground evidence. Those records let Cy-ExM invalidate only work whos
 request depends on the changed policy. Source identities, authenticated crop bounds,
 fixed-reference TIFFs, and reference-channel materialization remain independently
 reusable when their own requests still match.
+
+Rotation-enabled equivalents use strict formats 5, 6, and 7 respectively and bind
+the initialization JSON, transform, QC, and complete affine identities.
 
 ## Evaluate a dataset-specific policy
 

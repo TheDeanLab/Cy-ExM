@@ -30,6 +30,7 @@ from cyexm.workflow.fine_models import (
     WholeImageRegistrationTask,
 )
 from cyexm.workflow.models import RoundFailure, RoundTask
+from cyexm.workflow.round_task import _initial_alignment
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,34 +86,39 @@ def _thread_evidence(
 def _new_image_registration(task: RoundTask, threads: NativeThreadConfig) -> object:
     from cyexm.registration.whole_image import ImageRegistration
 
-    return ImageRegistration(
-        fixed_image_path=task.fixed_image,
-        moving_image_path=task.moving_image,
-        save_directory=task.registration_directory,
-        imaging_round=task.round,
-        pixel_size=task.voxel_spacing_xyz,
-        crop=task.registration.crop,
-        enable_logging=False,
-        force_override=task.force,
-        prepared_fixed=task.prepared_fixed,
-        native_threads=threads,
-        linear_type=task.registration.linear.type,
-        linear_accuracy=task.registration.linear.accuracy,
-        nonlinear_type=task.registration.nonlinear.type,
-        nonlinear_accuracy=task.registration.nonlinear.accuracy,
-        nonlinear_metric=task.registration.nonlinear.metric,
-        nonlinear_radius=task.registration.nonlinear.radius,
-        preprocess_filter_sigma_zyx=(
+    arguments: dict[str, object] = {
+        "fixed_image_path": task.fixed_image,
+        "moving_image_path": task.moving_image,
+        "save_directory": task.registration_directory,
+        "imaging_round": task.round,
+        "pixel_size": task.voxel_spacing_xyz,
+        "crop": task.registration.crop,
+        "enable_logging": False,
+        "force_override": task.force,
+        "prepared_fixed": task.prepared_fixed,
+        "native_threads": threads,
+        "linear_type": task.registration.linear.type,
+        "linear_accuracy": task.registration.linear.accuracy,
+        "nonlinear_type": task.registration.nonlinear.type,
+        "nonlinear_accuracy": task.registration.nonlinear.accuracy,
+        "nonlinear_metric": task.registration.nonlinear.metric,
+        "nonlinear_radius": task.registration.nonlinear.radius,
+        "preprocess_filter_sigma_zyx": (
             None
             if task.registration.preprocessing is None
             else task.registration.preprocessing.filter_sigma_zyx
         ),
-        preprocess_feature_mask=(
+        "preprocess_feature_mask": (
             None
             if task.registration.preprocessing is None
             else task.registration.preprocessing.feature_mask
         ),
-    )
+    }
+    initial_alignment = _initial_alignment(task)
+    if initial_alignment is not None:
+        arguments["initial_alignment"] = initial_alignment
+    registration_type: Any = ImageRegistration
+    return registration_type(**arguments)
 
 
 def _snapshots(paths: tuple[Path, ...]) -> dict[Path, object]:
@@ -234,6 +240,26 @@ def _progress_signature(
             "legacy-robust",
         ),
     }
+    if round_task.initial_alignment is not None:
+        common.update(
+            {
+                registration.initial_alignment_json: (
+                    "initial-alignment:evidence",
+                    "xy-rotation",
+                    "deterministic",
+                ),
+                registration.initial_alignment_qc: (
+                    "initial-alignment:qc",
+                    "xy-rotation-montage",
+                    "deterministic",
+                ),
+                registration.initial_alignment_transform: (
+                    "initial-alignment:transform",
+                    "xy-rotation",
+                    "exact",
+                ),
+            }
+        )
     if type(task) is RoundPreparationTask:
         prepared = PreparedRoundPaths.for_round(
             round_task.registration_directory, round_task.round
@@ -364,7 +390,11 @@ def _validated_prepared_manifest(
         StageRequest,
     )
     from cyexm.registration.prepared import PreparedManifest, PreparedRoundPaths
-    from cyexm.workflow._round_provenance import RegistrationArtifactPaths
+    from cyexm.workflow._round_provenance import (
+        RegistrationArtifactPaths,
+        SourceGeometries,
+        initial_alignment_artifacts,
+    )
     from cyexm.workflow.round_task import _inspect_image_geometry
 
     if not isinstance(descriptor, dict):
@@ -380,6 +410,8 @@ def _validated_prepared_manifest(
         if configured_preprocessing is None
         else (4 if configured_preprocessing.feature_mask is not None else 3)
     )
+    if task.initial_alignment is not None:
+        expected_format += 3
     if manifest.format_version != expected_format:
         raise ValueError(
             "prepared manifest format does not match registration preprocessing"
@@ -435,6 +467,64 @@ def _validated_prepared_manifest(
     registration = RegistrationArtifactPaths.for_round(
         task.registration_directory, task.round
     )
+    initial_alignment: dict[str, object] | None = None
+    initial_alignment_identities: tuple[FileIdentity, ...] = ()
+    if task.initial_alignment is not None:
+        from cyexm.registration.initial_alignment import (
+            InitialAlignmentPolicy,
+            initial_alignment_config_parameters,
+            parse_initial_alignment_result,
+        )
+
+        runtime_policy = _initial_alignment(task)
+        if type(runtime_policy) is not InitialAlignmentPolicy:
+            raise ValueError("prepared initial alignment policy is missing")
+        initial_alignment = manifest.initial_alignment
+        if not isinstance(initial_alignment, dict) or initial_alignment.get(
+            "configured"
+        ) != initial_alignment_config_parameters(runtime_policy):
+            raise ValueError(
+                "prepared initial alignment policy does not match the round"
+            )
+        parse_initial_alignment_result(
+            initial_alignment.get("realized"), runtime_policy
+        )
+        identity_paths = (
+            (manifest.initial_alignment_json, registration.initial_alignment_json),
+            (
+                manifest.initial_alignment_transform,
+                registration.initial_alignment_transform,
+            ),
+            (manifest.initial_alignment_qc, registration.initial_alignment_qc),
+        )
+        for identity, path in identity_paths:
+            if (
+                identity is None
+                or Path(identity.path) != path.resolve(strict=True)
+                or FileIdentity.from_path(path) != identity
+            ):
+                raise ValueError("prepared initial alignment identity is not current")
+        initial_alignment_identities = tuple(
+            identity for identity, _path in identity_paths if identity is not None
+        )
+        authenticated = initial_alignment_artifacts(
+            task,
+            registration,
+            SourceGeometries(
+                fixed=_inspect_image_geometry(task.fixed_image, task.voxel_spacing_xyz),
+                moving=_inspect_image_geometry(
+                    task.moving_image, task.voxel_spacing_xyz
+                ),
+            ),
+        )
+        if (
+            authenticated is None
+            or authenticated[0] != initial_alignment
+            or authenticated[1] != manifest.initial_alignment_transform
+        ):
+            raise ValueError(
+                "prepared initial alignment completion evidence is not current"
+            )
     if Path(manifest.affine.path) != registration.affine.resolve(strict=True):
         raise ValueError("prepared affine path is not canonical for the round")
     if FileIdentity.from_path(registration.affine) != manifest.affine:
@@ -484,6 +574,11 @@ def _validated_prepared_manifest(
             "mask_policy": manifest.mask_policy,
             "ants_pixeltype": manifest.pixeltypes[role],
             **({} if preprocessing is None else {"preprocessing": preprocessing}),
+            **(
+                {}
+                if initial_alignment is None
+                else {"initial_alignment": initial_alignment}
+            ),
         }
         expected = StageRequest.for_identities(
             stage=f"prepared:{role}",
@@ -508,6 +603,7 @@ def _validated_prepared_manifest(
         moving,
         *manifest.array_identities,
         *(() if manifest.moving_crop is None else (manifest.moving_crop,)),
+        *initial_alignment_identities,
     )
     expected_manifest = StageRequest.for_identities(
         stage="prepared:manifest",
@@ -523,6 +619,11 @@ def _validated_prepared_manifest(
             "mask_policy": manifest.mask_policy,
             "pixeltypes": manifest.pixeltypes,
             **({} if preprocessing is None else {"preprocessing": preprocessing}),
+            **(
+                {}
+                if initial_alignment is None
+                else {"initial_alignment": initial_alignment}
+            ),
         },
     )
     manifest_record = CompletionRecord.read(store.record_path(prepared.manifest))
@@ -673,7 +774,7 @@ def _chunk_context(
         pixeltype=region.pixeltypes["moving_linear_mask"],
     )
     preprocessing = None
-    if getattr(manifest, "format_version", 2) in {3, 4}:
+    if getattr(manifest, "format_version", 2) in {3, 4, 6, 7}:
         configured = round_task.registration.preprocessing
         if (
             configured is None
@@ -686,7 +787,7 @@ def _chunk_context(
             fixed_scale=manifest.fixed_feature_scale,
             moving_scale=manifest.moving_feature_scale,
         )
-        if manifest.format_version == 4:
+        if manifest.format_version in {4, 7}:
             if not isinstance(manifest.preprocessing, dict):
                 raise ValueError("prepared feature mask evidence is incomplete")
             feature_mask = manifest.preprocessing.get("feature_mask")

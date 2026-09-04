@@ -11,6 +11,7 @@ from cyexm.config.models import (
     ChunkSizeZYX,
     DatasetManifest,
     ExecutionProfile,
+    InitialAlignmentSpec,
     NativeThreadSpec,
     PixelSpacingXYZ,
     RegistrationSpec,
@@ -83,6 +84,7 @@ class RoundTask:
     overlap_fraction: float | None
     prepared_fixed: bool = True
     force: bool = False
+    initial_alignment: InitialAlignmentSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,15 +208,19 @@ class RoundStatus:
     complete_artifacts: tuple[str, ...]
     incomplete_artifacts: tuple[str, ...]
     invalid_artifacts: tuple[str, ...]
+    initial_alignment: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "round": self.round,
             "status": self.status,
             "complete_artifacts": list(self.complete_artifacts),
             "incomplete_artifacts": list(self.incomplete_artifacts),
             "invalid_artifacts": list(self.invalid_artifacts),
         }
+        if self.initial_alignment is not None:
+            value["initial_alignment"] = self.initial_alignment
+        return value
 
 
 @dataclass(frozen=True, slots=True)

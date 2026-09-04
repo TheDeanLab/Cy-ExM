@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Literal
 
+from cyexm.spatial import ImageGeometry
+
 ROTATION_ESTIMATOR_POLICY = "mip-gradient-phase-correlation-xy-rotation-v1"
+EXPLICIT_ROTATION_POLICY = "explicit-xy-rotation-v1"
 
 
 def _finite_float(value: object, name: str) -> float:
@@ -79,6 +82,13 @@ class InitialAlignmentPolicy:
 
     xy_rotation: XYRotationPolicy
 
+    def __post_init__(self) -> None:
+        if type(self.xy_rotation) not in {
+            ExplicitXYRotationPolicy,
+            EstimatedXYRotationPolicy,
+        }:
+            raise TypeError("xy_rotation must be an explicit or estimated policy")
+
 
 @dataclass(frozen=True, slots=True)
 class RotationScore:
@@ -149,6 +159,31 @@ def _projection_feature(np: Any, ndimage: Any, volume: Any, role: str) -> Any:
     return np.hypot(gradient_y, gradient_x).astype(np.float32, copy=False)
 
 
+def _physical_isotropic_image(
+    np: Any,
+    ndimage: Any,
+    feature: Any,
+    geometry: ImageGeometry,
+    target_spacing: float,
+) -> Any:
+    spacing_yx = geometry.spacing[1], geometry.spacing[0]
+    output_shape = tuple(
+        max(1, round((size - 1) * spacing / target_spacing) + 1)
+        for size, spacing in zip(feature.shape, spacing_yx, strict=True)
+    )
+    zoom = tuple(
+        output / source
+        for output, source in zip(output_shape, feature.shape, strict=True)
+    )
+    return ndimage.zoom(
+        feature,
+        zoom=zoom,
+        order=1,
+        mode="nearest",
+        prefilter=False,
+    ).astype(np.float32, copy=False)
+
+
 def _canvas_size(*images: Any) -> int:
     return math.ceil(
         max(math.hypot(int(image.shape[0]), int(image.shape[1])) for image in images)
@@ -180,6 +215,7 @@ def _score_angle(
     fixed_footprint: Any,
     moving_footprint: Any,
     angle: float,
+    translation_scale_yx: tuple[float, float],
 ) -> RotationScore | None:
     # Candidate angles use the public physical +Z right-hand convention.
     # scipy.ndimage.rotate uses row-down display coordinates, whose sign is
@@ -209,10 +245,10 @@ def _score_angle(
         upsample_factor=1,
         normalization=None,
     )
-    shift_yx = float(shift[0]), float(shift[1])
+    display_shift_yx = float(shift[0]), float(shift[1])
     aligned = ndimage.shift(
         rotated,
-        shift=shift_yx,
+        shift=display_shift_yx,
         order=1,
         mode="constant",
         cval=0.0,
@@ -220,7 +256,7 @@ def _score_angle(
     )
     aligned_footprint = ndimage.shift(
         rotated_footprint,
-        shift=shift_yx,
+        shift=display_shift_yx,
         order=0,
         mode="constant",
         cval=0,
@@ -245,7 +281,10 @@ def _score_angle(
         correlation = float(np.dot(fixed_values, moving_values) / denominator)
     return RotationScore(
         angle_deg=float(angle),
-        translation_yx_px=shift_yx,
+        translation_yx_px=(
+            display_shift_yx[0] * translation_scale_yx[0],
+            display_shift_yx[1] * translation_scale_yx[1],
+        ),
         correlation=correlation,
         valid_overlap_fraction=float(overlap_count / overlap.size),
     )
@@ -262,8 +301,16 @@ def estimate_xy_rotation(
     fixed_zyx: Any,
     moving_zyx: Any,
     policy: EstimatedXYRotationPolicy,
+    *,
+    fixed_geometry: ImageGeometry | None = None,
+    moving_geometry: ImageGeometry | None = None,
 ) -> XYRotationEstimate:
-    """Estimate an XY correction from fixed and moving registration channels."""
+    """Estimate an XY correction from fixed and moving registration channels.
+
+    Geometry-aware calls resample projection features onto a physical-isotropic
+    grid before scoring. Omitting both geometries retains pixel-space behavior for
+    direct array use; supplying only one geometry is invalid.
+    """
     if type(policy) is not EstimatedXYRotationPolicy:
         raise TypeError("policy must be an EstimatedXYRotationPolicy")
     np, ndimage, phase_cross_correlation = _scientific_runtime()
@@ -272,6 +319,45 @@ def estimate_xy_rotation(
         moving_feature = _projection_feature(np, ndimage, moving_zyx, "moving")
     except ValueError as error:
         return _rejected(str(error))
+
+    translation_scale_yx = (1.0, 1.0)
+    if (fixed_geometry is None) != (moving_geometry is None):
+        raise ValueError("fixed_geometry and moving_geometry must be supplied together")
+    if fixed_geometry is not None and moving_geometry is not None:
+        if (
+            type(fixed_geometry) is not ImageGeometry
+            or type(moving_geometry) is not ImageGeometry
+        ):
+            raise TypeError("geometries must be exact ImageGeometry values")
+        if fixed_geometry.shape != tuple(fixed_zyx.shape):
+            raise ValueError("fixed_geometry shape does not match fixed_zyx")
+        if moving_geometry.shape != tuple(moving_zyx.shape):
+            raise ValueError("moving_geometry shape does not match moving_zyx")
+        if not bool(
+            np.allclose(
+                np.asarray(fixed_geometry.direction),
+                np.asarray(moving_geometry.direction),
+                rtol=0.0,
+                atol=1e-8,
+            )
+        ):
+            return _rejected("incompatible-fixed-moving-direction")
+        target_spacing = min(
+            fixed_geometry.spacing[0],
+            fixed_geometry.spacing[1],
+            moving_geometry.spacing[0],
+            moving_geometry.spacing[1],
+        )
+        fixed_feature = _physical_isotropic_image(
+            np, ndimage, fixed_feature, fixed_geometry, target_spacing
+        )
+        moving_feature = _physical_isotropic_image(
+            np, ndimage, moving_feature, moving_geometry, target_spacing
+        )
+        translation_scale_yx = (
+            target_spacing / moving_geometry.spacing[1],
+            target_spacing / moving_geometry.spacing[0],
+        )
 
     size = _canvas_size(fixed_feature, moving_feature)
     fixed = _center_pad(np, fixed_feature, size)
@@ -293,6 +379,7 @@ def estimate_xy_rotation(
             fixed_footprint,
             moving_footprint,
             angle,
+            translation_scale_yx,
         )
 
     lower, upper = policy.search_range_deg
@@ -367,6 +454,10 @@ def _score_mapping(score: RotationScore) -> dict[str, object]:
     }
 
 
+def _result_source(result: XYRotationEstimate) -> str:
+    return "explicit" if result.policy == EXPLICIT_ROTATION_POLICY else "estimated"
+
+
 def initial_alignment_parameters(
     policy: EstimatedXYRotationPolicy,
     result: XYRotationEstimate,
@@ -378,6 +469,7 @@ def initial_alignment_parameters(
         raise TypeError("result must be an XYRotationEstimate")
     return {
         "algorithm": result.policy,
+        "source": _result_source(result),
         "mode": policy.mode,
         "search_range_deg": list(policy.search_range_deg),
         "coarse_step_deg": policy.coarse_step_deg,
@@ -397,6 +489,269 @@ def initial_alignment_parameters(
         "coarse_scores": [_score_mapping(item) for item in result.coarse_scores],
         "refined_scores": [_score_mapping(item) for item in result.refined_scores],
     }
+
+
+def initial_alignment_config_parameters(
+    policy: InitialAlignmentPolicy,
+) -> dict[str, object]:
+    """Return the canonical JSON-compatible initialization configuration."""
+    if type(policy) is not InitialAlignmentPolicy:
+        raise TypeError("policy must be an InitialAlignmentPolicy")
+    rotation = policy.xy_rotation
+    if type(rotation) is ExplicitXYRotationPolicy:
+        value: dict[str, object] = {
+            "mode": "explicit",
+            "angle_deg": rotation.angle_deg,
+        }
+    elif type(rotation) is EstimatedXYRotationPolicy:
+        value = {
+            "mode": "estimate",
+            "search_range_deg": list(rotation.search_range_deg),
+            "coarse_step_deg": rotation.coarse_step_deg,
+            "refinement_step_deg": rotation.refinement_step_deg,
+            "minimum_score_gain": rotation.minimum_score_gain,
+            "minimum_peak_margin": rotation.minimum_peak_margin,
+        }
+    else:  # pragma: no cover - protected by InitialAlignmentPolicy
+        raise TypeError("unsupported xy_rotation policy")
+    return {"xy_rotation": value}
+
+
+def initial_alignment_result_parameters(
+    result: XYRotationEstimate,
+) -> dict[str, object]:
+    """Return canonical JSON-compatible realized initialization evidence."""
+    if type(result) is not XYRotationEstimate:
+        raise TypeError("result must be an XYRotationEstimate")
+    return {
+        "algorithm": result.policy,
+        "source": _result_source(result),
+        "accepted": result.accepted,
+        "rejection_reason": result.rejection_reason,
+        "angle_deg": result.angle_deg,
+        "translation_yx_px": (
+            None if result.translation_yx_px is None else list(result.translation_yx_px)
+        ),
+        "zero_angle_score": result.zero_angle_score,
+        "score_gain": result.score_gain,
+        "peak_margin": result.peak_margin,
+        "valid_overlap_fraction": result.valid_overlap_fraction,
+        "coarse_scores": [_score_mapping(item) for item in result.coarse_scores],
+        "refined_scores": [_score_mapping(item) for item in result.refined_scores],
+    }
+
+
+def parse_initial_alignment_result(
+    value: object,
+    policy: InitialAlignmentPolicy,
+) -> XYRotationEstimate:
+    """Parse strict mode-aware realized initial-alignment evidence."""
+    expected_keys = frozenset(initial_alignment_result_parameters(_rejected("x")))
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("initial alignment result keys are not canonical")
+
+    def finite(item: object, name: str) -> float:
+        if type(item) is not float or not math.isfinite(item):
+            raise ValueError(f"initial alignment {name} must be a finite float")
+        return item
+
+    def optional_finite(name: str) -> float | None:
+        item = value[name]
+        return None if item is None else finite(item, name)
+
+    def parse_scores(name: str) -> tuple[RotationScore, ...]:
+        raw = value[name]
+        if not isinstance(raw, list):
+            raise TypeError(f"initial alignment {name} must be a JSON array")
+        parsed: list[RotationScore] = []
+        score_keys = {
+            "angle_deg",
+            "translation_yx_px",
+            "correlation",
+            "valid_overlap_fraction",
+        }
+        for item in raw:
+            if not isinstance(item, dict) or set(item) != score_keys:
+                raise ValueError(f"initial alignment {name} entry is not canonical")
+            translation = item["translation_yx_px"]
+            if not isinstance(translation, list) or len(translation) != 2:
+                raise ValueError("initial alignment score translation is invalid")
+            overlap = finite(item["valid_overlap_fraction"], "valid_overlap_fraction")
+            if not 0.0 <= overlap <= 1.0:
+                raise ValueError("initial alignment overlap must be within [0, 1]")
+            parsed.append(
+                RotationScore(
+                    angle_deg=finite(item["angle_deg"], "angle_deg"),
+                    translation_yx_px=(
+                        finite(translation[0], "translation_yx_px[0]"),
+                        finite(translation[1], "translation_yx_px[1]"),
+                    ),
+                    correlation=finite(item["correlation"], "correlation"),
+                    valid_overlap_fraction=overlap,
+                )
+            )
+        return tuple(parsed)
+
+    if type(value["accepted"]) is not bool:
+        raise TypeError("initial alignment accepted must be a built-in boolean")
+    rejection = value["rejection_reason"]
+    if rejection is not None and (type(rejection) is not str or not rejection):
+        raise TypeError("initial alignment rejection_reason must be text or null")
+    raw_translation = value["translation_yx_px"]
+    if raw_translation is None:
+        translation = None
+    elif isinstance(raw_translation, list) and len(raw_translation) == 2:
+        translation = (
+            finite(raw_translation[0], "translation_yx_px[0]"),
+            finite(raw_translation[1], "translation_yx_px[1]"),
+        )
+    else:
+        raise ValueError("initial alignment translation_yx_px is invalid")
+    result = XYRotationEstimate(
+        policy=str(value["algorithm"]),
+        accepted=value["accepted"],
+        rejection_reason=rejection,
+        angle_deg=optional_finite("angle_deg"),
+        translation_yx_px=translation,
+        zero_angle_score=optional_finite("zero_angle_score"),
+        score_gain=optional_finite("score_gain"),
+        peak_margin=optional_finite("peak_margin"),
+        valid_overlap_fraction=optional_finite("valid_overlap_fraction"),
+        coarse_scores=parse_scores("coarse_scores"),
+        refined_scores=parse_scores("refined_scores"),
+    )
+    rotation = policy.xy_rotation
+    if type(rotation) is ExplicitXYRotationPolicy:
+        if (
+            result.policy != EXPLICIT_ROTATION_POLICY
+            or value["source"] != "explicit"
+            or not result.accepted
+            or result.rejection_reason is not None
+            or result.angle_deg != rotation.angle_deg
+            or result.translation_yx_px != (0.0, 0.0)
+            or any(
+                item is not None
+                for item in (
+                    result.zero_angle_score,
+                    result.score_gain,
+                    result.peak_margin,
+                    result.valid_overlap_fraction,
+                )
+            )
+            or result.coarse_scores
+            or result.refined_scores
+        ):
+            raise ValueError("explicit initial alignment result is inconsistent")
+    elif type(rotation) is EstimatedXYRotationPolicy:
+        if result.policy != ROTATION_ESTIMATOR_POLICY or value["source"] != "estimated":
+            raise ValueError("estimated initial alignment policy is inconsistent")
+        if result.accepted != (result.rejection_reason is None):
+            raise ValueError("estimated acceptance and rejection reason disagree")
+        realized_values = (
+            result.angle_deg,
+            result.translation_yx_px,
+            result.zero_angle_score,
+            result.score_gain,
+            result.peak_margin,
+            result.valid_overlap_fraction,
+        )
+        scores = (*result.coarse_scores, *result.refined_scores)
+        if not scores:
+            if result.accepted or any(item is not None for item in realized_values):
+                raise ValueError("scoreless estimate has realized evidence")
+            allowed_rejections = {
+                "fixed-input-must-be-zyx",
+                "moving-input-must-be-zyx",
+                "nonfinite-fixed-input",
+                "nonfinite-moving-input",
+                "constant-fixed-input",
+                "constant-moving-input",
+                "incompatible-fixed-moving-direction",
+                "no-positive-valid-overlap",
+            }
+            if result.rejection_reason not in allowed_rejections:
+                raise ValueError("scoreless estimate has an unknown rejection reason")
+        else:
+            if any(item is None for item in realized_values):
+                raise ValueError("scored estimate is missing realized evidence")
+            assert result.angle_deg is not None
+            assert result.translation_yx_px is not None
+            assert result.zero_angle_score is not None
+            assert result.score_gain is not None
+            assert result.peak_margin is not None
+            assert result.valid_overlap_fraction is not None
+            if not 0.0 <= result.valid_overlap_fraction <= 1.0:
+                raise ValueError("initial alignment overlap must be within [0, 1]")
+            lower, upper = rotation.search_range_deg
+            if any(
+                item.angle_deg < lower - 1e-12 or item.angle_deg > upper + 1e-12
+                for item in scores
+            ):
+                raise ValueError("estimated score angle is outside the search range")
+            raw_winner = _best(result.refined_scores or result.coarse_scores)
+            normalized_to_zero = (
+                abs(raw_winner.angle_deg) <= rotation.refinement_step_deg
+                and result.angle_deg == 0.0
+            )
+            if not normalized_to_zero and result.angle_deg != raw_winner.angle_deg:
+                raise ValueError("estimated winner disagrees with score curves")
+            matching_winners = tuple(
+                item
+                for item in scores
+                if item.angle_deg == result.angle_deg
+                and item.translation_yx_px == result.translation_yx_px
+                and item.valid_overlap_fraction == result.valid_overlap_fraction
+            )
+            if matching_winners:
+                winner_score = matching_winners[0].correlation
+            elif normalized_to_zero and result.score_gain == 0.0:
+                winner_score = result.zero_angle_score
+            else:
+                raise ValueError("estimated winner is absent from score curves")
+            if not math.isclose(
+                result.score_gain,
+                winner_score - result.zero_angle_score,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError("estimated score gain disagrees with score curves")
+            competitors = tuple(
+                item
+                for item in scores
+                if abs(item.angle_deg - result.angle_deg)
+                >= rotation.coarse_step_deg - 1e-12
+            )
+            expected_margin = (
+                winner_score - _best(competitors).correlation if competitors else 1.0
+            )
+            if not math.isclose(
+                result.peak_margin,
+                expected_margin,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError("estimated peak margin disagrees with score curves")
+            reason: str | None = None
+            if math.isclose(result.angle_deg, lower, abs_tol=1e-12) or math.isclose(
+                result.angle_deg, upper, abs_tol=1e-12
+            ):
+                reason = "winner-at-search-boundary"
+            elif (
+                abs(result.angle_deg) > rotation.refinement_step_deg
+                and result.score_gain < rotation.minimum_score_gain
+            ):
+                reason = "insufficient-score-gain"
+            elif result.peak_margin < rotation.minimum_peak_margin:
+                reason = "insufficient-peak-margin"
+            if result.rejection_reason != reason:
+                raise ValueError(
+                    "estimated acceptance disagrees with confidence policy"
+                )
+    else:  # pragma: no cover - protected by InitialAlignmentPolicy
+        raise TypeError("unsupported xy_rotation policy")
+    if initial_alignment_result_parameters(result) != value:
+        raise ValueError("initial alignment result is not canonical")
+    return result
 
 
 def _display_panel(np: Any, image: Any) -> Any:
@@ -446,13 +801,38 @@ def render_initial_alignment_qc(
     fixed_zyx: Any,
     moving_zyx: Any,
     estimate: XYRotationEstimate,
+    *,
+    fixed_geometry: ImageGeometry | None = None,
+    moving_geometry: ImageGeometry | None = None,
 ) -> Any:
     """Render a deterministic grayscale QC montage without Matplotlib."""
     np, ndimage, _ = _scientific_runtime()
     fixed = np.max(np.asarray(fixed_zyx, dtype=np.float32), axis=0)
     moving = np.max(np.asarray(moving_zyx, dtype=np.float32), axis=0)
+    display_translation_yx = estimate.translation_yx_px
+    if fixed_geometry is not None and moving_geometry is not None:
+        target_spacing = min(
+            fixed_geometry.spacing[0],
+            fixed_geometry.spacing[1],
+            moving_geometry.spacing[0],
+            moving_geometry.spacing[1],
+        )
+        fixed = _physical_isotropic_image(
+            np, ndimage, fixed, fixed_geometry, target_spacing
+        )
+        moving = _physical_isotropic_image(
+            np, ndimage, moving, moving_geometry, target_spacing
+        )
+        if display_translation_yx is not None:
+            display_translation_yx = (
+                display_translation_yx[0] * moving_geometry.spacing[1] / target_spacing,
+                display_translation_yx[1] * moving_geometry.spacing[0] / target_spacing,
+            )
+    size = _canvas_size(fixed, moving)
+    fixed = _center_pad(np, fixed, size)
+    moving = _center_pad(np, moving, size)
     aligned = moving
-    if estimate.angle_deg is not None and estimate.translation_yx_px is not None:
+    if estimate.angle_deg is not None and display_translation_yx is not None:
         aligned = ndimage.rotate(
             moving,
             angle=-estimate.angle_deg,
@@ -464,7 +844,7 @@ def render_initial_alignment_qc(
         )
         aligned = ndimage.shift(
             aligned,
-            shift=estimate.translation_yx_px,
+            shift=display_translation_yx,
             order=1,
             mode="constant",
             cval=0.0,
@@ -488,6 +868,7 @@ def render_initial_alignment_qc(
 
 
 __all__ = [
+    "EXPLICIT_ROTATION_POLICY",
     "ROTATION_ESTIMATOR_POLICY",
     "EstimatedXYRotationPolicy",
     "ExplicitXYRotationPolicy",
@@ -496,6 +877,9 @@ __all__ = [
     "XYRotationEstimate",
     "XYRotationPolicy",
     "estimate_xy_rotation",
+    "initial_alignment_config_parameters",
     "initial_alignment_parameters",
+    "initial_alignment_result_parameters",
+    "parse_initial_alignment_result",
     "render_initial_alignment_qc",
 ]

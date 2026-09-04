@@ -5,7 +5,7 @@ import logging
 import os
 import socket
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
@@ -498,6 +498,7 @@ def _validate_workflow_plan(
             or task.native_threads != execution.native_threads
             or task.chunk_size_zyx != contract.chunk_size_zyx
             or task.overlap_fraction != contract.overlap_fraction
+            or task.initial_alignment != contract.initial_alignment
             or type(task.prepared_fixed) is not bool
             or not task.prepared_fixed
             or type(task.force) is not bool
@@ -520,6 +521,7 @@ def _validate_workflow_plan(
             != contract.registration_manifest_channel
             or manifest_round.chunk_size_zyx != contract.chunk_size_zyx
             or manifest_round.overlap_fraction != contract.overlap_fraction
+            or manifest_round.initial_alignment != contract.initial_alignment
             or len(manifest_round.channels) != len(contract.channels)
             or len(task.channels) != len(contract.channels)
         ):
@@ -801,6 +803,41 @@ def _write_run_record(
         payload["operational_failure"] = dict(operational_failure)
     if execution_evidence_error is not None:
         payload["execution_evidence_error"] = dict(execution_evidence_error)
+    workflow_status = _inspect_workflow_status(
+        path.parents[2],
+        plan.dataset_id,
+        _tasks=(plan.reference_task, *plan.tasks),
+    )
+    statuses_by_round = {item.round: item for item in workflow_status.rounds}
+    initial_alignments: list[dict[str, object]] = []
+    for task in plan.tasks:
+        if task.initial_alignment is None:
+            continue
+        configured = {
+            "xy_rotation": {
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in asdict(task.initial_alignment.xy_rotation).items()
+            }
+        }
+        evidence_path = (
+            task.registration_directory / f"initial_alignment_{task.round}.json"
+        )
+        status_alignment = getattr(
+            statuses_by_round.get(task.round), "initial_alignment", None
+        )
+        realized = (
+            None if status_alignment is None else status_alignment.get("realized")
+        )
+        initial_alignments.append(
+            {
+                "round": task.round,
+                "configured": configured,
+                "realized": realized,
+                "evidence_path": str(evidence_path),
+            }
+        )
+    if initial_alignments:
+        payload["initial_alignments"] = initial_alignments
     _write_text_atomically(path, canonical_json(payload) + "\n")
 
 

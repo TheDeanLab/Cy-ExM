@@ -23,6 +23,8 @@
   its local or HPC execution profile. Real cluster claims require explicitly selected
   HPC acceptance with operator-approved inputs and allocation.
 - The workflow examples include `examples/spheroid-dataset.yaml`,
+  `examples/explicit-rotation-dataset.yaml`,
+  `examples/estimated-rotation-dataset.yaml`,
   `examples/execution-sequential.yaml`, `examples/execution-local-dask.yaml`, and
   both `examples/execution-slurm-512gb.yaml` and
   `examples/execution-slurm-512gb-multi-process.yaml`. Keep them strict-loader

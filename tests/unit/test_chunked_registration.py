@@ -1305,7 +1305,10 @@ import cyexm.registration as registration
 assert not hasattr(registration, "ParallelChunkedImageRegistration")
 assert registration.__all__ == [
     "ChunkedImageRegistration",
+    "EstimatedXYRotationPolicy",
+    "ExplicitXYRotationPolicy",
     "ImageRegistration",
+    "InitialAlignmentPolicy",
     "register_round",
     "transform_channel",
 ]

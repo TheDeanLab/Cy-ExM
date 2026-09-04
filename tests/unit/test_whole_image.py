@@ -22,6 +22,13 @@ from cyexm.registration.artifacts import (
     FileIdentity,
     StageRequest,
 )
+from cyexm.registration.initial_alignment import (
+    EstimatedXYRotationPolicy,
+    ExplicitXYRotationPolicy,
+    InitialAlignmentPolicy,
+    RotationScore,
+    XYRotationEstimate,
+)
 from cyexm.registration.whole_image import (
     ImageRegistration,
     RegistrationPaths,
@@ -90,6 +97,129 @@ def round_paths(tmp_path: Path) -> RegistrationPaths:
 def completion_request(path: Path) -> object:
     store = ArtifactStore()
     return CompletionRecord.read(store.record_path(path)).request
+
+
+def test_explicit_initial_alignment_is_persisted_and_supplied_to_linear(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    policy = InitialAlignmentPolicy(ExplicitXYRotationPolicy(angle_deg=27.7))
+
+    make_registration(
+        tmp_path,
+        backend=backend,
+        initial_alignment=policy,
+    ).register()
+
+    paths = round_paths(tmp_path)
+    assert paths.initial_alignment_transform.is_file()
+    assert paths.initial_alignment_json.is_file()
+    assert paths.initial_alignment_qc.is_file()
+    evidence = json.loads(paths.initial_alignment_json.read_text(encoding="utf-8"))
+    assert evidence["configured"]["xy_rotation"] == {
+        "mode": "explicit",
+        "angle_deg": 27.7,
+    }
+    assert evidence["realized"]["angle_deg"] == 27.7
+    assert evidence["realized"]["translation_yx_px"] == [0.0, 0.0]
+    assert evidence["realized"]["source"] == "explicit"
+    assert evidence["crop"] == {"enabled": False}
+    assert set(evidence["sources"]) == {"fixed", "moving"}
+    assert set(evidence["geometries"]) == {"fixed", "moving"}
+    evidence_request = completion_request(paths.initial_alignment_json)
+    assert evidence_request.parameters["algorithm"] == "explicit-xy-rotation-v1"
+    assert backend.rotation_seeds[0][1:] == (27.7, (0.0, 0.0))
+    assert backend.linear_kwargs[0]["initial_transform"] == (
+        paths.initial_alignment_transform
+    )
+    affine_request = completion_request(paths.affine)
+    assert affine_request.parameters["initial_alignment"] == evidence
+
+    make_registration(
+        tmp_path,
+        backend=backend,
+        initial_alignment=policy,
+    ).register()
+    assert backend.linear_calls == 1
+    assert len(backend.rotation_seeds) == 1
+
+
+def test_rejected_estimate_persists_diagnostics_but_not_transform_or_affine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend()
+    rejected = XYRotationEstimate(
+        policy="mip-gradient-phase-correlation-xy-rotation-v1",
+        accepted=False,
+        rejection_reason="insufficient-peak-margin",
+        angle_deg=12.0,
+        translation_yx_px=(2.0, -3.0),
+        zero_angle_score=0.4,
+        score_gain=0.2,
+        peak_margin=0.6 - 0.599,
+        valid_overlap_fraction=0.7,
+        coarse_scores=(RotationScore(0.0, (0.0, 0.0), 0.4, 0.8),),
+        refined_scores=(
+            RotationScore(11.0, (2.0, -3.0), 0.599, 0.7),
+            RotationScore(12.0, (2.0, -3.0), 0.6, 0.7),
+        ),
+    )
+    monkeypatch.setattr(
+        whole_image, "estimate_xy_rotation", lambda *args, **kwargs: rejected
+    )
+    policy = InitialAlignmentPolicy(EstimatedXYRotationPolicy())
+
+    with pytest.raises(RegistrationStageError, match=r"initial-alignment.*inspect"):
+        make_registration(
+            tmp_path,
+            backend=backend,
+            initial_alignment=policy,
+        ).register()
+
+    paths = round_paths(tmp_path)
+    assert paths.initial_alignment_json.is_file()
+    assert paths.initial_alignment_qc.is_file()
+    assert not paths.initial_alignment_transform.exists()
+    assert not paths.affine.exists()
+    assert backend.linear_calls == 0
+
+
+def test_explicit_initial_alignment_rejects_different_direction_matrices(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    backend.moving_image.direction = (
+        (0.0, -1.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+
+    with pytest.raises(RegistrationStageError, match=r"matching.*direction matrices"):
+        make_registration(
+            tmp_path,
+            backend=backend,
+            initial_alignment=InitialAlignmentPolicy(
+                ExplicitXYRotationPolicy(angle_deg=15.0)
+            ),
+        ).register()
+
+    assert not round_paths(tmp_path).initial_alignment_json.exists()
+
+
+def test_omitted_initial_alignment_preserves_historical_affine_request(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+
+    make_registration(tmp_path, backend=backend).register()
+
+    paths = round_paths(tmp_path)
+    assert not paths.initial_alignment_transform.exists()
+    assert not paths.initial_alignment_json.exists()
+    assert not paths.initial_alignment_qc.exists()
+    assert "initial_transform" not in backend.linear_kwargs[0]
+    assert "initial_alignment" not in completion_request(paths.affine).parameters
 
 
 def test_nonlinear_request_policy_resolves_metric_sampling() -> None:

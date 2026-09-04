@@ -22,6 +22,10 @@ It preserves raw diagnostic masks based on values greater than zero; optional
 feature-derived masks inform registration metrics but do not replace raw outputs or
 diagnostic masks.
 
+Optional XY rotation initialization is resolved once inside the same shared affine
+preparation owner. Its seed is composed into the final affine; coarse and fine
+execution consume that affine and never create a second estimator lifecycle.
+
 ## Workflow configuration and planning
 
 The scientific dataset manifest holds rounds, channels, registration choices, and

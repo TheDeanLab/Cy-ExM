@@ -36,6 +36,7 @@ def test_registration_backend_declares_every_required_operation() -> None:
         "crop_image": ("self", "image", "bounds_zyx"),
         "create_xy_rotation_seed": (
             "self",
+            "fixed_geometry",
             "geometry",
             "angle_deg",
             "translation_yx_px",

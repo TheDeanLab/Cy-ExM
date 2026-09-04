@@ -68,6 +68,10 @@ resampled through the persisted transform chain onto fixed-reference geometry an
 clipped to uint16 without intensity normalization. Use the transformed channel for
 downstream original-intensity analysis rather than substituting the diagnostic image.
 
+When initial alignment is enabled, inspect `initial_alignment_qc_<round>.png` and its
+JSON evidence as well. Estimator acceptance is not proof of final registration
+accuracy.
+
 ## Recover from common failures
 
 - **Affine failure:** correct the resource or input problem and rerun. Earlier valid

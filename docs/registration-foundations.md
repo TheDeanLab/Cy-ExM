@@ -14,9 +14,10 @@ masks use nearest-neighbor interpolation. Accepted transforms are applied to the
 registration image and each dependent channel rather than replacing those outputs
 with registration features.
 
-An optional per-moving-round [XY rotation initial alignment](initial-alignment.md)
-can seed this same affine stage before TRSAA when acquisition introduces a large
-in-plane offset. The complete persisted affine still owns the downstream contract.
+An optional per-moving-round [XY rotation or similarity initial
+alignment](initial-alignment.md) can seed this same linear stage when acquisition
+introduces a large in-plane offset or modest uniform expansion difference. The
+complete persisted affine still owns the downstream contract.
 
 ## Whole-image registration
 

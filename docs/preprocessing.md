@@ -64,9 +64,9 @@ established diagnostic postprocessing. Feature images are internal evidence, not
 public image exports.
 
 Large geometric offsets are handled separately by per-round
-[`initial_alignment.xy_rotation`](initial-alignment.md). Rotation initialization is
-resolved from raw cropped registration channels before feature construction; it is
-not an intensity-preprocessing option.
+[`initial_alignment.xy_rotation` or `initial_alignment.xy_similarity`](initial-alignment.md).
+Geometric initialization is resolved from raw cropped registration-channel MIPs
+before feature construction; it is not an intensity-preprocessing option.
 
 ## Optional feature-derived masks
 

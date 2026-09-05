@@ -23,6 +23,7 @@ PHASE_TWO_EXAMPLE_PATHS = (
     "examples/spheroid-dataset.yaml",
     "examples/explicit-rotation-dataset.yaml",
     "examples/estimated-rotation-dataset.yaml",
+    "examples/estimated-similarity-dataset.yaml",
     "examples/execution-sequential.yaml",
     "examples/execution-local-dask.yaml",
     "examples/execution-slurm-512gb.yaml",

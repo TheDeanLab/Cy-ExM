@@ -1306,6 +1306,7 @@ assert not hasattr(registration, "ParallelChunkedImageRegistration")
 assert registration.__all__ == [
     "ChunkedImageRegistration",
     "EstimatedXYRotationPolicy",
+    "EstimatedXYSimilarityPolicy",
     "ExplicitXYRotationPolicy",
     "ImageRegistration",
     "InitialAlignmentPolicy",

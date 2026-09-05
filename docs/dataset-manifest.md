@@ -39,12 +39,16 @@ nonlinear-metric normalization is CC's documented optional radius default.
 | moving `round` | nonnegative built-in integer | Round identifier used in task and output names. |
 | moving `initial_alignment` | optional exact mapping | Per-round geometric seed; omission preserves the historical workflow. |
 | `initial_alignment` / `xy_rotation` / `mode` | `explicit` or `estimate` | Selects a reviewed angle or target-blind registration-channel estimate. |
+| `initial_alignment` / `xy_similarity` / `mode` | exact `estimate` | Selects target-blind MIP rotation, XY translation, and uniform XY scale estimation; mutually exclusive with `xy_rotation`. |
 | explicit `angle_deg` | finite number in `[-180, 180]` | Physical +Z right-hand correction; positive appears clockwise in an identity-direction row-down display. |
 | estimate `search_range_deg` | two increasing finite numbers within `[-180, 180]`; default `[-45, 45]` | Inclusive physical-angle search interval. |
 | estimate `coarse_step_deg` | positive finite number; default `1.0` | Coarse search spacing in degrees. |
 | estimate `refinement_step_deg` | positive finite number smaller than coarse step; default `0.1` | Local refinement spacing in degrees. |
 | estimate `minimum_score_gain` | positive finite number; default `0.01` | Required improvement over zero for a nonzero estimate. |
 | estimate `minimum_peak_margin` | positive finite number; default `0.01` | Required separation from competing angles. |
+| similarity `scale_range` | two increasing positive finite numbers strictly enclosing `1.0`; default `[0.9, 1.1]` | Inclusive visible uniform XY magnification range; physical Z scale remains one. |
+| similarity `coarse_scale_step` | positive finite number no larger than the range span; default `0.01` | Coarse scale search spacing. |
+| similarity `refinement_scale_step` | positive finite number smaller than the coarse scale step; default `0.002` | Local scale refinement spacing. |
 | `strategy` | `whole_image` or `serial_chunked` | Selects the registration implementation. |
 | `registration_channel` | safe relative POSIX path | The moving image used to estimate transforms. The registration channel must be listed in that round's `channels`. |
 | `channels` | list with unique `file` values | Original moving channels resampled through the round transform, in manifest order. |
@@ -129,7 +133,7 @@ For the preprocessing boundary, mask behavior, and dataset-specific interpretati
 see [Registration preprocessing](preprocessing.md) and
 [Feature-derived registration masks](feature-derived-registration-masks.md).
 For geometric initialization, its physical angle convention, confidence failures,
-and restart artifacts, see [XY rotation initial alignment](initial-alignment.md).
+and restart artifacts, see [XY rotation and similarity initial alignment](initial-alignment.md).
 
 ## Nonlinear metrics and CC radius
 

@@ -142,7 +142,7 @@ def test_explicit_initial_alignment_is_persisted_and_supplied_to_linear(
         initial_alignment=policy,
     ).register()
     assert backend.linear_calls == 1
-    assert len(backend.similarity_seeds) == 1
+    assert len(backend.rotation_seeds) == 1
     affine_request = completion_request(paths.affine)
     assert affine_request.parameters["initial_alignment"] == evidence
 

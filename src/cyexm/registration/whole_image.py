@@ -220,11 +220,10 @@ class ImageRegistration:
     remain diagnostic, and the final registered output remains raw intensity data.
     YAML scalar expansion occurs before this Python API.
 
-    ``initial_alignment`` optionally resolves a physical XY rotation correction
-    from the raw cropped registration channels before feature construction. The
-    seed is supplied to the existing linear registrar and composed into the one
-    persisted complete affine; dependent channels retain the established
-    warp-plus-affine resampling path.
+    ``initial_alignment`` optionally resolves a physical XY rotation or uniform
+    similarity correction from raw cropped registration-channel MIPs before feature
+    construction. The seed is supplied once to the existing 3-D linear registrar;
+    dependent channels retain the established warp-plus-affine resampling path.
 
     Parameters
     ----------
@@ -257,10 +256,12 @@ class ImageRegistration:
     preprocess_feature_mask : FeatureMaskSpec, optional
         Physical component filtering and dilation for feature-derived masks.
     initial_alignment : InitialAlignmentPolicy, optional
-        Per-moving-image physical XY rotation policy. Positive angles follow the
-        right-hand rule about physical +Z and appear clockwise in an
-        identity-direction row-down display. Automatic confidence rejection writes
-        JSON and QC evidence, then raises before linear registration.
+        Per-moving-image physical XY rotation or uniform-similarity policy. Positive
+        angles follow the right-hand rule about physical +Z and appear clockwise in
+        an identity-direction row-down display. Similarity scale is visible uniform
+        XY magnification about the moving physical center; Z scale remains one.
+        Automatic confidence rejection writes JSON and QC evidence, then raises
+        before linear registration.
 
     Raises
     ------
@@ -1864,7 +1865,7 @@ def register_round(
     preprocess_feature_mask : FeatureMaskSpec, optional
         Optional feature-derived mask policy.
     initial_alignment : InitialAlignmentPolicy, optional
-        Physical XY rotation seed policy for this moving round.
+        Physical XY rotation or uniform-similarity seed policy for this moving round.
 
     See Also
     --------

@@ -89,21 +89,21 @@ spheroid data, and submit a fresh production workflow.
   semantics, and update shared provenance validators/readers.
 - [x] Run `test_whole_image.py`, `test_prepared.py`, fine-task, status, API, and
   rotation integration regressions GREEN.
-- [ ] Commit lifecycle and provenance changes.
+- [x] Commit lifecycle and provenance changes.
 
 ## Task 5: Synchronize documentation/examples and run portable gates
 
-- [ ] Add `examples/estimated-similarity-dataset.yaml` with portable paths and
+- [x] Add `examples/estimated-similarity-dataset.yaml` with portable paths and
   constrained settings; add it to exact-loader documentation tests.
-- [ ] Update `docs/initial-alignment.md`, `docs/dataset-manifest.md`,
+- [x] Update `docs/initial-alignment.md`, `docs/dataset-manifest.md`,
   `docs/registration-artifacts.md`, `docs/preprocessing.md`, applicable README links,
   and API docstrings. State MIP-only estimation, uniform XY scale, coordinate
   convention, confidence limits, restart authority, and the residual 3-D method.
-- [ ] Run example/documentation tests, formatting, and targeted lint/type checks.
-- [ ] Export the exact required uv cache and Python locations, then run `uv lock
+- [x] Run example/documentation tests, formatting, and targeted lint/type checks.
+- [x] Export the exact required uv cache and Python locations, then run `uv lock
   --check`, unit tests, portable integration tests, Ruff check/format,
   BasedPyright, and pre-commit.
-- [ ] Commit documentation/example synchronization and any gate-only corrections.
+- [x] Commit documentation/example synchronization and any gate-only corrections.
 
 ## Task 6: Configure and launch a fresh spheroid production run
 

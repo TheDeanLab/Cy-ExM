@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -21,6 +21,19 @@ from cyexm.spatial import ImageGeometry
 from cyexm.workflow.fine_models import FineTaskResult, FineWorkflowTask
 
 type TaskStrategy = Literal["reference-preparation", "whole_image", "serial_chunked"]
+
+
+def _initial_alignment_mapping(value: InitialAlignmentSpec) -> dict[str, object]:
+    active = value.xy_rotation if value.xy_rotation is not None else value.xy_similarity
+    if active is None:  # pragma: no cover - InitialAlignmentSpec owns this invariant
+        raise ValueError("initial alignment has no active mode")
+    key = "xy_rotation" if value.xy_rotation is not None else "xy_similarity"
+    return {
+        key: {
+            field: list(item) if isinstance(item, tuple) else item
+            for field, item in asdict(active).items()
+        }
+    }
 
 
 def canonical_json(value: object) -> str:

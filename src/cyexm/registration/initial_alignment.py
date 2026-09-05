@@ -77,17 +77,70 @@ type XYRotationPolicy = ExplicitXYRotationPolicy | EstimatedXYRotationPolicy
 
 
 @dataclass(frozen=True, slots=True)
+class EstimatedXYSimilarityPolicy:
+    """Settings for target-blind XY similarity estimation."""
+
+    search_range_deg: tuple[float, float] = (-45.0, 45.0)
+    coarse_step_deg: float = 1.0
+    refinement_step_deg: float = 0.1
+    scale_range: tuple[float, float] = (0.9, 1.1)
+    coarse_scale_step: float = 0.01
+    refinement_scale_step: float = 0.002
+    minimum_score_gain: float = 0.01
+    minimum_peak_margin: float = 0.01
+    mode: Literal["estimate"] = "estimate"
+
+    def __post_init__(self) -> None:
+        angle = EstimatedXYRotationPolicy(
+            search_range_deg=self.search_range_deg,
+            coarse_step_deg=self.coarse_step_deg,
+            refinement_step_deg=self.refinement_step_deg,
+            minimum_score_gain=self.minimum_score_gain,
+            minimum_peak_margin=self.minimum_peak_margin,
+        )
+        if type(self.scale_range) is not tuple or len(self.scale_range) != 2:
+            raise TypeError("scale_range must be a two-value tuple")
+        lower = _finite_float(self.scale_range[0], "scale_range[0]")
+        upper = _finite_float(self.scale_range[1], "scale_range[1]")
+        coarse = _finite_float(self.coarse_scale_step, "coarse_scale_step")
+        refinement = _finite_float(self.refinement_scale_step, "refinement_scale_step")
+        if not lower < 1.0 < upper:
+            raise ValueError("scale_range must be strictly increasing around 1.0")
+        if coarse <= 0.0 or refinement <= 0.0:
+            raise ValueError("scale search steps must be positive")
+        if refinement >= coarse:
+            raise ValueError(
+                "refinement_scale_step must be smaller than coarse_scale_step"
+            )
+        if coarse > upper - lower:
+            raise ValueError("coarse_scale_step must not exceed the scale range span")
+        object.__setattr__(self, "search_range_deg", angle.search_range_deg)
+        object.__setattr__(self, "coarse_step_deg", angle.coarse_step_deg)
+        object.__setattr__(self, "refinement_step_deg", angle.refinement_step_deg)
+        object.__setattr__(self, "scale_range", (lower, upper))
+        object.__setattr__(self, "coarse_scale_step", coarse)
+        object.__setattr__(self, "refinement_scale_step", refinement)
+        object.__setattr__(self, "minimum_score_gain", angle.minimum_score_gain)
+        object.__setattr__(self, "minimum_peak_margin", angle.minimum_peak_margin)
+
+
+@dataclass(frozen=True, slots=True)
 class InitialAlignmentPolicy:
     """Optional geometric initialization accepted by registration entry points."""
 
-    xy_rotation: XYRotationPolicy
+    xy_rotation: XYRotationPolicy | None = None
+    xy_similarity: EstimatedXYSimilarityPolicy | None = None
 
     def __post_init__(self) -> None:
-        if type(self.xy_rotation) not in {
+        rotation_valid = type(self.xy_rotation) in {
             ExplicitXYRotationPolicy,
             EstimatedXYRotationPolicy,
-        }:
-            raise TypeError("xy_rotation must be an explicit or estimated policy")
+        }
+        similarity_valid = type(self.xy_similarity) is EstimatedXYSimilarityPolicy
+        if rotation_valid == similarity_valid:
+            raise ValueError(
+                "initial alignment requires exactly one of xy_rotation or xy_similarity"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -871,6 +924,7 @@ __all__ = [
     "EXPLICIT_ROTATION_POLICY",
     "ROTATION_ESTIMATOR_POLICY",
     "EstimatedXYRotationPolicy",
+    "EstimatedXYSimilarityPolicy",
     "ExplicitXYRotationPolicy",
     "InitialAlignmentPolicy",
     "RotationScore",

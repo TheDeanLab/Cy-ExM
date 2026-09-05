@@ -7,6 +7,7 @@ from scipy import ndimage
 from cyexm.registration.initial_alignment import (
     ROTATION_ESTIMATOR_POLICY,
     EstimatedXYRotationPolicy,
+    EstimatedXYSimilarityPolicy,
     ExplicitXYRotationPolicy,
     InitialAlignmentPolicy,
     XYRotationEstimate,
@@ -19,6 +20,53 @@ from cyexm.registration.initial_alignment import (
 from cyexm.spatial import ImageGeometry
 
 pytestmark = pytest.mark.unit
+
+
+def test_similarity_policy_normalizes_bounded_search_settings() -> None:
+    similarity = EstimatedXYSimilarityPolicy(
+        search_range_deg=(-18, 18),
+        coarse_step_deg=2,
+        refinement_step_deg=0.25,
+        scale_range=(0.92, 1.08),
+        coarse_scale_step=0.02,
+        refinement_scale_step=0.005,
+        minimum_score_gain=0.02,
+        minimum_peak_margin=0.004,
+    )
+
+    assert similarity.search_range_deg == (-18.0, 18.0)
+    assert similarity.scale_range == (0.92, 1.08)
+    assert similarity.coarse_scale_step == 0.02
+    assert similarity.refinement_scale_step == 0.005
+    assert InitialAlignmentPolicy(xy_similarity=similarity).xy_rotation is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"scale_range": (1.0, 1.1)},
+        {"scale_range": (0.9, 1.0)},
+        {"scale_range": (1.1, 0.9)},
+        {"coarse_scale_step": 0.0},
+        {"coarse_scale_step": 0.01, "refinement_scale_step": 0.01},
+        {"scale_range": (0.99, 1.01), "coarse_scale_step": 0.03},
+    ],
+)
+def test_similarity_policy_rejects_invalid_scale_search(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        EstimatedXYSimilarityPolicy(**overrides)  # type: ignore[arg-type]
+
+
+def test_initial_alignment_policy_requires_exactly_one_mode() -> None:
+    similarity = EstimatedXYSimilarityPolicy()
+    rotation = EstimatedXYRotationPolicy()
+
+    with pytest.raises(ValueError, match="exactly one"):
+        InitialAlignmentPolicy()
+    with pytest.raises(ValueError, match="exactly one"):
+        InitialAlignmentPolicy(xy_rotation=rotation, xy_similarity=similarity)
 
 
 def _asymmetric_volume() -> np.ndarray:

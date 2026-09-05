@@ -5,7 +5,7 @@ import math
 import re
 import stat
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
@@ -48,6 +48,7 @@ from cyexm.workflow.models import (
     RoundTask,
     WorkflowStatus,
     WorkflowTask,
+    _initial_alignment_mapping,
     canonical_json,
     sha256_fingerprint,
 )
@@ -1248,14 +1249,8 @@ def _round_status(
         status = "pending"
     initial_alignment: dict[str, object] | None = None
     if round_contract.initial_alignment is not None:
-        rotation = {
-            key: list(value) if isinstance(value, tuple) else value
-            for key, value in asdict(
-                round_contract.initial_alignment.xy_rotation
-            ).items()
-        }
         initial_alignment = {
-            "configured": {"xy_rotation": rotation},
+            "configured": _initial_alignment_mapping(round_contract.initial_alignment),
             "realized": None,
         }
         evidence = (

@@ -216,6 +216,7 @@ import cyexm.registration as registration
 assert registration.__all__ == [
     "ChunkedImageRegistration",
     "EstimatedXYRotationPolicy",
+    "EstimatedXYSimilarityPolicy",
     "ExplicitXYRotationPolicy",
     "ImageRegistration",
     "InitialAlignmentPolicy",

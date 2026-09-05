@@ -5,7 +5,7 @@ import logging
 import os
 import socket
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Protocol, cast
@@ -51,6 +51,7 @@ from cyexm.workflow.models import (
     WorkflowPlan,
     WorkflowResult,
     WorkflowTask,
+    _initial_alignment_mapping,
     canonical_json,
     sha256_fingerprint,
 )
@@ -813,12 +814,7 @@ def _write_run_record(
     for task in plan.tasks:
         if task.initial_alignment is None:
             continue
-        configured = {
-            "xy_rotation": {
-                key: list(value) if isinstance(value, tuple) else value
-                for key, value in asdict(task.initial_alignment.xy_rotation).items()
-            }
-        }
+        configured = _initial_alignment_mapping(task.initial_alignment)
         evidence_path = (
             task.registration_directory / f"initial_alignment_{task.round}.json"
         )

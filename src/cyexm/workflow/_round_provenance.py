@@ -484,13 +484,9 @@ def _validated_initial_alignment_evidence(
     configured = task.initial_alignment
     if configured is None:
         return None
-    from dataclasses import asdict
+    from cyexm.workflow.models import _initial_alignment_mapping
 
-    rotation = {
-        key: list(value) if isinstance(value, tuple) else value
-        for key, value in asdict(configured.xy_rotation).items()
-    }
-    configured_mapping = {"xy_rotation": rotation}
+    configured_mapping = _initial_alignment_mapping(configured)
     from cyexm.config.models import EstimatedXYRotationSpec, ExplicitXYRotationSpec
     from cyexm.registration.initial_alignment import (
         EXPLICIT_ROTATION_POLICY,

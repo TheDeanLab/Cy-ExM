@@ -49,11 +49,14 @@ from cyexm.registration.crop import (
 from cyexm.registration.initial_alignment import (
     EXPLICIT_ROTATION_POLICY,
     ROTATION_ESTIMATOR_POLICY,
+    SIMILARITY_ESTIMATOR_POLICY,
     EstimatedXYRotationPolicy,
+    EstimatedXYSimilarityPolicy,
     ExplicitXYRotationPolicy,
     InitialAlignmentPolicy,
     XYRotationEstimate,
     estimate_xy_rotation,
+    estimate_xy_similarity,
     initial_alignment_config_parameters,
     initial_alignment_result_parameters,
     parse_initial_alignment_result,
@@ -217,11 +220,10 @@ class ImageRegistration:
     remain diagnostic, and the final registered output remains raw intensity data.
     YAML scalar expansion occurs before this Python API.
 
-    ``initial_alignment`` optionally resolves a physical XY rotation correction
-    from the raw cropped registration channels before feature construction. The
-    seed is supplied to the existing linear registrar and composed into the one
-    persisted complete affine; dependent channels retain the established
-    warp-plus-affine resampling path.
+    ``initial_alignment`` optionally resolves a physical XY rotation or uniform
+    similarity correction from raw cropped registration-channel MIPs before feature
+    construction. The seed is supplied once to the existing 3-D linear registrar;
+    dependent channels retain the established warp-plus-affine resampling path.
 
     Parameters
     ----------
@@ -254,10 +256,12 @@ class ImageRegistration:
     preprocess_feature_mask : FeatureMaskSpec, optional
         Physical component filtering and dilation for feature-derived masks.
     initial_alignment : InitialAlignmentPolicy, optional
-        Per-moving-image physical XY rotation policy. Positive angles follow the
-        right-hand rule about physical +Z and appear clockwise in an
-        identity-direction row-down display. Automatic confidence rejection writes
-        JSON and QC evidence, then raises before linear registration.
+        Per-moving-image physical XY rotation or uniform-similarity policy. Positive
+        angles follow the right-hand rule about physical +Z and appear clockwise in
+        an identity-direction row-down display. Similarity scale is visible uniform
+        XY magnification about the moving physical center; Z scale remains one.
+        Automatic confidence rejection writes JSON and QC evidence, then raises
+        before linear registration.
 
     Raises
     ------
@@ -1110,11 +1114,18 @@ class ImageRegistration:
             return None
         configured = initial_alignment_config_parameters(policy)
         rotation = policy.xy_rotation
-        algorithm = (
-            EXPLICIT_ROTATION_POLICY
-            if type(rotation) is ExplicitXYRotationPolicy
-            else ROTATION_ESTIMATOR_POLICY
-        )
+        similarity = policy.xy_similarity
+        if type(rotation) is ExplicitXYRotationPolicy:
+            algorithm = EXPLICIT_ROTATION_POLICY
+            method = "xy-rotation"
+        elif type(rotation) is EstimatedXYRotationPolicy:
+            algorithm = ROTATION_ESTIMATOR_POLICY
+            method = "xy-rotation"
+        elif type(similarity) is EstimatedXYSimilarityPolicy:
+            algorithm = SIMILARITY_ESTIMATOR_POLICY
+            method = "xy-similarity"
+        else:  # pragma: no cover - InitialAlignmentPolicy owns this invariant
+            raise TypeError("unsupported initial alignment policy")
         source = (
             "explicit" if type(rotation) is ExplicitXYRotationPolicy else "estimated"
         )
@@ -1177,7 +1188,7 @@ class ImageRegistration:
             fixed,
             resolved,
             stage="initial-alignment:evidence",
-            method="xy-rotation",
+            method=method,
             accuracy="deterministic",
             upstream=None,
             parameters={
@@ -1236,6 +1247,14 @@ class ImageRegistration:
                     fixed_geometry=fixed_geometry,
                     moving_geometry=moving_geometry,
                 )
+            elif type(similarity) is EstimatedXYSimilarityPolicy:
+                result = estimate_xy_similarity(
+                    backend.to_array(fixed),
+                    backend.to_array(moving),
+                    similarity,
+                    fixed_geometry=fixed_geometry,
+                    moving_geometry=moving_geometry,
+                )
             else:  # pragma: no cover - protected by InitialAlignmentPolicy
                 raise TypeError("unsupported initial alignment policy")
             evidence = {
@@ -1260,7 +1279,7 @@ class ImageRegistration:
             fixed,
             resolved,
             stage="initial-alignment:qc",
-            method="xy-rotation-montage",
+            method=f"{method}-montage",
             accuracy="deterministic",
             upstream=evidence_identity,
             parameters=evidence,
@@ -1308,7 +1327,7 @@ class ImageRegistration:
             moving,
             resolved,
             stage="initial-alignment:transform",
-            method="xy-rotation",
+            method=method,
             accuracy="exact",
             upstream=evidence_identity,
             parameters=evidence,
@@ -1321,12 +1340,23 @@ class ImageRegistration:
             )
             if cached is not None:
                 return paths.initial_alignment_transform
-        transform = backend.create_xy_rotation_seed(
-            fixed_geometry=fixed_geometry,
-            geometry=moving_geometry,
-            angle_deg=result.angle_deg,
-            translation_yx_px=result.translation_yx_px or (0.0, 0.0),
-        )
+        if type(similarity) is EstimatedXYSimilarityPolicy:
+            if getattr(result, "scale", None) is None:
+                raise RegistrationStageError("accepted XY similarity has no scale")
+            transform = backend.create_xy_similarity_seed(
+                fixed_geometry=fixed_geometry,
+                geometry=moving_geometry,
+                angle_deg=result.angle_deg,
+                scale=result.scale,  # type: ignore[union-attr]
+                translation_yx_px=result.translation_yx_px or (0.0, 0.0),
+            )
+        else:
+            transform = backend.create_xy_rotation_seed(
+                fixed_geometry=fixed_geometry,
+                geometry=moving_geometry,
+                angle_deg=result.angle_deg,
+                translation_yx_px=result.translation_yx_px or (0.0, 0.0),
+            )
         self._commit_artifact(
             paths.initial_alignment_transform,
             transform_request,
@@ -1835,7 +1865,7 @@ def register_round(
     preprocess_feature_mask : FeatureMaskSpec, optional
         Optional feature-derived mask policy.
     initial_alignment : InitialAlignmentPolicy, optional
-        Physical XY rotation seed policy for this moving round.
+        Physical XY rotation or uniform-similarity seed policy for this moving round.
 
     See Also
     --------

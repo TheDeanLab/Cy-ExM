@@ -278,6 +278,9 @@ class FakeBackend:
     rotation_seeds: list[tuple[ImageGeometry, float, tuple[float, float]]] = field(
         default_factory=list
     )
+    similarity_seeds: list[tuple[ImageGeometry, float, float, tuple[float, float]]] = (
+        field(default_factory=list)
+    )
     temporary_warps: list[Path] = field(default_factory=list)
     nonlinear_candidates: list[FakeImage] = field(default_factory=list)
     _test_directory: Path | None = None
@@ -415,6 +418,19 @@ class FakeBackend:
         self.rotation_seeds.append((geometry, angle_deg, translation_yx_px))
         assert type(fixed_geometry) is ImageGeometry
         return b"affine-seed"
+
+    def create_xy_similarity_seed(
+        self,
+        *,
+        fixed_geometry: ImageGeometry,
+        geometry: ImageGeometry,
+        angle_deg: float,
+        scale: float,
+        translation_yx_px: tuple[float, float],
+    ) -> object:
+        self.similarity_seeds.append((geometry, angle_deg, scale, translation_yx_px))
+        assert type(fixed_geometry) is ImageGeometry
+        return b"affine-similarity-seed"
 
     def compose_affines(self, transforms: tuple[object, ...]) -> object:
         return b"affine-composed:" + b":".join(

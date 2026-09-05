@@ -165,9 +165,14 @@ def _initial_alignment(task: RoundTask) -> object | None:
     configured = task.initial_alignment
     if configured is None:
         return None
-    from cyexm.config.models import EstimatedXYRotationSpec, ExplicitXYRotationSpec
+    from cyexm.config.models import (
+        EstimatedXYRotationSpec,
+        EstimatedXYSimilaritySpec,
+        ExplicitXYRotationSpec,
+    )
     from cyexm.registration.initial_alignment import (
         EstimatedXYRotationPolicy,
+        EstimatedXYSimilarityPolicy,
         ExplicitXYRotationPolicy,
         InitialAlignmentPolicy,
     )
@@ -175,6 +180,7 @@ def _initial_alignment(task: RoundTask) -> object | None:
     rotation = configured.xy_rotation
     if type(rotation) is ExplicitXYRotationSpec:
         runtime = ExplicitXYRotationPolicy(angle_deg=rotation.angle_deg)
+        return InitialAlignmentPolicy(xy_rotation=runtime)
     elif type(rotation) is EstimatedXYRotationSpec:
         runtime = EstimatedXYRotationPolicy(
             search_range_deg=rotation.search_range_deg,
@@ -183,9 +189,23 @@ def _initial_alignment(task: RoundTask) -> object | None:
             minimum_score_gain=rotation.minimum_score_gain,
             minimum_peak_margin=rotation.minimum_peak_margin,
         )
+        return InitialAlignmentPolicy(xy_rotation=runtime)
+    similarity = configured.xy_similarity
+    if type(similarity) is EstimatedXYSimilaritySpec:
+        return InitialAlignmentPolicy(
+            xy_similarity=EstimatedXYSimilarityPolicy(
+                search_range_deg=similarity.search_range_deg,
+                coarse_step_deg=similarity.coarse_step_deg,
+                refinement_step_deg=similarity.refinement_step_deg,
+                scale_range=similarity.scale_range,
+                coarse_scale_step=similarity.coarse_scale_step,
+                refinement_scale_step=similarity.refinement_scale_step,
+                minimum_score_gain=similarity.minimum_score_gain,
+                minimum_peak_margin=similarity.minimum_peak_margin,
+            )
+        )
     else:  # pragma: no cover - parser and RoundTask type protect this boundary
         raise TypeError("unsupported initial alignment configuration")
-    return InitialAlignmentPolicy(runtime)
 
 
 def _reused_artifacts(

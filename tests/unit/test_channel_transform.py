@@ -935,6 +935,7 @@ def test_registration_namespace_exports_the_accepted_channel_operation() -> None
     assert registration_namespace.__all__ == [
         "ChunkedImageRegistration",
         "EstimatedXYRotationPolicy",
+        "EstimatedXYSimilarityPolicy",
         "ExplicitXYRotationPolicy",
         "ImageRegistration",
         "InitialAlignmentPolicy",

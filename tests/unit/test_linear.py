@@ -124,7 +124,7 @@ def test_linear_trsaa_preserves_established_registration_parameters(
     assert "shrink_factors" not in calls.registration
 
 
-def test_linear_prepends_initial_transform_and_returns_complete_affine(
+def test_linear_uses_ants_complete_forward_transform_without_reapplying_seed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -133,18 +133,11 @@ def test_linear_prepends_initial_transform_and_returns_complete_affine(
     residual_path = tmp_path / "residual.mat"
     seed_path.write_bytes(b"seed")
     residual_path.write_bytes(b"residual")
-    calls.forward_transforms = [residual_path, seed_path]
-    residual = object()
-    seed = object()
+    calls.forward_transforms = [residual_path]
     complete = fake_image()
     fake_ants, _ = linear._scientific_runtime()
-    monkeypatch.setattr(
-        fake_ants,
-        "read_transform",
-        lambda filename: residual if filename == str(residual_path) else seed,
-    )
-    compose = Mock(return_value=complete)
-    monkeypatch.setattr(linear, "compose_affine_transforms", compose)
+    read_transform = Mock(return_value=complete)
+    monkeypatch.setattr(fake_ants, "read_transform", read_transform)
 
     transformed, _, transform = register_image(
         moving_image=fake_image(),
@@ -153,7 +146,7 @@ def test_linear_prepends_initial_transform_and_returns_complete_affine(
     )
 
     assert calls.registration["initial_transform"] == [str(seed_path)]
-    compose.assert_called_once_with((residual, seed), native_threads=None)
+    read_transform.assert_called_once_with(filename=str(residual_path))
     assert transform is complete
     assert transformed is not complete
 

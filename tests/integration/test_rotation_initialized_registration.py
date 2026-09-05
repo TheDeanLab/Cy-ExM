@@ -12,6 +12,7 @@ from cyexm.config.models import (
     ChannelSpec,
     DatasetManifest,
     EstimatedXYRotationSpec,
+    EstimatedXYSimilaritySpec,
     ExecutionPaths,
     ExecutionProfile,
     ExplicitXYRotationSpec,
@@ -62,6 +63,7 @@ def _images(root: Path) -> None:
         ("explicit", "whole_image", "coarse"),
         ("estimate", "whole_image", "coarse"),
         ("explicit", "serial_chunked", "fine_grained"),
+        ("similarity", "serial_chunked", "fine_grained"),
     ],
 )
 def test_rotation_initialized_workflow_completes_with_authoritative_status(
@@ -75,7 +77,7 @@ def test_rotation_initialized_workflow_completes_with_authoritative_status(
     _images(data)
     if mode == "explicit":
         rotation = ExplicitXYRotationSpec(mode="explicit", angle_deg=15.0)
-    else:
+    elif mode == "estimate":
         rotation = EstimatedXYRotationSpec(
             mode="estimate",
             search_range_deg=(-25.0, 25.0),
@@ -83,6 +85,18 @@ def test_rotation_initialized_workflow_completes_with_authoritative_status(
             refinement_step_deg=1.0,
             minimum_score_gain=0.001,
             minimum_peak_margin=0.001,
+        )
+    else:
+        similarity = EstimatedXYSimilaritySpec(
+            mode="estimate",
+            search_range_deg=(-25.0, 25.0),
+            coarse_step_deg=5.0,
+            refinement_step_deg=1.0,
+            scale_range=(0.9, 1.1),
+            coarse_scale_step=0.05,
+            refinement_scale_step=0.01,
+            minimum_score_gain=0.001,
+            minimum_peak_margin=0.0001,
         )
     manifest = DatasetManifest(
         schema_version=1,
@@ -95,7 +109,10 @@ def test_rotation_initialized_workflow_completes_with_authoritative_status(
         ),
         registration=RegistrationSpec(
             crop=False,
-            linear=RegistrationStageSpec(type="TRSAA", accuracy="dry run"),
+            linear=RegistrationStageSpec(
+                type="Similarity" if mode == "similarity" else "TRSAA",
+                accuracy="dry run",
+            ),
             nonlinear=NonlinearRegistrationStageSpec(
                 type="SyNOnly",
                 accuracy="dry run",
@@ -112,7 +129,11 @@ def test_rotation_initialized_workflow_completes_with_authoritative_status(
                     ChannelSpec(PurePosixPath("r1.tif"), "linear"),
                     ChannelSpec(PurePosixPath("target.tif"), "linear"),
                 ),
-                initial_alignment=InitialAlignmentSpec(rotation),
+                initial_alignment=(
+                    InitialAlignmentSpec(xy_similarity=similarity)
+                    if mode == "similarity"
+                    else InitialAlignmentSpec(rotation)
+                ),
                 chunk_size_zyx=(8, 48, 48) if strategy == "serial_chunked" else None,
                 overlap_fraction=0.25 if strategy == "serial_chunked" else None,
             ),
@@ -145,6 +166,8 @@ def test_rotation_initialized_workflow_completes_with_authoritative_status(
         "explicit" if mode == "explicit" else "estimated"
     )
     assert evidence["realized"]["angle_deg"] == pytest.approx(15.0, abs=1.0)
+    if mode == "similarity":
+        assert evidence["realized"]["scale"] == pytest.approx(1.0, abs=0.02)
     moving_status = next(item for item in status.rounds if item.round == 1)
     assert moving_status.initial_alignment == {
         "configured": evidence["configured"],

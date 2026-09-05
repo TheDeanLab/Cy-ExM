@@ -5,7 +5,7 @@ import math
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from cyexm._nonlinear_metric import MATTES_BINS
@@ -43,6 +43,7 @@ from cyexm.workflow.models import (
     ReferenceTask,
     RoundTask,
     WorkflowPlan,
+    _initial_alignment_mapping,
     canonical_json,
     sha256_fingerprint,
 )
@@ -770,16 +771,9 @@ def _scientific_mapping(
                     {}
                     if round_spec.initial_alignment is None
                     else {
-                        "initial_alignment": {
-                            "xy_rotation": {
-                                field: (
-                                    list(value) if isinstance(value, tuple) else value
-                                )
-                                for field, value in asdict(
-                                    round_spec.initial_alignment.xy_rotation
-                                ).items()
-                            }
-                        }
+                        "initial_alignment": _initial_alignment_mapping(
+                            round_spec.initial_alignment
+                        )
                     }
                 ),
             }

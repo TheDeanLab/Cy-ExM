@@ -1,0 +1,34 @@
+schema_version: 1
+dataset_id: estimated-similarity-example
+voxel_spacing_um: {x: 0.324, y: 0.324, z: 0.900}
+reference:
+  round: 2
+  registration_channel: round_2_488_registration.tif
+  channels:
+    - {file: round_2_488_registration.tif}
+registration:
+  crop: false
+  # The 3-D residual stage refines the same translation, rotation, and uniform
+  # scale degrees of freedom after the inexpensive target-blind MIP seed.
+  linear: {type: Similarity, accuracy: high}
+  nonlinear: {type: SyNOnly, accuracy: high, metric: mattes}
+rounds:
+  - round: 1
+    strategy: serial_chunked
+    registration_channel: round_1_488_registration.tif
+    initial_alignment:
+      xy_similarity:
+        mode: estimate
+        search_range_deg: [-18, 18]
+        coarse_step_deg: 1
+        refinement_step_deg: 0.1
+        scale_range: [0.90, 1.10]
+        coarse_scale_step: 0.01
+        refinement_scale_step: 0.002
+        minimum_score_gain: 0.01
+        minimum_peak_margin: 0.01
+    chunk_size_zyx: [32, 512, 512]
+    overlap_fraction: 0.25
+    channels:
+      - {file: round_1_488_registration.tif, interpolation: linear}
+      - {file: round_1_647_target.tif, interpolation: linear}

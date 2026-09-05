@@ -112,6 +112,7 @@ def test_config_namespace_exports_the_scientific_and_execution_api() -> None:
         "ChannelSpec",
         "DatasetManifest",
         "EstimatedXYRotationSpec",
+        "EstimatedXYSimilaritySpec",
         "ExecutionPaths",
         "ExecutionProfile",
         "ExplicitXYRotationSpec",
@@ -208,6 +209,114 @@ def test_estimated_xy_rotation_normalizes_overrides_and_round_trips(
         minimum_peak_margin=0.03,
     )
     _validate_dataset_manifest(manifest)
+
+
+def test_estimated_xy_similarity_normalizes_defaults(tmp_path: Path) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 0))["initial_alignment"] = {
+        "xy_similarity": {"mode": "estimate"}
+    }
+
+    manifest = _load_data(tmp_path, data)
+
+    assert manifest.rounds[0].initial_alignment == config.InitialAlignmentSpec(
+        xy_similarity=config.EstimatedXYSimilaritySpec(
+            mode="estimate",
+            search_range_deg=(-45.0, 45.0),
+            coarse_step_deg=1.0,
+            refinement_step_deg=0.1,
+            scale_range=(0.9, 1.1),
+            coarse_scale_step=0.01,
+            refinement_scale_step=0.002,
+            minimum_score_gain=0.01,
+            minimum_peak_margin=0.01,
+        )
+    )
+
+
+def test_estimated_xy_similarity_normalizes_overrides_and_round_trips(
+    tmp_path: Path,
+) -> None:
+    from cyexm.config.dataset import _validate_dataset_manifest
+
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 1))["initial_alignment"] = {
+        "xy_similarity": {
+            "mode": "estimate",
+            "search_range_deg": [-18, 18],
+            "coarse_step_deg": 2,
+            "refinement_step_deg": 0.25,
+            "scale_range": [0.92, 1.08],
+            "coarse_scale_step": 0.02,
+            "refinement_scale_step": 0.005,
+            "minimum_score_gain": 0.02,
+            "minimum_peak_margin": 0.004,
+        }
+    }
+
+    manifest = _load_data(tmp_path, data)
+    alignment = manifest.rounds[1].initial_alignment
+
+    assert alignment is not None
+    assert alignment.xy_rotation is None
+    assert alignment.xy_similarity == config.EstimatedXYSimilaritySpec(
+        mode="estimate",
+        search_range_deg=(-18.0, 18.0),
+        coarse_step_deg=2.0,
+        refinement_step_deg=0.25,
+        scale_range=(0.92, 1.08),
+        coarse_scale_step=0.02,
+        refinement_scale_step=0.005,
+        minimum_score_gain=0.02,
+        minimum_peak_margin=0.004,
+    )
+    _validate_dataset_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    "xy_similarity",
+    [
+        {"mode": "explicit"},
+        {"mode": "estimate", "scale_range": [1.0, 1.1]},
+        {"mode": "estimate", "scale_range": [0.9, 1.0]},
+        {"mode": "estimate", "scale_range": [1.1, 0.9]},
+        {"mode": "estimate", "scale_range": [0.9, True]},
+        {"mode": "estimate", "coarse_scale_step": 0},
+        {
+            "mode": "estimate",
+            "coarse_scale_step": 0.01,
+            "refinement_scale_step": 0.01,
+        },
+        {
+            "mode": "estimate",
+            "scale_range": [0.99, 1.01],
+            "coarse_scale_step": 0.03,
+        },
+        {"mode": "estimate", "angle_deg": 5},
+    ],
+)
+def test_initial_alignment_rejects_invalid_xy_similarity(
+    tmp_path: Path,
+    xy_similarity: dict[str, object],
+) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 0))["initial_alignment"] = {
+        "xy_similarity": xy_similarity
+    }
+
+    with pytest.raises(ConfigurationValidationError, match="initial_alignment"):
+        _load_data(tmp_path, data)
+
+
+def test_initial_alignment_requires_exactly_one_geometric_mode(tmp_path: Path) -> None:
+    data = _valid_data()
+    _mapping_at(data, ("rounds", 0))["initial_alignment"] = {
+        "xy_rotation": {"mode": "explicit", "angle_deg": 5},
+        "xy_similarity": {"mode": "estimate"},
+    }
+
+    with pytest.raises(ConfigurationValidationError, match="keys must be exactly"):
+        _load_data(tmp_path, data)
 
 
 @pytest.mark.parametrize(

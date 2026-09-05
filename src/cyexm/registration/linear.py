@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from cyexm.io.images import external_to_ants_array
-from cyexm.registration.transforms import compose_affine_transforms
 from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
 logger = logging.getLogger(__name__)
@@ -131,19 +130,14 @@ def register_image(
         kwargs["outprefix"] = str(workspace / "ants-")
         registered = ants.registration(**kwargs)
         forward_paths = [Path(value) for value in registered["fwdtransforms"]]
-        transform: Any
-        if initial_transform is None:
-            transform = ants.read_transform(filename=str(forward_paths[0]))
-        else:
-            seed_path = Path(initial_transform)
-            if all(path.resolve() != seed_path.resolve() for path in forward_paths):
-                forward_paths.append(seed_path)
-            transform = compose_affine_transforms(
-                tuple(
-                    ants.read_transform(filename=str(path)) for path in forward_paths
-                ),
-                native_threads=native_threads,
+        if len(forward_paths) != 1:
+            raise RuntimeError(
+                "linear registration must return exactly one complete affine; "
+                f"got {len(forward_paths)} forward transforms"
             )
+        # ANTSpyX folds any supplied initial transform into this returned affine.
+        # Appending the seed would therefore apply the initialization twice.
+        transform = ants.read_transform(filename=str(forward_paths[0]))
         transformed_image = transform.apply_to_image(
             image=moving_image,
             reference=fixed_image,

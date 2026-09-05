@@ -19,6 +19,7 @@ from cyexm.config.models import (
     ChunkSizeZYX,
     DatasetManifest,
     EstimatedXYRotationSpec,
+    EstimatedXYSimilaritySpec,
     ExplicitXYRotationSpec,
     FeatureMaskSpec,
     InitialAlignmentSpec,
@@ -66,7 +67,7 @@ _SERIAL_CHUNKED_ROUND_KEYS = _WHOLE_IMAGE_ROUND_KEYS | frozenset(
     {"chunk_size_zyx", "overlap_fraction"}
 )
 _CHANNEL_KEYS = frozenset({"file", "interpolation"})
-_INITIAL_ALIGNMENT_KEYS = frozenset({"xy_rotation"})
+_INITIAL_ALIGNMENT_KEYS = frozenset({"xy_rotation", "xy_similarity"})
 _EXPLICIT_XY_ROTATION_KEYS = frozenset({"mode", "angle_deg"})
 _ESTIMATED_XY_ROTATION_KEYS = frozenset(
     {
@@ -77,6 +78,9 @@ _ESTIMATED_XY_ROTATION_KEYS = frozenset(
         "minimum_score_gain",
         "minimum_peak_margin",
     }
+)
+_ESTIMATED_XY_SIMILARITY_KEYS = _ESTIMATED_XY_ROTATION_KEYS | frozenset(
+    {"scale_range", "coarse_scale_step", "refinement_scale_step"}
 )
 _DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -422,13 +426,94 @@ def _xy_rotation(value: object, yaml_path: str) -> object:
     )
 
 
-def _initial_alignment(value: object, yaml_path: str) -> InitialAlignmentSpec:
-    mapping = require_exact_keys(value, _INITIAL_ALIGNMENT_KEYS, yaml_path)
-    return InitialAlignmentSpec(
-        xy_rotation=cast(
-            ExplicitXYRotationSpec | EstimatedXYRotationSpec,
-            _xy_rotation(mapping["xy_rotation"], f"{yaml_path}.xy_rotation"),
+def _xy_similarity(value: object, yaml_path: str) -> EstimatedXYSimilaritySpec:
+    if not isinstance(value, Mapping):
+        raise ConfigurationValidationError(
+            f"{yaml_path} must be a mapping; got {value!r}"
         )
+    actual = frozenset(value)
+    if not all(isinstance(key, str) for key in value) or not actual.issubset(
+        _ESTIMATED_XY_SIMILARITY_KEYS
+    ):
+        raise ConfigurationValidationError(
+            f"{yaml_path} keys must be exactly a subset of "
+            f"{sorted(_ESTIMATED_XY_SIMILARITY_KEYS)!r}; got {sorted(actual)!r}"
+        )
+    if value.get("mode") != "estimate":
+        raise ConfigurationValidationError(
+            f"{yaml_path}.mode must be 'estimate'; got {value.get('mode')!r}"
+        )
+    angle_value = {
+        key: item for key, item in value.items() if key in _ESTIMATED_XY_ROTATION_KEYS
+    }
+    angle = _xy_rotation(angle_value, yaml_path)
+    assert isinstance(angle, EstimatedXYRotationSpec)
+    raw_scale_range = value.get("scale_range", [0.9, 1.1])
+    scale_values = _list(raw_scale_range, f"{yaml_path}.scale_range")
+    if len(scale_values) != 2:
+        raise ConfigurationValidationError(
+            f"{yaml_path}.scale_range must contain exactly two values; "
+            f"got {raw_scale_range!r}"
+        )
+    lower = finite_positive_float(scale_values[0], f"{yaml_path}.scale_range[0]")
+    upper = finite_positive_float(scale_values[1], f"{yaml_path}.scale_range[1]")
+    if not lower < 1.0 < upper:
+        raise ConfigurationValidationError(
+            f"{yaml_path}.scale_range must be strictly increasing around 1.0; "
+            f"got {raw_scale_range!r}"
+        )
+    coarse = finite_positive_float(
+        value.get("coarse_scale_step", 0.01), f"{yaml_path}.coarse_scale_step"
+    )
+    refinement = finite_positive_float(
+        value.get("refinement_scale_step", 0.002),
+        f"{yaml_path}.refinement_scale_step",
+    )
+    if refinement >= coarse:
+        raise ConfigurationValidationError(
+            f"{yaml_path}.refinement_scale_step must be smaller than "
+            f"coarse_scale_step; got {refinement!r} >= {coarse!r}"
+        )
+    if coarse > upper - lower:
+        raise ConfigurationValidationError(
+            f"{yaml_path}.coarse_scale_step must not exceed the scale range span; "
+            f"got {coarse!r}"
+        )
+    return EstimatedXYSimilaritySpec(
+        mode="estimate",
+        search_range_deg=angle.search_range_deg,
+        coarse_step_deg=angle.coarse_step_deg,
+        refinement_step_deg=angle.refinement_step_deg,
+        scale_range=(lower, upper),
+        coarse_scale_step=coarse,
+        refinement_scale_step=refinement,
+        minimum_score_gain=angle.minimum_score_gain,
+        minimum_peak_margin=angle.minimum_peak_margin,
+    )
+
+
+def _initial_alignment(value: object, yaml_path: str) -> InitialAlignmentSpec:
+    if not isinstance(value, Mapping) or len(value) != 1:
+        actual = set(value) if isinstance(value, Mapping) else value
+        raise ConfigurationValidationError(
+            f"{yaml_path} keys must be exactly one of "
+            f"{sorted(_INITIAL_ALIGNMENT_KEYS)!r}; got {actual!r}"
+        )
+    key = next(iter(value))
+    if key == "xy_rotation":
+        return InitialAlignmentSpec(
+            xy_rotation=cast(
+                ExplicitXYRotationSpec | EstimatedXYRotationSpec,
+                _xy_rotation(value[key], f"{yaml_path}.xy_rotation"),
+            )
+        )
+    if key == "xy_similarity":
+        return InitialAlignmentSpec(
+            xy_similarity=_xy_similarity(value[key], f"{yaml_path}.xy_similarity")
+        )
+    raise ConfigurationValidationError(
+        f"{yaml_path} keys must be exactly one of "
+        f"{sorted(_INITIAL_ALIGNMENT_KEYS)!r}; got {[key]!r}"
     )
 
 
@@ -760,7 +845,13 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
                     f"InitialAlignmentSpec or null; got {initial_alignment!r}"
                 )
             rotation = initial_alignment.xy_rotation
+            similarity = initial_alignment.xy_similarity
+            rotation_mapping: dict[str, object] | None
             if type(rotation) is ExplicitXYRotationSpec:
+                if similarity is not None:
+                    raise ConfigurationValidationError(
+                        f"{round_path}.initial_alignment must select exactly one mode"
+                    )
                 if type(rotation.mode) is not str or rotation.mode != "explicit":
                     raise ConfigurationValidationError(
                         f"{round_path}.initial_alignment.xy_rotation.mode must be "
@@ -771,11 +862,15 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
                         f"{round_path}.initial_alignment.xy_rotation.angle_deg must "
                         f"be a built-in float; got {rotation.angle_deg!r}"
                     )
-                rotation_mapping: dict[str, object] = {
+                rotation_mapping = {
                     "mode": rotation.mode,
                     "angle_deg": rotation.angle_deg,
                 }
             elif type(rotation) is EstimatedXYRotationSpec:
+                if similarity is not None:
+                    raise ConfigurationValidationError(
+                        f"{round_path}.initial_alignment must select exactly one mode"
+                    )
                 if type(rotation.mode) is not str or rotation.mode != "estimate":
                     raise ConfigurationValidationError(
                         f"{round_path}.initial_alignment.xy_rotation.mode must be "
@@ -789,12 +884,29 @@ def _validate_dataset_manifest(manifest: DatasetManifest) -> None:
                     "minimum_score_gain": rotation.minimum_score_gain,
                     "minimum_peak_margin": rotation.minimum_peak_margin,
                 }
+            elif type(similarity) is EstimatedXYSimilaritySpec and rotation is None:
+                similarity_mapping: dict[str, object] = {
+                    "mode": similarity.mode,
+                    "search_range_deg": list(similarity.search_range_deg),
+                    "coarse_step_deg": similarity.coarse_step_deg,
+                    "refinement_step_deg": similarity.refinement_step_deg,
+                    "scale_range": list(similarity.scale_range),
+                    "coarse_scale_step": similarity.coarse_scale_step,
+                    "refinement_scale_step": similarity.refinement_scale_step,
+                    "minimum_score_gain": similarity.minimum_score_gain,
+                    "minimum_peak_margin": similarity.minimum_peak_margin,
+                }
+                round_mapping["initial_alignment"] = {
+                    "xy_similarity": similarity_mapping
+                }
+                rotation_mapping = None
             else:
                 raise ConfigurationValidationError(
-                    f"{round_path}.initial_alignment.xy_rotation has an unsupported "
-                    f"type; got {rotation!r}"
+                    f"{round_path}.initial_alignment has an unsupported mode; "
+                    f"got rotation={rotation!r}, similarity={similarity!r}"
                 )
-            round_mapping["initial_alignment"] = {"xy_rotation": rotation_mapping}
+            if rotation_mapping is not None:
+                round_mapping["initial_alignment"] = {"xy_rotation": rotation_mapping}
         if round_spec.strategy == "serial_chunked":
             chunk_size = round_spec.chunk_size_zyx
             if type(chunk_size) is not tuple or len(chunk_size) != 3:

@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from cyexm.registration.chunked import ChunkedImageRegistration
     from cyexm.registration.initial_alignment import (
         EstimatedXYRotationPolicy,
+        EstimatedXYSimilarityPolicy,
         ExplicitXYRotationPolicy,
         InitialAlignmentPolicy,
     )
@@ -30,6 +31,7 @@ def __getattr__(name: str) -> object:
         value = getattr(whole_image, name)
     elif name in {
         "EstimatedXYRotationPolicy",
+        "EstimatedXYSimilarityPolicy",
         "ExplicitXYRotationPolicy",
         "InitialAlignmentPolicy",
     }:
@@ -49,6 +51,7 @@ def __dir__() -> list[str]:
 __all__ = [
     "ChunkedImageRegistration",
     "EstimatedXYRotationPolicy",
+    "EstimatedXYSimilarityPolicy",
     "ExplicitXYRotationPolicy",
     "ImageRegistration",
     "InitialAlignmentPolicy",

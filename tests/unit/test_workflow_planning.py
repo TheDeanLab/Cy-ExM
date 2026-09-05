@@ -1097,6 +1097,54 @@ def test_initial_alignment_is_scientific_and_adds_planned_artifacts(
     } <= names
 
 
+def test_similarity_initial_alignment_is_canonical_scientific_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cyexm.config import EstimatedXYSimilaritySpec
+
+    base = _manifest(round_order=(2,))
+    similarity = InitialAlignmentSpec(
+        xy_similarity=EstimatedXYSimilaritySpec(
+            mode="estimate",
+            search_range_deg=(-18.0, 18.0),
+            coarse_step_deg=2.0,
+            refinement_step_deg=0.25,
+            scale_range=(0.92, 1.08),
+            coarse_scale_step=0.02,
+            refinement_scale_step=0.005,
+            minimum_score_gain=0.02,
+            minimum_peak_margin=0.004,
+        )
+    )
+    manifest = replace(
+        base,
+        rounds=(replace(base.rounds[0], initial_alignment=similarity),),
+    )
+    execution = _execution(tmp_path)
+    _create_manifest_inputs(execution.paths.dataset_root, manifest)
+    monkeypatch.setattr(
+        "cyexm.workflow.planning._inspect_tiff_header",
+        lambda path: _header(path),
+    )
+
+    scientific = json.loads(build_workflow_plan(manifest, execution).scientific_json)
+
+    assert scientific["rounds"][0]["initial_alignment"] == {
+        "xy_similarity": {
+            "mode": "estimate",
+            "search_range_deg": [-18.0, 18.0],
+            "coarse_step_deg": 2.0,
+            "refinement_step_deg": 0.25,
+            "scale_range": [0.92, 1.08],
+            "coarse_scale_step": 0.02,
+            "refinement_scale_step": 0.005,
+            "minimum_score_gain": 0.02,
+            "minimum_peak_margin": 0.004,
+        }
+    }
+
+
 def test_preprocessing_is_optional_canonical_scientific_identity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

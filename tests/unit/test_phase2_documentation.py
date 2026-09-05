@@ -13,6 +13,7 @@ EXAMPLE_PATHS = (
     "examples/spheroid-dataset.yaml",
     "examples/explicit-rotation-dataset.yaml",
     "examples/estimated-rotation-dataset.yaml",
+    "examples/estimated-similarity-dataset.yaml",
     "examples/execution-sequential.yaml",
     "examples/execution-local-dask.yaml",
     "examples/execution-slurm-512gb.yaml",
@@ -41,6 +42,10 @@ def test_initial_alignment_guide_and_examples_cover_the_public_contract() -> Non
         "refinement_step_deg",
         "minimum_score_gain",
         "minimum_peak_margin",
+        "xy_similarity",
+        "scale_range",
+        "coarse_scale_step",
+        "refinement_scale_step",
     ):
         assert key in manifest
 
@@ -49,6 +54,7 @@ def test_initial_alignment_guide_and_examples_cover_the_public_contract() -> Non
     for name in (
         "explicit-rotation-dataset.yaml",
         "estimated-rotation-dataset.yaml",
+        "estimated-similarity-dataset.yaml",
     ):
         parsed = load_dataset_manifest(REPOSITORY_ROOT / "examples" / name)
         assert parsed.reference.round == 2

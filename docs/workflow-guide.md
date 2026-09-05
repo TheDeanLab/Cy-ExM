@@ -28,6 +28,7 @@ Use these version-1 YAML files as editable starting points:
 - [Preprocessed spheroid scientific manifest](../examples/preprocessed-spheroid-dataset.yaml)
 - [Explicit XY-rotation scientific manifest](../examples/explicit-rotation-dataset.yaml)
 - [Estimated XY-rotation scientific manifest](../examples/estimated-rotation-dataset.yaml)
+- [Estimated XY-similarity scientific manifest](../examples/estimated-similarity-dataset.yaml)
 - [Sequential execution profile](../examples/execution-sequential.yaml)
 - [Local-Dask execution profile](../examples/execution-local-dask.yaml)
 - [Editable 512-GB SLURM profile](../examples/execution-slurm-512gb.yaml)

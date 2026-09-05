@@ -6,6 +6,7 @@ from cyexm.io.images import ants_to_external_array, external_to_ants_array
 from cyexm.registration.transforms import (
     compose_affine_transforms,
     create_xy_rotation_transform,
+    create_xy_similarity_transform,
 )
 from cyexm.spatial import ImageGeometry
 
@@ -75,3 +76,41 @@ def test_real_ants_flattened_affine_matches_sequential_points() -> None:
     sequential = scale.apply_to_point(translation.apply_to_point(point))
 
     assert complete.apply_to_point(point) == pytest.approx(sequential, abs=1e-6)
+
+
+def test_real_ants_similarity_seed_scales_about_physical_moving_center() -> None:
+    import ants
+
+    moving_zyx = np.zeros((3, 15, 15), dtype=np.float32)
+    moving_zyx[1, 7, 9] = 1.0
+    direction = np.asarray(
+        ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+    moving = ants.from_numpy(
+        external_to_ants_array(moving_zyx),
+        origin=(11.0, -7.0, 3.0),
+        spacing=(0.5, 0.75, 1.2),
+        direction=direction,
+    )
+    geometry = ImageGeometry(
+        shape=moving_zyx.shape,
+        origin=(11.0, -7.0, 3.0),
+        spacing=(0.5, 0.75, 1.2),
+        direction=((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    transform = create_xy_similarity_transform(
+        geometry=geometry,
+        fixed_geometry=geometry,
+        angle_deg=0.0,
+        scale=1.5,
+    )
+
+    transformed = transform.apply_to_image(
+        moving,
+        moving,
+        interpolation="nearestNeighbor",
+    )
+    actual = ants_to_external_array(transformed.numpy())
+
+    assert np.argwhere(actual > 0.5).tolist() == [[1, 7, 10]]

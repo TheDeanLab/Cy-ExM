@@ -52,6 +52,48 @@ def create_xy_rotation_transform(
     native_threads: NativeThreadConfig | None = None,
 ) -> object:
     """Create the inverse-map affine for a visible moving-image correction."""
+    return create_xy_similarity_transform(
+        geometry=geometry,
+        fixed_geometry=fixed_geometry,
+        angle_deg=angle_deg,
+        scale=1.0,
+        translation_yx_px=translation_yx_px,
+        native_threads=native_threads,
+    )
+
+
+def create_xy_similarity_transform(
+    *,
+    geometry: ImageGeometry,
+    fixed_geometry: ImageGeometry | None = None,
+    angle_deg: float,
+    scale: float,
+    translation_yx_px: tuple[float, float] = (0.0, 0.0),
+    native_threads: NativeThreadConfig | None = None,
+) -> object:
+    """Create a physical 3-D affine for a visible XY similarity correction.
+
+    Parameters
+    ----------
+    geometry : ImageGeometry
+        Cropped moving-image geometry.
+    fixed_geometry : ImageGeometry, optional
+        Cropped fixed-image geometry. Omission uses ``geometry``.
+    angle_deg : float
+        Physical +Z right-hand correction in degrees.
+    scale : float
+        Positive visible uniform magnification applied in the moving XY plane.
+        The physical Z scale remains one.
+    translation_yx_px : tuple of float, optional
+        Visible moving-image translation in moving-array YX pixels.
+    native_threads : NativeThreadConfig, optional
+        Native runtime thread policy resolved before loading ANTSpyX.
+
+    Returns
+    -------
+    object
+        Three-dimensional ANTs affine using inverse-map resampling semantics.
+    """
     ants, np = _configured_runtime(native_threads)
     if type(geometry) is not ImageGeometry:
         raise TypeError("geometry must be an ImageGeometry")
@@ -60,9 +102,14 @@ def create_xy_rotation_transform(
     if type(fixed_geometry) is not ImageGeometry:
         raise TypeError("fixed_geometry must be an ImageGeometry")
     angle = float(angle_deg)
+    visible_scale = float(scale)
     shift_y, shift_x = (float(value) for value in translation_yx_px)
-    if not all(math.isfinite(value) for value in (angle, shift_y, shift_x)):
-        raise ValueError("rotation and translation values must be finite")
+    if not all(
+        math.isfinite(value) for value in (angle, visible_scale, shift_y, shift_x)
+    ):
+        raise ValueError("rotation, scale, and translation values must be finite")
+    if visible_scale <= 0.0:
+        raise ValueError("scale must be positive")
     shape_xyz = np.asarray(geometry.shape[::-1], dtype=np.float64)
     spacing = np.asarray(geometry.spacing, dtype=np.float64)
     direction = np.asarray(geometry.direction, dtype=np.float64)
@@ -83,6 +130,7 @@ def create_xy_rotation_transform(
         ((cosine, -sine, 0.0), (sine, cosine, 0.0), (0.0, 0.0, 1.0)),
         dtype=np.float64,
     )
+    local_matrix[:2, :2] /= visible_scale
     matrix = direction @ local_matrix @ direction.T
     visible_shift = direction @ (
         spacing * np.asarray((shift_x, shift_y, 0.0), dtype=np.float64)
@@ -242,6 +290,7 @@ __all__ = [
     "apply_warp",
     "compose_affine_transforms",
     "create_xy_rotation_transform",
+    "create_xy_similarity_transform",
     "export_affine_transform",
     "import_affine_transform",
     "set_origin_and_spacing",

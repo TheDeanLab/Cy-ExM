@@ -42,10 +42,32 @@ type XYRotationSpec = ExplicitXYRotationSpec | EstimatedXYRotationSpec
 
 
 @dataclass(frozen=True, slots=True)
+class EstimatedXYSimilaritySpec:
+    """Target-blind XY similarity estimation settings for one moving round."""
+
+    mode: Literal["estimate"]
+    search_range_deg: tuple[float, float] = (-45.0, 45.0)
+    coarse_step_deg: float = 1.0
+    refinement_step_deg: float = 0.1
+    scale_range: tuple[float, float] = (0.9, 1.1)
+    coarse_scale_step: float = 0.01
+    refinement_scale_step: float = 0.002
+    minimum_score_gain: float = 0.01
+    minimum_peak_margin: float = 0.01
+
+
+@dataclass(frozen=True, slots=True)
 class InitialAlignmentSpec:
     """Optional geometric initialization for one moving round."""
 
-    xy_rotation: XYRotationSpec
+    xy_rotation: XYRotationSpec | None = None
+    xy_similarity: EstimatedXYSimilaritySpec | None = None
+
+    def __post_init__(self) -> None:
+        if (self.xy_rotation is None) == (self.xy_similarity is None):
+            raise ValueError(
+                "initial alignment requires exactly one of xy_rotation or xy_similarity"
+            )
 
 
 @dataclass(frozen=True, slots=True)

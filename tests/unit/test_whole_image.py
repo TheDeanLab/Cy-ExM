@@ -24,10 +24,13 @@ from cyexm.registration.artifacts import (
 )
 from cyexm.registration.initial_alignment import (
     EstimatedXYRotationPolicy,
+    EstimatedXYSimilarityPolicy,
     ExplicitXYRotationPolicy,
     InitialAlignmentPolicy,
     RotationScore,
+    SimilarityScore,
     XYRotationEstimate,
+    XYSimilarityEstimate,
 )
 from cyexm.registration.whole_image import (
     ImageRegistration,
@@ -132,6 +135,14 @@ def test_explicit_initial_alignment_is_persisted_and_supplied_to_linear(
     assert backend.linear_kwargs[0]["initial_transform"] == (
         paths.initial_alignment_transform
     )
+
+    make_registration(
+        tmp_path,
+        backend=backend,
+        initial_alignment=policy,
+    ).register()
+    assert backend.linear_calls == 1
+    assert len(backend.rotation_seeds) == 1
     affine_request = completion_request(paths.affine)
     assert affine_request.parameters["initial_alignment"] == evidence
 
@@ -183,6 +194,61 @@ def test_rejected_estimate_persists_diagnostics_but_not_transform_or_affine(
     assert not paths.initial_alignment_transform.exists()
     assert not paths.affine.exists()
     assert backend.linear_calls == 0
+
+
+def test_similarity_initial_alignment_persists_scale_and_supplies_one_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = FakeBackend()
+    identity = SimilarityScore(0.0, 1.0, (0.0, 0.0), 0.5, 0.8)
+    angle = SimilarityScore(10.0, 1.0, (2.0, -3.0), 0.7, 0.75)
+    winner = SimilarityScore(10.0, 1.04, (2.0, -3.0), 0.8, 0.7)
+    result = XYSimilarityEstimate(
+        policy="mip-gradient-phase-correlation-xy-similarity-v1",
+        accepted=True,
+        rejection_reason=None,
+        angle_deg=10.0,
+        scale=1.04,
+        translation_yx_px=(2.0, -3.0),
+        identity_score=0.5,
+        score_gain=0.3,
+        peak_margin=0.1,
+        valid_overlap_fraction=0.7,
+        coarse_angle_scores=(identity, angle),
+        refined_angle_scores=(angle,),
+        coarse_scale_scores=(angle, winner),
+        refined_scale_scores=(winner,),
+        joint_scores=(winner,),
+    )
+    monkeypatch.setattr(
+        whole_image, "estimate_xy_similarity", lambda *args, **kwargs: result
+    )
+    policy = InitialAlignmentPolicy(
+        xy_similarity=EstimatedXYSimilarityPolicy(
+            minimum_score_gain=0.01,
+            minimum_peak_margin=0.01,
+        )
+    )
+
+    make_registration(
+        tmp_path,
+        backend=backend,
+        initial_alignment=policy,
+    ).register()
+
+    paths = round_paths(tmp_path)
+    evidence = json.loads(paths.initial_alignment_json.read_text(encoding="utf-8"))
+    assert evidence["configured"]["xy_similarity"]["scale_range"] == [0.9, 1.1]
+    assert evidence["realized"]["scale"] == 1.04
+    assert completion_request(paths.initial_alignment_json).method == "xy-similarity"
+    assert completion_request(paths.initial_alignment_qc).method == (
+        "xy-similarity-montage"
+    )
+    assert backend.similarity_seeds[0][1:] == (10.0, 1.04, (2.0, -3.0))
+    assert backend.linear_kwargs[0]["initial_transform"] == (
+        paths.initial_alignment_transform
+    )
 
 
 def test_explicit_initial_alignment_rejects_different_direction_matrices(

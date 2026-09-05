@@ -6,12 +6,14 @@ from scipy import ndimage
 
 from cyexm.registration.initial_alignment import (
     ROTATION_ESTIMATOR_POLICY,
+    SIMILARITY_ESTIMATOR_POLICY,
     EstimatedXYRotationPolicy,
     EstimatedXYSimilarityPolicy,
     ExplicitXYRotationPolicy,
     InitialAlignmentPolicy,
     XYRotationEstimate,
     estimate_xy_rotation,
+    estimate_xy_similarity,
     initial_alignment_parameters,
     initial_alignment_result_parameters,
     parse_initial_alignment_result,
@@ -90,6 +92,116 @@ def _policy(**overrides: float | tuple[float, float]) -> EstimatedXYRotationPoli
     }
     values.update(overrides)
     return EstimatedXYRotationPolicy(**values)  # type: ignore[arg-type]
+
+
+def _similarity_policy(
+    **overrides: float | tuple[float, float],
+) -> EstimatedXYSimilarityPolicy:
+    values: dict[str, object] = {
+        "search_range_deg": (-20.0, 20.0),
+        "coarse_step_deg": 2.0,
+        "refinement_step_deg": 0.5,
+        "scale_range": (0.9, 1.1),
+        "coarse_scale_step": 0.02,
+        "refinement_scale_step": 0.005,
+        "minimum_score_gain": 0.002,
+        "minimum_peak_margin": 0.0001,
+    }
+    values.update(overrides)
+    return EstimatedXYSimilarityPolicy(**values)  # type: ignore[arg-type]
+
+
+def _center_scale(volume: np.ndarray, scale: float) -> np.ndarray:
+    center = (np.asarray(volume.shape[1:], dtype=np.float64) - 1.0) / 2.0
+    matrix = np.eye(3, dtype=np.float64)
+    matrix[1:, 1:] /= scale
+    offset = np.zeros(3, dtype=np.float64)
+    offset[1:] = center - matrix[1:, 1:] @ center
+    return ndimage.affine_transform(
+        volume,
+        matrix=matrix,
+        offset=offset,
+        output_shape=volume.shape,
+        order=1,
+        mode="constant",
+        cval=0.0,
+        prefilter=False,
+    )
+
+
+def test_similarity_estimator_recovers_rotation_translation_and_uniform_scale() -> None:
+    fixed = _asymmetric_volume()
+    expected_scale = 1.06
+    moving = _center_scale(fixed, 1.0 / expected_scale)
+    moving = ndimage.rotate(
+        moving,
+        angle=12.0,
+        axes=(1, 2),
+        reshape=False,
+        order=1,
+        mode="constant",
+        cval=0.0,
+        prefilter=False,
+    )
+    moving = ndimage.shift(
+        moving,
+        shift=(0.0, 4.0, -6.0),
+        order=1,
+        mode="constant",
+        cval=0.0,
+        prefilter=False,
+    )
+
+    estimate = estimate_xy_similarity(fixed, moving, _similarity_policy())
+    rotation_only = estimate_xy_rotation(fixed, moving, _policy())
+
+    assert estimate.accepted is True
+    assert estimate.policy == SIMILARITY_ESTIMATOR_POLICY
+    assert estimate.angle_deg == pytest.approx(12.0, abs=0.5)
+    assert estimate.scale == pytest.approx(expected_scale, abs=0.01)
+    assert estimate.translation_yx_px == pytest.approx((-4.0, 6.0), abs=2.0)
+    assert estimate.score_gain is not None and estimate.score_gain > 0.02
+    assert estimate.coarse_angle_scores
+    assert estimate.refined_scale_scores
+    assert estimate.joint_scores
+    assert (
+        max(item.correlation for item in estimate.joint_scores)
+        > max(
+            item.correlation
+            for item in (*rotation_only.coarse_scores, *rotation_only.refined_scores)
+        )
+        + 0.01
+    )
+
+
+def test_similarity_estimator_rejects_scale_at_search_boundary() -> None:
+    fixed = _asymmetric_volume()
+    moving = _center_scale(fixed, 1.0 / 1.12)
+
+    estimate = estimate_xy_similarity(
+        fixed,
+        moving,
+        _similarity_policy(scale_range=(0.96, 1.08)),
+    )
+
+    assert estimate.accepted is False
+    assert estimate.rejection_reason == "winner-at-scale-boundary"
+
+
+def test_similarity_result_round_trips_canonical_evidence() -> None:
+    policy = InitialAlignmentPolicy(xy_similarity=_similarity_policy())
+    similarity = policy.xy_similarity
+    assert similarity is not None
+    result = estimate_xy_similarity(
+        _asymmetric_volume(),
+        _center_scale(_asymmetric_volume(), 1.0 / 1.04),
+        similarity,
+    )
+
+    payload = initial_alignment_result_parameters(result)
+
+    assert payload["scale"] == pytest.approx(1.04, abs=0.01)
+    assert parse_initial_alignment_result(payload, policy) == result
 
 
 @pytest.mark.parametrize("applied_angle", [-24.0, 18.0])

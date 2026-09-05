@@ -56,23 +56,23 @@ spheroid data, and submit a fresh production workflow.
 - [x] Extend strict YAML normalization and workflow translation without importing a
   scientific runtime into config/planning.
 - [x] Run focused config, planning, import-contract, and fingerprint tests GREEN.
-- [ ] Commit the strict public configuration extension with the reuse analysis in
+- [x] Commit the strict public configuration extension with the reuse analysis in
   the commit body.
 
 ## Task 3: Implement deterministic MIP similarity estimation and transform
 
-- [ ] Add failing synthetic estimator tests in
+- [x] Add failing synthetic estimator tests in
   `tests/unit/test_initial_alignment.py` for known uniform scale plus angle and
   translation, deterministic tie breaking, boundary rejection, confidence
   rejection, canonical round trip, and unchanged rotation evidence.
-- [ ] Add failing physical landmark tests in
+- [x] Add failing physical landmark tests in
   `tests/integration/test_initial_alignment_transforms.py` for uniform XY scale,
   anisotropic spacing, shifted origins, and matching nonidentity directions.
-- [ ] Run those focused tests and retain RED.
-- [ ] Refactor shared MIP candidate scoring without changing rotation output, add
+- [x] Run those focused tests and retain RED.
+- [x] Refactor shared MIP candidate scoring without changing rotation output, add
   versioned coordinate-refinement similarity estimation, and implement one physical
   3-D XY similarity transform.
-- [ ] Run both focused modules GREEN and compare the synthetic similarity score
+- [x] Run both focused modules GREEN and compare the synthetic similarity score
   against rotation-only initialization.
 - [ ] Commit estimator and transform behavior with policy-version evidence.
 

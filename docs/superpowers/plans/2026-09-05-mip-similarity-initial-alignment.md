@@ -107,17 +107,17 @@ spheroid data, and submit a fresh production workflow.
 
 ## Task 6: Configure and launch a fresh spheroid production run
 
-- [ ] Reinspect TIFF inventory/geometry and the successful smoke evidence. Preserve
+- [x] Reinspect TIFF inventory/geometry and the successful smoke evidence. Preserve
   round 2 as fixed, retain existing per-round constrained angle ranges, use
   `scale_range: [0.90, 1.10]`, and change the 3-D linear method to `Similarity` high.
-- [ ] Create new dated dataset/execution YAMLs and a launch script in the spheroid
+- [x] Create new dated dataset/execution YAMLs and a launch script in the spheroid
   directory. Do not mutate the separate historical run or delete its output.
-- [ ] Point the execution profile to a new output root or use a new dataset ID so no
+- [x] Point the execution profile to a new output root or use a new dataset ID so no
   scientifically invalid cache can be reused.
-- [ ] Validate and plan with the exact feature-worktree executable; inspect the plan,
+- [x] Validate and plan with the exact feature-worktree executable; inspect the plan,
   scientific fingerprint, output targets, fine slot capacity, and empty user queue.
-- [ ] Submit the full-resolution workflow under a durable controller, capture PID,
+- [x] Submit the full-resolution workflow under a durable controller, capture PID,
   stdout/stderr path, Slurm job IDs, exact Git commit, manifests, and validation
   output, and confirm workers enter the queue.
-- [ ] Report submission state as running, not complete; identify commands and
+- [x] Report submission state as running, not complete; identify commands and
   artifact paths for later terminal verification.

@@ -74,20 +74,20 @@ spheroid data, and submit a fresh production workflow.
   3-D XY similarity transform.
 - [x] Run both focused modules GREEN and compare the synthetic similarity score
   against rotation-only initialization.
-- [ ] Commit estimator and transform behavior with policy-version evidence.
+- [x] Commit estimator and transform behavior with policy-version evidence.
 
 ## Task 4: Integrate restart-safe artifacts, QC, fine admission, and provenance
 
-- [ ] Add failing whole-image tests for similarity JSON/MAT/PNG requests, realized
+- [x] Add failing whole-image tests for similarity JSON/MAT/PNG requests, realized
   scale, geometry and source/crop context, force/restart, rejected evidence, and
   downstream invalidation.
-- [ ] Add failing prepared/fine/status/run-record tests proving similarity evidence
+- [x] Add failing prepared/fine/status/run-record tests proving similarity evidence
   is parsed canonically and every artifact completion request is authenticated.
-- [ ] Run focused tests and retain RED.
-- [ ] Route both policy kinds through the existing
+- [x] Run focused tests and retain RED.
+- [x] Route both policy kinds through the existing
   `_load_or_resolve_initial_alignment` lifecycle, render QC with exact physical seed
   semantics, and update shared provenance validators/readers.
-- [ ] Run `test_whole_image.py`, `test_prepared.py`, fine-task, status, API, and
+- [x] Run `test_whole_image.py`, `test_prepared.py`, fine-task, status, API, and
   rotation integration regressions GREEN.
 - [ ] Commit lifecycle and provenance changes.
 

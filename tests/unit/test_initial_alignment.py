@@ -203,6 +203,16 @@ def test_similarity_result_round_trips_canonical_evidence() -> None:
     assert payload["scale"] == pytest.approx(1.04, abs=0.01)
     assert parse_initial_alignment_result(payload, policy) == result
 
+    forged_scale = dict(payload)
+    forged_scale["scale"] = 1.1
+    with pytest.raises(ValueError, match=r"winner|confidence"):
+        parse_initial_alignment_result(forged_scale, policy)
+
+    missing_curve = dict(payload)
+    missing_curve.pop("joint_scores")
+    with pytest.raises(ValueError, match="keys are not canonical"):
+        parse_initial_alignment_result(missing_curve, policy)
+
 
 @pytest.mark.parametrize("applied_angle", [-24.0, 18.0])
 def test_estimator_recovers_xy_rotation_correction(applied_angle: float) -> None:
@@ -385,6 +395,18 @@ def test_qc_raster_is_deterministic_uint8_evidence() -> None:
     assert np.array_equal(first, second)
     assert np.count_nonzero(first) > 1000
     assert np.count_nonzero(first[:, 512:]) > 100
+
+
+def test_similarity_qc_depicts_scale_corrected_geometry() -> None:
+    fixed = _asymmetric_volume()
+    moving = _center_scale(fixed, 1.0 / 1.06)
+    estimate = estimate_xy_similarity(fixed, moving, _similarity_policy())
+
+    montage = render_initial_alignment_qc(fixed, moving, estimate)
+
+    before_difference = montage[:256, 512:768]
+    after_difference = montage[256:512, 256:512]
+    assert float(after_difference.mean()) < float(before_difference.mean())
 
 
 def test_realized_evidence_parser_rejects_explicit_angle_drift() -> None:

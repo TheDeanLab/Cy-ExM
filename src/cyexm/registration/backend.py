@@ -88,6 +88,17 @@ class RegistrationBackend(Protocol):
     ) -> object:
         raise NotImplementedError
 
+    def create_xy_similarity_seed(
+        self,
+        *,
+        fixed_geometry: ImageGeometry,
+        geometry: ImageGeometry,
+        angle_deg: float,
+        scale: float,
+        translation_yx_px: tuple[float, float],
+    ) -> object:
+        raise NotImplementedError
+
     def compose_affines(self, transforms: tuple[object, ...]) -> object:
         raise NotImplementedError
 
@@ -314,6 +325,24 @@ class AntsRegistrationBackend:
             fixed_geometry=fixed_geometry,
             geometry=geometry,
             angle_deg=angle_deg,
+            translation_yx_px=translation_yx_px,
+            native_threads=self.native_threads,
+        )
+
+    def create_xy_similarity_seed(
+        self,
+        *,
+        fixed_geometry: ImageGeometry,
+        geometry: ImageGeometry,
+        angle_deg: float,
+        scale: float,
+        translation_yx_px: tuple[float, float],
+    ) -> object:
+        return transform_helpers.create_xy_similarity_transform(
+            fixed_geometry=fixed_geometry,
+            geometry=geometry,
+            angle_deg=angle_deg,
+            scale=scale,
             translation_yx_px=translation_yx_px,
             native_threads=self.native_threads,
         )

@@ -241,21 +241,26 @@ def _progress_signature(
         ),
     }
     if round_task.initial_alignment is not None:
+        alignment_method = (
+            "xy-rotation"
+            if round_task.initial_alignment.xy_rotation is not None
+            else "xy-similarity"
+        )
         common.update(
             {
                 registration.initial_alignment_json: (
                     "initial-alignment:evidence",
-                    "xy-rotation",
+                    alignment_method,
                     "deterministic",
                 ),
                 registration.initial_alignment_qc: (
                     "initial-alignment:qc",
-                    "xy-rotation-montage",
+                    f"{alignment_method}-montage",
                     "deterministic",
                 ),
                 registration.initial_alignment_transform: (
                     "initial-alignment:transform",
-                    "xy-rotation",
+                    alignment_method,
                     "exact",
                 ),
             }

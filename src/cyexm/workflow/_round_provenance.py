@@ -487,11 +487,17 @@ def _validated_initial_alignment_evidence(
     from cyexm.workflow.models import _initial_alignment_mapping
 
     configured_mapping = _initial_alignment_mapping(configured)
-    from cyexm.config.models import EstimatedXYRotationSpec, ExplicitXYRotationSpec
+    from cyexm.config.models import (
+        EstimatedXYRotationSpec,
+        EstimatedXYSimilaritySpec,
+        ExplicitXYRotationSpec,
+    )
     from cyexm.registration.initial_alignment import (
         EXPLICIT_ROTATION_POLICY,
         ROTATION_ESTIMATOR_POLICY,
+        SIMILARITY_ESTIMATOR_POLICY,
         EstimatedXYRotationPolicy,
+        EstimatedXYSimilarityPolicy,
         ExplicitXYRotationPolicy,
         InitialAlignmentPolicy,
         parse_initial_alignment_result,
@@ -510,9 +516,28 @@ def _validated_initial_alignment_evidence(
             minimum_score_gain=configured_rotation.minimum_score_gain,  # type: ignore[union-attr]
             minimum_peak_margin=configured_rotation.minimum_peak_margin,  # type: ignore[union-attr]
         )
+    elif type(configured.xy_similarity) is EstimatedXYSimilaritySpec:
+        configured_similarity = configured.xy_similarity
+        algorithm = SIMILARITY_ESTIMATOR_POLICY
+        runtime_policy = InitialAlignmentPolicy(
+            xy_similarity=EstimatedXYSimilarityPolicy(
+                search_range_deg=configured_similarity.search_range_deg,
+                coarse_step_deg=configured_similarity.coarse_step_deg,
+                refinement_step_deg=configured_similarity.refinement_step_deg,
+                scale_range=configured_similarity.scale_range,
+                coarse_scale_step=configured_similarity.coarse_scale_step,
+                refinement_scale_step=configured_similarity.refinement_scale_step,
+                minimum_score_gain=configured_similarity.minimum_score_gain,
+                minimum_peak_margin=configured_similarity.minimum_peak_margin,
+            )
+        )
     else:  # pragma: no cover - RoundTask validation owns this boundary
         return None
-    runtime_policy = InitialAlignmentPolicy(runtime_rotation)
+    if configured_rotation is not None:
+        runtime_policy = InitialAlignmentPolicy(runtime_rotation)
+    alignment_method = (
+        "xy-rotation" if configured_rotation is not None else "xy-similarity"
+    )
     crop_evidence: dict[str, object] = {"enabled": task.registration.crop}
     if task.registration.crop:
         try:
@@ -552,7 +577,7 @@ def _validated_initial_alignment_evidence(
         stage="initial-alignment:evidence",
         inputs=inputs,
         geometry=geometries.fixed,
-        method="xy-rotation",
+        method=alignment_method,
         accuracy="deterministic",
         task=task,
         upstream=None,
@@ -600,17 +625,23 @@ def _initial_alignment_snapshots(
     evidence, evidence_identity, accepted = validated
     if not accepted:
         return None
+    alignment_method = (
+        "xy-rotation"
+        if task.initial_alignment is not None
+        and task.initial_alignment.xy_rotation is not None
+        else "xy-similarity"
+    )
     for path, stage, method, geometry in (
         (
             paths.initial_alignment_qc,
             "initial-alignment:qc",
-            "xy-rotation-montage",
+            f"{alignment_method}-montage",
             geometries.fixed,
         ),
         (
             paths.initial_alignment_transform,
             "initial-alignment:transform",
-            "xy-rotation",
+            alignment_method,
             geometries.moving,
         ),
     ):

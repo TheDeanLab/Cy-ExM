@@ -1520,13 +1520,33 @@ def render_initial_alignment_qc(
                 display_translation_yx[0] * moving_geometry.spacing[1] / target_spacing,
                 display_translation_yx[1] * moving_geometry.spacing[0] / target_spacing,
             )
-    size = _canvas_size(fixed, moving)
+    visible_scale = (
+        estimate.scale
+        if isinstance(estimate, XYSimilarityEstimate) and estimate.scale is not None
+        else 1.0
+    )
+    size = math.ceil(
+        max(math.hypot(*fixed.shape), math.hypot(*moving.shape) * visible_scale)
+    )
     fixed = _center_pad(np, fixed, size)
     moving = _center_pad(np, moving, size)
     aligned = moving
     if estimate.angle_deg is not None and display_translation_yx is not None:
+        if isinstance(estimate, XYSimilarityEstimate) and estimate.scale is not None:
+            center = (np.asarray(moving.shape, dtype=np.float64) - 1.0) / 2.0
+            matrix = np.eye(2, dtype=np.float64) / estimate.scale
+            aligned = ndimage.affine_transform(
+                aligned,
+                matrix=matrix,
+                offset=center - matrix @ center,
+                output_shape=aligned.shape,
+                order=1,
+                mode="constant",
+                cval=0.0,
+                prefilter=False,
+            )
         aligned = ndimage.rotate(
-            moving,
+            aligned,
             angle=-estimate.angle_deg,
             reshape=False,
             order=1,
